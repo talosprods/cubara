@@ -1,0 +1,24 @@
+[package]
+name = "cubara-render"
+description = "Cubara — GPU renderer: pipelines, meshing upload, camera and culling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# Enable in-process CPU profiling served over puffin_http (off by default).
+profile = ["dep:puffin_http"]
+
+[dependencies]
+cubara-voxel = { path = "../voxel" }
+cubara-world = { path = "../world" }
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+log.workspace = true
+# puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
+puffin.workspace = true
+puffin_http = { workspace = true, optional = true }

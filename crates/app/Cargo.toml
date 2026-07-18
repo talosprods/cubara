@@ -11,18 +11,18 @@ name = "cubara"
 path = "src/main.rs"
 
 [features]
-# Enable in-process CPU profiling served over puffin_http (off by default).
-profile = ["dep:puffin_http"]
+# Enable in-process CPU profiling; forwards to the renderer's puffin_http server.
+profile = ["cubara-render/profile"]
 
 [dependencies]
+cubara-render = { path = "../render" }
+cubara-world = { path = "../world" }
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
-glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
 # puffin scope macros compile to near-nothing unless scopes are enabled at runtime.
 puffin.workspace = true
-puffin_http = { workspace = true, optional = true }
 image.workspace = true
