@@ -11,6 +11,7 @@ mod arena;
 mod camera;
 pub mod culling;
 mod mesher;
+mod outline;
 pub mod profiling;
 mod render;
 mod text;

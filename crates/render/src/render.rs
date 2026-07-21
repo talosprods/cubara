@@ -20,9 +20,10 @@ use crate::arena::ChunkArena;
 use crate::camera::FlyCamera;
 use crate::culling::Frustum;
 use crate::mesher::{BuiltChunk, MeshPool};
+use crate::outline::OutlineRenderer;
 use crate::text::TextRenderer;
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// How many chunks out (square radius) to keep resident around the camera. The inner
 /// core is full resolution and only the far rings drop to a coarser LOD (see
@@ -122,6 +123,8 @@ pub struct Renderer {
 
     /// Screen-space text for the debug overlay.
     text: TextRenderer,
+    /// Wireframe box around the block the player is currently targeting.
+    outline: OutlineRenderer,
     /// Whether the F3 debug overlay is shown.
     show_debug: bool,
     /// Smoothed frame time in ms, for a stable on-screen FPS reading.
@@ -203,6 +206,7 @@ impl Renderer {
         });
 
         let pipeline = build_pipeline(&device, format, &camera_bgl);
+        let outline = OutlineRenderer::new(&device, format, &camera_bgl);
         let depth_view = create_depth_view(&device, config.width, config.height);
 
         // Start above the terrain near the origin, looking out over it and slightly
@@ -240,6 +244,7 @@ impl Renderer {
             frames: 0,
             last_report: Instant::now(),
             text,
+            outline,
             show_debug: true,
             frame_ms: 0.0,
         };
@@ -439,6 +444,7 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             self.arena.encode(&mut pass, draw_count);
+            self.outline.draw(&mut pass);
         }
 
         // Debug overlay: a second pass over the same colour target (loaded, no depth).
@@ -534,6 +540,11 @@ impl Renderer {
             self.frame_ms * 0.9 + ms * 0.1
         };
         self.camera.update(dt);
+
+        let origin = self.camera.pos.to_array();
+        let dir = self.camera.look_dir().to_array();
+        let target = World::raycast(origin, dir, EDIT_REACH).map(|hit| hit.block);
+        self.outline.set_target(&self.queue, target);
 
         let center = ChunkCoord::from_world_pos(self.camera.pos.to_array());
         if center != self.center {
