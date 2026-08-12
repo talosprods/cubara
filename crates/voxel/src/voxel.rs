@@ -471,10 +471,21 @@ fn push_quad(
     // Each corner's own texel-tile coordinate: (0,0) at the origin corner,
     // stepping to (w,h) at the far corner -- one tile per grid cell, tiling
     // the texture across the merged quad.
-    let uv0 = (0, 0);
-    let uv1 = (w, 0);
-    let uv2 = (w, h);
-    let uv3 = (0, h);
+    //
+    // The axis sweep above assigns u = (d+1)%3, v = (d+2)%3, so for d == 0
+    // (X-facing walls) u is world-Y (vertical) while for d == 2 (Z-facing
+    // walls) v is world-Y (vertical) -- the two wall orientations disagree on
+    // which texture axis is "up". Left alone, a texture with directional
+    // grain (grass_side: dirt at the bottom, grass at the top) reads
+    // correctly on one pair of walls and rotated 90 degrees on the other,
+    // purely depending on which way the wall faces. Transpose the corner
+    // coordinates for d == 0 so texture-v tracks world-Y on every side wall,
+    // matching d == 2 -- geometry (c0..c3, winding) is untouched.
+    let (uv0, uv1, uv2, uv3) = if d == 0 {
+        ((0, 0), (0, w), (h, w), (h, 0))
+    } else {
+        ((0, 0), (w, 0), (w, h), (0, h))
+    };
 
     // (du × dv) points toward +d, so keep that order for +d faces and reverse for -d
     // faces to stay outward/CCW for back-face culling. AO and UV follow the same reorder.
@@ -892,6 +903,45 @@ mod tests {
             let n = mesh.vertices[quad * 4].face().normal();
             let dot = geo[0] * n[0] + geo[1] * n[1] + geo[2] * n[2];
             assert!(dot > 0.0, "quad {quad} is wound inward (geo·n = {dot})");
+        }
+    }
+
+    #[test]
+    fn side_wall_texture_v_tracks_world_y_regardless_of_wall_facing() {
+        // A directional texture (grass_side: dirt at the bottom, grass at the
+        // top) must read the same way on every side wall. The mesher's axis
+        // sweep assigns u = Y for X-facing walls but v = Y for Z-facing walls
+        // -- without push_quad correcting for that, texture-v would track
+        // world-Y on one pair of walls and texture-u on the other, i.e. the
+        // texture would appear rotated 90 degrees depending only on which way
+        // the wall faced.
+        let mut chunk = empty();
+        set(&mut chunk, 5, 5, 5);
+        set(&mut chunk, 5, 6, 5); // a 1x2x1 pillar merges each side wall into one quad
+        let registry = registry();
+        let mesh = chunk.build_mesh(&ctx(&registry));
+
+        for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
+            let quad: Vec<Vertex> = mesh
+                .vertices
+                .iter()
+                .copied()
+                .filter(|v| v.face() == face)
+                .collect();
+            assert_eq!(quad.len(), 4, "{face:?} should merge into one quad");
+            let lo_y = quad.iter().map(|v| v.y()).min().unwrap();
+            let hi_y = quad.iter().map(|v| v.y()).max().unwrap();
+            assert!(hi_y > lo_y, "{face:?} quad must span two Y levels");
+            for v in &quad {
+                let expected_v = v.y() - lo_y;
+                assert_eq!(
+                    v.v(),
+                    expected_v,
+                    "{face:?}: texture-v must track world-Y (corner at y={}, got v()={})",
+                    v.y(),
+                    v.v()
+                );
+            }
         }
     }
 
