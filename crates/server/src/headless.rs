@@ -251,13 +251,28 @@ impl Session {
     /// Split out of `accept_new_clients` so that [`attach`](Self::attach) joins
     /// by the same route a socket does rather than by a parallel one that could
     /// drift.
-    fn welcome(&mut self, mut link: Link<ServerMessage, ClientMessage>) {
+    /// Take an already-connected link as a client, and report which player it
+    /// drives.
+    ///
+    /// What singleplayer joins through (block 2.12b part B). A local client is
+    /// a client whose transport happens to be a function call (§3.3), so it
+    /// arrives through the same welcome a socket does — same handshake, same
+    /// view, same fingerprints — rather than through a second path that would
+    /// have to be kept in step with this one.
+    ///
+    /// `None` when the world has no spawn point yet, which is the same refusal
+    /// a socket connection gets.
+    pub fn join_local(&mut self, link: Link<ServerMessage, ClientMessage>) -> Option<PlayerId> {
+        self.welcome(link)
+    }
+
+    fn welcome(&mut self, mut link: Link<ServerMessage, ClientMessage>) -> Option<PlayerId> {
         // From the *world*, not from a player. This used to read the local
         // player's spawn field, which is why a dedicated server needed a
         // player nobody was driving.
         let Some(spawn) = self.server.world_spawn() else {
             log::warn!("no spawn point yet -- refusing a connection until assets are set");
-            return;
+            return None;
         };
         let player =
             cubara_sim::Player::new(spawn, cubara_voxel::Angle::ZERO, cubara_voxel::Angle::ZERO);
@@ -303,6 +318,7 @@ impl Session {
         );
         link.send(ServerMessage::Effects(handshake));
         self.clients.insert(id, link);
+        Some(id)
     }
 
     /// Read whatever every client sent, and turn it into this tick's input.
