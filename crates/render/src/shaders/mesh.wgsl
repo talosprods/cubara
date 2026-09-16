@@ -28,6 +28,16 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
+// Throwaway diagnostic (variant E): fog thresholds pre-converted to
+// clip-space (z' = A/d - B) on the CPU, hardcoded here for --bench 64's
+// actual fog_start=576/fog_end=960, so the fragment stage does one
+// smoothstep and zero divisions. z_end < z_start (edge0 < edge1, well
+// defined per the WGSL spec) with `1.0 -` in front: z' *decreases* with
+// distance, so smoothstep(z_end, z_start, z) is 1 at the near fog edge and
+// 0 at the far one -- the opposite of what fog_amount needs.
+override fog_z_start: f32 = 0.0001236172919757099;
+override fog_z_end: f32 = 5.4169375135423426e-05;
+
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
 // node's world-space min corner; w is its scale -- world units per lattice
@@ -162,8 +172,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // checked explicitly rather than relied on via a huge sentinel distance:
     // `select` here means a disabled fog never evaluates `smoothstep` on an
     // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
+    let fog_amount = 1.0 - smoothstep(fog_z_end, fog_z_start, in.clip_pos.z);
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
 }
