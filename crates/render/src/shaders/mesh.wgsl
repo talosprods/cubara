@@ -50,6 +50,16 @@ override diffuse_weight: f32 = 0.75;
 // `Lighting::default` has ever produced) -- `tex.rgb * vec3(1.0)` is exactly
 // `tex.rgb`, so the multiply was pure cost for a shader that never used it.
 override sun_is_white: bool = true;
+// Throwaway diagnostic (variant C): isolate whatever uniform reads remain in
+// the fragment stage by making sun_dir/fog_color/fog range overrides too.
+override sun_dir_x: f32 = 0.37115407;
+override sun_dir_y: f32 = 0.92788516;
+override sun_dir_z: f32 = 0.27836555;
+override fog_color_r: f32 = 0.45;
+override fog_color_g: f32 = 0.62;
+override fog_color_b: f32 = 0.80;
+override fog_start_c: f32 = 576.0;
+override fog_end_c: f32 = 960.0;
 
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
@@ -129,12 +139,12 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = FACE_NORMALS[0];
+    let n = FACE_NORMALS[in.face];
 
     // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
     // already normalized (`Lighting`'s doc comment); the shader does not
     // renormalize it.
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * diffuse_weight;
+    let diffuse = max(dot(n, vec3<f32>(sun_dir_x, sun_dir_y, sun_dir_z)), 0.0) * diffuse_weight;
 
     // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
     let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
@@ -195,7 +205,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // `select` here means a disabled fog never evaluates `smoothstep` on an
     // equal-edges range, whose result WGSL leaves unspecified.
     let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
-    let color = mix(lit, frame.fog_color.rgb, fog_amount);
+    let fog_amount = smoothstep(fog_start_c, fog_end_c, view_depth);
+    let color = mix(lit, vec3<f32>(fog_color_r, fog_color_g, fog_color_b), fog_amount);
     return vec4<f32>(color, 1.0);
 }
