@@ -129,7 +129,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = FACE_NORMALS[in.face];
+    let n = FACE_NORMALS[0];
 
     // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
     // already normalized (`Lighting`'s doc comment); the shader does not
