@@ -52,12 +52,12 @@ struct VsIn {
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    // The packed `face` index itself, not the unit vector it picks out of
-    // `FACE_NORMALS` -- greedy-meshed faces never bend across a triangle, so
-    // there is nothing for the rasterizer to interpolate, and shipping one
-    // flat u32 instead of an interpolated (and fragment-renormalized) vec3
-    // is strictly less varying traffic for the same answer.
-    @location(0) @interpolate(flat) face: u32,
+    // Throwaway diagnostic (variant F): interpolated, not flat -- exactly
+    // pre-package-2's shape (`1fcd449`), to isolate whether the fragment
+    // stage merely *touching* the uniform buffer at all (occupancy on a
+    // tile-based GPU) is the missing cost, separate from which lighting
+    // fields it reads.
+    @location(0) normal: vec3<f32>,
     @location(1) ao: f32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
@@ -97,7 +97,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
-    out.face = face;
+    out.normal = FACE_NORMALS[face];
     out.ao = f32(ao_raw) / 3.0;
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
@@ -106,64 +106,17 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = FACE_NORMALS[in.face];
-
-    // Directional sun: clear sun-side / shadow-side split. `sun_dir` arrives
-    // already normalized (`Lighting`'s doc comment); the shader does not
-    // renormalize it.
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
-
-    // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
-    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
-
-    // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(frame.ambient.z, 1.0, in.ao);
-
+    // Throwaway diagnostic (variant F): exactly pre-package-2's fs_main
+    // (`1fcd449`) -- no `frame.` reference anywhere in this function, every
+    // lighting value a literal, no fog. Isolates whether the fragment stage
+    // merely being configured to see the uniform buffer (vs. this exact
+    // fragment shader never touching it) is itself the cost.
+    let n = normalize(in.normal);
+    let light_dir = normalize(vec3<f32>(0.4, 1.0, 0.3));
+    let diffuse = max(dot(n, light_dir), 0.0);
+    let ambient = mix(0.28, 0.42, n.y * 0.5 + 0.5);
+    let ao = mix(0.4, 1.0, in.ao);
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    let lit = tex.rgb * frame.sun_color.rgb * (ambient + diffuse) * ao;
-
-    // Depth fog, fading toward `fog_color` (the sky colour, by default --
-    // `Lighting::default`) rather than a hard render-radius edge. Planar
-    // (view-space depth), not radial (distance from the eye) -- measured on
-    // a tile-based GPU (Apple M3) that a world-space `distance()` needs a
-    // `world_pos` varying, and on this scene (~480k triangles, real
-    // overdraw) that varying alone cost ~0.3ms/frame in interpolation
-    // traffic, on top of the extra ALU cost.
-    //
-    // Two earlier approaches to view-space depth both turned out to read a
-    // value naga's DX12 backend gets wrong (wgpu 24; CI's Windows runner
-    // caught both, not this machine or the M3): `@builtin(position).w`,
-    // which the WGSL/WebGPU spec says is `1/w_clip` but which Direct3D's
-    // pixel-shader `SV_Position.w` gives raw, uninverted, with naga not
-    // correcting for the difference; and, as a fix, a plain vertex-shader
-    // `1/w_clip` carried across as an ordinary `@interpolate(linear)`
-    // varying, which was correct everywhere but still cost an extra f32 of
-    // interpolation traffic (measured on the M3: ~80 FPS, ~0.043 ms/frame).
-    //
-    // This reads `@builtin(position).z` instead -- the rasterizer's actual
-    // depth-buffer value, not a value under naga's `.w` handling at all, and
-    // recoverable with zero varyings since it's already per-fragment via the
-    // hardware depth interpolant every pipeline needs anyway. `reverse_z`
-    // only touches the z output row (not w), so starting from
-    // `perspective_rh`'s un-reversed NDC (`ndc_z = C - A/d` for view depth
-    // `d`) and applying `new_ndc_z = 1 - ndc_z` gives `ndc_z' = A/d - B` --
-    // solved for `d`, that's the `A/(z+B)` below. `frame.depth` carries
-    // `(A, B)`, computed once on the CPU from the same near/far the
-    // projection itself uses (`render.rs`'s `reverse_z_depth_constants`,
-    // pinned against the real matrix by a unit test there rather than
-    // trusted as algebra alone).
-    //
-    // The visible difference from the old world_pos-based radial fog is
-    // real, not a regression: at the screen edges the plane fades in
-    // slightly later than the true radial distance would (`distance` >
-    // `depth` off-axis), never earlier, so nothing pops out of fog too soon.
-    //
-    // `fog.y <= fog.x` is "fog off" ([`Lighting`]'s documented convention),
-    // checked explicitly rather than relied on via a huge sentinel distance:
-    // `select` here means a disabled fog never evaluates `smoothstep` on an
-    // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
-    let color = mix(lit, frame.fog_color.rgb, fog_amount);
+    let color = tex.rgb * (ambient + diffuse * 0.75) * ao;
     return vec4<f32>(color, 1.0);
 }
