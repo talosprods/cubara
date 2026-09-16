@@ -28,6 +28,11 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
+// Throwaway diagnostic (variant D): fold the whole fog block out via a real
+// `if`, not `select` (WGSL evaluates both `select` branches, so the toggle
+// never actually removed the fog math -- this isolates it for real).
+override fog_enabled: bool = false;
+
 // One world-space origin per resident node, indexed by the node_index packed
 // into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
 // node's world-space min corner; w is its scale -- world units per lattice
@@ -162,8 +167,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // checked explicitly rather than relied on via a huge sentinel distance:
     // `select` here means a disabled fog never evaluates `smoothstep` on an
     // equal-edges range, whose result WGSL leaves unspecified.
-    let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
-    let color = mix(lit, frame.fog_color.rgb, fog_amount);
+    var color = lit;
+    if fog_enabled {
+        let view_depth = frame.depth.x / (in.clip_pos.z + frame.depth.y);
+        let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, view_depth), frame.fog.y > frame.fog.x);
+        color = mix(lit, frame.fog_color.rgb, fog_amount);
+    }
     return vec4<f32>(color, 1.0);
 }
