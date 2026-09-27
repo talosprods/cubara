@@ -32,8 +32,13 @@ struct Params {
     // The box the voxel rings draw themselves: nothing here is drawn inside it.
     hole_min: vec4<f32>,
     hole_max: vec4<f32>,
-    // The average colour of the ground's top material, in linear light.
+    // What the ground is made of, in linear light (`aggregate::Materials`):
+    // the top of the surface block, its side, the soil and the stone beneath.
     top_color: vec4<f32>,
+    // `w`: how many blocks of soil lie between the surface block and stone.
+    side_color: vec4<f32>,
+    soil_color: vec4<f32>,
+    stone_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -41,6 +46,9 @@ struct Params {
 @group(1) @binding(1) var<storage, read> patches: array<Patch>;
 @group(1) @binding(2) var<storage, read> draw_slots: array<u32>;
 @group(1) @binding(3) var<uniform> params: Params;
+// `aggregate::MaskingTable`: 16 x 16 x (16 x 16), its last two axes stacked.
+@group(1) @binding(4) var masking: texture_3d<f32>;
+@group(1) @binding(5) var masking_sampler: sampler;
 
 const QUADS: i32 = 32;
 const VERTS: u32 = 33u;
@@ -106,16 +114,111 @@ fn vs_main(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Block-aggregate shading (`docs/PROPOSAL_FAR_VIEW.md` §3.3). The definition is
+// `crates/render/src/aggregate.rs`; every function below is the one of the
+// same name there, and its tests are what say this is right.
+// ---------------------------------------------------------------------------
+
+const TABLE_LAST: f32 = 15.0;
+const TABLE_MAX_SLOPE_DEG: f32 = 80.0;
+const DEG: f32 = 57.29577951308232;
+
+// `MaskingTable::top_fraction`: the top fraction when the risers along one
+// axis (A) face the eye and those along the other (B) hide what is behind
+// them. Slopes and view components are magnitudes.
+fn masked_top(g_a: f32, g_b: f32, v_a: f32, v_b: f32, v_y: f32) -> f32 {
+    let steepness = atan(length(vec2<f32>(g_a, g_b))) * DEG;
+    let lean = atan2(g_b, g_a) * DEG;
+    let seen = v_y + g_a * v_a;
+    let at = clamp(
+        vec4<f32>(
+            sqrt(steepness / TABLE_MAX_SLOPE_DEG),
+            lean / 90.0,
+            g_a * v_a / seen,
+            1.0 - sqrt(1.0 - min(g_b * v_b / seen, 1.0)),
+        ) * TABLE_LAST,
+        vec4<f32>(0.0),
+        vec4<f32>(TABLE_LAST),
+    );
+    // The fourth axis by hand, between two stacks the filter never mixes.
+    let stack = min(floor(at.w), TABLE_LAST - 1.0);
+    let blend = at.w - stack;
+    let xy = (at.xy + 0.5) / 16.0;
+    let near = textureSampleLevel(masking, masking_sampler, vec3<f32>(xy, (at.z + 16.0 * stack + 0.5) / 256.0), 0.0).r;
+    let far = textureSampleLevel(masking, masking_sampler, vec3<f32>(xy, (at.z + 16.0 * (stack + 1.0) + 0.5) / 256.0), 0.0).r;
+    return mix(near, far, blend);
+}
+
+// `visible_weights`: how much of the pixel tops, x-risers and z-risers cover,
+// for a slope of gradient `g` seen along `v` (unit, toward the eye).
+fn visible_weights(g: vec2<f32>, v: vec3<f32>) -> vec3<f32> {
+    // A riser faces the eye when the eye is on its downhill side.
+    let x_faces = g.x * v.x < 0.0;
+    let z_faces = g.y * v.z < 0.0;
+    let x_hides = g.x * v.x > 0.0;
+    let z_hides = g.y * v.z > 0.0;
+    if x_faces && z_hides {
+        let top = masked_top(abs(g.x), abs(g.y), abs(v.x), abs(v.z), v.y);
+        return vec3<f32>(top, 1.0 - top, 0.0);
+    }
+    if z_faces && x_hides {
+        let top = masked_top(abs(g.y), abs(g.x), abs(v.z), abs(v.x), v.y);
+        return vec3<f32>(top, 0.0, 1.0 - top);
+    }
+    // Nothing hides: each face's share of the projected area.
+    let top = max(v.y, 0.0);
+    let x = select(0.0, abs(g.x * v.x), x_faces);
+    let z = select(0.0, abs(g.y * v.z), z_faces);
+    let sum = top + x + z;
+    // A fragment of a slope facing away (the CPU's `None`): the smooth
+    // surface's own silhouette. Call it top.
+    if sum <= 1e-6 {
+        return vec3<f32>(1.0, 0.0, 0.0);
+    }
+    return vec3<f32>(top, x, z) / sum;
+}
+
+// `face_light`: `mesh.wgsl`'s lighting for a face of normal `n`, before
+// texture and ambient occlusion -- open ground from kilometres away has
+// nothing near enough to occlude it.
+fn face_light(n: vec3<f32>) -> vec3<f32> {
+    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
+    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
+    return frame.sun_color.rgb * (ambient + diffuse);
+}
+
+// `riser_colour`: the mean side colour of the risers on a slope of `slope`
+// blocks per block -- the surface block's side at the top of each, then
+// soil, then stone.
+fn riser_colour(slope: f32) -> vec3<f32> {
+    let s = abs(slope);
+    if s <= 0.0 {
+        return params.side_color.rgb;
+    }
+    let depth = params.side_color.w;
+    let surface = min(s, 1.0);
+    let soil = clamp(s - 1.0, 0.0, depth);
+    let stone = max(s - 1.0 - depth, 0.0);
+    return (params.side_color.rgb * surface + params.soil_color.rgb * soil
+        + params.stone_color.rgb * stone) / s;
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let p = in.world_pos;
     let n = normalize(in.normal);
-    // The terrain's own lighting terms (`mesh.wgsl`): hemispheric ambient and
-    // one sun. No ambient occlusion -- open ground from kilometres away has
-    // nothing near enough to occlude it.
-    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
-    let lit = params.top_color.rgb * frame.sun_color.rgb * (ambient + diffuse);
+    // The smooth surface stands for a staircase of blocks: its gradient is the
+    // staircase's slope, and the pixel shows the mix of the faces the blocks
+    // really have, as far as the eye can see them.
+    let g = vec2<f32>(-n.x, -n.z) / n.y;
+    let v = normalize(frame.eye.xyz - p);
+    let w = visible_weights(g, v);
+    let riser_x = vec3<f32>(select(1.0, -1.0, g.x > 0.0), 0.0, 0.0);
+    let riser_z = vec3<f32>(0.0, 0.0, select(1.0, -1.0, g.y > 0.0));
+    let lit = params.top_color.rgb * face_light(vec3<f32>(0.0, 1.0, 0.0)) * w.x
+        + riser_colour(g.x) * face_light(riser_x) * w.y
+        + riser_colour(g.y) * face_light(riser_z) * w.z;
 
     let dist = distance(p, frame.eye.xyz);
     let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
