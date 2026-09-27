@@ -35,10 +35,15 @@
 //!   and the table where something is, and then `mesh.wgsl`'s lighting is
 //!   applied to each face.
 //!
+//! A riser shows the blocks it cuts through: the side of the surface block at
+//! its top, then soil, then stone, as the world generates a column. A gentle
+//! slope's risers are one block tall and all grass-side; a cliff's are mostly
+//! stone ([`riser_colour`]).
+//!
 //! **Left out, on purpose:** baked ambient occlusion (the crease where a riser
 //! meets the top below it is darker on a real block), and shadows (the voxel
-//! renderer has none). Texture detail within a face belongs to the caller:
-//! `top` and `side` are the faces' mean colours.
+//! renderer has none). Texture detail within a face belongs to the caller: the
+//! [`Materials`] are the faces' mean colours.
 
 use glam::Vec3;
 
@@ -448,13 +453,41 @@ pub fn face_light(n: Vec3, lighting: &Lighting) -> Vec3 {
     lighting.sun_color * (ambient + diffuse)
 }
 
-/// The mean colours of a slope's faces.
+/// The mean colours of a slope's faces, in linear light, and how deep the soil
+/// goes: what a column of the world is made of, top down.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Materials {
-    /// The top of a block (grass, snow, sand...).
+    /// The top of the surface block (grass).
     pub top: Vec3,
-    /// The side of a block, as a riser shows it.
+    /// The side of the surface block, which every riser shows at its top.
     pub side: Vec3,
+    /// The side of the soil beneath it.
+    pub soil: Vec3,
+    /// The side of the stone beneath that.
+    pub stone: Vec3,
+    /// How many blocks of soil lie between the surface block and the stone
+    /// (`cubara_world::SOIL_DEPTH`; this crate does not depend on the world).
+    pub soil_depth: f32,
+}
+
+/// The mean colour of the risers on a slope of `slope` blocks per block
+/// along one axis.
+///
+/// A riser `k` blocks tall shows the side of the surface block at its top,
+/// then soil down to [`Materials::soil_depth`], then stone. Rounding a slope
+/// of `s` to whole blocks makes each riser `floor(s)` or `ceil(s)` tall, so
+/// the riser area at depth `d`, per column, is `clamp(s - d, 0, 1)`: the
+/// surface block's side takes `min(s, 1)`, the soil `clamp(s - 1, 0, depth)`,
+/// and the stone the rest.
+pub fn riser_colour(materials: &Materials, slope: f32) -> Vec3 {
+    let s = slope.abs();
+    if s <= 0.0 {
+        return materials.side;
+    }
+    let surface = s.min(1.0);
+    let soil = (s - 1.0).clamp(0.0, materials.soil_depth);
+    let stone = (s - 1.0 - materials.soil_depth).max(0.0);
+    (materials.side * surface + materials.soil * soil + materials.stone * stone) / s
 }
 
 /// The colour a pixel covering many blocks of a slope shows: each face's lit
@@ -475,7 +508,8 @@ pub fn aggregate_colour(
 fn lit(w: FaceWeights, gradient: [f32; 2], lighting: &Lighting, materials: &Materials) -> Vec3 {
     let (nx, nz) = riser_normals(gradient);
     materials.top * face_light(Vec3::Y, lighting) * w.top
-        + materials.side * (face_light(nx, lighting) * w.x + face_light(nz, lighting) * w.z)
+        + riser_colour(materials, gradient[0]) * face_light(nx, lighting) * w.x
+        + riser_colour(materials, gradient[1]) * face_light(nz, lighting) * w.z
 }
 
 #[cfg(test)]
@@ -486,30 +520,32 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Hit {
         Top,
-        /// A riser, by axis (0 = x, 1 = z) and whether its normal points
-        /// along `+axis`.
+        /// A riser, by axis (0 = x, 1 = z), whether its normal points along
+        /// `+axis`, and how many whole blocks below the column's top the ray
+        /// met it (0: the surface block).
         Side {
             axis: usize,
             positive: bool,
+            depth: u32,
         },
     }
 
     /// **The brute force**, independent of [`Staircase::scan`]: parallel rays
-    /// cast at the blocks one by one, counting which face each meets first.
+    /// cast at the blocks one by one, each handed to `hit` with the face it
+    /// meets first.
     ///
     /// The rays land uniformly on a 64 x 64 square of the slope, which is
     /// uniform on screen too, because a plane projects affinely. Each is
     /// followed from four blocks above the slope, column by column, so a ray
     /// that meets a step in front of its target counts there, as the eye would
     /// see it.
-    fn cast_rays(gradient: [f32; 2], view: Vec3, rays: usize) -> [f64; 3] {
+    fn for_each_ray(gradient: [f32; 2], view: Vec3, rays: usize, mut hit: impl FnMut(Hit)) {
         let stairs = Staircase::new([gradient[0] as f64, gradient[1] as f64]);
         let [gx, gz] = stairs.gradient;
         let (vx, vy, vz) = (view.x as f64, view.y as f64, view.z as f64);
         let m = vy - gx * vx - gz * vz;
         assert!(m > 0.0, "the slope faces away from the eye");
         let plane = |x: f64, z: f64| gx * x + gz * z + PHASE;
-        let mut counts = [0usize; 3];
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut unit = || {
             // xorshift64*, enough for placing rays.
@@ -525,16 +561,58 @@ mod tests {
             let tz = (b as f64 + unit()) / side as f64 * 64.0;
             let back = 4.0 / m;
             let o = [tx + vx * back, plane(tx, tz) + vy * back, tz + vz * back];
-            match cast(&stairs, o, [-vx, -vy, -vz]) {
-                Hit::Top => counts[0] += 1,
-                Hit::Side { axis, positive } => {
-                    let g = stairs.gradient[axis];
-                    assert_eq!(positive, g < 0.0, "a riser facing away was hit");
-                    counts[1 + axis] += 1;
+            let h = cast(&stairs, o, [-vx, -vy, -vz]);
+            if let Hit::Side { axis, positive, .. } = h {
+                let g = stairs.gradient[axis];
+                assert_eq!(positive, g < 0.0, "a riser facing away was hit");
+            }
+            hit(h);
+        }
+    }
+
+    /// The fraction of rays meeting tops, x-risers and z-risers.
+    fn cast_rays(gradient: [f32; 2], view: Vec3, rays: usize) -> [f64; 3] {
+        let mut counts = [0usize; 3];
+        for_each_ray(gradient, view, rays, |h| match h {
+            Hit::Top => counts[0] += 1,
+            Hit::Side { axis, .. } => counts[1 + axis] += 1,
+        });
+        counts.map(|c| c as f64 / rays as f64)
+    }
+
+    /// The side of the block `depth` blocks below a column's top, as the
+    /// world generates it: the surface block, then soil, then stone.
+    fn block_side(materials: &Materials, depth: u32) -> Vec3 {
+        if depth == 0 {
+            materials.side
+        } else if depth as f32 <= materials.soil_depth {
+            materials.soil
+        } else {
+            materials.stone
+        }
+    }
+
+    /// The mean colour of the rays: each takes the lit colour of the block
+    /// face it meets.
+    fn cast_colour(
+        gradient: [f32; 2],
+        view: Vec3,
+        rays: usize,
+        lighting: &Lighting,
+        materials: &Materials,
+    ) -> Vec3 {
+        let (nx, nz) = riser_normals(gradient);
+        let mut sum = Vec3::ZERO;
+        for_each_ray(gradient, view, rays, |h| {
+            sum += match h {
+                Hit::Top => materials.top * face_light(Vec3::Y, lighting),
+                Hit::Side { axis, depth, .. } => {
+                    let n = if axis == 0 { nx } else { nz };
+                    block_side(materials, depth) * face_light(n, lighting)
                 }
             }
-        }
-        counts.map(|c| c as f64 / rays as f64)
+        });
+        sum / rays as f32
     }
 
     /// Walk a ray from `o` along `d` column by column, and return the first
@@ -561,11 +639,18 @@ mod tests {
             }
         });
         let mut entered = 0.0;
+        // The face the ray came in through: axis, and which way it faces.
         let mut through = None;
         for _ in 0..1_000_000 {
             let top = stairs.top(cell[0], cell[1], PHASE);
-            if o[1] + d[1] * entered < top {
-                return through.expect("the ray starts above every step");
+            let y = o[1] + d[1] * entered;
+            if y < top {
+                let (axis, positive) = through.expect("the ray starts above every step");
+                return Hit::Side {
+                    axis,
+                    positive,
+                    depth: (top - y).floor() as u32,
+                };
             }
             let a = if next[0] < next[1] { 0 } else { 1 };
             if o[1] + d[1] * next[a] <= top {
@@ -575,10 +660,7 @@ mod tests {
             next[a] += delta[a];
             cell[a] += step[a];
             // Entering while moving +x meets the column's -x face.
-            through = Some(Hit::Side {
-                axis: a,
-                positive: step[a] < 0,
-            });
+            through = Some((a, step[a] < 0));
         }
         panic!("a ray walked a million columns without meeting the ground");
     }
@@ -827,15 +909,25 @@ mod tests {
         assert_eq!(reference_weights([1.0, 0.0], v), None);
     }
 
+    /// Distinct colours for each material, so a mix-up shows.
+    fn test_materials() -> Materials {
+        Materials {
+            top: Vec3::new(0.35, 0.60, 0.20),
+            side: Vec3::new(0.40, 0.45, 0.20),
+            soil: Vec3::new(0.45, 0.30, 0.18),
+            stone: Vec3::new(0.50, 0.50, 0.52),
+            soil_depth: 3.0,
+        }
+    }
+
     /// §7's colour check: the shaded colour against rays that each take the
-    /// lit colour of the face they meet, under several suns.
+    /// lit colour of the block face they meet -- surface block, soil or
+    /// stone, by how deep in the riser they land -- under several suns.
     #[test]
     fn the_colour_matches_counting_lit_faces() {
         let table = MaskingTable::committed();
-        let materials = Materials {
-            top: Vec3::new(0.35, 0.60, 0.20),
-            side: Vec3::new(0.45, 0.33, 0.22),
-        };
+        let materials = test_materials();
+        let mut worst_seen = 0.0f32;
         for sun in [
             Vec3::new(0.4, 1.0, 0.3),
             Vec3::new(-0.8, 0.5, 0.1),
@@ -847,24 +939,46 @@ mod tests {
             };
             for (g, v) in random_views(30) {
                 let shaded = aggregate_colour(&table, g, v, &lighting, &materials).unwrap();
-                let [top, x, z] = cast_rays(g, v, 10_000);
-                let counted = lit(
-                    FaceWeights {
-                        top: top as f32,
-                        x: x as f32,
-                        z: z as f32,
-                    },
-                    g,
-                    &lighting,
-                    &materials,
-                );
+                let counted = cast_colour(g, v, 10_000, &lighting, &materials);
                 let e = (shaded - counted).abs().max_element();
                 assert!(
                     e < 0.04,
                     "sun {sun} g {g:?} view {v}: shaded {shaded}, counted {counted}"
                 );
+                worst_seen = worst_seen.max(e);
             }
         }
+        assert!(worst_seen > 0.0, "shaded and counted never differed");
+    }
+
+    /// A riser's colour is the blocks it cuts through: walk a long staircase
+    /// along one axis and average the side of every block its risers expose.
+    #[test]
+    fn riser_colour_is_the_blocks_a_staircase_exposes() {
+        let materials = test_materials();
+        let stairs = |s: f64, i: i64| (s * (i as f64 + 0.5) + PHASE).floor() as i64;
+        for s in [0.3f32, 1.0, 1.7, 2.5, 4.6, 7.2] {
+            let mut sum = Vec3::ZERO;
+            let mut area = 0u32;
+            for i in 0..20_000 {
+                let rise = stairs(s as f64, i + 1) - stairs(s as f64, i);
+                for depth in 0..rise as u32 {
+                    sum += block_side(&materials, depth);
+                    area += 1;
+                }
+            }
+            let counted = sum / area as f32;
+            let formula = riser_colour(&materials, s);
+            assert!(
+                (counted - formula).abs().max_element() < 1e-3,
+                "slope {s}: counted {counted}, formula {formula}"
+            );
+        }
+        // And the sign of the slope does not matter.
+        assert_eq!(
+            riser_colour(&materials, -2.5),
+            riser_colour(&materials, 2.5)
+        );
     }
 
     /// `face_light` is `mesh.wgsl`'s `fs_main`, worked by hand for the
