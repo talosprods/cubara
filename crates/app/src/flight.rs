@@ -286,13 +286,14 @@ impl FlightReport {
             loading: 0.0,
             hole: 0.0,
         });
-        let (work_p99, work_max) = p99_and_max(&self.work_times);
+        let tail = WorkTail::of(&self.work_times);
         let (any, visible, worst_px) = self.hole_frames();
         let kept_holes = self.samples.iter().filter(|s| s.hole > 0.0).count();
         let kept_worst = self.samples.iter().map(|s| s.hole).fold(0.0, f64::max);
         format!(
             "FLIGHT: loading mean {:.2}% worst {:.2}% (at {:.2} s, {:.0?}), \
-             frames over 1%: {:.0}%, work p99 {:.1} ms max {:.1} ms ({} kept frames) | \
+             frames over 1%: {:.0}%, work p99 {:.1} ms p99.9 {:.1} ms max {:.1} ms, \
+             over 16.7 ms {} over 33.3 ms {} ({} kept frames) | \
              HOLES: {any} of {} frames show a hole, {visible} over 0.1% of the screen, \
              worst {:.3}%; kept frames with nothing where the finished frame has land: \
              {kept_holes}, worst {:.3}%",
@@ -301,8 +302,11 @@ impl FlightReport {
             worst.t,
             worst.eye,
             self.frames_over(0.01) * 100.0,
-            work_p99 * 1000.0,
-            work_max * 1000.0,
+            tail.p99 * 1000.0,
+            tail.p999 * 1000.0,
+            tail.max * 1000.0,
+            tail.over_one,
+            tail.over_two,
             self.samples.len(),
             self.holes.len(),
             worst_px as f64 * 100.0 / self.pixels.max(1) as f64,
@@ -322,14 +326,40 @@ impl FlightReport {
     }
 }
 
-fn p99_and_max(times: &[f32]) -> (f32, f32) {
-    let mut sorted = times.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let p99 = sorted
-        .get(sorted.len().saturating_sub(1) * 99 / 100)
-        .copied()
-        .unwrap_or(0.0);
-    (p99, sorted.last().copied().unwrap_or(0.0))
+/// The slow end of the work per frame, in seconds -- what a player feels as a
+/// stutter (block 3.0a; the exit gate's item 0 asks for p99.9 under a 60 Hz
+/// interval and no frame over two).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorkTail {
+    pub p99: f32,
+    pub p999: f32,
+    pub max: f32,
+    /// Frames whose work alone took longer than one 60 Hz interval, and two.
+    pub over_one: usize,
+    pub over_two: usize,
+}
+
+/// One frame at 60 Hz, in seconds.
+const INTERVAL_60HZ: f32 = 1.0 / 60.0;
+
+impl WorkTail {
+    pub fn of(times: &[f32]) -> Self {
+        let mut sorted = times.to_vec();
+        sorted.sort_by(f32::total_cmp);
+        let at = |per_mille: usize| {
+            sorted
+                .get(sorted.len().saturating_sub(1) * per_mille / 1000)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        Self {
+            p99: at(990),
+            p999: at(999),
+            max: sorted.last().copied().unwrap_or(0.0),
+            over_one: times.iter().filter(|&&t| t > INTERVAL_60HZ).count(),
+            over_two: times.iter().filter(|&&t| t > 2.0 * INTERVAL_60HZ).count(),
+        }
+    }
 }
 
 /// Everything a flight streams: the world, the game's two streamers, and the
@@ -673,6 +703,21 @@ mod tests {
             hole_fraction(&image([nothing; 9]), &image([nothing; 9])),
             0.0
         );
+    }
+
+    /// The tail reads the slow end: p99.9 and the worst, and counts frames
+    /// over one and two 60 Hz intervals -- not frames at exactly one.
+    #[test]
+    fn the_work_tail_is_the_slow_end() {
+        let mut times = vec![0.002f32; 1000];
+        times[10] = 0.020; // over one interval
+        times[20] = 0.040; // over two
+        times[30] = 1.0 / 60.0; // exactly one: not over
+        let t = WorkTail::of(&times);
+        assert_eq!((t.over_one, t.over_two), (2, 1));
+        assert_eq!(t.max, 0.040);
+        assert_eq!(t.p999, 0.020, "p99.9 of 1,000 frames is the second worst");
+        assert_eq!(t.p99, 0.002);
     }
 
     #[test]

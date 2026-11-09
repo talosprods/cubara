@@ -1246,7 +1246,7 @@ every 0.25 s; then the same line is flown again, stopping at each kept frame
 until nothing is left to load. **Loading** is the share of pixels more than 40
 levels off the finished frame at the same eye. Work/frame is the time a frame
 spent streaming and drawing (not waiting for the display). M3, 1280×720, far
-terrain at High. Details in ⁷⁴.
+terrain at High. Details in ⁷⁴; the slow end of the work per frame in ⁸².
 
 | Date | Change | Flight | Loading mean | Worst frame | Frames > 1% loading | Work/frame p99 | Commit |
 |---|---|---|---|---|---|---|---|
@@ -2776,3 +2776,24 @@ flight, which looks at ground only: a few dozen pixels (about 0.004%) where
 the clear colour shows through the ground for a frame or two. These are cracks
 in the surface, the kind a viewer sees as sparkles. They are the next step in
 #318.
+
+⁸² **The work-time tail while flying (block 3.0a), Linux, 2026-11-09.**
+`--bench flight` now reports the slow end of each frame's work: streaming
+and drawing, without waiting for the display or the per-frame readback. It
+gives p99, p99.9, the worst frame, and frames over one and two 60 Hz intervals.
+`main` at `f3f37dc`, one run each, 1280×720, High, with the lid closed (CPU
+52–94 °C):
+
+```
+           p99      p99.9    max       > 16.7 ms   > 33.3 ms
+low        4.5 ms   6.7 ms   11.0 ms   0           0
+high       4.4 ms   5.7 ms    7.4 ms   0           0
+down       3.8 ms   5.1 ms    6.1 ms   0           0
+toward a peak  3.7 ms   7.3 ms   10.4 ms   0           0
+```
+
+So streaming and drawing are not what stutters while flying here. The worst
+frame is two-thirds of an interval. The exit gate's frame-time item (p99.9
+under one interval, nothing over two) is about the whole frame, which this
+does not measure: the simulation's tick, the GPU and the display's pacing. That
+needs the game's own loop, which is the next measurement in #318.
