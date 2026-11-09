@@ -39,6 +39,10 @@ gathered the same day and is summarised where it changed a choice (marked
   bomen … geleidelijk van boomsoort wisselen naarmate je door het land gaat"*.
 - **Variation between years.** *"variatie in de seizoenen … hoeveel sneeuw er
   komt en hoe ver in de winter … 1 x in de 10-20 jaar sneeuw in de woestijn"*.
+- **Rivers may end in lakes; consistency over ambition; the look is Switzerland.**
+  *"prima als het bij een meer uitkomt. een bergmeer is ook leuk. ik heb liever
+  dat het consistent goed is, dan dat je vage fouten hebt en te erg probeert. het
+  moet er vooral echt adembenemend uitzien. denk aan zwitserland enzo"*.
 - **Night.** *"schaduwen en contouren zijn gaaf, maar het moet niet welkom voelen
   om naar buiten te gaan"*.
 - **Later, not now:** shadows (*"schaduwen komen op een gegeven moment wel"*),
@@ -131,51 +135,72 @@ So rivers come before climate in the order (§5). The requirements:
 - Vintage Story's rivers mod (a node graph per 32 km region) works, but
   players complain of straight rivers, steep banks and memory use.
 
-**The proposal: rivers first, terrain carved around them, in bounded regions.**
+**The rule that makes chunks join exactly: every river decision is local.**
+
+The owner asked whether this can be generated per chunk without seams and
+without heavy precomputation. The answer is yes, but only if no river decision
+depends on the *order* in which anything is computed. A network "grown from the
+coast" per region does depend on order. Two neighbouring regions would then see
+almost, not exactly, the same rivers in their overlap: a seam at the 50 km
+scale. So:
 
 1. **Base terrain stays as it is:** continents, ranges and plateaus from noise.
-   It owns the ridges and watersheds, which avoids the Red Blob failure.
-2. **A coarse drainage network per large region.**
-   - The region is something like 32–64 km, on a grid of a few hundred blocks
-     per cell.
-   - Over it, the network is grown **from the coast inland**: breadth-first,
-     with a noisy visit order, always stepping to the neighbouring cell that
-     rises.
-   - The result is a tree, acyclic by construction, in which every cell drains
-     to a mouth. *Research: this is how Red Blob's experiments got rivers that
-     always reach the sea. "Plate-Local River Generation" uses the same idea per
-     tectonic plate, with a border margin larger than the warp so seams stay
-     downhill.*
-   - **Regions overlap by a margin.** A region's network is computed from its
-     own cells plus the margin, so neighbouring regions agree across the seam.
-   - The network is **computed once per region, cached, and never saved**.
-     It is pure in the seed, so every machine computes the same rivers, and
-     memory stays bounded by the regions near players.
-   - Basins with no outlet at this scale become **lakes**, nodes in the
-     graph whose outflow continues from their lowest rim point.
-3. **Flow and width from the tree.**
-   - Flow accumulation is exact on a finite tree, so it is cheap.
-   - Width and depth grow with catchment: a 2-block headwater stream becomes a
-     mouth tens to hundreds of blocks wide.
-   - Rivers below a threshold catchment are not drawn, so the density is
-     tunable.
-4. **Carving.**
-   - The channel's bed elevation is defined *along the tree*: sea level at the
-     mouth, rising upstream with a minimum slope. It is clamped under the base
-     terrain, so it is monotonic by construction.
+   It owns the ridges and watersheds.
+2. **Drainage by strict descent on a coarse grid.**
+   - Each coarse cell (a few hundred blocks) drains to the neighbour with the
+     strictly lowest value of a smooth **potential** field: the large-scale
+     elevation, with a hash of the cell as tie-breaker.
+   - That is a pure function of the cell and its 8 neighbours. No region, no
+     visit order, no seam.
+   - Strictly decreasing means **no loops are possible**. Every path ends in the
+     sea or in a basin (a local minimum).
+3. **Basins are lakes.**
+   - A basin, a local minimum of the potential, becomes a lake.
+   - A lake may spill at its lowest rim cell and continue downstream, when the
+     rim search finds an outlet within a bounded radius. Otherwise it is a
+     terminal lake, such as a mountain lake or a lake in a dry basin.
+   - The owner chose this explicitly: a river ends in the sea **or a lake**, and
+     consistent correctness beats trying too hard. No rule exists to force every
+     river to the sea.
+4. **Levels, not one grid.**
+   - Trunk rivers live on a very coarse grid. Tributaries live on finer grids
+     and always drain into the coarser level's channel.
+   - Each level is local. Width and depth come from the level and the position
+     along the channel, so a tributary is never wider than the river it joins.
+   - The density of rivers is a parameter per level.
+5. **Per column, a chunk only asks:** which channel segments are near, how far
+   am I from them, and how high is the bed at that point.
+   - The bed is a property of the *segment*: sea level at the mouth, rising
+     upstream with a minimum slope, clamped under the base terrain. Two chunks
+     on opposite banks get exactly the same bed.
    - The terrain is lowered toward the bed within a valley profile around the
-     channel, using the distance to the river line: a pure function, evaluated
-     per column.
-   - Where the base terrain drops faster than the allowed bed slope, the
-     river gets a **waterfall** instead of an unnatural cut.
-5. **Meanders and natural lines.** The coarse polyline is refined per chunk by
-   deterministic noise displacement, bounded so the channel never leaves its
-   valley. This is the cure for "straight rivers".
-6. **Passes** are where two headwaters from opposite sides of a ridge come
-   closest: the network knows both, so a pass is a query on the graph.
-   Routes and villages, later, read the same graph:
-   - confluences and mouths are natural village sites
-   - valleys are natural roads
+     channel.
+   - Where the base terrain drops faster than the allowed bed slope, the river
+     gets a **waterfall** instead of an unnatural cut.
+6. **Meanders.** The coarse polyline is displaced by deterministic noise of the
+   segment, never of the chunk. It is bounded so the channel stays in its
+   valley. This cures "straight rivers".
+7. **Passes** are where two headwaters from opposite sides of a ridge come
+   closest: a query on the same local graph.
+   - Routes and villages, later, read it too: confluences and mouths are
+     natural village sites, and valleys are natural roads.
+
+**"Cache, but never decide in the cache."** Coarse cells may be cached per
+region to make worldgen fast. Every cached value must be computable identically
+from any vantage point, so the cache is an accelerator, never a source of truth.
+The up-front cost is small: a 64 km region at 256-block cells is ~60,000 cells
+of a few noise samples each, a few milliseconds.
+
+*Research behind this:*
+- Rivers from thresholded noise run uphill and loop.
+- An unbounded trace to the sea "will not work" in an infinite world.
+- Deriving the whole terrain from a river tree fails, because ridges between
+  basins need agreeing heights. Here the base terrain owns the ridges.
+- Vintage Story's region-graph rivers mod draws complaints of straight rivers,
+  steep banks and memory use.
+- "Plate-Local River Generation" traces downhill per plate with a border margin.
+  This proposal goes one step further: the descent rule is local, so it needs
+  no margin.
 
 **Engine consequences.**
 - Water (§5 block 1) must exist first.
@@ -188,8 +213,12 @@ So rivers come before climate in the order (§5). The requirements:
 **Checked by:**
 - **Every river reaches sea level or a lake**, and the bed never rises
   downstream: a property test over many seeds and regions.
-- **Seams agree:** two regions computed independently give the same channel at
-  their shared border.
+- **Seams cannot exist:**
+  - a chunk computed with a cold cache, and with a cache warmed from far
+    away, is bit-identical;
+  - two neighbouring chunks computed independently have identical border
+    columns;
+  - the far terrain's river field matches the voxels' at the join.
 - **Determinism:** the same seed gives the same network in any evaluation
   order and thread count.
 - **Coverage:** within N blocks of any spawn there is water. The owner's
@@ -197,6 +226,34 @@ So rivers come before climate in the order (§5). The requirements:
 - **Performance:** one region's network costs at most X ms to build, and the
   per-column carve stays inside the worldgen budget. Both are `BENCHMARKS.md`
   rows.
+
+### 2.2b The look: Switzerland
+
+The owner's target is *"echt adembenemend … denk aan zwitserland"*. Alpine
+landscapes are made of a few recognisable forms. Each becomes a terrain feature
+with a test or a golden image, rather than a hope:
+
+- **U-shaped valleys**: wide, flat floors between steep walls, as glaciers
+  leave them (Lauterbrunnen). Main valleys get a U profile; small streams keep a
+  V.
+- **Hanging valleys and waterfalls**: side valleys that end high above the main
+  valley floor, their stream falling over the wall. These follow from §2.2a's
+  rule that a bed steeper than allowed becomes a waterfall. Lauterbrunnen's
+  walls are the reference image.
+- **Long lakes in valley floors**, like Lake Geneva or Lake Lucerne. In this
+  design a lake is where a valley fills, so a glacial valley with a basin
+  becomes a finger lake.
+- **Sharp peaks and arêtes** above the tree line (the Matterhorn's horn), on top
+  of today's ridged ranges.
+- **Alpine meadows** between forest and rock, and the **seasonal snow line**
+  (§2.5) moving over them.
+- **Scale that reads:** valley floors a few hundred blocks wide, walls of
+  500–1,500 blocks, peaks of 3,000–4,500. Big enough to look Alpine from the
+  valley floor and from 100 km away. That is within the vertical world and the
+  far view already built.
+
+Judged from images at fixed eyes (a valley floor, a pass, a peak, a lake shore),
+in the style F5's haze was judged, then pinned as golden images.
 
 ### 2.3 Biomes as a caricature
 
