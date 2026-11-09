@@ -405,6 +405,55 @@ fn a_block_is_not_broken_before_its_hardness_is_paid() {
     );
 }
 
+/// A tick on which a client's input did not arrive pauses its swing; it does not
+/// cancel it.
+///
+/// The server applies one input per tick per client and steps a client only on a
+/// tick it has one (`PlayerInputs::pause`). A paused tick used to read as "button
+/// up", which abandons progress -- so a late packet restarted every swing.
+#[test]
+fn a_paused_tick_does_not_abandon_a_swing_in_progress() {
+    let hardness = {
+        let mut s = Server::new();
+        s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
+        let blocks = s.blocks_registry.as_deref().expect("assets");
+        let id = blocks.id_of("cubara:stone").expect("stone is a block");
+        blocks.hardness(id).expect("stone is breakable")
+    };
+    let mut s = Server::new();
+    s.open(std::path::Path::new("cubara-nonexistent-untrusted-fixture"));
+    let who = s.sim.join(Player::new(
+        FixedVec3::from_blocks(0, SKY, 0),
+        Angle::ZERO,
+        Angle::ZERO,
+    ));
+    s.open_view(who);
+    let stone = s
+        .blocks_registry
+        .as_deref()
+        .and_then(|r| r.id_of("cubara:stone"))
+        .expect("stone is a block");
+    let target = [0, SKY, -3];
+    s.set_block(target, stone);
+    let holding = InputFrame {
+        breaking: true,
+        ..InputFrame::default()
+    };
+    for _ in 0..(hardness - 1) {
+        s.tick_mining_all(&PlayerInputs::one(who, holding));
+    }
+    let mut gap = PlayerInputs::default();
+    gap.pause(who);
+    s.tick_mining_all(&gap);
+    s.tick_mining_all(&PlayerInputs::one(who, holding));
+    assert_eq!(
+        s.world
+            .block_at(target[0], target[1], target[2], s.terrain()),
+        cubara_voxel::BlockId::AIR,
+        "a tick with no input from the client reset its swing"
+    );
+}
+
 /// There is no message a client can send that asks for an instant break.
 ///
 /// The structural half of this block, and the reason `Action::Break` was

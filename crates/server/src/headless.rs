@@ -29,8 +29,8 @@ use crate::clock::Pacer;
 use crate::net::{Acceptor, Link};
 use crate::wire::{ClientMessage, ServerMessage};
 use crate::{Action, Server};
-use cubara_sim::{PlayerId, PlayerInputs};
-use std::collections::BTreeMap;
+use cubara_sim::{InputFrame, PlayerId, PlayerInputs};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// How the server was asked to run.
@@ -90,6 +90,16 @@ pub const MAX_ACTIONS_PER_TICK: usize = 8;
 /// sits.
 pub const MAX_PENDING: usize = 64;
 
+/// How many received-but-unapplied inputs one client may have queued.
+///
+/// The server applies one input per tick, so a jitter burst becomes a short
+/// backlog that stays at its depth while the client keeps sending one per tick.
+/// Without a bound a client could queue seconds of movement and have it replayed
+/// later. Past this, the **oldest** are discarded (and counted as passed by the
+/// ack); the client's next reconcile corrects the difference. Eight ticks is
+/// ~130 ms, more than any jitter burst this protocol is for.
+pub const MAX_QUEUED_INPUTS: usize = 8;
+
 /// How long a connection may stay silent before it is dropped, in ticks.
 ///
 /// 600 ticks is ten seconds at 60 tps, which is the same patience the client
@@ -120,7 +130,15 @@ pub struct Session {
     /// knows which of its outstanding inputs the server has seen. Counted here
     /// rather than in `Server` because it is a property of the *connection*, and
     /// a world has no opinion about how many messages a link has carried.
+    ///
+    /// **Means exactly: every input up to this number has been applied** (or, if
+    /// the queue overflowed, deliberately discarded -- see [`MAX_QUEUED_INPUTS`]).
+    /// `0` means none yet, which is why the client counts from 1.
     last_seq: BTreeMap<PlayerId, u64>,
+    /// Inputs received and not yet applied, per client, oldest first. One is
+    /// consumed per tick, so the server steps a player exactly as often, and
+    /// with exactly the same frames, as that player's prediction did.
+    queued: BTreeMap<PlayerId, VecDeque<(u64, InputFrame)>>,
     /// Actions refused this session for exceeding [`MAX_ACTIONS_PER_TICK`].
     ///
     /// Counted rather than only logged, for two reasons. A server operator
@@ -202,6 +220,7 @@ impl Session {
             acceptor: None,
             clients: BTreeMap::new(),
             last_seq: BTreeMap::new(),
+            queued: BTreeMap::new(),
             dropped_actions: 0,
             most_in_one_tick: 0,
             writing: None,
@@ -232,6 +251,7 @@ impl Session {
             acceptor: None,
             clients: BTreeMap::new(),
             last_seq: BTreeMap::new(),
+            queued: BTreeMap::new(),
             dropped_actions: 0,
             most_in_one_tick: 0,
             writing: None,
@@ -479,14 +499,15 @@ impl Session {
 
     /// Read whatever every client sent, and turn it into this tick's input.
     ///
-    /// Several inputs from one client in one tick collapse to the last: a client
-    /// that sends faster than the world ticks does not get to move faster than
-    /// it. Actions are applied in the order they arrived, per client, and
+    /// Inputs are queued per client and one is applied per tick: a client that
+    /// sends faster than the world ticks does not get to move faster than it,
+    /// and none of what it sent is silently skipped. Actions are applied in the order they arrived, per client, and
     /// clients are visited in id order.
     fn collect_input(&mut self) -> PlayerInputs {
         let mut inputs = PlayerInputs::default();
         let mut took_shirt: Vec<(PlayerId, crate::wire::Shirt)> = Vec::new();
         let last_seq = &mut self.last_seq;
+        let queued = &mut self.queued;
         let dropped = &mut self.dropped_actions;
         let mut actions: Vec<(PlayerId, Action)> = Vec::new();
         let mut gone: Vec<PlayerId> = Vec::new();
@@ -500,13 +521,22 @@ impl Session {
                     ClientMessage::Input { seq, frame } => {
                         // Block 2.14: the one place untrusted input enters the
                         // simulation, so the one place it is cleaned.
-                        inputs.set(who, frame.sanitized());
-                        // Highest wins rather than latest: messages arrive in
-                        // order over TCP today, and acknowledging a *lower*
-                        // number after a higher one would tell a client to
-                        // replay input the server had already applied.
-                        let slot = last_seq.entry(who).or_insert(0);
-                        *slot = (*slot).max(seq);
+                        //
+                        // Queued, not applied: one input per tick, in order, so
+                        // the ack below can mean "applied". A seq that is not
+                        // above everything already received is a duplicate or
+                        // a reorder and is ignored.
+                        let q = queued.entry(who).or_default();
+                        let newest = q
+                            .back()
+                            .map(|&(s, _)| s)
+                            .or_else(|| last_seq.get(&who).copied());
+                        if newest.is_none_or(|n| seq > n) {
+                            q.push_back((seq, frame.sanitized()));
+                            while q.len() > MAX_QUEUED_INPUTS {
+                                q.pop_front();
+                            }
+                        }
                     }
                     ClientMessage::Act(a) => {
                         // Block 2.14. A client that sends a thousand actions in
@@ -543,6 +573,19 @@ impl Session {
             let n = actions.iter().filter(|(p, _)| *p == who).count();
             self.most_in_one_tick = self.most_in_one_tick.max(n);
         }
+        // One input per client per tick. With nothing queued the client is
+        // **paused for the tick**, not stepped with `InputFrame::default()`: its
+        // prediction took one step per input, so a step with no input behind it
+        // is one the two sides could never agree on.
+        for &who in self.clients.keys() {
+            match self.queued.get_mut(&who).and_then(|q| q.pop_front()) {
+                Some((seq, frame)) => {
+                    self.last_seq.insert(who, seq);
+                    inputs.set(who, frame);
+                }
+                None => inputs.pause(who),
+            }
+        }
         for (who, shirt) in took_shirt {
             self.server.note_shirt(who, shirt);
         }
@@ -565,6 +608,7 @@ impl Session {
         log::info!("player {who:?} disconnected");
         self.clients.remove(&who);
         self.last_seq.remove(&who);
+        self.queued.remove(&who);
         self.server.close_view(who);
         self.server.sim.leave(who);
         self.server.announce_departure(who);

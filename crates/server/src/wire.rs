@@ -329,6 +329,8 @@ fn get_furnace(c: &mut Cursor<'_>) -> Result<Furnace, WireError> {
         output: c.item_slot()?,
         burning: c.u32()?,
         progress: c.u32()?,
+        // Wear is server-side state; a client only draws what is in the slots.
+        ..Furnace::default()
     })
 }
 
@@ -851,6 +853,7 @@ mod tests {
             output: Some((ItemId(11), 1)),
             burning: 40,
             progress: 123,
+            ..Furnace::default()
         }
     }
 

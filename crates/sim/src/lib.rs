@@ -30,7 +30,7 @@ pub use player::{
 pub use rng::WorldRng;
 pub use save::{load_world, plan_save, save_world, LoadError, SaveError, SavePlan, FORMAT_VERSION};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cubara_world::{TerrainBlocks, World};
 
@@ -55,14 +55,28 @@ pub const REACH: f32 = 6.0;
 /// too. Those are the same thing to the simulation, and treating them
 /// differently would make the world depend on packet timing.
 #[derive(Debug, Default, Clone)]
-pub struct PlayerInputs(BTreeMap<PlayerId, InputFrame>);
+pub struct PlayerInputs(BTreeMap<PlayerId, InputFrame>, BTreeSet<PlayerId>);
 
 impl PlayerInputs {
     /// The one-player case: singleplayer, and most tests.
     pub fn one(id: PlayerId, input: InputFrame) -> Self {
         let mut m = BTreeMap::new();
         m.insert(id, input);
-        Self(m)
+        Self(m, BTreeSet::new())
+    }
+
+    /// This player has no input this tick and is **not stepped at all**.
+    ///
+    /// Distinct from `InputFrame::default()`, which is "pressing nothing" and
+    /// still runs gravity. A networked client predicts exactly one step per input
+    /// it sends; a server that steps it on a tick where nothing arrived takes a
+    /// step the client never predicted, and every later correction is off by it.
+    pub fn pause(&mut self, id: PlayerId) {
+        self.1.insert(id);
+    }
+
+    pub fn is_paused(&self, id: PlayerId) -> bool {
+        self.1.contains(&id)
     }
 
     pub fn set(&mut self, id: PlayerId, input: InputFrame) {
@@ -239,6 +253,9 @@ impl Sim {
     /// project is allowed to have (Rule 1).
     pub fn tick(&mut self, world: &mut World, inputs: &PlayerInputs, blocks: TerrainBlocks) {
         for id in self.player_ids() {
+            if inputs.is_paused(id) {
+                continue;
+            }
             let input = inputs.get(id);
             self.step_player(id, world, &input, blocks);
         }

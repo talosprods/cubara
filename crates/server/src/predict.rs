@@ -37,7 +37,7 @@
 //!
 //! # Why the sequence number is not a tick number
 //!
-//! The client counts its own inputs from zero. The server echoes back the last
+//! The client counts its own inputs from one (zero is the server's "nothing applied yet"). The server echoes back the last
 //! one it applied, and the gap between that and what the client has sent is
 //! exactly the set of inputs to replay.
 //!
@@ -95,6 +95,7 @@ pub struct Prediction {
     /// Inputs sent and not yet acknowledged, oldest first.
     pending: VecDeque<(u64, InputFrame)>,
     /// The next sequence number [`predict`](Self::predict) will hand out.
+    /// Starts at 1; an ack of 0 means "nothing applied yet".
     next_seq: u64,
     /// The highest sequence number the server has acknowledged.
     acked: u64,
@@ -118,7 +119,9 @@ impl Prediction {
         Self {
             sim: Sim::new(seed, player),
             pending: VecDeque::new(),
-            next_seq: 0,
+            // From 1: the server's ack is 0 until it has applied something,
+            // so 0 must never name a real input.
+            next_seq: 1,
             acked: 0,
             stalled: false,
         }

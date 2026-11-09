@@ -52,7 +52,7 @@ use cubara_sim::REACH;
 /// *centre* of a legitimately reachable block can be. See
 /// [`Server::within_reach`].
 const HALF_DIAGONAL: f32 = 0.866_025_4;
-use cubara_voxel::{BlockId, DropRule, FixedVec3, Interact, ItemStack, ItemState};
+use cubara_voxel::{BlockId, DropRule, FixedVec3, Interact, ItemId, ItemStack, ItemState};
 use cubara_world::{ChunkState, Furnace, SmeltCtx, TerrainBlocks, TimedProcess, World};
 
 /// Everything the simulation is authoritative about.
@@ -711,6 +711,10 @@ impl Server {
         self.mining.retain(|who, _| present.contains(who));
 
         for who in present {
+            // Not stepped this tick, so the swing neither advances nor resets.
+            if inputs.is_paused(who) {
+                continue;
+            }
             self.tick_mining_for(who, inputs.get(who).breaking);
         }
     }
@@ -1775,11 +1779,18 @@ impl Server {
                     furnace: None,
                 },
             );
-            let contents: Vec<_> = [f.input, f.fuel, f.output].into_iter().flatten().collect();
+            let contents: Vec<_> = [
+                (f.input, f.input_wear),
+                (f.fuel, f.fuel_wear),
+                (f.output, None),
+            ]
+            .into_iter()
+            .filter_map(|(slot, wear)| slot.map(|(id, count)| (id, count, wear)))
+            .collect();
             if let Some(items) = self.items.as_ref() {
                 let spawned: Vec<_> = contents
                     .into_iter()
-                    .filter_map(|(id, count)| items.new_stack(id, count).ok())
+                    .filter_map(|(id, count, wear)| slot_stack(items, id, count, wear))
                     .collect();
                 for stack in spawned {
                     self.sim
@@ -1968,9 +1979,9 @@ impl Server {
             // rather than something the server took on trust.
             return;
         };
-        let slot = match slot {
-            FurnaceSlot::Input => &mut f.input,
-            FurnaceSlot::Fuel => &mut f.fuel,
+        let (slot, wear) = match slot {
+            FurnaceSlot::Input => (&mut f.input, &mut f.input_wear),
+            FurnaceSlot::Fuel => (&mut f.fuel, &mut f.fuel_wear),
             FurnaceSlot::Output => {
                 // Take-only.
                 if held.is_none() {
@@ -1984,17 +1995,18 @@ impl Server {
                 return;
             }
         };
-        match held {
-            Some(stack) => {
-                let previous = slot.replace((stack.item(), stack.count()));
-                let give_back = previous.and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player_mut(who).crafting.set_held(give_back);
-            }
-            None => {
-                let taken = slot.take().and_then(|(id, c)| items.new_stack(id, c).ok());
-                self.sim.player_mut(who).crafting.set_held(taken);
-            }
+        // What leaves the slot keeps the wear it went in with; what enters
+        // brings its own. No path rebuilds a tool from `(id, count)` alone.
+        let previous = slot.take().map(|(id, c)| (id, c, wear.take()));
+        if let Some(stack) = held {
+            *slot = Some((stack.item(), stack.count()));
+            *wear = match stack.state() {
+                ItemState::Durability { remaining } => Some(remaining),
+                ItemState::None => None,
+            };
         }
+        let given = previous.and_then(|(id, c, w)| slot_stack(items, id, c, w));
+        self.sim.player_mut(who).crafting.set_held(given);
         self.note_block_entity(pos);
     }
 
@@ -2193,6 +2205,20 @@ impl Server {
             self.note_block_entity(target);
         }
         Some(cc)
+    }
+}
+
+/// A furnace slot's contents back as a stack, with its tool's remaining wear.
+fn slot_stack(items: &ItemRegistry, id: ItemId, count: u8, wear: Option<u16>) -> Option<ItemStack> {
+    match wear {
+        Some(remaining) => ItemStack::new(
+            id,
+            count,
+            ItemState::Durability { remaining },
+            items.max_stack(id),
+        )
+        .ok(),
+        None => items.new_stack(id, count).ok(),
     }
 }
 

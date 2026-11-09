@@ -307,11 +307,18 @@ fn from_xyz(v: (i64, i64, i64)) -> cubara_voxel::FixedVec3 {
     )
 }
 
-/// A furnace slot's `(id, count)` as an [`ItemStack`], so the same
-/// [`to_saved`] path serialises it. Furnace slots never hold durability.
-fn stack_of(slot: Option<(ItemId, u8)>, items: &ItemRegistry) -> Option<ItemStack> {
+/// A furnace slot's `(id, count)` plus the wear its tool carries, as an
+/// [`ItemStack`], so the same [`to_saved`] path serialises it.
+fn stack_of(
+    slot: Option<(ItemId, u8)>,
+    wear: Option<u16>,
+    items: &ItemRegistry,
+) -> Option<ItemStack> {
     let (id, count) = slot?;
-    ItemStack::new(id, count, ItemState::None, items.max_stack(id)).ok()
+    let state = wear.map_or(ItemState::None, |remaining| ItemState::Durability {
+        remaining,
+    });
+    ItemStack::new(id, count, state, items.max_stack(id)).ok()
 }
 
 /// A live stack in its saved form, or `None` for an empty slot.
@@ -333,17 +340,59 @@ fn to_saved(stack: Option<ItemStack>, items: &ItemRegistry) -> Option<SavedStack
 /// survive an item being renamed or removed; refusing to load the whole save is
 /// a worse answer than a missing stack, and the same stance `with_oak` and
 /// `with_ores` take for missing data.
-fn from_saved(saved: &Option<SavedStack>, items: &ItemRegistry) -> Option<ItemStack> {
+///
+/// **A stack bigger than this run's `max_stack` is never deleted.** An asset
+/// edit that lowers a limit (64 to 16) used to make every saved stack above it
+/// fail `ItemStack::new` and vanish without a word. Now the slot gets as many as
+/// fit and the rest goes into `excess`, in stacks that each fit, for the caller
+/// to put somewhere: a player's free inventory slots, or failing that the floor.
+fn from_saved(
+    saved: &Option<SavedStack>,
+    items: &ItemRegistry,
+    excess: &mut Vec<ItemStack>,
+) -> Option<ItemStack> {
     let saved = saved.as_ref()?;
     let Some(id) = items.id_of(&saved.item) else {
-        log::debug!("save names unknown item {:?}; dropping it", saved.item);
+        log::warn!("save names unknown item {:?}; dropping it", saved.item);
         return None;
     };
     let state = match saved.durability {
         Some(remaining) => ItemState::Durability { remaining },
         None => ItemState::None,
     };
-    ItemStack::new(id, saved.count, state, items.max_stack(id)).ok()
+    // A limit of zero would make the item unrepresentable; one is the floor.
+    let max = items.max_stack(id).max(1);
+    if saved.count == 0 {
+        return None;
+    }
+    // State implies a stack of one, so a (corrupt) counted tool is one tool in
+    // the slot and the rest are singles; stateless stacks split by `max`.
+    let fits = if state == ItemState::None {
+        saved.count.min(max)
+    } else {
+        1
+    };
+    if fits < saved.count {
+        log::warn!(
+            "saved stack of {} x{} exceeds the stack limit {max}; keeping {fits},              moving the other {} elsewhere",
+            saved.item,
+            saved.count,
+            saved.count - fits
+        );
+        let mut left = saved.count - fits;
+        while left > 0 {
+            let n = if state == ItemState::None {
+                left.min(max)
+            } else {
+                1
+            };
+            if let Ok(st) = ItemStack::new(id, n, state, max) {
+                excess.push(st);
+            }
+            left -= n;
+        }
+    }
+    ItemStack::new(id, fits, state, max).ok()
 }
 
 /// One player, as the save format holds them.
@@ -428,9 +477,9 @@ fn build_header(
             .block_entities()
             .map(|(pos, f)| SavedFurnace {
                 pos: (pos[0], pos[1], pos[2]),
-                input: to_saved(stack_of(f.input, items), items),
-                fuel: to_saved(stack_of(f.fuel, items), items),
-                output: to_saved(stack_of(f.output, items), items),
+                input: to_saved(stack_of(f.input, f.input_wear, items), items),
+                fuel: to_saved(stack_of(f.fuel, f.fuel_wear, items), items),
+                output: to_saved(stack_of(f.output, None, items), items),
                 burning: f.burning,
                 progress: f.progress,
             })
@@ -620,8 +669,17 @@ fn load_players(dir: &Path) -> Result<Vec<(u64, SavedPlayer)>, LoadError> {
 /// Split out of `load_world` in block 2.10: it now runs once per player rather
 /// than once per world, and a loop body that long inside an already long
 /// function is how the two drift apart.
-fn restore_player(s: &SavedPlayer, items: &ItemRegistry) -> Player {
-    Player {
+///
+/// Stacks that no longer fit their slot (see [`from_saved`]) go into this
+/// player's free inventory slots; whatever does not fit there is appended to
+/// `spill` with the player's position, for the caller to drop on the floor.
+fn restore_player(
+    s: &SavedPlayer,
+    items: &ItemRegistry,
+    spill: &mut Vec<(cubara_voxel::FixedVec3, ItemStack)>,
+) -> Player {
+    let mut excess = Vec::new();
+    let mut player = Player {
         pos: from_xyz(s.pos),
         velocity: from_xyz(s.vel),
         on_ground: s.on_ground,
@@ -634,7 +692,7 @@ fn restore_player(s: &SavedPlayer, items: &ItemRegistry) -> Player {
         inventory: {
             let mut inv = Inventory::new();
             for (i, saved) in s.inventory.iter().enumerate() {
-                inv.set_slot(i, from_saved(saved, items));
+                inv.set_slot(i, from_saved(saved, items, &mut excess));
             }
             inv.select(s.selected_slot);
             inv
@@ -649,14 +707,20 @@ fn restore_player(s: &SavedPlayer, items: &ItemRegistry) -> Player {
         crafting: {
             let mut c = Crafting::new(s.grid_width);
             for (i, saved) in s.grid.iter().enumerate() {
-                c.set_cell(i, from_saved(saved, items));
+                c.set_cell(i, from_saved(saved, items, &mut excess));
             }
-            c.set_held(from_saved(&s.held, items));
+            c.set_held(from_saved(&s.held, items, &mut excess));
             c
         },
         // Recomputed by the first tick; not part of saved state.
         target: None,
+    };
+    for stack in excess {
+        if let Some(rest) = player.inventory.add(stack, items) {
+            spill.push((player.pos, rest));
+        }
     }
+    player
 }
 
 pub fn load_world(
@@ -733,9 +797,12 @@ pub fn load_world(
         Vec::new()
     };
 
+    // Items that no longer fit a stack limit and had nowhere to go: dropped on
+    // the floor after the world is built, never deleted.
+    let mut spill: Vec<(cubara_voxel::FixedVec3, ItemStack)> = Vec::new();
     let players: BTreeMap<PlayerId, Player> = saved_players
         .iter()
-        .map(|(id, s)| (PlayerId(*id), restore_player(s, items)))
+        .map(|(id, s)| (PlayerId(*id), restore_player(s, items, &mut spill)))
         .collect();
 
     // Never below what the ids already in use demand: a counter that came back
@@ -744,7 +811,7 @@ pub fn load_world(
         .next_player
         .max(players.keys().map(|id| id.0 + 1).max().unwrap_or(0));
 
-    let sim = Sim {
+    let mut sim = Sim {
         tick: header.tick,
         rng: WorldRng {
             state: header.rng.state,
@@ -758,9 +825,13 @@ pub fn load_world(
             // alike (§10.2).
             let mut e = crate::Entities::default();
             for saved in &header.entities {
-                let Some(stack) = from_saved(&Some(saved.stack.clone()), items) else {
+                let mut excess = Vec::new();
+                let Some(stack) = from_saved(&Some(saved.stack.clone()), items, &mut excess) else {
                     continue;
                 };
+                for st in excess {
+                    spill.push((from_xyz(saved.pos), st));
+                }
                 e.restore_item(
                     crate::EntityKey(saved.key),
                     crate::DroppedItem {
@@ -788,14 +859,31 @@ pub fn load_world(
         let pos = [f.pos.0, f.pos.1, f.pos.2];
         world.add_furnace(pos);
         if let Some(furnace) = world.furnace_at_mut(pos) {
-            let slot =
-                |s: &Option<SavedStack>| from_saved(s, items).map(|st| (st.item(), st.count()));
-            furnace.input = slot(&f.input);
-            furnace.fuel = slot(&f.fuel);
-            furnace.output = slot(&f.output);
+            let above = cubara_voxel::FixedVec3::from_blocks(pos[0], pos[1] + 1, pos[2]);
+            let mut excess = Vec::new();
+            let slot = |s: &Option<SavedStack>, excess: &mut Vec<ItemStack>| {
+                from_saved(s, items, excess).map(|st| (st.item(), st.count()))
+            };
+            let wear = |s: &Option<SavedStack>| {
+                from_saved(s, items, &mut Vec::new()).and_then(|st| match st.state() {
+                    ItemState::Durability { remaining } => Some(remaining),
+                    ItemState::None => None,
+                })
+            };
+            furnace.input = slot(&f.input, &mut excess);
+            furnace.input_wear = wear(&f.input);
+            furnace.fuel = slot(&f.fuel, &mut excess);
+            furnace.fuel_wear = wear(&f.fuel);
+            furnace.output = slot(&f.output, &mut excess);
             furnace.burning = f.burning;
             furnace.progress = f.progress;
+            spill.extend(excess.into_iter().map(|st| (above, st)));
         }
+    }
+
+    for (pos, stack) in spill {
+        sim.entities
+            .spawn_item(stack, pos, cubara_voxel::FixedVec3::ZERO);
     }
 
     Ok((sim, world))

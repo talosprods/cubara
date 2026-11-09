@@ -435,15 +435,17 @@ fn a_repeat_of_the_same_sequence_still_applies() {
     let start = *server.sim.player(server.local.expect("a local client"));
     let mut client = Prediction::new(seed, start);
 
-    client.predict(InputFrame::default(), &mut world, blocks);
+    let seq = client
+        .predict(InputFrame::default(), &mut world, blocks)
+        .expect("a sequence number");
 
     let mut first = start.state();
     first.pos = FixedVec3::from_blocks(5, 40, 5);
-    client.reconcile(0, first, &mut world, blocks);
+    client.reconcile(seq, first, &mut world, blocks);
 
     let mut second = start.state();
     second.pos = FixedVec3::from_blocks(5, 30, 5);
-    client.reconcile(0, second, &mut world, blocks);
+    client.reconcile(seq, second, &mut world, blocks);
 
     assert_eq!(
         client.player().state().pos.y,
@@ -505,5 +507,216 @@ fn an_unacknowledged_client_stops_predicting_rather_than_growing() {
     assert!(
         client.predict(forward(), &mut world, blocks).is_some(),
         "prediction did not resume after the stall was cleared"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Against a real `Session`: what the server acknowledges means "applied"
+// ---------------------------------------------------------------------------
+
+/// A client predicting against the real server loop, over a link that delays,
+/// bunches and starves its inputs.
+///
+/// The harness above applies inputs by hand, so it can never notice what
+/// `Session::collect_input` does with them -- which is where the defect was:
+/// two inputs arriving in one tick were collapsed to the last but *both*
+/// acknowledged, a tick with none stepped the player with a default input the
+/// client never predicted, and `0` was acknowledged before anything was applied.
+/// All three make the ack mean something other than "applied", and the client
+/// replays from the ack.
+///
+/// The assertion is the same one the central claim above makes -- the state the
+/// server reports for input N is identical to what the client predicted for N --
+/// but through the real queue, with a tick that delivers two inputs and ticks
+/// that deliver none.
+#[test]
+fn acks_mean_applied_through_a_bunched_and_starved_link() {
+    use cubara_server::headless::{Config, Session};
+    use cubara_server::wire::{ClientMessage, ServerMessage, Shirt};
+
+    let cfg = Config {
+        world: std::path::PathBuf::from("cubara-nonexistent-prediction-session-fixture"),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+    let mut session = Session::open(&cfg);
+    let mut link = session.attach();
+    link.send(ClientMessage::Hello(Shirt::default()));
+    session.advance(1, &cfg);
+    let me = *session
+        .server
+        .sim
+        .player_ids()
+        .first()
+        .expect("the attached client has a player");
+    let seed = session.server.world.seed();
+    let blocks = session.server.terrain();
+    let mut world = World::with_seed(seed);
+    let mut client = Prediction::new(seed, *session.server.sim.player(me));
+
+    // Every input differs (a turn of a different size each tick), so an input
+    // the server skipped changes the reported yaw whether or not the walker is
+    // currently blocked by terrain.
+    let frame_for = |now: u64| InputFrame {
+        look_delta: [
+            Angle::from_raw(1_000_000 + (now as i32) * 7_919),
+            Angle::ZERO,
+        ],
+        jump: now.is_multiple_of(37),
+        ..forward()
+    };
+    let mut up: Vec<(u64, ClientMessage)> = Vec::new();
+    let mut last_due = 0;
+    let mut down: Vec<(u64, Vec<Effect>)> = Vec::new();
+    let mut predicted: std::collections::HashMap<u64, PlayerState> = Default::default();
+    let (mut checked, mut wrong) = (0u32, 0u32);
+    let (mut bunched, mut starved) = (false, false);
+    let mut seen_seqs = Vec::new();
+    let mut distinct = std::collections::HashSet::new();
+
+    for now in 0..400u64 {
+        if let Some(seq) = client.predict(frame_for(now), &mut world, blocks) {
+            predicted.insert(seq, client.player().state());
+            // Seq 150 is late by one tick (a starved tick, then two at once);
+            // 200..=202 are held back until they arrive together.
+            let extra = match seq {
+                150 => 1,
+                200 => 3,
+                _ => 0,
+            };
+            last_due = last_due.max(now + LATENCY + extra);
+            up.push((
+                last_due,
+                ClientMessage::Input {
+                    seq,
+                    frame: frame_for(now),
+                },
+            ));
+        }
+        let mut delivered = 0;
+        for (_, m) in up.iter().filter(|(at, _)| *at <= now) {
+            link.send(m.clone());
+            delivered += 1;
+        }
+        up.retain(|(at, _)| *at > now);
+        if now > 100 {
+            bunched |= delivered >= 2;
+            starved |= delivered == 0;
+        }
+
+        session.advance(1, &cfg);
+
+        for m in link.poll() {
+            if let ServerMessage::Effects(fx) = m {
+                down.push((now + LATENCY, fx));
+            }
+        }
+        let arrived: Vec<Vec<Effect>> = down
+            .iter()
+            .filter(|(at, _)| *at <= now)
+            .map(|(_, fx)| fx.clone())
+            .collect();
+        down.retain(|(at, _)| *at > now);
+        for fx in arrived {
+            for e in fx {
+                if let Effect::SelfState { seq, state } = e {
+                    seen_seqs.push(seq);
+                    distinct.insert(state.yaw.raw());
+                    if now > 60 {
+                        if let Some(&guess) = predicted.get(&seq) {
+                            checked += 1;
+                            wrong += u32::from(guess != state);
+                        }
+                    }
+                    client.reconcile(seq, state, &mut world, blocks);
+                }
+            }
+        }
+    }
+
+    assert!(
+        bunched && starved,
+        "the link never bunched and starved inputs; the test exercised nothing"
+    );
+    assert!(
+        distinct.len() > 100,
+        "the player's yaw barely changed ({} values), so a skipped input would not show",
+        distinct.len()
+    );
+    assert!(checked > 200, "only {checked} predictions were compared");
+    assert_eq!(
+        wrong, 0,
+        "{wrong} of {checked} acknowledged inputs disagreed with the client's \
+         prediction: the ack claims more (or fewer) inputs than were applied"
+    );
+    assert!(
+        seen_seqs.windows(2).all(|w| w[0] <= w[1]),
+        "an ack went backwards"
+    );
+}
+
+/// A duplicated or reordered input is not applied twice.
+#[test]
+fn a_duplicate_or_reordered_input_is_ignored() {
+    use cubara_server::headless::{Config, Session};
+    use cubara_server::wire::{ClientMessage, ServerMessage, Shirt};
+
+    let cfg = Config {
+        world: std::path::PathBuf::from("cubara-nonexistent-prediction-dup-fixture"),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+    let mut session = Session::open(&cfg);
+    let mut link = session.attach();
+    link.send(ClientMessage::Hello(Shirt::default()));
+    session.advance(1, &cfg);
+    let _ = link.poll();
+    for seq in [1, 2, 2, 1] {
+        link.send(ClientMessage::Input {
+            seq,
+            frame: forward(),
+        });
+    }
+    let mut acks = Vec::new();
+    for _ in 0..4 {
+        session.advance(1, &cfg);
+        for m in link.poll() {
+            if let ServerMessage::Effects(fx) = m {
+                for e in fx {
+                    if let Effect::SelfState { seq, .. } = e {
+                        acks.push(seq);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        acks,
+        vec![1, 2, 2, 2],
+        "a repeated or older seq was applied again (or an ack went backwards)"
+    );
+}
+
+/// An ack of `n` means inputs `..=n` were applied, so before anything has been
+/// applied the ack must be a number no input carries.
+#[test]
+fn a_client_with_nothing_applied_is_not_told_input_zero_was() {
+    let mut server = Server::new();
+    server.open(std::path::Path::new(
+        "cubara-nonexistent-prediction-fixture",
+    ));
+    server.place_player_on_ground();
+    let blocks = server.terrain();
+    let mut world = World::with_seed(server.world.seed());
+    let start = *server.sim.player(server.local.expect("a local client"));
+    let mut client = Prediction::new(server.world.seed(), start);
+
+    let first = client.predict(forward(), &mut world, blocks).expect("seq");
+    // The server's "nothing applied yet" ack, delivered before it saw the input.
+    client.reconcile(0, start.state(), &mut world, blocks);
+    assert_eq!(
+        client.pending_len(),
+        1,
+        "an ack of 0 (nothing applied) discarded the first input (seq {first}) unreplayed"
     );
 }

@@ -286,6 +286,11 @@ impl WorldHash {
             }
             self.write_u32(f.burning);
             self.write_u32(f.progress);
+            // Only when worn, so a world with no worn tool in a furnace hashes
+            // exactly as it always did.
+            for wear in [f.input_wear, f.fuel_wear].into_iter().flatten() {
+                self.write_u16(wear);
+            }
         }
     }
 }

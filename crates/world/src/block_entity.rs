@@ -61,6 +61,16 @@ pub struct Furnace {
     pub burning: u32,
     /// Ticks of progress on the current item.
     pub progress: u32,
+    /// Uses left on the tool in the input slot, if it is a worn tool.
+    ///
+    /// The slots above are `(id, count)`, which cannot say how worn an item is.
+    /// Without this a worn pickaxe put in and taken back out came back brand
+    /// new -- a free repair. Meaningful only while `input` is `Some`; cleared
+    /// whenever the slot empties, so two furnaces that are the same compare
+    /// equal and hash alike.
+    pub input_wear: Option<u16>,
+    /// As [`Furnace::input_wear`], for the fuel slot.
+    pub fuel_wear: Option<u16>,
 }
 
 /// What one call to [`Furnace::advance`] consumed and produced, so the caller
@@ -153,6 +163,7 @@ impl TimedProcess for Furnace {
                     break;
                 };
                 self.fuel = (count > 1).then_some((fuel_id, count - 1));
+                self.clear_empty_wear();
                 self.burning = burn;
                 if burn == 0 {
                     // A zero-burn fuel would spin forever; treat it as not fuel.
@@ -262,6 +273,7 @@ impl Furnace {
                 return;
             };
             self.fuel = (count > 1).then_some((fuel_id, count - 1));
+            self.clear_empty_wear();
             self.burning = burn;
         }
 
@@ -294,6 +306,17 @@ impl Furnace {
     fn take_one_input(&mut self) {
         if let Some((id, count)) = self.input {
             self.input = (count > 1).then_some((id, count - 1));
+        }
+        self.clear_empty_wear();
+    }
+
+    /// Wear belongs to the item in a slot; an emptied slot has none.
+    fn clear_empty_wear(&mut self) {
+        if self.input.is_none() {
+            self.input_wear = None;
+        }
+        if self.fuel.is_none() {
+            self.fuel_wear = None;
         }
     }
 
