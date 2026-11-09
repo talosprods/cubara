@@ -1291,6 +1291,8 @@ finished frame has land. Linux (GTX 1060 Max-Q), 1280×720, High. Details in ⁷
 | 2026-11-09 | the same⁸⁰ | high | 652 / 654 | 23 / **0** | 1.76% / **0.002%** | 1 / 2, 0.82% / 0.001% | `main` |
 | 2026-11-09 | the same⁸⁰ | down | 897 / 895 | 0 / 0 | 0.004% / 0.004% | 2 / 2, 0.002% / 0.001% | `main` |
 | 2026-11-09 | the same⁸⁰ | toward a peak | 1,278 / 1,249 | 0 / 0 | 0.023% / 0.001% | 3 / 4, 0.022% / 0.000% | `main` |
+| 2026-11-09 | **Voxel quads sealed against T-junction cracks** (corners moved out 0.05 px)⁸¹ — `main` / sealed | down, 1 run each | 897 / **7** | 0 / 0 | 0.004% / **0.000%** | 3 / **0** | *(this PR)* |
+| 2026-11-09 | the same⁸¹ | low | 673 / **330** | 0 / 0 | 0.005% / 0.004% | 13 / 10, 0.015% | *(this PR)* |
 
 ## Detailed run logs
 
@@ -2777,6 +2779,35 @@ flight, which looks at ground only: a few dozen pixels (about 0.004%) where
 the clear colour shows through the ground for a frame or two. These are cracks
 in the surface, the kind a viewer sees as sparkles. They are the next step in
 #318.
+
+⁸¹ **Sealing the voxels' T-junction cracks (block 3.0a), Linux, 2026-11-09.**
+Frames saved from the down flight showed the specks left after ⁸⁰ as single
+pixels in the middle of flat grass. That is a greedy mesh's T-junction: a long
+quad's edge passes a corner of the shorter quads beside it, the corner lands a
+rounding error off the projected edge, and a pixel centre falls through to the
+clear colour. Every vertex now records which side of its quad it is on along
+the face's two in-plane axes (`Vertex::with_corner`, two spare bits beside the
+node index). `mesh.wgsl` moves it out by `CRACK_SEAL` = 0.00005 of its
+distance from the eye, which is 0.05 px at 1080p.
+
+| Seal | Down: hole frames | Low: hole frames | Golden `lod_boundary` / `terrain` (`main`: 0.000% / 0.072%) |
+|---|---|---|---|
+| none (`main`) | 897, 898 | 673, 690 | -- |
+| 0.000005 (0.005 px) | 203, 202 | 415, 448 | 0.038% / 0.095% |
+| **0.00005 (0.05 px)** | **7** | **330** | 0.334% / 0.273% |
+
+The smaller seal leaves a quarter of the down flight's frames cracked, so the
+rounding error here is larger than 0.005 px. The chosen seal moves edges by a
+twentieth of a pixel. The goldens still pass at their threshold of 0.5% and
+were not regenerated; the tightest is `lod_boundary` at 0.33%. One pass with
+CPU 52–94 °C and GPU 57–72 °C, with the lid closed.
+
+The low flight keeps about 330 frames with a few pixels. The down flight shows
+these are not the voxels' cracks. Saved frames show them on skylines of voxel
+ridges: a coarse node replaced at the skyline drops the ridge by
+a pixel, and the approaching ridge covers it again a few frames later. That is
+an LOD swap's silhouette changing, not a hole; R1 and mesh-ahead shrink it
+(#318, `docs/PROPOSAL_LOD_TRANSITIONS.md`).
 
 ⁸² **The work-time tail while flying (block 3.0a), Linux, 2026-11-09.**
 `--bench flight` now reports the slow end of each frame's work: streaming

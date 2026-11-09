@@ -116,6 +116,11 @@ const FACE_NORMALS = array<vec3<f32>, 6>(
     vec3<f32>(0.0, 0.0, -1.0),
 );
 
+// How far a corner moves out of its quad, per block of distance from the eye:
+// 0.05 of a pixel at 1080p with a 60-degree field of view (a pixel is about
+// 0.97 milliradians there). See `vs_main`.
+const CRACK_SEAL: f32 = 0.00005;
+
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     // word 0: x:10 y:10 z:10 ao:2
@@ -130,12 +135,34 @@ fn vs_main(in: VsIn) -> VsOut {
     let u = f32((in.packed1 >> 15u) & 0xFFu);
     let v = f32((in.packed1 >> 23u) & 0xFFu);
 
-    // word 2: node_index:16 (16 spare)
+    // word 2: node_index:16 corner_u:1 corner_v:1 (14 spare)
     let node_index = in.packed2 & 0xFFFFu;
+    let corner = (in.packed2 >> 16u) & 3u;
 
     let local_pos = vec3<f32>(x, y, z);
     let node_origin = node_origins[node_index];
-    let world_pos = node_origin.xyz + local_pos * node_origin.w;
+    let on_grid = node_origin.xyz + local_pos * node_origin.w;
+    // Seal the cracks a greedy mesh's T-junctions leave: where a long quad's
+    // edge passes a corner of the shorter quads beside it, the corner lands a
+    // rounding error off the projected edge, and now and then a pixel centre
+    // falls through to whatever is behind -- the sky, as single-pixel
+    // sparkles (block 3.0a). Each corner moves out along its quad's two
+    // in-plane axes (`Vertex::with_corner`) by CRACK_SEAL of its distance: a
+    // twentieth of a pixel at 1080p wherever it is, far more than the
+    // rounding and far less than anything that shows.
+    // Written without indexing a vector by a computed axis: D3D's FXC refuses
+    // that as an l-value ("not natively addressable"), found on Windows CI.
+    let axis = face / 2u;
+    let ua = (axis + 1u) % 3u;
+    let va = (axis + 2u) % 3u;
+    let su = select(-1.0, 1.0, (corner & 1u) != 0u);
+    let sv = select(-1.0, 1.0, (corner & 2u) != 0u);
+    let outward = vec3<f32>(
+        select(0.0, su, ua == 0u) + select(0.0, sv, va == 0u),
+        select(0.0, su, ua == 1u) + select(0.0, sv, va == 1u),
+        select(0.0, su, ua == 2u) + select(0.0, sv, va == 2u),
+    );
+    let world_pos = on_grid + outward * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);

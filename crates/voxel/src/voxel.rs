@@ -592,32 +592,39 @@ fn push_quad(
 
     // (du × dv) points toward +d, so keep that order for +d faces and reverse for -d
     // faces to stay outward/CCW for back-face culling. AO and UV follow the same reorder.
-    let (verts, uvs, vao) = if sign == 1 {
+    // Which side of the quad each corner is on, along the sweep axes u and v.
+    let (k0, k1, k2, k3) = ((false, false), (true, false), (true, true), (false, true));
+    let (verts, uvs, vao, sides) = if sign == 1 {
         (
             [c0, c1, c2, c3],
             [uv0, uv1, uv2, uv3],
             [ao[0], ao[1], ao[2], ao[3]],
+            [k0, k1, k2, k3],
         )
     } else {
         (
             [c0, c3, c2, c1],
             [uv0, uv3, uv2, uv1],
             [ao[0], ao[3], ao[2], ao[1]],
+            [k0, k3, k2, k1],
         )
     };
 
     let start = mesh.vertices.len() as u32;
-    for ((c, (cu, cv)), a) in verts.iter().zip(uvs).zip(vao) {
-        mesh.vertices.push(Vertex::new(
-            (c[0] * scale) as u32,
-            (c[1] * scale) as u32,
-            (c[2] * scale) as u32,
-            a as u32,
-            face,
-            tex_layer,
-            cu as u32,
-            cv as u32,
-        ));
+    for (((c, (cu, cv)), a), (u_max, v_max)) in verts.iter().zip(uvs).zip(vao).zip(sides) {
+        mesh.vertices.push(
+            Vertex::new(
+                (c[0] * scale) as u32,
+                (c[1] * scale) as u32,
+                (c[2] * scale) as u32,
+                a as u32,
+                face,
+                tex_layer,
+                cu as u32,
+                cv as u32,
+            )
+            .with_corner(u_max, v_max),
+        );
     }
 
     // Pick the diagonal that connects the two most-similar corners, so the darkened
@@ -844,6 +851,44 @@ mod tests {
             }
         }
         count
+    }
+
+    /// Every corner knows which side of its quad it is on, along the face's
+    /// two in-plane axes -- what `mesh.wgsl` moves it out by to seal
+    /// T-junction cracks. A wrong bit would move a corner *into* its quad and
+    /// open the crack wider instead.
+    #[test]
+    fn every_corner_knows_which_side_of_its_quad_it_is_on() {
+        let registry = registry();
+        let mut chunk = empty();
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 0..16 {
+                    if (x * 7 + y * 3 + z * 5) % 11 < 4 || y < (x + z) % 5 {
+                        set(&mut chunk, x, y, z);
+                    }
+                }
+            }
+        }
+        for mesh in [
+            chunk.build_mesh(&ctx(&registry)),
+            chunk.build_mesh_lod(&ctx(&registry), 1),
+        ] {
+            assert!(!mesh.vertices.is_empty());
+            // The mesher writes four corners per quad, in order.
+            for quad in mesh.vertices.chunks(4) {
+                let d = quad[0].face() as usize / 2;
+                for (axis, which) in [((d + 1) % 3, 0), ((d + 2) % 3, 1)] {
+                    let at = |v: &Vertex| [v.x(), v.y(), v.z()][axis];
+                    let max = quad.iter().map(at).max().unwrap();
+                    assert!(quad.iter().any(|v| at(v) != max), "a quad with no width");
+                    for v in quad {
+                        let side = [v.corner().0, v.corner().1][which];
+                        assert_eq!(side, at(v) == max, "{:?} axis {axis}", v.face());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

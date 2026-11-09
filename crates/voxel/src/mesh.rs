@@ -95,6 +95,10 @@ const V_SHIFT: u32 = TEX_LAYER_BITS + FACE_BITS + EXTENT_BITS;
 /// bits is generous headroom over that cap.
 const NODE_INDEX_BITS: u32 = 16;
 const NODE_INDEX_MASK: u32 = (1 << NODE_INDEX_BITS) - 1;
+/// Which side of its quad a corner is on, along the two sweep axes
+/// ([`Vertex::with_corner`]): one bit each, above the node index.
+const CORNER_U_BIT: u32 = 1 << NODE_INDEX_BITS;
+const CORNER_V_BIT: u32 = 1 << (NODE_INDEX_BITS + 1);
 
 /// A single mesh vertex, packed into 12 bytes: node-local lattice position,
 /// baked ambient occlusion, texture-array layer, face direction, this
@@ -168,9 +172,31 @@ impl Vertex {
     pub fn with_node_index(self, node_index: u32) -> Self {
         debug_assert!(node_index <= NODE_INDEX_MASK, "node index out of range");
         Self {
-            packed2: node_index,
+            packed2: (self.packed2 & !NODE_INDEX_MASK) | node_index,
             ..self
         }
+    }
+
+    /// Returns a copy of this vertex marked as its quad's corner on the
+    /// high side of the first sweep axis (`u_max`) and of the second
+    /// (`v_max`) -- for a face along axis `d`, the axes `(d + 1) % 3` and
+    /// `(d + 2) % 3`. What lets `mesh.wgsl` push each corner a fraction of a
+    /// pixel away from its quad, closing the cracks a greedy mesh's
+    /// T-junctions leave (the sparkles of block 3.0a).
+    pub fn with_corner(self, u_max: bool, v_max: bool) -> Self {
+        let bits = if u_max { CORNER_U_BIT } else { 0 } | if v_max { CORNER_V_BIT } else { 0 };
+        Self {
+            packed2: (self.packed2 & !(CORNER_U_BIT | CORNER_V_BIT)) | bits,
+            ..self
+        }
+    }
+
+    /// The corner [`with_corner`](Self::with_corner) set: `(u_max, v_max)`.
+    pub fn corner(self) -> (bool, bool) {
+        (
+            self.packed2 & CORNER_U_BIT != 0,
+            self.packed2 & CORNER_V_BIT != 0,
+        )
     }
 
     pub fn node_index(self) -> u32 {
@@ -307,6 +333,22 @@ mod tests {
                 assert_eq!(vertex.node_index(), node_index, "node_index for {face:?}");
             }
         }
+    }
+
+    /// The corner bits sit above the node index: setting either keeps the
+    /// other, in both orders.
+    #[test]
+    fn corner_and_node_index_keep_each_other() {
+        let v = Vertex::new(1, 2, 3, 1, Face::PosZ, 7, 4, 5);
+        let a = v.with_corner(true, false).with_node_index(NODE_INDEX_MASK);
+        assert_eq!(
+            (a.corner(), a.node_index()),
+            ((true, false), NODE_INDEX_MASK)
+        );
+        let b = v.with_node_index(12345).with_corner(false, true);
+        assert_eq!((b.corner(), b.node_index()), ((false, true), 12345));
+        assert_eq!(b.with_corner(true, true).corner(), (true, true));
+        assert_eq!(v.corner(), (false, false));
     }
 
     #[test]
