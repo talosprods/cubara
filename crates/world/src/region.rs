@@ -59,6 +59,9 @@ pub enum RegionError {
     /// The file is shorter than its own directory says it should be.
     Truncated,
     Chunk(ChunkPayloadError),
+    /// A directory entry names a chunk position outside the region
+    /// (`>= REGION_SIZE^3`).
+    BadLocalIndex(u16),
 }
 
 impl std::fmt::Display for RegionError {
@@ -71,6 +74,12 @@ impl std::fmt::Display for RegionError {
             }
             RegionError::Truncated => write!(f, "region file is truncated"),
             RegionError::Chunk(e) => write!(f, "region file contains a bad chunk payload: {e}"),
+            RegionError::BadLocalIndex(i) => {
+                write!(
+                    f,
+                    "region file names chunk position {i}, outside the region"
+                )
+            }
         }
     }
 }
@@ -200,6 +209,9 @@ pub fn decode_region(
         let payload = bytes
             .get(offset..offset + length)
             .ok_or(RegionError::Truncated)?;
+        if i32::from(local) >= REGION_SIZE * REGION_SIZE * REGION_SIZE {
+            return Err(RegionError::BadLocalIndex(local));
+        }
         let chunk = Chunk::read_payload(payload).map_err(RegionError::Chunk)?;
         result.push((coord_from_local(region, local), chunk));
     }
@@ -319,6 +331,19 @@ mod tests {
         assert_eq!(region_of(ChunkCoord::new(-1, 0, 0)), (-1, 0, 0));
         assert_eq!(region_of(ChunkCoord::new(-32, 0, 0)), (-1, 0, 0));
         assert_eq!(region_of(ChunkCoord::new(-33, 0, 0)), (-2, 0, 0));
+    }
+
+    #[test]
+    fn a_local_index_outside_the_region_is_an_error_not_a_wrong_chunk() {
+        let chunk = Chunk::from_fn(|_, _, _| BlockId::STONE);
+        let mut bytes = encode_region(&[(ChunkCoord::new(0, 0, 0), chunk)]).unwrap();
+        // The first directory entry starts after magic (4) + version (2) +
+        // count (4); its first two bytes are the local index.
+        bytes[10..12].copy_from_slice(&40_000u16.to_le_bytes());
+        assert!(matches!(
+            decode_region(&bytes, (0, 0, 0)),
+            Err(RegionError::BadLocalIndex(40_000))
+        ));
     }
 
     #[test]

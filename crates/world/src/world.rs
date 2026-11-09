@@ -384,6 +384,25 @@ impl World {
     }
 
     fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
+        self.chunk_with(coord, blocks, true)
+    }
+
+    /// The chunk at `coord` as it is before any player touches it: terrain
+    /// **and structures** (trees), no edits.
+    ///
+    /// The one definition of "unedited" (Rule 5). [`build_chunk`] layers the
+    /// edit overlay over exactly this, and [`load_chunk_edits`] diffs a loaded
+    /// chunk against exactly this -- so a broken log, saved as air, differs
+    /// from the tree that would grow there and is recorded as an edit instead
+    /// of growing back after a reload.
+    ///
+    /// [`build_chunk`]: Self::build_chunk
+    /// [`load_chunk_edits`]: Self::load_chunk_edits
+    pub fn unedited_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
+        self.chunk_with(coord, blocks, false)
+    }
+
+    fn chunk_with(&self, coord: ChunkCoord, blocks: TerrainBlocks, overlay_edits: bool) -> Chunk {
         let size = Chunk::SIZE as i32;
         // Resolved once for the whole chunk. Which trees can reach a voxel
         // depends only on its chunk column, so this is the hoist the structure
@@ -397,8 +416,10 @@ impl World {
             let wx = coord.x * size + lx as i32;
             let wy = coord.y * size + ly as i32;
             let wz = coord.z * size + lz as i32;
-            if let Some(&block) = self.edits.get(&[wx, wy, wz]) {
-                return block;
+            if overlay_edits {
+                if let Some(&block) = self.edits.get(&[wx, wy, wz]) {
+                    return block;
+                }
             }
             if let (Some(trees), Some(oak)) = (trees.as_ref(), blocks.oak) {
                 if let Some(block) = self.worldgen.tree_block_at(trees, wx, wy, wz, oak) {
@@ -455,7 +476,7 @@ impl World {
     pub fn load_chunk_edits(&mut self, coord: ChunkCoord, chunk: &Chunk, blocks: TerrainBlocks) {
         let size = Chunk::SIZE as i32;
         let origin = [coord.x * size, coord.y * size, coord.z * size];
-        let generated = self.worldgen.generate(origin, 1, blocks);
+        let generated = self.unedited_chunk(coord, blocks);
         for lz in 0..Chunk::SIZE {
             for ly in 0..Chunk::SIZE {
                 for lx in 0..Chunk::SIZE {
@@ -885,6 +906,124 @@ mod tests {
         // Exactly one voxel in this chunk differs from pure generation (the
         // one edit above), so exactly one new overlay entry should appear.
         assert_eq!(loaded.edit_count(), edits_before + 1);
+    }
+
+    /// Trees on, so the unedited world has structures in it.
+    fn tree_blocks() -> TerrainBlocks {
+        TerrainBlocks {
+            oak: Some(crate::worldgen::Oak {
+                log: BlockId(10),
+                leaves: BlockId(11),
+                grows_on: BlockId(1),
+                height: (4, 6),
+                canopy_radius: 2,
+                density: 4,
+            }),
+            ores: OreSet::EMPTY,
+            grass: BlockId(1),
+            soil: BlockId(2),
+            stone: BlockId(3),
+        }
+    }
+
+    /// Where this seed really puts a log, found by looking: the chunk and the
+    /// block. A hardcoded coordinate would silently stop testing anything the
+    /// moment the terrain is retuned.
+    fn find_a_log(world: &World, blocks: TerrainBlocks) -> (ChunkCoord, [i32; 3]) {
+        let log = blocks.oak.unwrap().log;
+        for cz in -4..4 {
+            for cx in -4..4 {
+                for cy in 0..8 {
+                    let cc = ChunkCoord::new(cx, cy, cz);
+                    let chunk = world.unedited_chunk(cc, blocks);
+                    for lz in 0..Chunk::SIZE {
+                        for ly in 0..Chunk::SIZE {
+                            for lx in 0..Chunk::SIZE {
+                                if chunk.get(lx, ly, lz) == log {
+                                    let s = Chunk::SIZE as i32;
+                                    return (
+                                        cc,
+                                        [
+                                            cx * s + lx as i32,
+                                            cy * s + ly as i32,
+                                            cz * s + lz as i32,
+                                        ],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("this seed grows no trees in the searched area");
+    }
+
+    #[test]
+    fn a_broken_log_stays_broken_after_a_reload() {
+        let blocks = tree_blocks();
+        let log = blocks.oak.unwrap().log;
+        let mut original = World::with_seed(0x77EE_5EED);
+        let (cc, [x, y, z]) = find_a_log(&original, blocks);
+        assert_eq!(original.block_at(x, y, z, blocks), log, "the tree is there");
+
+        original.set_block(x, y, z, BlockId::AIR);
+        let saved = original.edited_chunk_at(cc, blocks);
+
+        let mut loaded = World::with_seed(0x77EE_5EED);
+        loaded.load_chunk_edits(cc, &saved, blocks);
+        assert_eq!(
+            loaded.block_at(x, y, z, blocks),
+            BlockId::AIR,
+            "the broken log grew back after a reload"
+        );
+        assert!(!loaded.is_solid_at(x, y, z, blocks));
+        assert_eq!(
+            loaded.edits().collect::<Vec<_>>(),
+            original.edits().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_untouched_tree_in_a_dirty_chunk_is_not_an_edit() {
+        let blocks = tree_blocks();
+        let mut original = World::with_seed(0x77EE_5EED);
+        let (cc, log_pos) = find_a_log(&original, blocks);
+        // One genuine edit in the same chunk, somewhere that is not the tree:
+        // the first air cell found that is air in the unedited chunk.
+        let unedited = original.unedited_chunk(cc, blocks);
+        let s = Chunk::SIZE as i32;
+        let (lx, ly, lz) = (0..Chunk::SIZE)
+            .flat_map(|x| {
+                (0..Chunk::SIZE).flat_map(move |y| (0..Chunk::SIZE).map(move |z| (x, y, z)))
+            })
+            .find(|&(x, y, z)| unedited.get(x, y, z) == BlockId::AIR)
+            .expect("the chunk has air in it");
+        let edit = [
+            cc.x * s + lx as i32,
+            cc.y * s + ly as i32,
+            cc.z * s + lz as i32,
+        ];
+        assert_ne!(edit, log_pos);
+        original.set_block(edit[0], edit[1], edit[2], BlockId(3));
+        let before: Vec<_> = original.edits().collect();
+        assert_eq!(before.len(), 1);
+
+        let saved = original.edited_chunk_at(cc, blocks);
+        let mut loaded = World::with_seed(0x77EE_5EED);
+        loaded.load_chunk_edits(cc, &saved, blocks);
+
+        assert_eq!(
+            loaded.edit_count(),
+            1,
+            "every intact tree voxel became a spurious edit"
+        );
+        assert_eq!(loaded.edits().collect::<Vec<_>>(), before);
+        assert_eq!(
+            loaded.edited_chunk_at(cc, blocks),
+            saved,
+            "the chunk differs across a reload"
+        );
     }
 
     #[test]

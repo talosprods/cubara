@@ -254,6 +254,9 @@ impl ChunkStorage {
             0 => Ok(ChunkStorage::Uniform(BlockId(cursor.u16()?))),
             1 => {
                 let len = cursor.u8()? as usize;
+                if len == 0 {
+                    return Err(ChunkPayloadError::EmptyPalette);
+                }
                 let mut palette = Vec::with_capacity(len);
                 for _ in 0..len {
                     palette.push(BlockId(cursor.u16()?));
@@ -266,6 +269,14 @@ impl ChunkStorage {
                 let mut data = Vec::with_capacity(words);
                 for _ in 0..words {
                     data.push(cursor.u64()?);
+                }
+                // An index past the palette would panic on the first lookup;
+                // a corrupt save is an error, not a crash.
+                for idx in 0..volume {
+                    let index = get_packed(&data, bits, idx);
+                    if index as usize >= len {
+                        return Err(ChunkPayloadError::PaletteIndexOutOfRange { index, len });
+                    }
                 }
                 Ok(ChunkStorage::Palette {
                     palette,
@@ -292,6 +303,13 @@ pub enum ChunkPayloadError {
     UnknownStorageTag(u8),
     InvalidBits(u8),
     PaletteTooLarge(usize),
+    /// A palette chunk with no palette entries: nothing for an index to name.
+    EmptyPalette,
+    /// A packed voxel index at or past the palette's length.
+    PaletteIndexOutOfRange {
+        index: u32,
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for ChunkPayloadError {
@@ -304,6 +322,11 @@ impl std::fmt::Display for ChunkPayloadError {
             ChunkPayloadError::InvalidBits(bits) => write!(
                 f,
                 "chunk payload has invalid palette width {bits} bits (expected one of {WIDTHS:?})"
+            ),
+            ChunkPayloadError::EmptyPalette => write!(f, "chunk payload has an empty palette"),
+            ChunkPayloadError::PaletteIndexOutOfRange { index, len } => write!(
+                f,
+                "chunk payload has palette index {index} but the palette has {len} entries"
             ),
             ChunkPayloadError::PaletteTooLarge(len) => write!(
                 f,
@@ -367,6 +390,51 @@ impl Default for ChunkStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VOLUME: usize = 4096;
+
+    /// A hand-built palette payload: `palette` ids, then `bits` and packed
+    /// words in which every voxel holds `fill`.
+    fn palette_payload(palette: &[u16], bits: u8, fill: u32) -> Vec<u8> {
+        let mut out = vec![1, palette.len() as u8];
+        for id in palette {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out.push(bits);
+        let mut data = zero_words(bits, VOLUME);
+        for idx in 0..VOLUME {
+            set_packed(&mut data, bits, idx, fill);
+        }
+        for word in data.iter() {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn a_palette_index_past_the_palette_is_an_error_not_a_panic() {
+        // Two entries, but every voxel says index 3.
+        let bytes = palette_payload(&[0, 1], 2, 3);
+        assert_eq!(
+            ChunkStorage::read_payload(&bytes, VOLUME),
+            Err(ChunkPayloadError::PaletteIndexOutOfRange { index: 3, len: 2 })
+        );
+    }
+
+    #[test]
+    fn an_empty_palette_is_an_error_not_a_panic() {
+        let bytes = palette_payload(&[], 1, 0);
+        assert_eq!(
+            ChunkStorage::read_payload(&bytes, VOLUME),
+            Err(ChunkPayloadError::EmptyPalette)
+        );
+    }
+
+    #[test]
+    fn a_valid_hand_built_palette_payload_still_reads() {
+        let bytes = palette_payload(&[0, 1], 1, 1);
+        assert!(ChunkStorage::read_payload(&bytes, VOLUME).is_ok());
+    }
 
     #[test]
     fn round_trips_every_width() {
