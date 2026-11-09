@@ -53,7 +53,9 @@ contradictory copies of itself.
 
 FPS is the sustained pipelined throughput; CPU/frame is the per-frame CPU submit
 cost (the stabler metric — see above). All runs are 1920×1080, 2000 measured
-frames after 200 warmup.
+frames after a warm-up: 200 frames until 2026-11-09, and since then at least 200
+frames **and** at least 1 s, so clocks have settled (⁷⁵). Rows before that date
+read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 
 ### Windows 11 — i7-12650H / RTX 4060 Laptop GPU (Vulkan)
 
@@ -94,6 +96,12 @@ frames after 200 warmup.
 | 2026-09-27 | *Experiment:* gate eye hill, 2,000 warm-up frames⁶⁹ | 869 | 436,690 voxel + far | ~4,324 | 0.096 ms | 0.305 ms | `b533a70` |
 | 2026-09-27 | *Experiment:* gate eye flight, 2,000 warm-up frames⁶⁹ | 0 | far only | ~5,439 | 0.084 ms | 0.371 ms | `b533a70` |
 | 2026-09-27 | *Experiment:* radius 64 (orbit), 2,000 warm-up frames⁶⁹ | 2,219 | 901,932 (595,323 drawn) | ~3,641 | 0.141 ms | 0.402 ms | `b533a70` |
+| 2026-11-09 | `main` before the change: gate eye ground + far terrain (High), 200 warm-up frames⁷⁵ | 1,940 | 819,928 voxel + far | ~3,443 | 0.189 ms | 0.555 ms | `b8a8550` |
+| 2026-11-09 | `main` before: gate eye hill + far terrain (High)⁷⁵ | 869 | 436,690 voxel + far | ~3,426 | 0.187 ms | 0.537 ms | `b8a8550` |
+| 2026-11-09 | `main` before: gate eye flight + far terrain (High)⁷⁵ | 0 | far only | ~4,892 | 0.143 ms | 0.444 ms | `b8a8550` |
+| 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁵ | 1,940 | 819,928 voxel + far | **~3,650** | **0.104 ms** | 0.253 ms | *(this PR)* |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁵ | 869 | 436,690 voxel + far | **~3,617** | **0.088 ms** | 0.230 ms | *(this PR)* |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁵ | 0 | far only | **~5,427** | **0.067 ms** | 0.191 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2494,3 +2502,32 @@ quality (flight at High 2,450 → 1,254 FPS), and the table's arctangents
 another 0.035 ms at ground. Both measurements are in
 `docs/PROPOSAL_FAR_VIEW.md` §3.3. The M3 is where this matters most: it met
 the gate at Low with ground at 1,090. It should be re-measured there.
+
+⁷⁵ **The warm-up waits for steady clocks: the owner's decision, 2026-11-09.**
+Note ⁶⁹ showed the 200-frame warm-up (~50 ms here) measuring a CPU and GPU still
+clocking up, and left the choice to the owner. Asked, he said: *"pas gerust de
+tests aan als je merkt dat wat je meet niet representatief is. Graag zelfs.
+houd er dan alleen rekening mee dat je dat zo vroeg mogelijk in het proces
+aanpast"*. So it changed before the next feature measured by the gate (F5).
+The warm-up now runs until at least 200 frames **and** at least 1 s have
+passed. A longer warm-up goes round the same first 200 frames of the camera
+path, so the measured frames still start in the same place and see the same
+scene. Wall time rather than more frames, so a slow machine is not held for
+tens of seconds.
+
+`--bench gate`, the same commit with and without the change, as separate
+binaries, run alternately, on AC power: 2 runs before and 3 after. CPU/frame
+after, at ground, is from the one run whose log kept it.
+
+```
+             200 frames (~50 ms)                  >= 200 frames and >= 1 s
+ground   3,456 / 3,429 FPS, CPU 0.188 / 0.190  ->  3,596 / 3,633 / 3,721 FPS, CPU 0.104
+hill     3,447 / 3,404 FPS, CPU 0.186 / 0.187  ->  3,631 / 3,593 / 3,628 FPS, CPU 0.090 / 0.087 / 0.088
+flight   4,934 / 4,850 FPS, CPU 0.143 / 0.142  ->  5,430 / 5,424 / 5,428 FPS, CPU 0.064 / 0.071 / 0.066
+```
+
+FPS rises 6% (ground), 6% (hill) and 11% (flight). CPU/frame roughly halves,
+and p99 CPU/frame falls from ~0.55 to ~0.23 ms. One second is 4,100–6,800 warm-up
+frames on this laptop, and the spread between runs narrows to about 1%. The
+M3 may move the other way (⁵⁵: a hot M3 read slower). It is re-measured when
+the Mac runs the gate next, and its rows before this date stay as they are.

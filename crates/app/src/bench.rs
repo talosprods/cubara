@@ -26,7 +26,7 @@
 //! that is really garbage (see [`should_disable_gpu_timing`]).
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cubara_render::{
     gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, GpuTimestamps,
@@ -41,7 +41,19 @@ use crate::streaming::to_meshed_node;
 
 /// The resolution every row in `BENCHMARKS.md` was measured at.
 pub const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
+/// The warm-up runs until *both* of these hold ([`warmed_up`]). At least this
+/// many frames, which is also the stretch of camera path the warm-up covers --
+/// longer warm-ups go round it again, so the measured frames always start at
+/// the same place and see the same scene.
 const WARMUP_FRAMES: u32 = 200;
+/// ... and at least this long. 200 frames alone pass in ~50 ms on a fast
+/// machine, and measured a CPU and GPU still clocking up: CPU/frame ~40% high,
+/// FPS 12-15% low, and a burst of slow GPU frames at the start of the timed
+/// window (`BENCHMARKS.md` ⁶⁹). Play runs the GPU continuously, so steady
+/// clocks are what a player gets, and what the gate and `--bench tune` should
+/// judge. Wall time rather than more frames, so a slow machine is not held
+/// for tens of seconds.
+const WARMUP_MIN: Duration = Duration::from_secs(1);
 const MEASURE_FRAMES: u32 = 2000;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// Fixed camera advance per frame, so the path is framerate-independent.
@@ -771,22 +783,37 @@ pub fn run(
         )
     };
 
-    log::info!("warming up ({WARMUP_FRAMES} frames), then measuring {MEASURE_FRAMES}...");
+    log::info!(
+        "warming up (at least {WARMUP_FRAMES} frames and {:.1} s), then measuring {MEASURE_FRAMES}...",
+        WARMUP_MIN.as_secs_f64()
+    );
 
     let mut frame_index = 0u64;
-    for _ in 0..WARMUP_FRAMES {
+    let warmup_start = Instant::now();
+    let warmup_t0 = virtual_t;
+    let mut warmup_frames = 0u32;
+    while !warmed_up(warmup_frames, warmup_start.elapsed()) {
         submit_frame(
             &mut arena,
             &mut far_terrain,
             &mut scene,
-            virtual_t,
+            warmup_t0 + warmup_path_step(warmup_frames) as f32 * VIRTUAL_DT,
             gpu_timer.as_ref(),
             frame_index,
         );
         let _ = device.poll(wgpu::PollType::Poll);
-        virtual_t += VIRTUAL_DT;
+        warmup_frames += 1;
         frame_index += 1;
     }
+    // Where 200 warm-up frames always left the camera, summed the same way
+    // they summed it, so the measured frames see bit-for-bit the same path.
+    for _ in 0..WARMUP_FRAMES {
+        virtual_t += VIRTUAL_DT;
+    }
+    log::info!(
+        "warmed up: {warmup_frames} frames in {:.2} s",
+        warmup_start.elapsed().as_secs_f64()
+    );
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     // Warmup's own readings are never counted in the reported stats -- only
     // measurement frames count -- but the drain still classifies them,
@@ -1193,6 +1220,21 @@ fn orbit_eye(t: f32, center: [f32; 3], radius: f32) -> [f32; 3] {
     CameraUniform::orbit_eye(t, center, radius)
 }
 
+/// Whether the warm-up is done: at least [`WARMUP_FRAMES`] frames *and* at
+/// least [`WARMUP_MIN`] of wall time -- the frames so every backend has
+/// compiled and uploaded what the scene needs, the time so the CPU and GPU
+/// have reached the clocks a player's sustained play runs at.
+fn warmed_up(frames: u32, elapsed: Duration) -> bool {
+    frames >= WARMUP_FRAMES && elapsed >= WARMUP_MIN
+}
+
+/// Where on the camera path warm-up frame `frame` is, in frames from the
+/// start: the first [`WARMUP_FRAMES`] of the path, over and over, so however
+/// long the warm-up runs, the measured frames start where they always did.
+fn warmup_path_step(frame: u32) -> u32 {
+    frame % WARMUP_FRAMES
+}
+
 /// Parse a `--eye` value: `X,Y,Z` in blocks, e.g. `8,40,8`.
 pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
     let parts: Vec<f32> = text
@@ -1205,6 +1247,32 @@ pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_warm_up_needs_both_the_frames_and_the_time() {
+        let second = Duration::from_secs(1);
+        // Enough frames, not enough time: the ~50 ms that 200 frames take on a
+        // fast machine is exactly what measured a CPU/GPU still clocking up.
+        assert!(!warmed_up(WARMUP_FRAMES, Duration::from_millis(50)));
+        assert!(!warmed_up(100_000, second - Duration::from_millis(1)));
+        // Enough time, not enough frames: a slow machine still does all 200.
+        assert!(!warmed_up(WARMUP_FRAMES - 1, 10 * second));
+        // Both: done, from the first moment both hold.
+        assert!(warmed_up(WARMUP_FRAMES, second));
+        assert!(warmed_up(4_000, second + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_long_warm_up_goes_round_the_same_stretch_of_path() {
+        // However long the warm-up, it never leaves the first WARMUP_FRAMES
+        // of the camera path -- the measured frames start where they always
+        // did, so a longer warm-up cannot change the scene being measured.
+        assert_eq!(warmup_path_step(0), 0);
+        assert_eq!(warmup_path_step(WARMUP_FRAMES - 1), WARMUP_FRAMES - 1);
+        assert_eq!(warmup_path_step(WARMUP_FRAMES), 0);
+        assert_eq!(warmup_path_step(3 * WARMUP_FRAMES + 7), 7);
+        assert!((0..20_000).all(|f| warmup_path_step(f) < WARMUP_FRAMES));
+    }
     use crate::far_streaming::FarQuality;
 
     fn eye(name: &'static str, must_see: bool) -> GateEye {
