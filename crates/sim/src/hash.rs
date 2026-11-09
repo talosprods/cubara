@@ -124,7 +124,16 @@ impl WorldHash {
         self.write_i64(p.velocity.y.raw());
         self.write_i64(p.velocity.z.raw());
         self.write_bool(p.on_ground);
-        self.write_bool(p.free_fly);
+        // Spectating is player state: a flag, and the camera only when there is
+        // one, so a world nobody spectates in hashes as it always did.
+        self.write_bool(p.spectating.is_some());
+        if let Some(c) = &p.spectating {
+            self.write_i64(c.pos.x.raw());
+            self.write_i64(c.pos.y.raw());
+            self.write_i64(c.pos.z.raw());
+            self.write_i32(c.yaw.raw());
+            self.write_i32(c.pitch.raw());
+        }
         self.write_bool(p.creative);
         self.write_i32(p.yaw.raw());
         self.write_i32(p.pitch.raw());

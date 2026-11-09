@@ -227,8 +227,8 @@ pub enum Action {
     /// Switch survival/creative (owner's call, 2026-09-18 -- `ROADMAP.md`'s
     /// phase 3 note).
     ///
-    /// An `Action`, not an `InputFrame` field like [`free_fly`
-    /// toggling](cubara_sim::InputFrame::toggle_fly): this is a discrete,
+    /// An `Action`, not an `InputFrame` field like [`spectating`
+    /// toggling](cubara_sim::InputFrame::toggle_spectate): this is a discrete,
     /// deliberate switch a menu click sends once, not a per-tick control, and
     /// it needs the block/item registries (to grant the creative loadout)
     /// that only this layer -- not `cubara-sim`'s tick -- has (Rule 3).
@@ -768,6 +768,12 @@ impl Server {
     /// the held tool changes. Each of those makes the stored `Mining` stop
     /// matching, and a non-match restarts from zero rather than resuming.
     fn tick_mining_for(&mut self, who: PlayerId, breaking: bool) {
+        if self.is_spectating(who) {
+            // A camera breaks nothing, and a swing in progress when F4 was
+            // pressed is abandoned like any other.
+            self.mining.remove(&who);
+            return;
+        }
         if !breaking {
             self.mining.remove(&who);
             return;
@@ -1237,7 +1243,9 @@ impl Server {
         let Some(player) = self.sim.get(who) else {
             return;
         };
-        let centre = ChunkCoord::from_world_pos(player.pos.to_f32());
+        // The camera while spectating, so you can look around far from your
+        // body; the body again the moment you leave (owner, 2026-11-09).
+        let centre = ChunkCoord::from_world_pos(player.view_pos().to_f32());
         let Some(view) = self.views.get_mut(&who) else {
             return;
         };
@@ -1470,7 +1478,16 @@ impl Server {
         }
     }
 
-    /// Switch `who`'s play mode: the pause menu's `[C]`, and `/gamemode`.
+    /// Whether `who` is a spectator: a camera that takes no part in the world.
+    /// Every action that touches the world asks this first.
+    fn is_spectating(&self, who: PlayerId) -> bool {
+        self.sim.get(who).is_some_and(Player::is_spectating)
+    }
+
+    /// Switch `who`'s *normal* play mode: the pause menu's `[C]`, and
+    /// `/gamemode survival|creative`. It does not leave Spectator by itself
+    /// (`[C]` works while spectating and changes what F4 returns you to);
+    /// `/gamemode` leaves it explicitly.
     fn set_creative_as(&mut self, who: PlayerId, creative: bool) {
         if self.sim.get(who).is_none() {
             return;
@@ -1534,15 +1551,24 @@ impl Server {
             }
             Some("seed") => format!("seed: {}", self.world.seed()),
             Some("gamemode") => match words.next() {
+                // `/gamemode survival|creative` sets the normal mode and leaves
+                // Spectator; `/gamemode spectator` is F4 pressed to enter
+                // (owner, 2026-11-09).
                 Some("creative") => {
+                    self.sim.player_mut(who).leave_spectator();
                     self.set_creative_as(who, true);
                     "play mode: creative".to_string()
                 }
                 Some("survival") => {
+                    self.sim.player_mut(who).leave_spectator();
                     self.set_creative_as(who, false);
                     "play mode: survival".to_string()
                 }
-                _ => "usage: /gamemode survival|creative".to_string(),
+                Some("spectator") => {
+                    self.sim.player_mut(who).enter_spectator();
+                    "play mode: spectator".to_string()
+                }
+                _ => "usage: /gamemode survival|creative|spectator".to_string(),
             },
             Some("give") => self.give_as(who, words.next(), words.next()),
             // Asked for with the rest, and not built: there is no time of day
@@ -1720,6 +1746,9 @@ impl Server {
     /// this only decides *whose* inventory it happens to, which is the part a
     /// client may not be trusted with (§3.4).
     pub fn click_slot_as(&mut self, who: PlayerId, slot: SlotRef, right: bool) {
+        if self.is_spectating(who) {
+            return;
+        }
         let (Some(items), Some(book)) = (self.items.as_ref(), self.recipes.as_ref()) else {
             return;
         };
@@ -1940,6 +1969,9 @@ impl Server {
     /// the point to generalise it, "with two real cases to design against" --
     /// the furnace is that second case.
     fn interact_as(&mut self, who: PlayerId) -> Option<Screen> {
+        if self.is_spectating(who) {
+            return None;
+        }
         let (Some(registry), Some(terrain)) = (self.blocks_registry.as_deref(), self.terrain)
         else {
             return None;
@@ -1985,6 +2017,9 @@ impl Server {
     /// comes back as a `BlockEntity` effect, rather than the client editing a
     /// furnace it does not own.
     fn click_furnace_as(&mut self, who: PlayerId, pos: [i32; 3], slot: FurnaceSlot) {
+        if self.is_spectating(who) {
+            return;
+        }
         let Some(items) = self.items.as_ref() else {
             return;
         };
@@ -2182,6 +2217,9 @@ impl Server {
     }
 
     fn break_looked_at_inner(&mut self, who: PlayerId) -> Option<[i32; 3]> {
+        if self.is_spectating(who) {
+            return None;
+        }
         let origin = self.sim.player_mut(who).pos.to_f32();
         let dir = self.sim.player_mut(who).look_dir_f32().to_array();
         let hit = self.world.raycast(origin, dir, REACH, self.terrain())?;
@@ -2196,6 +2234,9 @@ impl Server {
     /// **and consumes nothing**: a click that does nothing must not quietly
     /// spend an item.
     fn place_held_as(&mut self, who: PlayerId) -> Option<ChunkCoord> {
+        if self.is_spectating(who) {
+            return None;
+        }
         // An interactive block under the crosshair takes precedence over
         // placing. Otherwise a bench would be unusable the moment you are
         // holding anything -- which is most of the time.

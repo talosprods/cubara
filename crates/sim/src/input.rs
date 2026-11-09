@@ -13,7 +13,7 @@ use cubara_voxel::Angle;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InputFrame {
     /// Movement input this frame, each axis in `-1.0..=1.0`: `[0]` strafe
-    /// (+right), `[1]` vertical (+up, free-fly only), `[2]` forward (+look
+    /// (+right), `[1]` vertical (+up, Spectator only), `[2]` forward (+look
     /// direction). Not a raw key snapshot -- opposing keys held together are
     /// already cancelled out (`right - left`, etc.) by whoever builds this.
     pub move_axes: [f32; 3],
@@ -32,14 +32,15 @@ pub struct InputFrame {
     pub look_delta: [Angle; 2],
     /// Jump, as a rising edge -- `true` only on the frame the key went down,
     /// not for as long as it's held. Walking mode consumes this once; it has
-    /// no effect in free-fly. The caller (`cubara-app`) is responsible for
+    /// no effect while spectating. The caller (`cubara-app`) is responsible for
     /// only setting this on the actual edge and clearing it once consumed,
     /// so a multi-tick catch-up burst this frame doesn't apply it more than
     /// once (see [`crate::Sim::tick`]).
     pub jump: bool,
-    /// Toggle free-fly debug mode, also a rising edge, same one-shot
+    /// Toggle Spectator (F4): between the normal mode and the camera that
+    /// flies through everything. Also a rising edge, same one-shot
     /// contract as [`Self::jump`].
-    pub toggle_fly: bool,
+    pub toggle_spectate: bool,
     /// Whether the break button is **held** this frame.
     ///
     /// Held state like [`Self::move_axes`], deliberately *not* a rising edge

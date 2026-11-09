@@ -578,12 +578,12 @@ mod tests {
     }
 
     #[test]
-    fn free_fly_ignores_collision() {
-        // Not `step`'s job to test free-fly's own movement (that's
-        // `player::tests`) -- this pins that free-fly is genuinely a
-        // separate path with no collision, the thing that makes noclip
-        // useful for debugging.
-        let mut player = Player::new(
+    fn spectator_flight_ignores_collision() {
+        // Not `step`'s job to test the camera's own movement (that's
+        // `player::tests`) -- this pins that Spectator is genuinely a
+        // separate path with no collision: the camera flies through the
+        // floor that the walking body stands on.
+        let mut cam = crate::SpectatorState::at(
             cubara_voxel::FixedVec3::from_f32([0.5, 0.5, 0.5]),
             Angle::ZERO,
             Angle::ZERO,
@@ -592,10 +592,10 @@ mod tests {
             move_axes: [0.0, -1.0, 0.0],
             ..InputFrame::default()
         };
-        player.apply_free_fly(&down, 1.0);
+        cam.fly(&down, 1.0);
         assert!(
-            player.pos.y < Fixed::from_blocks(-5),
-            "free-fly flew straight through the floor"
+            cam.pos.y < Fixed::from_blocks(-5),
+            "the spectator camera did not fly through the floor"
         );
     }
 }

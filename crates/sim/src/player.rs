@@ -1,4 +1,5 @@
-//! The player: position, look direction, and (phase 1) free-fly movement.
+//! The player: position, look direction, walking physics, and the spectator
+//! camera.
 //!
 //! Moved here from `cubara-render`'s old `FlyCamera` (block 1.6, issue #57):
 //! movement is gameplay, and it now runs inside [`crate::Sim::tick`] at a
@@ -64,7 +65,7 @@ impl PlayerId {
 /// them a client mispredicts fall damage and regeneration.
 ///
 /// It lives in this crate rather than in `cubara-server` deliberately. Partly
-/// because `yaw`, `pitch` and `free_fly` are `pub(crate)` and a pose cannot be
+/// because `yaw`, `pitch` and `spectating` are `pub(crate)` and a pose cannot be
 /// rebuilt from outside. Mostly because *which fields a tick changes* is
 /// knowledge belonging to the crate that owns the tick: whoever adds a physics
 /// field later should be made to decide, in this file, whether it is authority.
@@ -79,47 +80,130 @@ pub struct PlayerState {
     pub yaw: Angle,
     pub pitch: Angle,
     pub on_ground: bool,
-    pub free_fly: bool,
+    /// The spectator camera, when there is one. Part of what a replay
+    /// reconstructs: entering, flying and leaving Spectator are driven by the
+    /// input stream, so a client that rewound without it would replay camera
+    /// movement into a body that is not frozen.
+    pub spectating: Option<SpectatorState>,
     pub creative: bool,
     pub fall_distance: Fixed,
     pub health: u8,
     pub ticks_since_damage: u32,
 }
 
+/// The Spectator camera: a position and a look direction of its own, flown
+/// through everything (owner's decision, 2026-11-09; `ROADMAP.md`, "Recorded,
+/// 2026-11-09 -- play modes").
+///
+/// While a player spectates, their **body** -- [`Player::pos`] and everything
+/// else the walking physics owns -- is frozen where F4 was pressed, and this is
+/// what the input drives instead. All integers, like the body: it is player
+/// state, so it is in the world hash and in client prediction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpectatorState {
+    pub pos: FixedVec3,
+    pub yaw: Angle,
+    pub pitch: Angle,
+}
+
+impl SpectatorState {
+    /// The camera as it starts: at the body's eye, looking where the body looks.
+    pub fn at(pos: FixedVec3, yaw: Angle, pitch: Angle) -> Self {
+        Self { pos, yaw, pitch }
+    }
+
+    /// Unit view direction, from the same integer trigonometry as the body's.
+    pub fn look_dir(&self) -> [Fixed; 3] {
+        cubara_voxel::angle::look_dir(self.yaw, self.pitch)
+    }
+
+    /// [`look_dir`](Self::look_dir) as floats, for the camera.
+    pub fn look_dir_f32(&self) -> Vec3 {
+        let d = self.look_dir();
+        Vec3::new(d[0].to_f32(), d[1].to_f32(), d[2].to_f32())
+    }
+
+    /// Interpolate toward `other` by `t`, for the render camera only.
+    pub fn lerp(&self, other: &SpectatorState, t: f32) -> SpectatorState {
+        SpectatorState {
+            pos: self.pos.lerp(other.pos, t),
+            yaw: self.yaw.lerp(other.yaw, t),
+            pitch: self.pitch.lerp(other.pitch, t),
+        }
+    }
+
+    /// Apply one fixed tick's worth of noclip flight: turn by
+    /// `input.look_delta`, then move by `input.move_axes` at [`SPEED`]
+    /// blocks/second, `dt` seconds' worth. `move_axes[2]` (forward) moves along
+    /// the full look direction -- fly toward where you look -- `[0]` (strafe)
+    /// along the horizontal right vector, `[1]` (vertical) along world up.
+    /// Ignores collision entirely: that is what Spectator is.
+    pub fn fly(&mut self, input: &InputFrame, dt: f32) {
+        let (yaw, pitch) = turned(self.yaw, self.pitch, input);
+        self.yaw = yaw;
+        self.pitch = pitch;
+
+        let look = self.look_dir_f32();
+        let (_, r) = cubara_voxel::angle::horizontal_axes(self.yaw);
+        let right = Vec3::new(r[0].to_f32(), r[1].to_f32(), r[2].to_f32());
+
+        let delta =
+            look * input.move_axes[2] + right * input.move_axes[0] + Vec3::Y * input.move_axes[1];
+        if delta != Vec3::ZERO {
+            // A camera is never authoritative over anything -- the body it
+            // leaves behind is -- so converting through f32 costs nothing.
+            let step = delta.normalize() * SPEED * dt;
+            self.pos += FixedVec3::from_f32([step.x, step.y, step.z]);
+        }
+    }
+}
+
+/// Yaw and pitch after `input.look_delta`: yaw wraps (exact), pitch is
+/// subtracted (screen y grows downward) and clamped. The one implementation of
+/// "turn", shared by the walking body and the spectator camera (Rule 5).
+fn turned(yaw: Angle, pitch: Angle, input: &InputFrame) -> (Angle, Angle) {
+    (
+        yaw.wrapping_add(input.look_delta[0]),
+        pitch.wrapping_sub(input.look_delta[1]).clamp(PITCH_LIMIT),
+    )
+}
+
 /// Where the player is, which way they're looking, and (block 1.7a) their
-/// walking-physics state. Free-fly and walking are two *modes* of this one
-/// type, not two competing implementations (Rule 5) -- [`Self::free_fly`]
-/// picks which of [`Self::apply_free_fly`] / `crate::physics::step` runs each
-/// tick, decided in [`crate::Sim::tick`].
+/// walking-physics state. Walking and Spectator are two *modes* of this one
+/// type, not two competing implementations (Rule 5) -- [`Self::spectating`]
+/// picks whether `crate::physics::step` moves the body or
+/// [`SpectatorState::fly`] moves the camera each tick, decided in
+/// [`crate::Sim::tick`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Player {
     /// The eye/camera position. Walking physics derives its collision box
     /// from this by subtracting a fixed eye height (`crate::physics`), so
     /// this field's meaning doesn't change between modes.
     pub pos: FixedVec3,
-    /// Blocks/second. Driven by gravity and walking input in walking mode;
-    /// held at zero in free-fly (there's nothing to carry across the mode
-    /// switch back).
+    /// Blocks/second. Driven by gravity and walking input; frozen, with the
+    /// rest of the body, while [`Self::spectating`].
     pub velocity: FixedVec3,
     /// Whether the last walking-physics tick ended standing on solid ground.
-    /// Always `false` in free-fly (not meaningful there -- nothing reads it
-    /// as "falling").
     pub on_ground: bool,
-    /// Free-fly (noclip) debug mode vs. real walking physics. Not `pub`:
-    /// toggled only via [`InputFrame::toggle_fly`], consumed inside
-    /// [`crate::Sim::tick`], so it stays driven by the recorded input stream
-    /// a replay (block 1.8) needs to reproduce -- not a side channel outside
-    /// it.
-    pub(crate) free_fly: bool,
+    /// The Spectator camera, `None` in the normal mode (Survival or Creative).
+    /// Not `pub`: entered and left only through [`InputFrame::toggle_spectate`]
+    /// (consumed inside [`crate::Sim::tick`]) and [`Self::enter_spectator`] /
+    /// [`Self::leave_spectator`], so it stays driven by the recorded input
+    /// stream a replay needs to reproduce -- not a side channel outside it.
+    ///
+    /// While this is `Some`, the body (`pos`, `velocity`, `on_ground`,
+    /// `fall_distance`, health) does not change at all: no physics, no damage,
+    /// no regeneration. Leaving drops the camera and the body carries on
+    /// bit-identical. Never saved (a save holds the frozen body).
+    pub(crate) spectating: Option<SpectatorState>,
     /// Survival vs. creative (owner's call, 2026-09-18 -- `ROADMAP.md`'s phase
-    /// 3 note). `pub(crate)`, same reason as [`Self::free_fly`]: changed only
+    /// 3 note). `pub(crate)`, same reason as [`Self::spectating`]: changed only
     /// through [`Self::set_creative`], which is what keeps it flowing through
     /// the recorded `Action` stream a replay needs, not a side channel.
     ///
-    /// Deliberately a `bool`, not an enum: exactly two modes are decided.
-    /// `ROADMAP.md`'s note names "survival and creative for now" -- a third
-    /// mode is a real possibility this leaves for whoever adds it, not a
-    /// hypothetical designed around today.
+    /// The *normal* mode, a `bool`: Survival when false. Spectator is not a
+    /// third value of it but [`Self::spectating`], because F4 switches between
+    /// the normal mode and Spectator in either (owner, 2026-11-09).
     pub(crate) creative: bool,
     /// Heading around +Y. 0 looks toward −Z. `pub(crate)`, not private:
     /// `crate::hash::WorldHash` needs the raw angle (`look_dir()` only exposes
@@ -198,7 +282,7 @@ impl Player {
             pos,
             velocity: FixedVec3::ZERO,
             on_ground: false,
-            free_fly: false,
+            spectating: None,
             creative: false,
             yaw,
             pitch: pitch.clamp(PITCH_LIMIT),
@@ -219,7 +303,9 @@ impl Player {
     /// regeneration counter, so a fall inside the safe distance does not
     /// interrupt healing.
     pub fn take_damage(&mut self, points: u8) -> bool {
-        if points == 0 {
+        // No damage of any kind while spectating: the body is frozen and the
+        // camera takes no part in the world (owner, 2026-11-09).
+        if points == 0 || self.is_spectating() {
             return false;
         }
         self.ticks_since_damage = 0;
@@ -279,11 +365,47 @@ impl Player {
             .min(u8::MAX as u32) as u8
     }
 
-    /// Whether the player is currently in free-fly (noclip) debug mode
-    /// rather than walking under gravity. Read-only outside this crate --
-    /// only [`InputFrame::toggle_fly`], via [`crate::Sim::tick`], changes it.
-    pub fn is_free_fly(&self) -> bool {
-        self.free_fly
+    /// The Spectator camera, when this player is spectating. Read-only outside
+    /// this crate.
+    pub fn spectating(&self) -> Option<&SpectatorState> {
+        self.spectating.as_ref()
+    }
+
+    /// Whether this player is spectating: a camera that takes no part in the
+    /// world. Read-only outside this crate -- only
+    /// [`InputFrame::toggle_spectate`], via [`crate::Sim::tick`], and
+    /// [`Self::enter_spectator`] / [`Self::leave_spectator`] change it.
+    pub fn is_spectating(&self) -> bool {
+        self.spectating.is_some()
+    }
+
+    /// Start spectating: the camera begins at the body's eye, looking where the
+    /// body looks. Does nothing if already spectating (so `/gamemode spectator`
+    /// twice does not snap the camera back).
+    pub fn enter_spectator(&mut self) {
+        if self.spectating.is_none() {
+            self.spectating = Some(SpectatorState::at(self.pos, self.yaw, self.pitch));
+        }
+    }
+
+    /// Stop spectating. The camera is dropped; the body was never touched, so
+    /// the player continues exactly where F4 was pressed.
+    pub fn leave_spectator(&mut self) {
+        self.spectating = None;
+    }
+
+    /// Where the player's *view* is: the camera while spectating, the body's
+    /// eye otherwise. What the render camera, streaming and interest follow.
+    pub fn view_pos(&self) -> FixedVec3 {
+        self.spectating.map_or(self.pos, |s| s.pos)
+    }
+
+    /// The view direction, as floats -- the camera's while spectating.
+    pub fn view_dir_f32(&self) -> Vec3 {
+        match &self.spectating {
+            Some(s) => s.look_dir_f32(),
+            None => self.look_dir_f32(),
+        }
     }
 
     /// Whether the player is in creative mode. Read-only outside this crate --
@@ -292,21 +414,19 @@ impl Player {
         self.creative
     }
 
-    /// Enter or leave creative mode.
+    /// Enter or leave creative mode: the *normal* mode, the one F4 returns to.
     ///
-    /// Entering always starts flying and leaving always stops it: survival
-    /// never flies, and a player switching to creative mid-air or mid-walk
-    /// should not fall the instant they land. `F4`'s independent
-    /// [`Self::free_fly`] toggle still works normally once creative, exactly
-    /// as it always has, to land and walk around without leaving creative --
-    /// the two flags are set together only at this transition, not tied
-    /// together afterward.
+    /// Creative walks like Survival (owner, 2026-11-09: "gewoon op de grond
+    /// loopt"); it differs in no fall damage and its loadout. Switching mid-air
+    /// therefore does not hold you up: you fall, unhurt if creative. Works
+    /// while spectating too, and then only changes what you return to.
     pub fn set_creative(&mut self, creative: bool) {
         self.creative = creative;
-        self.free_fly = creative;
-        self.velocity = FixedVec3::ZERO;
-        self.on_ground = false;
-        self.fall_distance = Fixed::ZERO;
+        if self.spectating.is_none() {
+            self.velocity = FixedVec3::ZERO;
+            self.on_ground = false;
+            self.fall_distance = Fixed::ZERO;
+        }
     }
 
     /// Unit view direction from the current yaw/pitch, in [`Fixed`].
@@ -324,7 +444,7 @@ impl Player {
             yaw: self.yaw,
             pitch: self.pitch,
             on_ground: self.on_ground,
-            free_fly: self.free_fly,
+            spectating: self.spectating,
             creative: self.creative,
             fall_distance: self.fall_distance,
             health: self.health,
@@ -344,7 +464,7 @@ impl Player {
         self.yaw = state.yaw;
         self.pitch = state.pitch;
         self.on_ground = state.on_ground;
-        self.free_fly = state.free_fly;
+        self.spectating = state.spectating;
         self.creative = state.creative;
         self.fall_distance = state.fall_distance;
         self.health = state.health;
@@ -392,51 +512,25 @@ impl Player {
     /// can produce -- which matters because this value will arrive from a
     /// client, and §3.4 says a client may never be believed.
     pub(crate) fn apply_look(&mut self, input: &InputFrame) {
-        self.yaw = self.yaw.wrapping_add(input.look_delta[0]);
-        self.pitch = self
-            .pitch
-            .wrapping_sub(input.look_delta[1])
-            .clamp(PITCH_LIMIT);
+        let (yaw, pitch) = turned(self.yaw, self.pitch, input);
+        self.yaw = yaw;
+        self.pitch = pitch;
     }
 
     /// Horizontal (pitch-ignored) `(forward, right)` unit vectors from the
     /// current yaw -- what walking moves along, since looking up/down must
-    /// not tilt you into the ground or the sky. `right` is also what
-    /// [`Self::apply_free_fly`] strafes along.
+    /// not tilt you into the ground or the sky.
     pub(crate) fn horizontal_axes(&self) -> (Vec3, Vec3) {
         let (f, r) = cubara_voxel::angle::horizontal_axes(self.yaw);
         let v = |a: [Fixed; 3]| Vec3::new(a[0].to_f32(), a[1].to_f32(), a[2].to_f32());
         (v(f), v(r))
     }
 
-    /// Apply one fixed tick's worth of free-fly movement: turn (see
-    /// [`Self::apply_look`]), then move by `input.move_axes` at [`SPEED`]
-    /// blocks/second, `dt` seconds' worth. `input.move_axes[2]` (forward)
-    /// moves along the full look direction -- fly toward where you look --
-    /// `[0]` (strafe) along the horizontal right vector, `[1]` (vertical)
-    /// along world up. Ignores collision entirely -- that's the point of a
-    /// noclip debug mode.
-    pub fn apply_free_fly(&mut self, input: &InputFrame, dt: f32) {
-        self.apply_look(input);
-
-        let look = self.look_dir_f32();
-        let (_, right) = self.horizontal_axes();
-
-        let delta =
-            look * input.move_axes[2] + right * input.move_axes[0] + Vec3::Y * input.move_axes[1];
-        if delta != Vec3::ZERO {
-            // Free-fly is a debug mode and never authoritative, so converting
-            // through f32 here costs nothing that matters.
-            let step = delta.normalize() * SPEED * dt;
-            self.pos += FixedVec3::from_f32([step.x, step.y, step.z]);
-        }
-    }
-
     /// Linearly interpolate between two ticks' poses by `t` in `0.0..=1.0` --
     /// what lets the renderer show a smooth pose between two 60 Hz sim
     /// states at whatever frame rate it's actually running
     /// (`docs/PHASE1_ARCHITECTURE.md` §9). Render-side only; never written
-    /// back into the sim (Rule 3). `velocity`/`on_ground`/`free_fly` aren't
+    /// back into the sim (Rule 3). `velocity`/`on_ground` aren't
     /// rendered, so they aren't meaningfully interpolatable -- `other`'s
     /// (the current tick's) values pass through unchanged.
     pub fn lerp(&self, other: &Player, t: f32) -> Player {
@@ -444,7 +538,12 @@ impl Player {
             pos: self.pos.lerp(other.pos, t),
             velocity: other.velocity,
             on_ground: other.on_ground,
-            free_fly: other.free_fly,
+            // The camera is rendered, so it interpolates -- when it was there
+            // on both ends. Entering or leaving passes the current state.
+            spectating: match (&self.spectating, &other.spectating) {
+                (Some(a), Some(b)) => Some(a.lerp(b, t)),
+                _ => other.spectating,
+            },
             creative: other.creative,
             // The short way round, which wrapping gives for free -- and the one
             // place a float belongs, because this is the render camera (§9).
@@ -497,9 +596,13 @@ mod tests {
         assert!((d - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "{d:?}");
     }
 
+    fn camera() -> SpectatorState {
+        SpectatorState::at(FixedVec3::ZERO, Angle::ZERO, Angle::ZERO)
+    }
+
     #[test]
     fn pitch_is_clamped() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
+        let mut cam = camera();
         let look_up = InputFrame {
             // Far more than a quarter turn in one tick, which no mouse can
             // produce -- and which a lying client could send, so the clamp has
@@ -507,23 +610,22 @@ mod tests {
             look_delta: [Angle::ZERO, Angle::from_raw(-Angle::QUARTER_TURN.raw())],
             ..InputFrame::default()
         };
-        player.apply_free_fly(&look_up, 1.0);
-        assert!(player.pitch <= PITCH_LIMIT && player.pitch >= Angle::from_raw(-PITCH_LIMIT.raw()));
-        assert!(player.look_dir()[1] < Fixed::ONE, "never fully vertical");
+        cam.fly(&look_up, 1.0);
+        assert!(cam.pitch <= PITCH_LIMIT && cam.pitch >= Angle::from_raw(-PITCH_LIMIT.raw()));
+        assert!(cam.look_dir()[1] < Fixed::ONE, "never fully vertical");
     }
 
     #[test]
     fn forward_axis_moves_along_look_dir() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
-        player.apply_free_fly(&moving([0.0, 0.0, 1.0]), 1.0);
+        let mut cam = camera();
+        cam.fly(&moving([0.0, 0.0, 1.0]), 1.0);
         // One second of SPEED along −Z.
         assert!(
-            player
-                .pos
+            cam.pos
                 .distance_squared(FixedVec3::from_f32([0.0, 0.0, -SPEED]))
                 < (cubara_voxel::fixed::ONE as i128).pow(2) / 10_000,
             "{:?}",
-            player.pos
+            cam.pos
         );
     }
 
@@ -532,16 +634,16 @@ mod tests {
         // A caller building InputFrame from held keys already cancels W+S
         // etc. into a zero axis -- this pins that a zero axis truly means no
         // movement on that axis, not that it happens to net out via floats.
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
-        player.apply_free_fly(&moving([0.0, 0.0, 0.0]), 1.0);
-        assert_eq!(player.pos, FixedVec3::ZERO);
+        let mut cam = camera();
+        cam.fly(&moving([0.0, 0.0, 0.0]), 1.0);
+        assert_eq!(cam.pos, FixedVec3::ZERO);
     }
 
     #[test]
     fn zero_dt_does_not_move_even_with_input_held() {
-        let mut player = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
-        player.apply_free_fly(&moving([1.0, 1.0, 1.0]), 0.0);
-        assert_eq!(player.pos, FixedVec3::ZERO);
+        let mut cam = camera();
+        cam.fly(&moving([1.0, 1.0, 1.0]), 0.0);
+        assert_eq!(cam.pos, FixedVec3::ZERO);
     }
 
     #[test]
@@ -774,37 +876,61 @@ mod tests {
     }
 
     #[test]
-    fn entering_creative_starts_flying_and_leaving_stops_it() {
+    fn creative_is_a_normal_mode_that_never_flies() {
         let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
         assert!(!p.is_creative());
-        assert!(!p.is_free_fly());
+        assert!(!p.is_spectating());
 
         p.set_creative(true);
         assert!(p.is_creative());
-        assert!(p.is_free_fly(), "entering creative should start flying");
+        assert!(
+            !p.is_spectating(),
+            "creative walks (owner, 2026-11-09): entering it must not start a camera"
+        );
 
         p.set_creative(false);
         assert!(!p.is_creative());
-        assert!(
-            !p.is_free_fly(),
-            "leaving creative should stop flying -- survival never flies"
+        assert!(!p.is_spectating());
+    }
+
+    #[test]
+    fn switching_the_normal_mode_while_spectating_keeps_the_camera_and_the_body() {
+        let mut p = Player::new(
+            FixedVec3::from_blocks(3, 40, 3),
+            Angle::from_radians(0.5),
+            Angle::ZERO,
+        );
+        p.velocity = FixedVec3::from_blocks(0, -9, 0);
+        p.fall_distance = Fixed::from_blocks(7);
+        p.enter_spectator();
+        let body = (p.pos, p.velocity, p.fall_distance, p.on_ground);
+
+        p.set_creative(true);
+        assert!(p.is_spectating(), "[C] must not leave Spectator");
+        assert!(p.is_creative(), "but it changes what you return to");
+        assert_eq!(
+            (p.pos, p.velocity, p.fall_distance, p.on_ground),
+            body,
+            "the frozen body is not touched by a mode switch"
         );
     }
 
     #[test]
-    fn f4_still_toggles_flight_independently_while_creative() {
-        let mut p = Player::new(cubara_voxel::FixedVec3::ZERO, Angle::ZERO, Angle::ZERO);
-        p.set_creative(true);
-        assert!(p.is_free_fly());
-
-        // The existing debug toggle (`InputFrame::toggle_fly`, consumed in
-        // `Sim::step_player`) flips `free_fly` directly -- it doesn't know
-        // about creative and shouldn't need to. Exercised here at the
-        // `Player` level since that's as far down as this field reaches.
-        p.free_fly = false;
-        assert!(
-            p.is_creative(),
-            "landing in creative must not leave creative mode"
+    fn the_camera_starts_at_the_bodys_eye_and_entering_twice_does_not_reset_it() {
+        let mut p = Player::new(
+            FixedVec3::from_blocks(1, 2, 3),
+            Angle::from_radians(0.3),
+            Angle::from_radians(-0.2),
         );
+        p.enter_spectator();
+        let at_start = *p.spectating().expect("spectating");
+        assert_eq!(at_start.pos, p.pos);
+        assert_eq!((at_start.yaw, at_start.pitch), (p.yaw, p.pitch));
+
+        p.spectating.as_mut().unwrap().pos = FixedVec3::from_blocks(9, 9, 9);
+        p.enter_spectator();
+        assert_eq!(p.view_pos(), FixedVec3::from_blocks(9, 9, 9));
+        p.leave_spectator();
+        assert_eq!(p.view_pos(), p.pos, "the view is the body again");
     }
 }

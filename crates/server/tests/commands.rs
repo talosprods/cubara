@@ -102,16 +102,68 @@ fn gamemode_switches_play_mode_the_way_the_pause_menu_does() {
 #[test]
 fn a_gamemode_it_does_not_know_changes_nothing_and_says_how() {
     let (mut s, who) = fixture();
-    for text in ["gamemode", "gamemode spectator"] {
+    for text in ["gamemode", "gamemode flying"] {
         assert_eq!(
             run(&mut s, who, text),
-            ["usage: /gamemode survival|creative"]
+            ["usage: /gamemode survival|creative|spectator"]
         );
         assert!(
             !s.sim.player(who).is_creative(),
             "{text:?} changed the mode"
         );
+        assert!(
+            !s.sim.player(who).is_spectating(),
+            "{text:?} started a camera"
+        );
     }
+}
+
+/// `/gamemode spectator` is F4 pressed to enter: the camera starts at the body,
+/// and the normal mode is what it was.
+#[test]
+fn gamemode_spectator_enters_spectator_and_leaves_the_normal_mode_alone() {
+    let (mut s, who) = fixture();
+    run(&mut s, who, "gamemode creative");
+
+    assert_eq!(
+        run(&mut s, who, "gamemode spectator"),
+        ["play mode: spectator"]
+    );
+    let p = s.sim.player(who);
+    assert!(p.is_spectating());
+    assert!(p.is_creative(), "the mode F4 returns to is still creative");
+    assert_eq!(p.view_pos(), p.pos, "the camera starts at the body's eye");
+}
+
+/// `/gamemode survival|creative` sets the normal mode **and** leaves Spectator;
+/// the pause menu's `[C]` (`Action::SetCreative`) sets the normal mode and does
+/// not.
+#[test]
+fn gamemode_survival_and_creative_leave_spectator_but_the_pause_menu_does_not() {
+    let (mut s, who) = fixture();
+
+    run(&mut s, who, "gamemode spectator");
+    s.apply_as(who, Action::SetCreative(true));
+    assert!(s.sim.player(who).is_spectating(), "[C] left Spectator");
+    assert!(
+        s.sim.player(who).is_creative(),
+        "[C] changed what you return to"
+    );
+
+    run(&mut s, who, "gamemode survival");
+    assert!(
+        !s.sim.player(who).is_spectating(),
+        "/gamemode survival stayed in Spectator"
+    );
+    assert!(!s.sim.player(who).is_creative());
+
+    run(&mut s, who, "gamemode spectator");
+    run(&mut s, who, "gamemode creative");
+    assert!(
+        !s.sim.player(who).is_spectating(),
+        "/gamemode creative stayed in Spectator"
+    );
+    assert!(s.sim.player(who).is_creative());
 }
 
 #[test]

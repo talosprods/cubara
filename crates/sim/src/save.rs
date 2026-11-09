@@ -101,6 +101,7 @@ struct SavedPlayer {
     yaw: i32,
     pitch: i32,
     on_ground: bool,
+    /// Legacy: written `false`, ignored on load (no format change, 2026-11-09).
     free_fly: bool,
     /// Survival vs. creative. `#[serde(default)]`, like every field added
     /// after the format existed: an old save has no opinion, so it loads
@@ -406,7 +407,9 @@ fn saved_player(p: &Player, items: &ItemRegistry) -> SavedPlayer {
         yaw: p.yaw.raw(),
         pitch: p.pitch.raw(),
         on_ground: p.on_ground,
-        free_fly: p.free_fly,
+        // The format keeps a `free_fly` field it no longer has a use for; a
+        // spectating player's save stores the frozen body, never the camera.
+        free_fly: false,
         creative: p.creative,
         inventory: (0..crate::inventory::SLOT_COUNT)
             .map(|i| to_saved(p.inventory.slot(i), items))
@@ -683,7 +686,9 @@ fn restore_player(
         pos: from_xyz(s.pos),
         velocity: from_xyz(s.vel),
         on_ground: s.on_ground,
-        free_fly: s.free_fly,
+        // `s.free_fly` is ignored: it is a flag from before the play modes, and
+        // loading always starts in the normal mode, at the body.
+        spectating: None,
         creative: s.creative,
         yaw: Angle::from_raw(s.yaw),
         pitch: Angle::from_raw(s.pitch),

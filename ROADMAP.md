@@ -472,6 +472,9 @@ from once phase 3 is actually scoped:
   *2026-11-09: Options is no longer empty. The far-terrain quality keys
   (1–4 for the level, A for auto, B for the benchmark) live there (#289).*
 
+  *2026-11-09: the third play mode is decided: Spectator, on F4. See
+  "Recorded, 2026-11-09 — play modes" below.*
+
 Creative mode and the options-menu shell that exposes it are being built ahead
 of this list, directly from the owner's request ("chill to be able to fly
 before we get to worldgen") — not as a phase-3 admission, the same way the
@@ -536,6 +539,28 @@ it, because the flight eye must see something. **Confirmed by the owner on
 1,000 at High, the M3 only at Low): each machine may have its own quality, and
 the gate is met when one with the far terrain on holds 1,000 at every eye.
 
+
+### Recorded, 2026-11-09 — play modes
+
+The third play mode is decided. The owner, in his own words:
+*"ik wil graag een creative mode waarbij je gewoon op de grond loopt en er niet
+doorheen kan vliegen. een survival mode die hetzelfde werkt (maar dan survival
+natuurlijk), en een spectator mode, waarbij je door alle blokken heen kan
+vliegen en echt kan "spectaten". … wellicht kan [F4] wisselen tussen de
+normale modus en spectator"*. Asked two follow-up questions, he answered:
+
+- **Leaving Spectator:** *"Terug waar je was"*. You are back where you pressed
+  F4. The body waits there, frozen, and the camera is dropped.
+- **Where F4 works:** *"Overal"*: in Survival and in Creative.
+
+So **Survival** and **Creative** both walk with collision; Creative still differs
+only by taking no damage and by its loadout. **Spectator** is a camera that flies
+through everything and takes no part in the world. The server rejects its edits,
+furnace clicks, crafting and pickups. It takes no damage. Others see the body,
+not the camera. `[C]` in the pause menu keeps choosing the normal mode, and
+`/gamemode spectator` enters Spectator. This replaces the 2026-09-18 note's
+*"Survival / Creative, for now — no third mode decided"*, and the free-fly debug
+mode that Creative used to fly with. Design and tests: issue #305.
 
 ### Recorded, 2026-11-09 — climate, biomes and seasons
 

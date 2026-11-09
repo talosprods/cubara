@@ -1176,3 +1176,58 @@ fn a_plan_can_be_committed_on_another_thread() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **Save while spectating, then load** (owner's decision, 2026-11-09): the
+/// save holds the frozen body and no camera, and the loaded player is at the
+/// body, in their normal mode, not spectating.
+#[test]
+fn a_save_written_while_spectating_loads_at_the_body_not_spectating() {
+    let registry = test_registry();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let seed = 0x0005_BEC7_A70B;
+
+    let mut world = World::with_seed(seed);
+    let mut sim = Sim::new(
+        seed,
+        Player::new(
+            cubara_voxel::FixedVec3::from_f32([0.5, 40.0, 0.5]),
+            Angle::from_radians(0.6),
+            Angle::from_radians(-0.2),
+        ),
+    );
+    sim.player_mut(P).set_creative(true);
+
+    // F4, then fly far from the body.
+    let f4 = InputFrame {
+        toggle_spectate: true,
+        ..InputFrame::default()
+    };
+    let fly = InputFrame {
+        move_axes: [1.0, 1.0, 1.0],
+        ..InputFrame::default()
+    };
+    sim.tick(&mut world, &PlayerInputs::one(P, f4), blocks);
+    for _ in 0..300 {
+        sim.tick(&mut world, &PlayerInputs::one(P, fly), blocks);
+    }
+    let saved = *sim.player(P);
+    let camera = saved.spectating().expect("spectating when saved").pos;
+    assert_ne!(camera, saved.pos, "the camera never left the body");
+
+    let dir = scratch_dir("spectating");
+    save_world(&dir, &sim, &world, &registry, &test_items(), blocks).expect("save");
+    let (loaded, _) = load_world(&dir, &registry, &test_items(), blocks).expect("load");
+    let p = loaded.player(P);
+
+    assert!(!p.is_spectating(), "a load started in Spectator");
+    assert_eq!(p.pos, saved.pos, "the player is not at the frozen body");
+    assert_eq!(p.view_pos(), saved.pos, "and the view is not at the body");
+    assert_ne!(p.pos, camera, "the camera was saved as if it were the body");
+    assert_eq!(
+        (p.velocity, p.yaw(), p.pitch()),
+        (saved.velocity, saved.yaw(), saved.pitch()),
+        "the body did not come back as it was frozen"
+    );
+    assert!(p.is_creative(), "the normal mode was not saved");
+    std::fs::remove_dir_all(&dir).ok();
+}

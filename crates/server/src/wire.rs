@@ -313,7 +313,18 @@ fn put_player_state(out: &mut Vec<u8>, s: &PlayerState) {
     out.extend_from_slice(&s.yaw.raw().to_le_bytes());
     out.extend_from_slice(&s.pitch.raw().to_le_bytes());
     out.push(s.on_ground as u8);
-    out.push(s.free_fly as u8);
+    // The spectator camera: present-or-not, then its pose. It is a client's own
+    // state coming back to that client -- other players are told the body, and
+    // never this.
+    match &s.spectating {
+        Some(c) => {
+            out.push(1);
+            put_fixed_vec3(out, c.pos);
+            out.extend_from_slice(&c.yaw.raw().to_le_bytes());
+            out.extend_from_slice(&c.pitch.raw().to_le_bytes());
+        }
+        None => out.push(0),
+    }
     out.push(s.creative as u8);
     out.extend_from_slice(&s.fall_distance.raw().to_le_bytes());
     out.push(s.health);
@@ -327,7 +338,15 @@ fn get_player_state(c: &mut Cursor<'_>) -> Result<PlayerState, WireError> {
         yaw: c.angle()?,
         pitch: c.angle()?,
         on_ground: c.bool()?,
-        free_fly: c.bool()?,
+        spectating: if c.bool()? {
+            Some(cubara_sim::SpectatorState {
+                pos: c.fixed_vec3()?,
+                yaw: c.angle()?,
+                pitch: c.angle()?,
+            })
+        } else {
+            None
+        },
         creative: c.bool()?,
         fall_distance: Fixed::from_raw(c.i64()?),
         health: c.u8()?,
@@ -613,7 +632,7 @@ fn put_input(out: &mut Vec<u8>, i: &InputFrame) {
     out.extend_from_slice(&i.look_delta[0].raw().to_le_bytes());
     out.extend_from_slice(&i.look_delta[1].raw().to_le_bytes());
     out.push(i.jump as u8);
-    out.push(i.toggle_fly as u8);
+    out.push(i.toggle_spectate as u8);
     out.push(i.breaking as u8);
 }
 
@@ -622,7 +641,7 @@ fn get_input(c: &mut Cursor<'_>) -> Result<InputFrame, WireError> {
         move_axes: [c.f32()?, c.f32()?, c.f32()?],
         look_delta: [c.angle()?, c.angle()?],
         jump: c.bool()?,
-        toggle_fly: c.bool()?,
+        toggle_spectate: c.bool()?,
         breaking: c.bool()?,
     })
 }
@@ -958,7 +977,7 @@ mod tests {
         assert_eq!(state.yaw, s.yaw, "yaw");
         assert_eq!(state.pitch, s.pitch, "pitch");
         assert_eq!(state.on_ground, s.on_ground, "on_ground");
-        assert_eq!(state.free_fly, s.free_fly, "free_fly");
+        assert_eq!(state.spectating, s.spectating, "spectating");
         assert_eq!(state.fall_distance, s.fall_distance, "fall_distance");
         assert_eq!(state.health, s.health, "health");
         assert_eq!(
@@ -976,7 +995,11 @@ mod tests {
             yaw: Angle::from_raw(123_456),
             pitch: Angle::from_raw(-7_654),
             on_ground: true,
-            free_fly: false,
+            spectating: Some(cubara_sim::SpectatorState {
+                pos: FixedVec3::from_f32([-300.5, 90.0, 12.25]),
+                yaw: Angle::from_raw(-99_999),
+                pitch: Angle::from_raw(3_333),
+            }),
             creative: true,
             fall_distance: Fixed::from_f32(12.5),
             health: 13,
@@ -994,7 +1017,7 @@ mod tests {
                     move_axes: [-1.0, 0.25, 1.0],
                     look_delta: [Angle::from_raw(9), Angle::from_raw(-9)],
                     jump: true,
-                    toggle_fly: false,
+                    toggle_spectate: true,
                     breaking: true,
                 },
             },

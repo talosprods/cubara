@@ -2,16 +2,18 @@
 //!
 //! Owns the window and event loop; all GPU work lives in `cubara_render`. Forwards
 //! keyboard + mouse input to [`Game`] (WASD to move, Space to jump, mouse to look,
-//! F4 toggles the free-fly debug mode, 1-9 or the wheel pick a hotbar slot,
+//! F4 toggles Spectator (a camera that flies through everything while the body
+//! waits, #305), 1-9 or the wheel pick a hotbar slot,
 //! Esc opens the pause menu (or closes whatever screen is open -- inventory,
 //! pause, console), a click takes the cursor
-//! back, F11 or Alt+Enter toggles fullscreen). Walking under
-//! gravity is the default; free-fly (Space/Shift up/down, no collision) is a
-//! debug mode inside the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
+//! back, F11 or Alt+Enter toggles fullscreen). Survival and Creative both walk
+//! under gravity; Spectator flies (Space/Shift up/down, no collision) inside
+//! the same sim (`docs/PHASE1_ARCHITECTURE.md` §10).
 //!
 //! `/` opens the command console (`/tp`, `/give`, `/gamemode`, `/seed` --
-//! `ROADMAP.md`'s phase 3 note); `C` in the pause menu switches survival/creative -- creative flies,
-//! takes no damage, and has unlimited blocks (owner's call, 2026-09-18).
+//! `ROADMAP.md`'s phase 3 note); `C` in the pause menu switches survival/creative -- creative walks too,
+//! takes no damage, and has unlimited blocks (owner's calls, 2026-09-18 and
+//! 2026-11-09).
 
 mod bench;
 mod caps;
@@ -191,10 +193,11 @@ fn menu_text(game: &Game) -> Option<String> {
         return Some(format!("{console}_\n[Enter] send   [Esc] cancel"));
     }
     if game.pause_open() {
-        let mode = if game.is_creative() {
-            "Creative"
-        } else {
-            "Survival"
+        let mode = match (game.is_creative(), game.is_spectating()) {
+            (true, false) => "Creative",
+            (false, false) => "Survival",
+            (true, true) => "Creative (spectating)",
+            (false, true) => "Survival (spectating)",
         };
         let new_world = if !game.hosting() {
             "New World -- only whoever runs the world can"
@@ -783,7 +786,11 @@ impl ApplicationHandler for App {
                     }
                     far.update(renderer, camera.eye.to_array());
                 }
-                let slots = self.game.hotbar_slots();
+                // Spectating hides the play HUD (#305): no hotbar, hearts or
+                // crosshair. The outline and cracks go too, because the sim
+                // gives a spectator no target and the server no swing.
+                let playing = !self.game.is_spectating();
+                let slots = self.game.hotbar_slots().filter(|_| playing);
                 let hotbar = slots.as_ref().map(|s| HotbarView {
                     slots: s,
                     selected: self.game.selected_hotbar_slot(),
@@ -819,10 +826,10 @@ impl ApplicationHandler for App {
                     Hud {
                         hotbar,
                         panel,
-                        health: Some(self.game.health_view()),
+                        health: playing.then(|| self.game.health_view()),
                         // Only while looking through the camera: over a
                         // screen it would mark nothing.
-                        crosshair: self.cursor_captured && !self.game.inventory_open(),
+                        crosshair: playing && self.cursor_captured && !self.game.inventory_open(),
                         menu: menu.as_deref(),
                     },
                     // Fog at the far terrain's edge, not the voxels': until the
@@ -1176,6 +1183,17 @@ mod tests {
             menu_text(&game).is_some_and(|t| t.contains("Creative")),
             "the pause menu must reflect the switch, not just the game's own state"
         );
+    }
+
+    #[test]
+    fn menu_text_says_when_you_are_spectating() {
+        let mut game = Game::new();
+        game.key_input(winit::keyboard::KeyCode::F4, true);
+        game.advance(cubara_sim::TICK_DT);
+        assert!(game.is_spectating());
+        game.toggle_pause();
+        let text = menu_text(&game).unwrap();
+        assert!(text.contains("play mode: Survival (spectating)"), "{text}");
     }
 
     #[test]

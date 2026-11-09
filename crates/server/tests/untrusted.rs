@@ -19,13 +19,13 @@
 //!   rather than by statement, and `InputFrame::sanitized` now says it.
 //! - **Rate** is capped per client per tick.
 //!
-//! What is deliberately **not** here, so that its absence is a decision rather
-//! than an oversight: `InputFrame::toggle_fly` lets any client enter free-fly,
-//! which is noclip. Whether a server permits that is a rule about what the game
-//! *is*, not a question about what a client may be believed about, and the
-//! project owner has deferred it to a future set of game rules rather than
-//! having it invented here. It is a hole, it is a known one, and it is not this
-//! block's to close.
+//! `InputFrame::toggle_spectate` lets any client enter Spectator, in Survival
+//! too (owner, 2026-11-09: "overal"). That used to be a known hole -- free-fly
+//! was noclip with full interaction. It is not any more: a spectating player's
+//! body is frozen and every action that touches the world is refused by the
+//! server (`tests/spectator.rs`), so the camera cannot be used to cheat. Whether
+//! Survival should be *allowed* the toggle is a rule about what the game is,
+//! deferred by the owner to a future set of game rules.
 
 use cubara_server::{Action, FurnaceSlot, Server};
 use cubara_sim::{InputFrame, Player, PlayerId, PlayerInputs};
@@ -213,7 +213,7 @@ fn ordinary_input_survives_cleaning_unchanged() {
         move_axes: [-1.0, 0.0, 0.5],
         look_delta: [Angle::from_raw(1234), Angle::from_raw(-99)],
         jump: true,
-        toggle_fly: false,
+        toggle_spectate: false,
         breaking: true,
     };
     assert_eq!(

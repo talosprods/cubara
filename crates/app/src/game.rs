@@ -203,16 +203,16 @@ pub struct Game {
     right: bool,
     up: bool,
     down: bool,
-    /// Whether the free-fly toggle key is currently held -- tracked so
+    /// Whether the Spectator toggle key (F4) is currently held -- tracked so
     /// `key_input` can tell a fresh press from OS key-repeat and only raise
-    /// `fly_toggle_pending` on the rising edge.
-    fly_toggle_held: bool,
+    /// `spectate_toggle_pending` on the rising edge.
+    spectate_toggle_held: bool,
     /// Jump / fly-toggle: `true` from the tick they were pressed until the
     /// next `advance` call hands them to `Sim::tick` as an `InputFrame`
     /// button edge, then cleared -- see `advance`'s doc comment for why
     /// they're consumed by only the first tick of a catch-up burst.
     jump_pending: bool,
-    fly_toggle_pending: bool,
+    spectate_toggle_pending: bool,
     /// Mouse motion (pixels) accumulated since the last `advance` call.
     /// Mouse motion accumulated since the last tick, already converted to
     /// [`Angle`]s.
@@ -413,9 +413,9 @@ impl Game {
             right: false,
             up: false,
             down: false,
-            fly_toggle_held: false,
+            spectate_toggle_held: false,
             jump_pending: false,
-            fly_toggle_pending: false,
+            spectate_toggle_pending: false,
             look_delta: (Angle::ZERO, Angle::ZERO),
             scroll_pending: 0.0,
         }
@@ -614,7 +614,8 @@ impl Game {
         &self.world
     }
 
-    /// The camera pose to render from: the sim's player pose, interpolated
+    /// The camera pose to render from: the sim's player pose -- the Spectator
+    /// camera's while spectating (#305) -- interpolated
     /// between its previous and current tick by the accumulator's leftover
     /// fraction. Render-side only (§9) -- never read back into the sim.
     pub fn camera_pose(&self) -> CameraPose {
@@ -624,8 +625,8 @@ impl Game {
             // The renderer works in floats, and that is the correct side of the
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
             // difference (§3.5, presentation may be float).
-            eye: glam::Vec3::from_array(player.pos.to_f32()),
-            look_dir: player.look_dir_f32(),
+            eye: glam::Vec3::from_array(player.view_pos().to_f32()),
+            look_dir: player.view_dir_f32(),
         }
     }
 
@@ -665,6 +666,9 @@ impl Game {
     /// the renderer to outline -- computed by the sim's own raycast each
     /// tick (`cubara_sim::Sim::tick`), not here. The renderer draws it; it
     /// does not decide it (`ARCHITECTURE.md` Rule 3, issue #52).
+    ///
+    /// `None` while spectating: the sim clears a spectator's target, because a
+    /// camera that takes no part in the world aims at nothing (#305).
     pub fn selected_block(&self) -> Option<[i32; 3]> {
         self.me.player().target
     }
@@ -672,8 +676,8 @@ impl Game {
     /// Record a movement key going down/up. Unmapped keys are ignored (returns
     /// whether the key was one the game cares about).
     ///
-    /// Space and F4 double as both a *held* signal (free-fly's vertical axis,
-    /// respectively nothing) and a *rising-edge* signal (jump; the free-fly
+    /// Space and F4 double as both a *held* signal (Spectator's vertical axis,
+    /// respectively nothing) and a *rising-edge* signal (jump; the Spectator
     /// toggle) -- `cubara-sim` decides which one applies, based on which mode
     /// the player is currently in, so this method just reports both truthfully
     /// rather than guessing the mode here (Rule 3: no gameplay decisions on
@@ -692,10 +696,10 @@ impl Game {
             }
             KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft => self.down = pressed,
             KeyCode::F4 => {
-                if pressed && !self.fly_toggle_held {
-                    self.fly_toggle_pending = true;
+                if pressed && !self.spectate_toggle_held {
+                    self.spectate_toggle_pending = true;
                 }
-                self.fly_toggle_held = pressed;
+                self.spectate_toggle_held = pressed;
             }
             // Hotbar selection. Applied on press only -- releasing a number
             // key must not reselect, and holding it must not repeat.
@@ -743,7 +747,7 @@ impl Game {
     /// reproduces exactly.
     ///
     /// The one-shot accumulated inputs -- `look_delta` (however far the mouse
-    /// moved since the last tick) and the `jump`/`toggle_fly` key edges -- are
+    /// moved since the last tick) and the `jump`/`toggle_spectate` key edges -- are
     /// held until a tick actually consumes them, and cleared after the *first*
     /// tick of any catch-up burst. Two failure modes both come from getting
     /// that wrong, and only `move_axes` (a genuinely *held* continuous state,
@@ -787,13 +791,13 @@ impl Game {
             ],
             look_delta: [self.look_delta.0, self.look_delta.1],
             jump: self.jump_pending,
-            toggle_fly: self.fly_toggle_pending,
+            toggle_spectate: self.spectate_toggle_pending,
             breaking: self.breaking,
         };
         // A tick below will consume these, so it's safe to clear them now.
         self.look_delta = (Angle::ZERO, Angle::ZERO);
         self.jump_pending = false;
-        self.fly_toggle_pending = false;
+        self.spectate_toggle_pending = false;
 
         let mut ticks = 0;
         while self.accumulator >= TICK_DT as f64 {
@@ -853,7 +857,7 @@ impl Game {
             // would have.
 
             input.jump = false;
-            input.toggle_fly = false;
+            input.toggle_spectate = false;
             input.look_delta = [Angle::ZERO, Angle::ZERO];
             self.accumulator -= TICK_DT as f64;
             ticks += 1;
@@ -957,7 +961,7 @@ impl Game {
         self.right = false;
         self.up = false;
         self.down = false;
-        self.fly_toggle_held = false;
+        self.spectate_toggle_held = false;
         self.breaking = false;
     }
 
@@ -1695,6 +1699,12 @@ impl Game {
     /// Whether the local player is in creative mode.
     pub fn is_creative(&self) -> bool {
         self.me.player().is_creative()
+    }
+
+    /// Whether this client's player is spectating (F4, #305): the camera flies
+    /// free and the play HUD -- hotbar, hearts, crosshair, outline -- is gone.
+    pub fn is_spectating(&self) -> bool {
+        self.me.player().is_spectating()
     }
 
     /// Switch play mode (the pause menu's "survival/creative", `ROADMAP.md`'s
@@ -2514,24 +2524,27 @@ mod tests {
     fn key_input_reports_whether_the_key_was_mapped() {
         let mut game = Game::new();
         assert!(game.key_input(KeyCode::KeyW, true));
-        assert!(game.key_input(KeyCode::F4, true), "the free-fly toggle key");
+        assert!(
+            game.key_input(KeyCode::F4, true),
+            "the Spectator toggle key"
+        );
         assert!(!game.key_input(KeyCode::KeyP, true), "unmapped key");
     }
 
     #[test]
-    fn fly_toggle_flips_the_mode_on_a_single_press() {
+    fn f4_enters_spectator_on_a_single_press() {
         let mut game = Game::new();
         assert!(
-            !game.host_player_mut().is_free_fly(),
+            !game.host_player_mut().is_spectating(),
             "walking is the default mode"
         );
         game.key_input(KeyCode::F4, true);
         game.advance(TICK_DT);
-        assert!(game.host_player_mut().is_free_fly());
+        assert!(game.host_player_mut().is_spectating());
     }
 
     #[test]
-    fn fly_toggle_edge_is_consumed_once_not_once_per_catchup_tick() {
+    fn f4_edge_is_consumed_once_not_once_per_catchup_tick() {
         // A single key press must flip the mode exactly once, even when it
         // lands in a frame whose accumulator backlog forces several ticks to
         // run in one `advance` call -- reusing the same `InputFrame` across a
@@ -2544,7 +2557,7 @@ mod tests {
         game.advance(2.0 * TICK_DT);
         assert_eq!(game.server().sim.tick, 2);
         assert!(
-            game.host_player_mut().is_free_fly(),
+            game.host_player_mut().is_spectating(),
             "one press should flip the mode once (false -> true), not twice (-> false)"
         );
     }
@@ -3912,9 +3925,31 @@ mod tests {
     }
 
     #[test]
-    fn free_fly_never_hurts_however_far_you_descend() {
-        // It is a debug mode; dropping out of the sky in it must not kill you
-        // (§13.3). The fall distance is cleared every tick it is active.
+    fn a_spectator_outlines_nothing_it_was_aiming_at() {
+        // Standing over the ground and aiming at it, then F4: the outline the
+        // renderer draws (`selected_block`) goes, because a camera aims at
+        // nothing -- even before it has moved.
+        let (mut game, ground) = game_looking_at_ground();
+        for _ in 0..20 {
+            game.advance(TICK_DT);
+        }
+        assert_eq!(
+            game.selected_block(),
+            Some(ground),
+            "aiming at the ground first"
+        );
+        game.key_input(KeyCode::F4, true);
+        game.advance(TICK_DT);
+        assert!(game.is_spectating());
+        assert_eq!(game.selected_block(), None, "a spectator outlined a block");
+    }
+
+    #[test]
+    fn spectating_flies_the_camera_and_leaves_the_body_where_it_was() {
+        // The owner's Spectator (#305): the camera flies through everything,
+        // the body waits where F4 was pressed, and nothing hurts. Here the
+        // camera descends 600 ticks from 80 blocks up -- through the ground --
+        // while the body stays in the air, unharmed.
         let (mut game, _) = game_looking_at_ground();
         let ground = game
             .world()
@@ -3925,18 +3960,26 @@ mod tests {
             Angle::ZERO,
             Angle::from_radians(-1.5),
         );
-        // Toggle free-fly on, then descend through the whole drop.
-        game.fly_toggle_pending = true;
+        let body = game.host_player_mut().pos;
+        game.spectate_toggle_pending = true;
         game.down = true;
         for _ in 0..600 {
             game.advance(TICK_DT);
         }
-        let health_in_flight = game.host_player_mut().health;
+        assert!(game.is_spectating());
         assert_eq!(
-            health_in_flight,
+            game.host_player_mut().health,
             cubara_sim::MAX_HEALTH,
-            "free-fly descent cost health"
+            "spectating cost health"
         );
+        assert_eq!(game.host_player_mut().pos, body, "the body moved");
+        let eye = game.camera_pose().eye;
+        assert!(
+            eye.y < ground.block[1] as f32,
+            "the camera should have flown down through the ground, it is at {eye}"
+        );
+        assert_eq!(game.selected_block(), None, "a spectator aims at nothing");
+        assert_eq!(game.cracking(), None, "a spectator digs nothing");
     }
 
     #[test]

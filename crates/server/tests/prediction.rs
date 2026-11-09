@@ -329,6 +329,68 @@ fn every_prediction_matches_what_the_server_later_reports() {
     );
 }
 
+/// Entering, flying and leaving Spectator (#305) are predicted exactly: the
+/// camera and the frozen body are both player state, driven by the same input
+/// stream on both sides, so no prediction across the whole round trip may
+/// disagree with the server.
+///
+/// Flies up and forward, so the camera really leaves the body -- and checks
+/// that it did, and that the body was waiting where F4 was pressed.
+#[test]
+fn entering_flying_and_leaving_spectator_is_predicted_exactly() {
+    let f4 = InputFrame {
+        toggle_spectate: true,
+        ..InputFrame::default()
+    };
+    let fly = InputFrame {
+        move_axes: [0.0, 1.0, 1.0],
+        ..InputFrame::default()
+    };
+    let mut h = Harness::new();
+    // Settle first, for the reasons `every_prediction_matches_...` gives.
+    for _ in 0..40 {
+        h.tick(forward());
+    }
+    for _ in 0..(LATENCY * 2 + 2) {
+        h.tick(InputFrame::default());
+    }
+    h.mispredictions = 0;
+    h.checked = 0;
+
+    let body = h.believed().pos;
+    h.tick(f4);
+    for _ in 0..60 {
+        h.tick(fly);
+    }
+    let flying = h.believed();
+    let camera = flying
+        .spectating
+        .expect("F4 should have started spectating")
+        .pos;
+    assert_eq!(flying.pos, body, "the body moved while spectating");
+    assert!(
+        camera.y > body.y,
+        "the camera never left the body ({camera:?} vs {body:?}), so this proved nothing"
+    );
+    h.tick(f4);
+    for _ in 0..30 {
+        h.tick(InputFrame::default());
+    }
+    h.settle();
+
+    assert!(
+        h.believed().spectating.is_none(),
+        "F4 again should have left"
+    );
+    assert!(h.checked > 80, "only {} predictions checked", h.checked);
+    assert_eq!(
+        h.mispredictions, 0,
+        "{} of {} predictions disagreed with the server around Spectator",
+        h.mispredictions, h.checked
+    );
+    assert_eq!(h.believed(), h.authoritative());
+}
+
 // ---------------------------------------------------------------------------
 // When the client is wrong
 // ---------------------------------------------------------------------------

@@ -24,8 +24,8 @@ pub use hash::{hash_region, WorldHash};
 pub use input::InputFrame;
 pub use inventory::{Inventory, HOTBAR_WIDTH, SLOT_COUNT};
 pub use player::{
-    Player, PlayerId, PlayerState, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH, REGEN_INTERVAL,
-    SAFE_FALL, SENSITIVITY_PER_PIXEL,
+    Player, PlayerId, PlayerState, SpectatorState, FALL_DAMAGE_PER_BLOCK, HEART, MAX_HEALTH,
+    REGEN_INTERVAL, SAFE_FALL, SENSITIVITY_PER_PIXEL,
 };
 pub use rng::WorldRng;
 pub use save::{load_world, plan_save, save_world, LoadError, SaveError, SavePlan, FORMAT_VERSION};
@@ -210,10 +210,10 @@ impl Sim {
     }
 
     /// Advance the simulation by exactly one fixed step of [`TICK_DT`]
-    /// seconds: a free-fly toggle edge (consumed here, exactly once, so a
+    /// seconds: a spectate toggle edge (consumed here, exactly once, so a
     /// multi-tick catch-up burst can't flip it more than the real key press
-    /// warrants), then either free-fly or real walking physics against
-    /// `world`, depending on which mode the player is currently in
+    /// warrants), then either the spectator camera's flight or real walking
+    /// physics against `world`, depending on which mode the player is in
     /// (`docs/PHASE1_ARCHITECTURE.md` §10, issue #53), then re-targets from
     /// the resulting pose (issue #52).
     /// `blocks` is which ids the terrain is made of. The tick needs it because
@@ -240,6 +240,12 @@ impl Sim {
         // same stack in a different order would empty the floor differently.
         for id in self.player_ids() {
             let p = self.players.get_mut(&id).expect("id came from the map");
+            // A spectator takes no part in the world: its frozen body does not
+            // pick things up (owner, 2026-11-09), however long it stands in
+            // a drop's reach.
+            if p.is_spectating() {
+                continue;
+            }
             self.entities.collect_nearby(p.pos, &mut p.inventory, items);
         }
     }
@@ -273,19 +279,24 @@ impl Sim {
         blocks: TerrainBlocks,
     ) {
         let player = self.players.get_mut(&id).expect("id came from the map");
-        if input.toggle_fly {
-            player.free_fly = !player.free_fly;
+        if input.toggle_spectate {
+            if player.is_spectating() {
+                player.leave_spectator();
+            } else {
+                player.enter_spectator();
+            }
         }
-        if player.free_fly {
-            player.velocity = cubara_voxel::FixedVec3::ZERO;
-            player.on_ground = false;
-            // Free-fly is a debug mode and must never hurt: dropping out of it
-            // should not kill you (§13.3), so the accumulated fall goes with it.
-            player.fall_distance = cubara_voxel::Fixed::ZERO;
-            player.apply_free_fly(input, TICK_DT);
-        } else {
-            physics::step(player, input, |x, y, z| world.is_solid_at(x, y, z, blocks));
+        if let Some(camera) = player.spectating.as_mut() {
+            // Spectator: the input flies the camera and the **body does not
+            // change at all** -- no physics, no fall, no damage, no
+            // regeneration tick. Leaving continues from exactly this body
+            // (owner, 2026-11-09: "terug waar je was"). A camera takes no part
+            // in the world, so it targets nothing either.
+            camera.fly(input, TICK_DT);
+            player.target = None;
+            return;
         }
+        physics::step(player, input, |x, y, z| world.is_solid_at(x, y, z, blocks));
         // After physics, so damage taken this tick resets the counter before it
         // is incremented -- a tick you were hurt on is not a damage-free tick.
         player.tick_regeneration();
@@ -374,7 +385,6 @@ mod tests {
                 Angle::from_radians(-std::f32::consts::FRAC_PI_2),
             ),
         );
-        sim.player_mut(P).free_fly = true; // hold position -- only the raycast matters here
         sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.player(P).target, Some(ground.block));
     }
@@ -392,7 +402,6 @@ mod tests {
                 Angle::ZERO,
             ),
         );
-        sim.player_mut(P).free_fly = true;
         sim.tick(&mut world, &no_input(), blocks());
         assert_eq!(sim.player(P).target, None);
     }
