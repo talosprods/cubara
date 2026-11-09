@@ -248,8 +248,8 @@ impl Chunk {
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
         greedy_mesh(
-            Self::SIZE as i32,
-            1,
+            [Self::SIZE as i32; 3],
+            [1, 1, 1],
             |x, y, z| self.block_at(x, y, z),
             occluded,
             may_be_solid,
@@ -273,8 +273,8 @@ impl Chunk {
         let n = Self::SIZE as i32 / factor;
         let coarse = self.downsample(ctx.registry, level);
         greedy_mesh(
-            n,
-            factor,
+            [n; 3],
+            [factor; 3],
             |x, y, z| {
                 if x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n {
                     BlockId::AIR
@@ -330,50 +330,68 @@ impl Chunk {
     }
 }
 
-/// Greedy mesher over any cubic grid. Sweeps slices along each axis, builds a
-/// per-slice mask of visible faces (orientation + per-corner AO + block), and
-/// merges equal cells into the largest quads. `block_at` answers the block id
-/// in grid space (out of bounds = air); `scale` multiplies vertex positions (1
-/// for full res, `factor` for a downsampled LOD), keeping the world footprint
-/// constant. Positions stay integers throughout -- the packed [`Vertex`]
-/// format has no room for fractional coordinates, and greedy-meshed corners
-/// never need one.
+/// Greedy mesher over any lattice, with a size and a vertex-position scale per
+/// axis (`dims`/`scale`, indexed 0=x, 1=y, 2=z). Sweeps slices along each axis,
+/// builds a per-slice mask of visible faces (orientation + per-corner AO +
+/// block), and merges equal cells into the largest quads. `block_at` answers
+/// the block id in grid space (out of bounds = air); `scale[axis]` multiplies
+/// that axis's vertex positions (1 for full res, `factor` for a uniformly
+/// downsampled LOD today -- R1b gives each axis its own), keeping the world
+/// footprint constant. Positions stay integers throughout -- the packed
+/// [`Vertex`] format has no room for fractional coordinates, and greedy-meshed
+/// corners never need one.
+///
+/// Every call today passes a cubic `dims` and a uniform `scale`; this is a
+/// pure internal generalisation (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1's
+/// "R1a"), proven output-identical to the single-`n`/single-`scale` version by
+/// `tests::r1a_refactor_is_byte_identical_to_pre_refactor_main`.
 ///
 /// `occluded` is [`Chunk::build_mesh_occluded`]'s: whether a border face of an
 /// inside solid cell may be dropped because the outside cell covers it.
 fn greedy_mesh(
-    n: i32,
-    scale: i32,
+    dims: [i32; 3],
+    scale: [i32; 3],
     block_at: impl Fn(i32, i32, i32) -> BlockId,
     occluded: impl Fn(i32, i32, i32) -> bool,
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ctx: &MeshContext,
 ) -> Mesh {
     let mut mesh = Mesh::default();
-    // `mask[v * n + u]`: the face at each slice cell.
-    let mut mask = vec![NO_CELL; (n * n) as usize];
-    // The same grid, captured before the merge loop consumes `mask`: does
-    // this cell own a real face? A skirt must never cover a cell that does
-    // -- see `push_skirt`.
-    let mut has_own_face = vec![false; (n * n) as usize];
-    // Which cells of the current slice had a face dropped as covered.
-    let mut covered_cell = vec![false; (n * n) as usize];
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
         let v = (d + 2) % 3;
+        // `nd` bounds the sweep axis itself (and is the node-edge plane a
+        // skirt checks against); `nu`/`nv` are this slice's own two axes, and
+        // the mask below is sized and strided by them -- not by `nd`.
+        let (nd, nu, nv) = (dims[d], dims[u], dims[v]);
         let mut pos = [0i32; 3];
         let mut step = [0i32; 3];
         step[d] = 1;
 
-        // Sweep the slice boundaries from -1 to n-1; the face plane is at pos[d]+1.
+        // `mask[vv * nu + uu]`: the face at each slice cell.
+        let mut mask = vec![NO_CELL; (nu * nv) as usize];
+        // The same grid, captured before the merge loop consumes `mask`: does
+        // this cell own a real face? A skirt must never cover a cell that does
+        // -- see `push_skirt`.
+        let mut has_own_face = vec![false; (nu * nv) as usize];
+        // Which cells of the current slice had a face dropped as covered.
+        let mut covered_cell = vec![false; (nu * nv) as usize];
+
+        // Sweep the slice boundaries from -1 to nd-1; the face plane is at pos[d]+1.
+        // One past nd would still compile and loop (`<=` instead of `<`) but is a
+        // true no-op, not just an untested one: both `block_at` calls at pos[d] ==
+        // nd land out of range on both sides (`nd` itself and `nd + 1`), `block_at`
+        // treats out-of-range as air on every caller, so `a == b == false` and
+        // `sign` is always 0 there -- no mask cell, no quad, regardless of
+        // `occluded`/`may_be_solid`. That is why no test pins `<` specifically.
         pos[d] = -1;
-        while pos[d] < n {
+        while pos[d] < nd {
             // Build the mask for this slice boundary.
             let mut idx = 0usize;
-            for vv in 0..n {
+            for vv in 0..nv {
                 pos[v] = vv;
-                for uu in 0..n {
+                for uu in 0..nu {
                     pos[u] = uu;
                     let a_id = block_at(pos[0], pos[1], pos[2]);
                     let b_id = block_at(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]);
@@ -388,9 +406,9 @@ fn greedy_mesh(
                     };
                     // A border face covered by its neighbour: dropped, and
                     // remembered as covered so no skirt is laid over it
-                    // either. `a` is outside at the -1 boundary, `b` at n.
+                    // either. `a` is outside at the -1 boundary, `b` at nd.
                     let covered = (sign == 1
-                        && pos[d] + 1 == n
+                        && pos[d] + 1 == nd
                         && occluded(pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]))
                         || (sign == -1 && pos[d] == -1 && occluded(pos[0], pos[1], pos[2]));
                     if covered {
@@ -426,10 +444,10 @@ fn greedy_mesh(
 
             // Greedily merge the mask into quads.
             let mut j = 0i32;
-            while j < n {
+            while j < nv {
                 let mut i = 0i32;
-                while i < n {
-                    let m = mask[(j * n + i) as usize];
+                while i < nu {
+                    let m = mask[(j * nu + i) as usize];
                     if m.sign == 0 {
                         i += 1;
                         continue;
@@ -438,13 +456,13 @@ fn greedy_mesh(
                     // Grow the quad width along u, then height along v — only over
                     // cells with an identical face (same orientation, AO *and* block).
                     let mut w = 1i32;
-                    while i + w < n && mask[(j * n + i + w) as usize] == m {
+                    while i + w < nu && mask[(j * nu + i + w) as usize] == m {
                         w += 1;
                     }
                     let mut h = 1i32;
-                    'height: while j + h < n {
+                    'height: while j + h < nv {
                         for k in 0..w {
-                            if mask[((j + h) * n + i + k) as usize] != m {
+                            if mask[((j + h) * nu + i + k) as usize] != m {
                                 break 'height;
                             }
                         }
@@ -464,7 +482,8 @@ fn greedy_mesh(
                         j,
                         w,
                         h,
-                        n,
+                        nd,
+                        nu,
                         m,
                         ctx,
                         scale,
@@ -475,7 +494,7 @@ fn greedy_mesh(
                     // Consume the merged cells.
                     for l in 0..h {
                         for k in 0..w {
-                            mask[((j + l) * n + i + k) as usize] = NO_CELL;
+                            mask[((j + l) * nu + i + k) as usize] = NO_CELL;
                         }
                     }
                     i += w;
@@ -521,9 +540,9 @@ fn face_ao(
 /// Emit one merged quad on the plane `plane` along axis `d`, spanning `w`×`h` cells
 /// in the (`u`,`v`) axes starting at (`i`,`j`), with orientation `sign` (±1), per-corner
 /// AO `ao` (levels 0..=3, corner order c0..c3), and the `block` the quad belongs to
-/// (resolved to a texture layer via `ctx`). `scale` multiplies grid coordinates into
-/// local space (>1 for downsampled LOD meshes) -- always an integer, so the result is
-/// always an exact lattice coordinate for the packed [`Vertex`] format.
+/// (resolved to a texture layer via `ctx`). `scale[axis]` multiplies that axis's grid
+/// coordinate into local space (>1 for downsampled LOD meshes) -- always an integer, so
+/// the result is always an exact lattice coordinate for the packed [`Vertex`] format.
 #[allow(clippy::too_many_arguments)]
 fn push_quad(
     mesh: &mut Mesh,
@@ -539,7 +558,7 @@ fn push_quad(
     ao: [u8; 4],
     block: BlockId,
     ctx: &MeshContext,
-    scale: i32,
+    scale: [i32; 3],
 ) {
     let mut base = [0i32; 3];
     base[d] = plane;
@@ -614,9 +633,9 @@ fn push_quad(
     for (((c, (cu, cv)), a), (u_max, v_max)) in verts.iter().zip(uvs).zip(vao).zip(sides) {
         mesh.vertices.push(
             Vertex::new(
-                (c[0] * scale) as u32,
-                (c[1] * scale) as u32,
-                (c[2] * scale) as u32,
+                (c[0] * scale[0]) as u32,
+                (c[1] * scale[1]) as u32,
+                (c[2] * scale[2]) as u32,
                 a as u32,
                 face,
                 tex_layer,
@@ -662,8 +681,9 @@ fn push_quad(
 /// already used for the real quad above; a skirt is that same wall, minus
 /// its top cell of height/width, shifted down by one. Only a `d == 0` (X)
 /// or `d == 2` (Z) wall sitting exactly on the node's own edge (`plane` is
-/// `0` or `n`) qualifies -- `d == 1` (a top/bottom face) has no "downward"
-/// that would hide a horizontal-boundary crack. No-op where the wall's own
+/// `0` or `edge`, i.e. `dims[d]`) qualifies -- `d == 1` (a top/bottom face)
+/// has no "downward" that would hide a horizontal-boundary crack. No-op
+/// where the wall's own
 /// bottom is already at the lattice floor (`i`/`j` == 0): nothing there to
 /// extend into without a negative, unrepresentable coordinate, and a wall
 /// reaching the floor has no gap to hide anyway.
@@ -691,14 +711,20 @@ fn push_skirt(
     j: i32,
     w: i32,
     h: i32,
-    n: i32,
+    // `dims[d]`: the sweep axis's own extent, for the node-edge plane check
+    // and for `outside`'s world-space coordinate one step past it.
+    edge: i32,
+    // `dims[u]`: this slice's mask row length (`greedy_mesh`'s `nu`), for
+    // indexing `has_own_face` -- a different value from `edge` whenever the
+    // lattice isn't cubic.
+    stride: i32,
     m: MaskCell,
     ctx: &MeshContext,
-    scale: i32,
+    scale: [i32; 3],
     has_own_face: &[bool],
     may_be_solid: &impl Fn(i32, i32, i32) -> bool,
 ) {
-    if d == 1 || (plane != 0 && plane != n) {
+    if d == 1 || (plane != 0 && plane != edge) {
         return;
     }
 
@@ -711,16 +737,16 @@ fn push_skirt(
     let span = if d == 0 { h } else { w };
     let cell = |k: i32| -> usize {
         if d == 0 {
-            ((j + k) * n + (i - 1)) as usize
+            ((j + k) * stride + (i - 1)) as usize
         } else {
-            ((j - 1) * n + (i + k)) as usize
+            ((j - 1) * stride + (i + k)) as usize
         }
     };
 
     // The cell one step outside the chunk beside skirt cell `k`.
     let outside = |k: i32| {
         let mut g = [0i32; 3];
-        g[d] = if plane == 0 { -1 } else { n };
+        g[d] = if plane == 0 { -1 } else { edge };
         if d == 0 {
             g[u] = i - 1;
             g[v] = j + k;
@@ -763,6 +789,279 @@ fn push_skirt(
 mod tests {
     use super::*;
     use crate::registry::{DropRule, Faces, Interact, Material, Shape};
+
+    /// Deterministic FNV-1a-based hash of a mesh's full vertex content (every
+    /// public accessor -- position, ao, face, texture layer, tile uv, corner
+    /// bits, node index) and its index buffer, in order. Used only to pin
+    /// mesher *output* across the R1a refactor (per-axis sizes/scale) without
+    /// duplicating the mesher itself as a "reference implementation" (which
+    /// `ARCHITECTURE.md` Rule 5 forbids) -- deliberately not `DefaultHasher`,
+    /// whose algorithm is unspecified and may change across Rust versions.
+    fn mesh_hash(mesh: &Mesh) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix_u32 = |word: u32| {
+            for byte in word.to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for v in &mesh.vertices {
+            mix_u32(v.x());
+            mix_u32(v.y());
+            mix_u32(v.z());
+            mix_u32(v.ao());
+            mix_u32(v.face() as u32);
+            mix_u32(v.tex_layer());
+            mix_u32(v.u());
+            mix_u32(v.v());
+            mix_u32(v.corner().0 as u32);
+            mix_u32(v.corner().1 as u32);
+            mix_u32(v.node_index());
+        }
+        for &i in &mesh.indices {
+            mix_u32(i);
+        }
+        h
+    }
+
+    /// **R1a equivalence.** These hashes were computed on `main` (commit
+    /// `cfba97d`, before this refactor) by a throwaway test that printed
+    /// `mesh_hash` for each fixture below -- see the PR description for the
+    /// exact values and how they were produced. Pinning them here is how a
+    /// pure internal refactor (per-axis `greedy_mesh`/`push_quad`/
+    /// `push_skirt`, called with cubic sizes and uniform scale everywhere
+    /// today) is proven to leave every public entry point's output
+    /// byte-for-byte unchanged, per `ARCHITECTURE.md` Rule 6 -- without
+    /// keeping a second "reference" mesher around (Rule 5) to compare against.
+    #[test]
+    fn r1a_refactor_is_byte_identical_to_pre_refactor_main() {
+        let registry = registry();
+        let c = ctx(&registry);
+
+        let mut diagonal = empty();
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 0..16 {
+                    if (x * 7 + y * 3 + z * 5) % 11 < 4 || y < (x + z) % 5 {
+                        set(&mut diagonal, x, y, z);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            mesh_hash(&diagonal.build_mesh(&c)),
+            0x8ceb4cb55432cc0f,
+            "build_mesh on a varied-fill chunk"
+        );
+        assert_eq!(
+            mesh_hash(&diagonal.build_mesh_lod(&c, 1)),
+            0x1eee232b476b7f52,
+            "build_mesh_lod(1) on the same chunk"
+        );
+        assert_eq!(
+            mesh_hash(&diagonal.build_mesh_lod(&c, 2)),
+            0xe41a17fe04bdd845,
+            "build_mesh_lod(2) on the same chunk"
+        );
+
+        let mut single = empty();
+        set(&mut single, 5, 5, 5);
+        assert_eq!(
+            mesh_hash(&single.build_mesh(&c)),
+            0xd02c10334228a6a5,
+            "a single interior block"
+        );
+
+        let full = uniform(BlockId::STONE);
+        assert_eq!(
+            mesh_hash(&full.build_mesh(&c)),
+            0x02e97074fda4f5e5,
+            "a fully solid chunk"
+        );
+        assert_eq!(
+            mesh_hash(&full.build_mesh_occluded(&c, |x, _, _| x == 16)),
+            0x21283f1910f67b87,
+            "a fully solid chunk with one border face occluded"
+        );
+
+        let skirt_fixture = Chunk::from_fn(|x, y, _| {
+            if x == 0 && y >= 8 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        assert_eq!(
+            mesh_hash(&skirt_fixture.build_mesh(&c)),
+            0xe26da51221c6ad87,
+            "build_mesh (default: may_be_solid everywhere) on the skirt fixture"
+        );
+        assert_eq!(
+            mesh_hash(&skirt_fixture.build_mesh_with_neighbours(
+                &c,
+                |_, _, _| false,
+                |_, _, _| true
+            )),
+            0xe26da51221c6ad87,
+            "skirt fixture beside a neighbour that may be solid"
+        );
+        assert_eq!(
+            mesh_hash(&skirt_fixture.build_mesh_with_neighbours(
+                &c,
+                |_, _, _| false,
+                |_, _, _| false
+            )),
+            0x9254398ef69c95c5,
+            "skirt fixture beside open air -- no skirt"
+        );
+
+        let two_materials = two_material_registry();
+        let stone = two_materials.id_of("cubara:stone").unwrap();
+        let dirt = two_materials.id_of("cubara:dirt").unwrap();
+        let two_mat_chunk = Chunk::from_fn(|x, _, _| if x < 8 { stone } else { dirt });
+        let layer_of = |name: &str| if name == "stone" { 0 } else { 1 };
+        let mesh_ctx = MeshContext {
+            registry: &two_materials,
+            layer_of: &layer_of,
+        };
+        assert_eq!(
+            mesh_hash(&two_mat_chunk.build_mesh(&mesh_ctx)),
+            0xe8cfeb383a60bc85,
+            "two adjacent materials, each its own texture layer"
+        );
+
+        let staircase = Chunk::from_fn(|x, y, _| {
+            if (y as i32) <= x as i32 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        assert_eq!(
+            mesh_hash(&staircase.build_mesh(&c)),
+            0x44a5f6a24a7c5e45,
+            "a diagonal staircase"
+        );
+        assert_eq!(
+            mesh_hash(&staircase.build_mesh_lod(&c, 1)),
+            0xef035cf0b527f325,
+            "the staircase at LOD 1"
+        );
+    }
+
+    /// `greedy_mesh` on a genuinely anisotropic lattice -- 4×8×4 cells, with a
+    /// scale of [2, 1, 2] -- is what R1b needs this refactor *for* (a level-1
+    /// node with v=1 cells would be 16 wide/deep by 32 tall at scale
+    /// [2,1,2]'s shape, just bigger). One solid cell, away from every lattice
+    /// edge so no skirt complicates the picture, must still produce exactly
+    /// six unmerged faces, each at the block-space extent its axis's own
+    /// scale implies -- not the other axes'.
+    #[test]
+    fn a_non_cubic_lattice_scales_each_axis_independently() {
+        let registry = registry();
+        let c = ctx(&registry);
+        let dims = [4, 8, 4];
+        let scale = [2, 1, 2];
+        // The one solid cell, at grid (1, 3, 1) -- interior on every axis, so
+        // push_skirt's "sits on the node's own edge" check never fires here.
+        let mesh = greedy_mesh(
+            dims,
+            scale,
+            |x, y, z| {
+                if (x, y, z) == (1, 3, 1) {
+                    BlockId::STONE
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| true,
+            &c,
+        );
+        assert_eq!(mesh.triangle_count(), 12, "6 unmerged faces, no skirts");
+
+        // Expected world-space box: grid [1,2]×[3,4]×[1,2] scaled per axis.
+        let (expect_min, expect_max) = ([2.0, 3.0, 2.0], [4.0, 4.0, 4.0]);
+        let (min, max) = bounds(&mesh);
+        assert_eq!(
+            (min, max),
+            (expect_min, expect_max),
+            "x and z (scale 2) must span twice the cell count that y (scale 1) does"
+        );
+
+        // Per-face extents: an x/z-facing quad is 1×1 block in its scaled
+        // (y,z)/(x,y) plane; a y-facing quad is 2×2 blocks in its scaled
+        // (z,x) plane -- exactly what scale=[2,1,2] on a 1-cell quad implies.
+        for quad in mesh.vertices.as_chunks::<4>().0 {
+            let face = quad[0].face();
+            let (xs, ys, zs): (Vec<u32>, Vec<u32>, Vec<u32>) = (
+                quad.iter().map(|v| v.x()).collect(),
+                quad.iter().map(|v| v.y()).collect(),
+                quad.iter().map(|v| v.z()).collect(),
+            );
+            let span = |vals: &[u32]| vals.iter().max().unwrap() - vals.iter().min().unwrap();
+            let (sx, sy, sz) = (span(&xs), span(&ys), span(&zs));
+            match face {
+                Face::PosX | Face::NegX => assert_eq!((sx, sy, sz), (0, 1, 2), "{face:?}"),
+                Face::PosY | Face::NegY => assert_eq!((sx, sy, sz), (2, 0, 2), "{face:?}"),
+                Face::PosZ | Face::NegZ => assert_eq!((sx, sy, sz), (2, 1, 0), "{face:?}"),
+            }
+        }
+    }
+
+    /// `push_skirt` takes two different lattice extents now: `edge`
+    /// (`dims[d]`, the sweep axis's own length, for the node-boundary check)
+    /// and `stride` (`dims[u]`, the mask's row length, for indexing
+    /// `has_own_face`). On a cubic chunk those are always equal, so a bug
+    /// that passes one where the other belongs is invisible there -- this
+    /// fixture only tells the difference because `dims = [4, 8, 4]` makes
+    /// `dims[0] = 4` (the x-sweep's edge) and `dims[1] = 8` (its u-axis
+    /// stride, since u = y for a d = 0 wall) genuinely different numbers.
+    #[test]
+    fn a_skirt_on_a_non_cubic_lattice_uses_the_sweep_axis_extent_not_the_slice_stride() {
+        let registry = registry();
+        let c = ctx(&registry);
+        let dims = [4, 8, 4];
+        // Solid at the +x border (x == dims[0] - 1 == 3) from y >= 4 up: a
+        // border wall whose base sits above the lattice floor, on the *high*
+        // edge (plane == dims[0], not 0) -- the case that needs the sweep
+        // axis's true extent, not the mask's row length, to even be
+        // recognised as a node-edge wall.
+        let mesh = greedy_mesh(
+            dims,
+            [1, 1, 1],
+            |x, y, z| {
+                if x == 3 && (4..8).contains(&y) && (0..4).contains(&z) {
+                    BlockId::STONE
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| true,
+            &c,
+        );
+        let skirt_quads: Vec<_> = mesh
+            .vertices
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| {
+                q.iter().all(|v| v.face() == Face::PosX)
+                    && q.iter().map(|v| v.y()).min() == Some(3)
+                    && q.iter().map(|v| v.y()).max() == Some(4)
+            })
+            .collect();
+        assert_eq!(
+            skirt_quads.len(),
+            1,
+            "expected one merged skirt quad below the +x wall, got {}",
+            skirt_quads.len()
+        );
+        let q = skirt_quads[0];
+        assert_eq!(q.iter().map(|v| v.z()).min(), Some(0), "full z run, start");
+        assert_eq!(q.iter().map(|v| v.z()).max(), Some(4), "full z run, end");
+    }
 
     fn empty() -> Chunk {
         Chunk {
@@ -1055,6 +1354,46 @@ mod tests {
             skirted(&only_low),
             0,
             "a skirt laid on another row's answer"
+        );
+    }
+
+    /// All the skirt fixtures above sit at the node's *low* edge (`x == 0`,
+    /// `plane == 0`), where `push_skirt`'s `outside()` reports the cell just
+    /// past it as `g[d] == -1`. The *high* edge (`plane == edge`, i.e.
+    /// `dims[d]`) must report `g[d] == edge` instead -- a property nothing
+    /// above exercises, since a `may_be_solid` that is `true` (or `false`)
+    /// everywhere cannot tell `-1` from `edge` apart. Here `may_be_solid`
+    /// does care which one it was asked about.
+    #[test]
+    fn a_skirt_at_the_high_edge_asks_may_be_solid_about_the_cell_past_that_edge_not_before_it() {
+        let registry = registry();
+        // The high-edge mirror of the fixture above: solid at x == SIZE-1,
+        // from y >= 8 up.
+        let chunk = Chunk::from_fn(|x, y, _| {
+            if x == 15 && y >= 8 {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            }
+        });
+        let skirted = |m: &Mesh| {
+            m.vertices
+                .iter()
+                .filter(|v| v.face() == Face::PosX && v.y() < 8)
+                .count()
+        };
+        let wanted_past_the_high_edge =
+            chunk.build_mesh_with_neighbours(&ctx(&registry), |_, _, _| false, |x, _, _| x == 16);
+        assert!(
+            skirted(&wanted_past_the_high_edge) > 0,
+            "may_be_solid(16, _, _) = true should still get a skirt at the high edge"
+        );
+        let wanted_only_before_the_low_edge =
+            chunk.build_mesh_with_neighbours(&ctx(&registry), |_, _, _| false, |x, _, _| x == -1);
+        assert_eq!(
+            skirted(&wanted_only_before_the_low_edge),
+            0,
+            "a high-edge skirt must ask may_be_solid about x == 16, not x == -1"
         );
     }
 
