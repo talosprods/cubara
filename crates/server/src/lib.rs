@@ -84,6 +84,13 @@ struct Mining {
     progress: u32,
 }
 
+/// How far from the origin column, in blocks, spawn looks for open ground.
+const SPAWN_SEARCH_RADIUS: i32 = 64;
+
+/// Blocks above the surface that must be free of solids for spawn to count it
+/// open: the tallest tree and then some.
+const SPAWN_CLEARANCE: i32 = 32;
+
 pub struct Server {
     /// The world being simulated. Behind an [`Arc`] so meshing jobs can carry
     /// the exact snapshot they were queued against; an edit publishes a new one.
@@ -539,7 +546,9 @@ impl Server {
     /// actually joined — the tail wagging the dog, and the reason the ghost
     /// existed at all.
     ///
-    /// Derived rather than stored: the surface of the origin column, and
+    /// Derived rather than stored: the nearest column to the origin that is real
+    /// surface under open sky (a cave mouth or a tree does not count: the
+    /// player would start in a pit with no tools), and
     /// worldgen is a pure function of the seed, so this is the same answer on
     /// every machine and after every restart. No new state, no save format
     /// change, and nothing that can drift out of agreement with itself.
@@ -564,6 +573,28 @@ impl Server {
         let Some(terrain) = self.terrain else {
             return Some(FixedVec3::from_blocks(0, 48, 0));
         };
+        // The nearest column to the origin that is real surface under open
+        // sky, searched in square rings outward and, inside a ring, in a fixed
+        // z-then-x order: the same answer on every machine (Rule 1).
+        for ring in 0..=SPAWN_SEARCH_RADIUS {
+            for dz in -ring..=ring {
+                for dx in -ring..=ring {
+                    if dx.abs().max(dz.abs()) != ring {
+                        continue;
+                    }
+                    if let Some(surface) = self.open_surface_at(dx, dz, terrain) {
+                        return Some(FixedVec3::new(
+                            cubara_voxel::Fixed::from_f32(dx as f32 + 0.5),
+                            cubara_voxel::Fixed::from_blocks(surface + 2),
+                            cubara_voxel::Fixed::from_f32(dz as f32 + 0.5),
+                        ));
+                    }
+                }
+            }
+        }
+        // Nowhere in range is open ground (an ocean of rock, or edits
+        // everywhere): spawning must never fail, so take the first solid block
+        // under the old start height, as this always did.
         let hit = self
             .world
             .raycast([0.5, 200.0, 0.5], [0.0, -1.0, 0.0], 400.0, terrain)?;
@@ -572,6 +603,17 @@ impl Server {
             cubara_voxel::Fixed::from_blocks(hit.block[1] + 2),
             cubara_voxel::Fixed::from_f32(0.5),
         ))
+    }
+
+    /// The y of the generated surface at column `(x, z)` if it is somewhere to
+    /// stand: the surface block itself is solid (not a cave mouth, whose
+    /// highest solid block is lower down) and nothing solid -- a tree, a hill
+    /// overhang -- is within `SPAWN_CLEARANCE` blocks above it.
+    fn open_surface_at(&self, x: i32, z: i32, terrain: TerrainBlocks) -> Option<i32> {
+        let surface = self.world.surface_height(x, z);
+        let solid = |y| self.world.is_solid_at(x, y, z, terrain);
+        (solid(surface) && (surface + 1..=surface + SPAWN_CLEARANCE).all(|y| !solid(y)))
+            .then_some(surface)
     }
 
     /// The local client's player, or a panic explaining why there isn't one.
