@@ -972,6 +972,21 @@ fn main() {
             // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--toward-peak] [--seconds S]
             // [--speed B] [--fps F] [--frames DIR]`: how much of the screen is
             // still loading while flying at the game's speed.
+            // `--bench walk [--seconds S] [--fps F] [--fly]`: the whole frame's
+            // time while a scripted player walks (or, with `--fly`, spectates
+            // flying forward).
+            bench::Target::Walk => {
+                let seconds = flag("--seconds")
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(30.0);
+                let fps = flag("--fps").and_then(|t| t.parse().ok()).unwrap_or(60);
+                let fly = args.iter().any(|a| a == "--fly");
+                match flight::walk(seconds, size, fps, fly) {
+                    Some(report) => log::info!("{}", report.line()),
+                    None => log::error!("WALK: no GPU to walk on"),
+                }
+                return;
+            }
             bench::Target::Flight => {
                 let number = |name: &str, default: f32| {
                     flag(name).map_or(default, |t| {

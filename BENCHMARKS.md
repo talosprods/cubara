@@ -1246,7 +1246,8 @@ every 0.25 s; then the same line is flown again, stopping at each kept frame
 until nothing is left to load. **Loading** is the share of pixels more than 40
 levels off the finished frame at the same eye. Work/frame is the time a frame
 spent streaming and drawing (not waiting for the display). M3, 1280×720, far
-terrain at High. Details in ⁷⁴; the slow end of the work per frame in ⁸².
+terrain at High. Details in ⁷⁴; the slow end of the work per frame in ⁸², and of
+the whole frame in the game's own loop (`--bench walk`) in ⁸³.
 
 | Date | Change | Flight | Loading mean | Worst frame | Frames > 1% loading | Work/frame p99 | Commit |
 |---|---|---|---|---|---|---|---|
@@ -2797,3 +2798,28 @@ frame is two-thirds of an interval. The exit gate's frame-time item (p99.9
 under one interval, nothing over two) is about the whole frame, which this
 does not measure: the simulation's tick, the GPU and the display's pacing. That
 needs the game's own loop, which is the next measurement in #318.
+
+⁸³ **The whole frame in the game's own loop (`--bench walk`, block 3.0a),
+Linux, 2026-11-09.** The work time in ⁸² leaves out the simulation's tick and
+the GPU. `--bench walk` runs the game's own loop offscreen: `Game::advance`
+(the simulation and the server, in process), voxel and far streaming, and the
+renderer. It times each frame from its start until the GPU has finished it,
+paced at 60 Hz, once the spawn has loaded. The player either walks forward
+for 30 s, jumping every second, or with `--fly` spectates (F4) and flies
+forward. `main` at `562e3f4` (#322) with this PR, one run each, CPU 53–61 °C, GPU
+up to 64 °C:
+
+```
+                   moved        p99      p99.9    max       > 16.7 ms   > 33.3 ms
+1280x720  walk      26 blocks   6.0 ms   6.3 ms    8.6 ms   0           0
+1280x720  fly      719 blocks   6.6 ms   7.3 ms    8.4 ms   0           0
+1920x1080 walk      26 blocks   7.7 ms   7.9 ms    8.3 ms   0           0
+1920x1080 fly      719 blocks   9.3 ms  12.4 ms   13.3 ms   0           0
+```
+
+On this machine the loop meets the gate's frame-time terms: p99.9 under one
+60 Hz interval and no frame over two. The walk stops against the terrain
+after 26 blocks, so it measures the tick more than the streaming; the flight
+measures the streaming. Not measured here: the display's pacing (a window's
+present mode), the start-up `--bench tune` child, and the other machines.
+The owner's stutters, if they persist, are most likely in one of those.

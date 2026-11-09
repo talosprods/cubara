@@ -335,6 +335,9 @@ pub enum Target {
     /// `--bench flight`: how much of the screen is still loading while
     /// flying (`crate::flight`).
     Flight,
+    /// `--bench walk`: the whole frame's time -- the game's tick, streaming,
+    /// drawing and the GPU -- while a scripted player walks (`crate::flight::walk`).
+    Walk,
     /// `--bench <radius>`: one scene of this chunk radius -- 12, a
     /// realistically heavy world, when none is given.
     Radius(i32),
@@ -346,6 +349,7 @@ pub fn parse_target(word: Option<&str>) -> Target {
         Some("gate") => Target::Gate,
         Some("tune") => Target::Tune,
         Some("flight") => Target::Flight,
+        Some("walk") => Target::Walk,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
     }
 }

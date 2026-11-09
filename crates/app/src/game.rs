@@ -1697,6 +1697,11 @@ impl Game {
     }
 
     /// Whether the local player is in creative mode.
+    /// The hosted world's tick, for measurement (`--bench walk`).
+    pub fn sim_tick(&self) -> u64 {
+        self.server().sim.tick
+    }
+
     pub fn is_creative(&self) -> bool {
         self.me.player().is_creative()
     }

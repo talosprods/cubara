@@ -362,6 +362,138 @@ impl WorkTail {
     }
 }
 
+/// What `--bench walk` found: every frame's whole time, start to GPU done.
+pub struct WalkReport {
+    pub frame_times: Vec<f32>,
+    pub ticks: u64,
+    pub distance: f32,
+}
+
+impl WalkReport {
+    pub fn line(&self) -> String {
+        let t = WorkTail::of(&self.frame_times);
+        format!(
+            "WALK: {} frames, {} ticks, walked {:.0} blocks | frame p99 {:.1} ms p99.9 {:.1} ms \
+             max {:.1} ms, over 16.7 ms {} over 33.3 ms {}",
+            self.frame_times.len(),
+            self.ticks,
+            self.distance,
+            t.p99 * 1000.0,
+            t.p999 * 1000.0,
+            t.max * 1000.0,
+            t.over_one,
+            t.over_two,
+        )
+    }
+}
+
+/// `--bench walk`: the game's own loop, offscreen -- [`Game::advance`] (the
+/// simulation and the server, in process), the voxel and far streaming, the
+/// renderer -- while a scripted player walks forward for `seconds`, jumping
+/// every second to take steps. Each frame is timed from its start until the
+/// GPU has finished it, paced at `fps`: the whole frame the exit gate's item 0
+/// asks about (block 3.0a), where `--bench flight` times only streaming and
+/// drawing. Starts once the spawn has loaded. `None` without a GPU.
+///
+/// With `fly`, F4 first: the same loop with the player spectating, flying
+/// forward through everything at free-fly speed -- the streaming under load,
+/// with the simulation still ticking.
+pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkReport> {
+    use crate::game::{load_item_registry, load_recipe_book, Game};
+    use winit::keyboard::KeyCode;
+
+    let mut game = Game::new();
+    let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
+    let layers = assets.layers;
+    let registry = Arc::new(assets.registry);
+    let items = load_item_registry();
+    let recipes = load_recipe_book(&items);
+    game.set_assets(Arc::clone(&registry), items, recipes);
+    let mut nodes = NodeStreaming::new(
+        registry,
+        &crate::game::load_structure_registry(),
+        &crate::game::load_ore_registry(),
+        move |name: &str| layers.layer_of(name),
+    );
+    let mut far = FarStreaming::new(game.world().seed(), FarQuality::High);
+    let budget = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let mut frame = |game: &mut Game, dt: f32, renderer: &mut Renderer| {
+        for cc in game.advance(dt) {
+            nodes.invalidate(game.world(), cc);
+        }
+        let camera = game.camera_pose();
+        let eye = camera.eye.to_array();
+        nodes.update(renderer, game.world(), eye);
+        let hole = nodes.far_hole(renderer, eye);
+        far.update(renderer, eye, hole);
+        renderer.render(
+            camera,
+            game.selected_block(),
+            game.cracking(),
+            &game.other_players(),
+            cubara_render::Hud {
+                hotbar: None,
+                panel: None,
+                health: Some(game.health_view()),
+                crosshair: true,
+                menu: None,
+            },
+            FAR_VIEW_RADIUS as f32,
+        );
+        let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
+        nodes.settled() && far.settled() && renderer.uploads_pending() == 0
+    };
+    // Load the spawn first, standing still: what the walk measures is
+    // walking through a loaded world, not loading one.
+    let waiting = Instant::now();
+    while !frame(&mut game, budget.as_secs_f32(), &mut renderer) {
+        if waiting.elapsed() > Duration::from_secs(120) {
+            log::warn!("walk: the spawn did not settle in two minutes");
+            break;
+        }
+    }
+    let start_pos = game.camera_pose().eye;
+    let ticks_before = game.sim_tick();
+    if fly {
+        game.key_input(KeyCode::F4, true);
+        frame(&mut game, budget.as_secs_f32(), &mut renderer);
+        game.key_input(KeyCode::F4, false);
+    }
+    game.key_input(KeyCode::KeyW, true);
+    let mut frame_times = Vec::new();
+    let start = Instant::now();
+    let mut last = start;
+    let mut next_jump = 1.0;
+    let mut next_frame = start;
+    while start.elapsed().as_secs_f32() < seconds {
+        let t = start.elapsed().as_secs_f32();
+        let jump = !fly && t >= next_jump;
+        if jump {
+            game.key_input(KeyCode::Space, true);
+            next_jump += 1.0;
+        }
+        let began = Instant::now();
+        let dt = (began - last).as_secs_f32();
+        last = began;
+        frame(&mut game, dt, &mut renderer);
+        frame_times.push(began.elapsed().as_secs_f32());
+        if jump {
+            game.key_input(KeyCode::Space, false);
+        }
+        next_frame += budget;
+        let now = Instant::now();
+        match next_frame.checked_duration_since(now) {
+            Some(rest) => std::thread::sleep(rest),
+            None => next_frame = now,
+        }
+    }
+    Some(WalkReport {
+        frame_times,
+        ticks: game.sim_tick() - ticks_before,
+        distance: (game.camera_pose().eye - start_pos).length(),
+    })
+}
+
 /// Everything a flight streams: the world, the game's two streamers, and the
 /// game's renderer.
 struct Streamed {
