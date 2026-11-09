@@ -536,6 +536,23 @@ it, because the flight eye must see something. **Confirmed by the owner on
 1,000 at High, the M3 only at Low): each machine may have its own quality, and
 the gate is met when one with the far terrain on holds 1,000 at every eye.
 
+
+### Recorded, 2026-11-09 — climate, biomes and seasons
+
+The owner set the direction for the world's climate in a design conversation:
+seasons that change the biomes, altitude as climate (high plateaus with mountain
+lakes above a tree line, a long descent to large seas), two climate axes
+(warm/cold × dry/wet) laid over the infinite world as an organic patchwork with
+no hemispheres, biomes as an exaggerated caricature (volcanoes, islands, giant
+forests, tree species that blend), a 40–60 minute day with a quarter of it dark,
+seasons of at least three hours, years that differ (snow in a desert once in
+10–20 years), **no temperature mechanic for the player**, and rivers as the
+backbone of the geography (always reaching the sea, valleys and passes that later
+routes and villages follow). His words, and
+engineering's proposal for building it, are in
+[`docs/PROPOSAL_CLIMATE.md`](docs/PROPOSAL_CLIMATE.md). It is a proposal: it
+becomes blocks when it is planned as a phase.
+
 ---
 
 ## Where the existing open issues land
