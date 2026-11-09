@@ -875,14 +875,7 @@ mod tests {
             );
             let mut start = 0usize;
             for (k, &count) in mesh.face_indices.iter().enumerate() {
-                let face = [
-                    Face::PosX,
-                    Face::NegX,
-                    Face::PosY,
-                    Face::NegY,
-                    Face::PosZ,
-                    Face::NegZ,
-                ][k];
+                let face = Face::DRAW_ORDER[k];
                 for tri in mesh.indices[start..start + count as usize].chunks(3) {
                     let [a, b, c] = [0, 1, 2].map(|i| mesh.vertices[tri[i] as usize]);
                     assert!([a, b, c].iter().all(|v| v.face() == face));

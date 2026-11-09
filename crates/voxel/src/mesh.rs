@@ -22,6 +22,24 @@ pub enum Face {
 }
 
 impl Face {
+    /// The order [`Mesh::group_by_face`] puts a mesh's quads in, and so the
+    /// order of [`Mesh::face_indices`]; a renderer drawing one run per stretch
+    /// of directions that can face the camera reads it in the same order.
+    ///
+    /// No two directions of one axis are neighbours. A camera outside a
+    /// node's box sees one direction of each axis, and from all eight corners
+    /// two of those three are adjacent here: at most two runs, 1.75 on
+    /// average. In `Face` order each axis's pair is adjacent, and the three
+    /// seen are never: up to three runs, 2.5 on average.
+    pub const DRAW_ORDER: [Face; 6] = [
+        Face::PosX,
+        Face::PosY,
+        Face::PosZ,
+        Face::NegY,
+        Face::NegZ,
+        Face::NegX,
+    ];
+
     /// The face for a mesher axis (0=x, 1=y, 2=z) and sign (+1 or -1).
     pub fn from_axis_sign(axis: usize, sign: i8) -> Self {
         match (axis, sign) {
@@ -199,9 +217,9 @@ impl Vertex {
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    /// How many of `indices` face each way, in [`Face`] order, once
+    /// How many of `indices` face each way, in [`Face::DRAW_ORDER`], once
     /// [`group_by_face`](Self::group_by_face) has put them in that order: the
-    /// first `face_indices[0]` indices are `PosX` quads, and so on.
+    /// first `face_indices[0]` indices are `DRAW_ORDER[0]` quads, and so on.
     ///
     /// What lets a renderer skip every face pointing away from the camera
     /// without running a vertex of it. All zero for a mesh that was never
@@ -215,9 +233,9 @@ impl Mesh {
     }
 
     /// Reorder the quads so all of one [`Face`] direction come together, in
-    /// `Face` order, and record the counts in `face_indices`. Every quad is
-    /// six indices into four vertices of one face (what the greedy mesher
-    /// emits); the order within a direction is kept.
+    /// [`Face::DRAW_ORDER`], and record the counts in `face_indices`. Every
+    /// quad is six indices into four vertices of one face (what the greedy
+    /// mesher emits); the order within a direction is kept.
     pub fn group_by_face(&mut self) {
         debug_assert_eq!(self.indices.len() % 6, 0, "a mesh of whole quads");
         let mut groups: [Vec<u32>; 6] = Default::default();
@@ -226,8 +244,9 @@ impl Mesh {
             groups[face].extend_from_slice(quad);
         }
         self.indices.clear();
-        for (face, group) in groups.iter().enumerate() {
-            self.face_indices[face] = group.len() as u32;
+        for (k, face) in Face::DRAW_ORDER.into_iter().enumerate() {
+            let group = &groups[face as usize];
+            self.face_indices[k] = group.len() as u32;
             self.indices.extend_from_slice(group);
         }
     }

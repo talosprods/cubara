@@ -222,6 +222,38 @@ pub fn faces_facing(aabb: &Aabb, eye: glam::Vec3) -> [bool; 6] {
     ]
 }
 
+/// The draws for one grouped node: `counts` indices per direction, in
+/// [`Face::DRAW_ORDER`](cubara_voxel::Face::DRAW_ORDER) from `first_index`,
+/// and `facing` per direction in `Face` order ([`faces_facing`]). Adjacent
+/// directions that are both drawn share one draw, handed to `emit` as
+/// `(first_index, index_count)`. From outside the box that is at most two
+/// draws, which is what `DRAW_ORDER` is for.
+fn facing_runs(
+    first_index: u32,
+    counts: [u32; 6],
+    facing: [bool; 6],
+    mut emit: impl FnMut(u32, u32),
+) {
+    let mut start = first_index;
+    let mut run: Option<(u32, u32)> = None;
+    for (count, face) in counts.into_iter().zip(cubara_voxel::Face::DRAW_ORDER) {
+        if count > 0 {
+            if facing[face as usize] {
+                run = Some(match run {
+                    Some((first, n)) => (first, n + count),
+                    None => (start, count),
+                });
+            } else if let Some((first, n)) = run.take() {
+                emit(first, n);
+            }
+        }
+        start += count;
+    }
+    if let Some((first, n)) = run {
+        emit(first, n);
+    }
+}
+
 /// First-fit free-list suballocator over a fixed capacity of fixed-size units
 /// (vertices or indices). Free ranges are kept sorted and coalesced so repeated
 /// load/unload churn doesn't permanently fragment the arena.
@@ -657,30 +689,11 @@ impl ChunkArena {
                 self.visible_triangles += slot.index_count as u64 / 3;
                 continue;
             };
-            // Adjacent directions that are both drawn share one draw. At most
-            // three runs: of each opposite pair (adjacent in `Face` order) a
-            // camera outside the box sees one.
             let facing = faces_facing(&slot.aabb, eye);
-            let mut start = slot.first_index;
-            let mut run: Option<(u32, u32)> = None;
-            for (count, facing) in counts.into_iter().zip(facing) {
-                if count > 0 {
-                    if facing {
-                        run = Some(match run {
-                            Some((first, n)) => (first, n + count),
-                            None => (start, count),
-                        });
-                    } else if let Some((first, n)) = run.take() {
-                        self.visible.push(draw(first, n));
-                        self.visible_triangles += n as u64 / 3;
-                    }
-                }
-                start += count;
-            }
-            if let Some((first, n)) = run {
+            facing_runs(slot.first_index, counts, facing, |first, n| {
                 self.visible.push(draw(first, n));
                 self.visible_triangles += n as u64 / 3;
-            }
+            });
         }
         if !self.visible.is_empty() {
             queue.write_buffer(
@@ -956,6 +969,65 @@ mod tests {
             }
         }
         assert!(left_out > 0, "nothing was ever left out");
+    }
+
+    /// From each of the eight corners outside a node, its faces that can show
+    /// are at most two draws -- the point of `Face::DRAW_ORDER`, which in
+    /// `Face` order would be three from half of them. And the draws are
+    /// exactly the facing directions' indices, each once, so the bound cannot
+    /// be met by dropping or merging a direction that should not be.
+    #[test]
+    fn a_node_seen_from_any_corner_is_at_most_two_draws() {
+        let aabb = Aabb::new(glam::vec3(16.0, -32.0, 48.0), glam::vec3(32.0, 0.0, 80.0));
+        // A different count per direction, so a run's length says which
+        // directions it holds.
+        let counts = [6, 12, 24, 48, 96, 192];
+        let first = 1_000;
+        for corner in 0..8 {
+            let pick = |bit: u32, lo: f32, hi: f32| {
+                if corner & (1 << bit) == 0 {
+                    lo - 10.0
+                } else {
+                    hi + 10.0
+                }
+            };
+            let eye = glam::vec3(
+                pick(0, aabb.min.x, aabb.max.x),
+                pick(1, aabb.min.y, aabb.max.y),
+                pick(2, aabb.min.z, aabb.max.z),
+            );
+            let facing = faces_facing(&aabb, eye);
+            assert_eq!(facing.iter().filter(|&&f| f).count(), 3, "eye {eye}");
+            let mut draws = Vec::new();
+            facing_runs(first, counts, facing, |f, n| draws.push((f, n)));
+            assert!(
+                draws.len() <= 2,
+                "eye {eye}: {} draws, {draws:?}",
+                draws.len()
+            );
+            // Every index drawn belongs to a facing direction, and every
+            // facing direction's indices are drawn.
+            let mut drawn = vec![false; counts.iter().sum::<u32>() as usize];
+            for (f, n) in draws {
+                for i in f..f + n {
+                    assert!(!drawn[(i - first) as usize], "index {i} drawn twice");
+                    drawn[(i - first) as usize] = true;
+                }
+            }
+            let mut start = 0;
+            for (k, face) in cubara_voxel::Face::DRAW_ORDER.into_iter().enumerate() {
+                let end = start + counts[k] as usize;
+                assert!(
+                    drawn[start..end]
+                        .iter()
+                        .all(|&d| d == facing[face as usize]),
+                    "eye {eye}: {face:?} drawn {} but facing {}",
+                    drawn[start],
+                    facing[face as usize]
+                );
+                start = end;
+            }
+        }
     }
 
     #[test]

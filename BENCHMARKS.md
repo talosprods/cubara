@@ -211,6 +211,8 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁷ | 1,940 | 819,928 voxel + far | ~1,618 (+1.7%) | **0.167 ms** (−46%) | 0.539 ms | `5b29370` |
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁷ | 869 | 436,690 voxel + far | ~1,793 (−0.3%) | **0.147 ms** (−36%) | 0.548 ms | `5b29370` |
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
+| 2026-11-09 | **Face groups in `Face::DRAW_ORDER`** (D1) — gate eye ground (High): 1,055 draws for 592 nodes, was 1,325⁷⁸ | 1,940 | 819,928 voxel + far | ~1,622 (+0.1%) | 0.169 ms (within noise) | 0.762 ms | *(this PR)* |
+| 2026-11-09 | Face groups in `DRAW_ORDER` (D1) — gate eye hill (High): 530 draws for 277 nodes, was 644⁷⁸ | 869 | 436,690 voxel + far | ~1,798 (+0.7%) | 0.159 ms (within noise) | 0.509 ms | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2679,3 +2681,26 @@ in every run (2.5 s in, at (65, 111, 25)). Most likely that is the oldest CPU
 of the three, six cores from 2018, meshing the finer nodes behind a chunk
 crossing more slowly (⁷⁴'s "what is left"); not measured further here.
 Work/frame p99 is 3.1–4.3 ms, well inside a 60 Hz frame.
+
+⁷⁸ **Face groups in `Face::DRAW_ORDER` (D1), Linux, 2026-11-09.** `main` at
+`5b29370` against this branch, separate binaries, run alternately, 3 runs
+each, `--bench gate`, on AC power. Draws per node fall as the order predicts:
+1,325 to 1,055 draws for 592 nodes at ground (2.24 to 1.78), 644 to 530 for 277
+at hill (2.32 to 1.91). The triangles drawn are the same (165,711 and 99,170),
+and so are the goldens. CPU/frame does not move measurably:
+
+```
+            main (5b29370)                                           D1
+ground  1,626 / 1,614 / 1,623 FPS, CPU 0.159 / 0.169 / 0.169  ->  1,622 / 1,615 / 1,630 FPS, CPU 0.159 / 0.160 / 0.188
+hill    1,800 / 1,774 / 1,784 FPS, CPU 0.146 / 0.148 / 0.147  ->  1,789 / 1,792 / 1,812 FPS, CPU 0.147 / 0.147 / 0.182
+flight  2,045 / 2,425 / 2,414 FPS, CPU 0.180 / 0.080 / 0.077  ->  2,411 / 2,409 / 2,455 FPS, CPU 0.075 / 0.079 / 0.094
+```
+
+The third D1 run read high at every eye, flight included. Flight has no voxel
+nodes, so D1 changes nothing there: that run's high reading is the machine,
+not the order. The same goes for main's first flight. The medians are 0.169 to
+0.160 ms at ground and 0.147 to 0.147 at hill. Here, 270 fewer indirect draws
+a frame cost no CPU worth measuring. `prepare` writes fewer 20-byte records,
+and one `multi_draw_indexed_indirect` submits them all either way. GPU/frame is
+unchanged too (0.547–0.552 ms at ground). Whether a GPU's front end notices
+fewer draw records is for the M3 to measure.

@@ -148,20 +148,24 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
     }
 }
 
-/// `ChunkArena::prepare`'s doc comment says it emits "one draw per run of
-/// face directions that can face the camera... at most three runs" -- pin
-/// that against the real pipeline rather than trusting the comment. A corner
-/// view (diagonal on all three axes) is deliberate: a camera looking straight
-/// at one face only ever exercises a single run per node, which could not
-/// tell a regression that collapsed `prepare` back to one draw per node
-/// (dropping the face-direction split entirely) from correct behaviour --
-/// both would pass. The corner forces at least one node to need more than
-/// one draw, which is what `draw_count > visible_nodes` below actually pins.
+/// `ChunkArena::prepare` emits one draw per run of face directions that can
+/// face the camera, in `Face::DRAW_ORDER` -- at most two runs from outside a
+/// node. Pin that against the real pipeline rather than trusting the comment.
+///
+/// The corner is chosen. From the (+x, +y, +z) corner the three directions in
+/// view are adjacent in `DRAW_ORDER` and every node is one draw, which could
+/// not tell a regression that collapsed `prepare` back to one draw per node
+/// (dropping the face-direction split entirely) from correct behaviour. From
+/// (+x, +y, -z) they are two runs, so a node with faces in both needs two
+/// draws -- which is what `draw_count > visible_nodes` below pins.
+///
+/// Not "at least one draw per visible node": a node in the frustum whose
+/// faces all point away from the camera rightly gets none.
 #[test]
-fn prepare_emits_between_one_and_three_draws_per_visible_node() {
+fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
     let Some((device, queue)) = test_device() else {
         eprintln!(
-            "SKIP prepare_emits_between_one_and_three_draws_per_visible_node: no GPU adapter"
+            "SKIP prepare_emits_at_most_two_draws_per_visible_node_from_outside: no GPU adapter"
         );
         return;
     };
@@ -207,7 +211,7 @@ fn prepare_emits_between_one_and_three_draws_per_visible_node() {
         .max(max[1] - min[1])
         .max(max[2] - min[2])
         .max(1.0);
-    let eye = center + glam::vec3(extent, extent, extent);
+    let eye = center + glam::vec3(extent, extent, -extent);
     let vp = cubara_render::CameraUniform::look_view_proj(1.0, eye, center - eye);
     let frustum = cubara_render::Frustum::from_view_proj(vp);
 
@@ -219,14 +223,9 @@ fn prepare_emits_between_one_and_three_draws_per_visible_node() {
         "the corner camera must see some of the test region"
     );
     assert!(
-        draw_count >= visible_nodes,
-        "prepare must issue at least one draw per visible node, got {draw_count} draws for \
-         {visible_nodes} nodes"
-    );
-    assert!(
-        draw_count <= visible_nodes * 3,
-        "prepare must issue at most three draws per visible node (one per opposite-face pair \
-         still facing the camera), got {draw_count} draws for {visible_nodes} nodes"
+        draw_count <= visible_nodes * 2,
+        "from outside every node, prepare must issue at most two draws per visible node \
+         (Face::DRAW_ORDER), got {draw_count} draws for {visible_nodes} nodes"
     );
     assert!(
         draw_count > visible_nodes,
