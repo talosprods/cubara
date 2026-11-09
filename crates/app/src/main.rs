@@ -16,6 +16,8 @@
 mod bench;
 mod caps;
 mod capture;
+#[cfg(test)]
+mod far_census;
 mod far_streaming;
 mod flight;
 mod game;
