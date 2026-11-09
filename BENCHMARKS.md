@@ -202,6 +202,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-09-27 | **Gate eye: ground + far terrain, block-aggregate shading (F4, High)**⁷⁰ | 1,940 | 819,928 voxel + far | ~1,572 | 0.348 ms | 1.113 ms | `feat/far-aggregate-shading` |
 | 2026-09-27 | **Gate eye: hill + far terrain, F4 (High)**⁷⁰ | 869 | 436,690 voxel + far | ~1,731 | 0.275 ms | 0.970 ms | `feat/far-aggregate-shading` |
 | 2026-09-27 | **Gate eye: flight + far terrain, F4 (High)**⁷⁰ | 0 | far only | ~2,462 | 0.166 ms | 0.747 ms | `feat/far-aggregate-shading` |
+| 2026-11-09 | `main` before the warm-up change: gate eye ground + far terrain (High), 200 warm-up frames⁷⁷ | 1,940 | 819,928 voxel + far | ~1,590 | 0.309 ms | 0.948 ms | `b8a8550` |
+| 2026-11-09 | `main` before: gate eye hill + far terrain (High)⁷⁷ | 869 | 436,690 voxel + far | ~1,798 | 0.230 ms | 0.917 ms | `b8a8550` |
+| 2026-11-09 | `main` before: gate eye flight + far terrain (High)⁷⁷ | 0 | far only | ~2,395 | 0.174 ms | 0.732 ms | `b8a8550` |
+| 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁷ | 1,940 | 819,928 voxel + far | ~1,618 (+1.7%) | **0.167 ms** (−46%) | 0.539 ms | `5b29370` |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁷ | 869 | 436,690 voxel + far | ~1,793 (−0.3%) | **0.147 ms** (−36%) | 0.548 ms | `5b29370` |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -1250,6 +1256,10 @@ terrain at High. Details in ⁷⁴.
 | 2026-11-09 | **Windows**, the same three⁷⁴ | low, 2 runs | **0.21% / 0.22%** | **3.2% / 3.3%** | **8% / 8%** | 3.6 / 4.4 ms | this PR |
 | 2026-11-09 | **Windows**, before⁷⁴ | down, 2 runs | 17.49% / 18.51% | 97.4% / 97.4% | 35% / 37% | 4.5 / 4.6 ms | `bench/flight-before` |
 | 2026-11-09 | **Windows**, the same three⁷⁴ | down, 2 runs | **0.42% / 0.44%** | **24.5% / 24.5%** | **2% / 3%** | 6.6 / 4.9 ms | this PR |
+| 2026-11-09 | **Linux** (i7-8750H / GTX 1060 Max-Q, 1280×720, High), before⁷⁷ | low, 2 runs | 4.61% / 4.99% | 24.3% / 24.6% | 59% / 60% | 2.6 / 2.9 ms | `bench/flight-before` |
+| 2026-11-09 | **Linux**, the same three⁷⁷ | low, 2 runs | **0.44% / 0.37%** | **5.8% / 5.6%** | **14% / 10%** | 3.1 / 3.6 ms | `5b29370` |
+| 2026-11-09 | **Linux**, before⁷⁷ | down, 2 runs | 22.80% / 21.81% | 97.9% / 97.9% | 42% / 37% | 3.4 / 3.3 ms | `bench/flight-before` |
+| 2026-11-09 | **Linux**, the same three⁷⁷ | down, 2 runs | **0.79% / 0.79%** | **24.0% / 24.0%** | **5% / 5%** | 3.6 / 4.3 ms | `5b29370` |
 
 ## Detailed run logs
 
@@ -2606,3 +2616,44 @@ and p99 CPU/frame falls from ~0.55 to ~0.23 ms. One second is 4,100–6,800 warm
 frames on this laptop, and the spread between runs narrows to about 1%. The
 M3 may move the other way (⁵⁵: a hot M3 read slower). It is re-measured when
 the Mac runs the gate next, and its rows before this date stay as they are.
+
+⁷⁷ **The warm-up change (⁷⁵) on Linux, 2026-11-09.** The GTX 1060 Max-Q laptop
+from ⁵⁴, on AC power (charging, 75–99%), `--bench gate` at 1920×1080, High.
+`b8a8550` (200 warm-up frames) and `main` at `5b29370` (#298's warm-up, plus
+#297, #300 and #301, none of which changes what the gate draws: the same
+nodes, draws and far triangles at every eye) as separate binaries, run
+alternately, 3 runs each. The rows are the means.
+
+```
+             200 frames                             >= 200 frames and >= 1 s
+ground   1,612 / 1,581 / 1,578 FPS, CPU 0.311 / 0.316 / 0.300  ->  1,623 / 1,621 / 1,609 FPS, CPU 0.159 / 0.181 / 0.160
+hill     1,777 / 1,817 / 1,801 FPS, CPU 0.232 / 0.226 / 0.232  ->  1,810 / 1,794 / 1,775 FPS, CPU 0.147 / 0.146 / 0.147
+flight   2,478 / 2,331 / 2,377 FPS, CPU 0.165 / 0.182 / 0.174  ->  2,435 / 2,466 / 2,416 FPS, CPU 0.076 / 0.080 / 0.075
+GPU/frame (means)  ground 0.588, hill 0.512, flight 0.387 ms   ->  0.549, 0.504, 0.358 ms
+```
+
+CPU/frame falls as it did on Windows, by 46% (ground), 36% (hill) and 56%
+(flight), and p99 CPU/frame from 0.73–0.95 ms to 0.15–0.55. FPS does not
+follow it here: +1.7%, −0.3%, +1.8%, inside the spread between runs. This GPU
+is busy for 85–90% of every frame (GPU/frame 0.55 ms at 1,618 FPS, a 0.62 ms
+frame), so a shorter CPU submit has nothing to shorten. What the second of
+warm-up buys here is a GPU that has clocked up -- GPU/frame about 7% lower at
+ground and flight -- and steadier runs: the three runs of an eye span 2.1%
+(ground) and 6.1% (flight) before, 0.9% and 2.1% after. One second is
+2,986–3,096 warm-up frames at ground, 3,096–3,572 at hill and 3,941–4,465 at
+flight. Draws per node are 2.24 at ground (1,325 for 592 nodes) and 2.32 at
+hill (644 for 277), as on Windows.
+
+**`--bench flight` on the same laptop**, the pair from ⁷⁴ (`bench/flight-before`,
+`02e7643`, against `main` at `5b29370`), 1280×720, alternating, two runs each,
+on AC power. The same picture as the M3 and Windows: the low flight's mean
+loading falls 10–13x (4.6–5.0% to 0.37–0.44%) and the down flight's 28x
+(21.8–22.8% to 0.79%), and no run logged "chunk arena full" or a start that
+differed from itself. The worst descending frame is the same ring edge
+(24.0%; 24.5% on Windows, 20.8% on the M3). The low flight is where this
+machine is behind: its worst frame is 5.6–5.8% (3.2–3.3% on Windows and the
+M3) and 10–14% of its frames are over 1% (5–8% there), at the same moment
+in every run (2.5 s in, at (65, 111, 25)). Most likely that is the oldest CPU
+of the three, six cores from 2018, meshing the finer nodes behind a chunk
+crossing more slowly (⁷⁴'s "what is left"); not measured further here.
+Work/frame p99 is 3.1–4.3 ms, well inside a 60 Hz frame.
