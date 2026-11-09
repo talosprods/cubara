@@ -541,6 +541,14 @@ impl ChunkArena {
         }
     }
 
+    /// Free every node.
+    pub fn clear(&mut self) {
+        let ids: Vec<NodeId> = self.slots.keys().copied().collect();
+        for id in ids {
+            self.remove(id);
+        }
+    }
+
     pub fn contains(&self, id: NodeId) -> bool {
         self.slots.contains_key(&id)
     }
