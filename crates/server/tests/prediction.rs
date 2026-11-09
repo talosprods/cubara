@@ -30,6 +30,9 @@ use cubara_world::World;
 const LATENCY: u64 = 4;
 
 /// Walking forward, held.
+/// How far the walking lane runs ahead of the client, in blocks.
+const LANE_LENGTH: i32 = 90;
+
 fn forward() -> InputFrame {
     InputFrame {
         move_axes: [0.0, 0.0, 1.0],
@@ -100,12 +103,43 @@ impl Harness {
         server.open_view(me);
 
         let seed = server.world.seed();
+        let mut world = World::with_seed(seed);
+
+        // A clear lane to walk down. Forward at yaw 0 is -Z, and the default
+        // terrain beside the spawn has a step a walking player cannot climb:
+        // measured, the client stopped 0.7 blocks along and then stood against
+        // it for the rest of every test here, so "walks for 90 ticks" and
+        // "predicts across a long walk" were tests of a player at rest. Both
+        // sides get the same lane, so nothing below is a misprediction caused
+        // by the harness itself.
+        let (px, py, pz) = (
+            ground.x.floor_block() + 6,
+            // `pos` is the eye, 1.62 above the feet: two blocks down is the
+            // block the feet are in.
+            ground.y.floor_block() - 2,
+            ground.z.floor_block(),
+        );
+        for z in (pz - LANE_LENGTH)..=(pz + 2) {
+            for x in (px - 1)..=(px + 1) {
+                for (dy, block) in [
+                    (-1, BlockId::STONE),
+                    (0, BlockId::AIR),
+                    (1, BlockId::AIR),
+                    (2, BlockId::AIR),
+                    (3, BlockId::AIR),
+                ] {
+                    world.set_block(x, py + dy, z, block);
+                    server.set_block([x, py + dy, z], block);
+                }
+            }
+        }
+
         // The client starts from the state the handshake would have carried.
         let client = Prediction::new(seed, *server.sim.player(me));
         Self {
             server,
             me,
-            world: World::with_seed(seed),
+            world,
             client,
             now: 0,
             up: Vec::new(),
@@ -256,6 +290,7 @@ fn the_player_moves_on_the_tick_the_key_was_pressed() {
 #[test]
 fn prediction_converges_on_what_the_server_later_says() {
     let mut h = Harness::new();
+    let start_z = h.believed().pos.z;
     for _ in 0..90 {
         h.tick(forward());
     }
@@ -267,9 +302,12 @@ fn prediction_converges_on_what_the_server_later_says() {
         "the client and the server disagree about where the client is after \
          everything has been delivered"
     );
+    let walked = start_z.floor_block() - h.believed().pos.z.floor_block();
     assert!(
-        h.believed().pos != FixedVec3::ZERO,
-        "the player never moved, so this proved nothing"
+        walked >= 5,
+        "the player walked only {walked} blocks of -Z in 90 ticks (start {:?}, ended at {:?}), so this          proved nothing about prediction",
+        start_z,
+        h.believed().pos
     );
 }
 
@@ -407,15 +445,20 @@ fn a_correction_wins_when_the_client_was_wrong() {
         h.tick(forward());
     }
 
-    // A wall, one block ahead of where the player is walking, at body height.
+    // A wall ahead of where the player is walking, at body height. Forward at
+    // yaw 0 is -Z (`horizontal_axes`), so ahead is `z - dz`; the first version
+    // of this test built it at `z + dz`, behind the walker, and passed with no
+    // collision at all.
     let p = h.authoritative().pos;
+    let start_z = p.z;
+    h.mispredictions = 0;
     for dy in 0..3 {
         for dz in 1..4 {
             h.server.set_block(
                 [
                     p.x.floor_block(),
                     p.y.floor_block() - 1 + dy,
-                    p.z.floor_block() + dz,
+                    p.z.floor_block() - dz,
                 ],
                 BlockId::STONE,
             );
@@ -427,6 +470,15 @@ fn a_correction_wins_when_the_client_was_wrong() {
     }
     h.settle();
 
+    assert!(
+        h.mispredictions > 0,
+        "the client never mispredicted, so the wall was never in its way and          this test exercised no correction"
+    );
+    let walked = start_z.floor_block() - h.authoritative().pos.z.floor_block();
+    assert!(
+        (0..=4).contains(&walked),
+        "the player walked {walked} blocks into a wall 1..4 blocks ahead;          the server's collision did not stop it"
+    );
     assert_eq!(
         h.believed(),
         h.authoritative(),

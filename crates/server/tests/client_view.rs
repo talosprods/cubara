@@ -76,8 +76,26 @@ fn two_clients_in_one_world_leave_one_authoritative_state() {
     };
     let a_block = under(&a, local);
     let b_block = under(&a, second);
+    let terrain = a.terrain();
+    assert!(
+        a.world
+            .is_solid_at(a_block[0], a_block[1], a_block[2], terrain)
+            && a.world
+                .is_solid_at(b_block[0], b_block[1], b_block[2], terrain),
+        "both blocks start solid, or breaking them proves nothing"
+    );
     a.break_at(a_block);
-    a.break_at(b_block);
+    // The second client mines its own block, as itself: the drop lands in its
+    // inventory, not the local player's.
+    a.break_at_as(second, b_block);
+    // The script did something. Without this, every comparison below holds
+    // just as well when `break_at` is a no-op.
+    for block in [a_block, b_block] {
+        assert!(
+            !a.world.is_solid_at(block[0], block[1], block[2], terrain),
+            "{block:?} is still solid after being broken"
+        );
+    }
 
     for _ in 0..20 {
         tick(&mut a, &PlayerInputs::default());
@@ -87,7 +105,7 @@ fn two_clients_in_one_world_leave_one_authoritative_state() {
     // same world -- and the hash is what says so, at one worker and at six.
     let mut b = server();
     let b_local = b.local.expect("a local client");
-    add_player(
+    let b_second = add_player(
         &mut b,
         [
             ground.x.floor_block() + 6,
@@ -96,11 +114,68 @@ fn two_clients_in_one_world_leave_one_authoritative_state() {
         ],
     );
     assert_eq!(b_local, local, "the local id is not positional luck");
+    assert_eq!(b_second, second, "the second id is not positional luck");
     b.break_at(a_block);
-    b.break_at(b_block);
+    b.break_at_as(b_second, b_block);
     for _ in 0..20 {
         tick(&mut b, &PlayerInputs::default());
     }
+
+    // Controls: the hash must be able to tell this world from one in which the
+    // script did not happen, and from one in which the second client is not
+    // there. If it cannot, "the hashes agree" says nothing about two clients.
+    let mut untouched = server();
+    add_player(
+        &mut untouched,
+        [
+            ground.x.floor_block() + 6,
+            ground.y.floor_block(),
+            ground.z.floor_block() + 6,
+        ],
+    );
+    for _ in 0..20 {
+        tick(&mut untouched, &PlayerInputs::default());
+    }
+    assert_ne!(
+        a.hash_with_workers(1),
+        untouched.hash_with_workers(1),
+        "the hash does not notice two broken blocks"
+    );
+    // Same two blocks gone, same two players, but the local player mined both
+    // and the second mined none: the terrain is identical and only whose
+    // pockets the drops landed in differs. If the hash cannot see that,
+    // players are not in it.
+    let mut swapped = server();
+    let swapped_second = add_player(
+        &mut swapped,
+        [
+            ground.x.floor_block() + 6,
+            ground.y.floor_block(),
+            ground.z.floor_block() + 6,
+        ],
+    );
+    let _ = swapped_second;
+    swapped.break_at(a_block);
+    swapped.break_at(b_block);
+    for _ in 0..20 {
+        tick(&mut swapped, &PlayerInputs::default());
+    }
+    assert_ne!(
+        a.hash_with_workers(1),
+        swapped.hash_with_workers(1),
+        "the hash does not notice whose inventory the drops went to"
+    );
+    let mut alone = server();
+    alone.break_at(a_block);
+    alone.break_at(b_block);
+    for _ in 0..20 {
+        tick(&mut alone, &PlayerInputs::default());
+    }
+    assert_ne!(
+        a.hash_with_workers(1),
+        alone.hash_with_workers(1),
+        "the hash does not notice the second player"
+    );
 
     assert_eq!(
         a.hash_with_workers(1),

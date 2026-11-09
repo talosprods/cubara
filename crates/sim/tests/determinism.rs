@@ -235,6 +235,13 @@ fn replay_of_the_same_seed_and_script_is_deterministic() {
     );
 }
 
+// **What "multi-threaded" means here, stated plainly.** The simulation has no
+// parallel part: `replay_with_edits` ticks on one thread, and the only code in
+// `cubara-sim` that spawns threads is the hash reducer (`hash::hash_region`).
+// So this varies the *reducer's* worker count (1 vs 6) and pins the value; it
+// does not, and cannot until a threaded tick exists, show that a threaded
+// *simulation* agrees with a single-threaded one. The phase gate's line says
+// the same. When a threaded tick or mesh step lands, add its variant here.
 #[test]
 fn the_fixture_reaches_a_known_hash_regardless_of_worker_count() {
     let (sim, world) = replay_with_edits(FIXTURE_SEED, &fixture_script(), &fixture_edits());

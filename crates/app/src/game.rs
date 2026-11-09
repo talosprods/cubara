@@ -3706,7 +3706,9 @@ mod tests {
         // Run the same furnace two ways for the same number of ticks: once with
         // the player standing next to it the whole time, and once with the
         // player far away so the chunk sleeps and is caught up on return.
-        for total in [50u64, 199, 200, 201, 450] {
+        // 1500 is long enough for the first log to burn out, so the catch-up has
+        // to relight from the fuel stack mid-sleep.
+        for total in [50u64, 199, 200, 201, 450, 1500] {
             let continuous = {
                 let (mut game, _) = game_looking_at_ground();
                 let pos = open_a_furnace(&mut game);
@@ -3727,7 +3729,18 @@ mod tests {
                 let home = game.host_player_mut().pos;
                 game.advance(TICK_DT);
                 game.host_player_mut().pos = home + FixedVec3::from_f32([4000.0, 0.0, 0.0]);
-                for _ in 0..total - 2 {
+                game.advance(TICK_DT);
+                // Without this the two runs are equal by construction whenever
+                // the teleport fails to put the chunk to sleep.
+                let coord = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
+                assert!(
+                    matches!(
+                        game.server().world.chunk_states().get(coord),
+                        cubara_world::ChunkState::Dormant { .. }
+                    ),
+                    "the chunk never went dormant, so nothing was caught up (total {total})"
+                );
+                for _ in 0..total - 3 {
                     game.advance(TICK_DT);
                 }
                 // Come back: the chunk wakes and catches up.
@@ -3736,14 +3749,27 @@ mod tests {
                 game.world().furnace_at(pos).copied().expect("still there")
             };
 
+            // The whole furnace, not only what the player can see: a catch-up
+            // that loses fuel, drops the burn in flight or resets progress
+            // leaves input and output right and everything else wrong.
             assert_eq!(
-                continuous.output, slept.output,
-                "output diverged after {total} ticks"
+                continuous, slept,
+                "the furnace diverged after {total} ticks"
             );
-            assert_eq!(
-                continuous.input, slept.input,
-                "input diverged after {total} ticks"
-            );
+            // Non-triviality: the short run is a furnace part-way through a
+            // smelt, the long ones have produced something. Neither is the
+            // empty furnace both sides would trivially agree about.
+            if total == 50 {
+                assert!(
+                    continuous.burning > 0 && continuous.progress > 0,
+                    "expected a furnace part-way through a smelt at {total} ticks: {continuous:?}"
+                );
+            } else if total >= 201 {
+                assert!(
+                    continuous.output.is_some(),
+                    "nothing was smelted in {total} ticks, so the comparison is empty"
+                );
+            }
         }
     }
 
@@ -3982,6 +4008,37 @@ mod tests {
         assert_eq!(game.cracking(), None, "a spectator digs nothing");
     }
 
+    /// The player stands on their column's surface block with open sky above.
+    ///
+    /// `on_ground` and full health are both true of a player standing in a cave
+    /// pocket or on a tree canopy, so a spawn that regressed to the bottom of a
+    /// shaft (the bug `crates/server/tests/spawn.rs` was written for) passed the
+    /// survival tests below. The full sweep over many seeds lives in that file;
+    /// this pins the same property through the real start-up path of the game.
+    fn assert_stands_on_the_surface(game: &Game) {
+        let server = game.server();
+        let terrain = server.terrain.expect("assets are set");
+        let pos = game.host_player().pos;
+        let (x, z) = (pos.x.floor_block(), pos.z.floor_block());
+        let feet = ((pos.y - cubara_sim::physics::EYE_HEIGHT).to_f32() + 0.01).floor() as i32;
+        let surface = server.world.surface_height(x, z);
+        assert_eq!(
+            feet,
+            surface + 1,
+            "not standing on the surface at ({x}, {z})"
+        );
+        assert!(
+            server.world.is_solid_at(x, surface, z, terrain),
+            "no solid surface block under the feet"
+        );
+        for y in feet..=feet + 32 {
+            assert!(
+                !server.world.is_solid_at(x, y, z, terrain),
+                "something solid at y = {y} above the player: a cave roof or a canopy"
+            );
+        }
+    }
+
     #[test]
     fn the_game_does_not_start_by_killing_the_player() {
         // **The test that was missing.** Every other test in this file
@@ -4014,6 +4071,7 @@ mod tests {
             "starting the game cost {} health",
             cubara_sim::MAX_HEALTH - health
         );
+        assert_stands_on_the_surface(&game);
     }
 
     #[test]
@@ -4041,6 +4099,7 @@ mod tests {
             "respawning cost health, so death loops"
         );
         assert!(game.host_player_mut().on_ground, "and it landed");
+        assert_stands_on_the_surface(&game);
     }
 
     #[test]

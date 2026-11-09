@@ -1135,6 +1135,12 @@ mod tests {
         // not on a peak (iron, which lies below y = 40, stays within reach, and
         // the tests framed on the origin keep their terrain), and a range is
         // close enough to see.
+        //
+        // This is about the *shape of the land* around the origin. That the
+        // spawn point itself stands on the surface under open sky (not in a
+        // cave pocket) is `crates/server/tests/spawn.rs`'s job, over 1000
+        // seeds, and the game's start-up path is checked by
+        // `the_game_does_not_start_by_killing_the_player` in the app.
         let gen = WorldGen::new(DEFAULT_TEST_SEED);
         let mut nearest_peak = f64::MAX;
         for x in (-640..=640).step_by(8) {

@@ -212,7 +212,7 @@ fn assert_frame_golden(name: &str, frame: Option<Frame>) {
         // No adapter (a GPU-less CI runner). Skipping is honest here — the
         // alternative is a red build that says nothing about the code — but it is
         // reported loudly so a silently-never-running test is noticeable.
-        eprintln!("SKIP {name}: no GPU adapter available on this machine");
+        eprintln!("SKIPPED {name}: no GPU adapter available on this machine");
         return;
     };
 
@@ -301,7 +301,7 @@ fn the_same_scene_renders_byte_identically() {
     // state is hashed or saved; see issue #83.
     let shot = Shot::default();
     let Some(a) = render_world(&World::new(), shot.clone()) else {
-        eprintln!("SKIP the_same_scene_renders_byte_identically: no GPU adapter");
+        eprintln!("SKIPPED the_same_scene_renders_byte_identically: no GPU adapter");
         return;
     };
     let b = render_world(&World::new(), shot).expect("adapter was available a moment ago");
@@ -1202,7 +1202,7 @@ fn distinct_materials_render_with_distinct_textures() {
         headless::render_chunks(&chunks, shot)
     };
     let Some(frame) = frame else {
-        eprintln!("SKIP distinct_materials_render_with_distinct_textures: no GPU adapter");
+        eprintln!("SKIPPED distinct_materials_render_with_distinct_textures: no GPU adapter");
         return;
     };
 
@@ -1254,7 +1254,7 @@ fn edits_change_what_is_drawn() {
     let shot = Shot::default();
     let mut world = World::new();
     let Some(base) = render_world(&World::new(), shot.clone()) else {
-        eprintln!("SKIP edits_change_what_is_drawn: no GPU adapter");
+        eprintln!("SKIPPED edits_change_what_is_drawn: no GPU adapter");
         return;
     };
 
@@ -1569,7 +1569,7 @@ fn far_shading_is_the_aggregate_reference() {
             headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
         };
         let Some(frame) = frame else {
-            eprintln!("SKIP far_shading_is_the_aggregate_reference: no GPU adapter");
+            eprintln!("SKIPPED far_shading_is_the_aggregate_reference: no GPU adapter");
             return;
         };
         let at = ((32 * frame.width + 32) * 4) as usize;
