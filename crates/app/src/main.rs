@@ -934,7 +934,7 @@ fn main() {
             // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--seconds S]
             // [--speed B] [--fps F] [--frames DIR]`: how much of the screen is
             // still loading while flying at the game's speed.
-            bench::Target::Flight => {
+            bench::Target::Flight | bench::Target::Still => {
                 let number = |name: &str, default: f32| {
                     flag(name).map_or(default, |t| {
                         t.parse().unwrap_or_else(|_| {
@@ -949,19 +949,38 @@ fn main() {
                         std::process::exit(2);
                     })
                 });
+                let still = target == bench::Target::Still;
                 let flight = flight::Flight {
                     start: eye.unwrap_or([8.0, 120.0, 8.0]),
                     look,
-                    speed: number("--speed", flight::FLY_SPEED),
+                    speed: if still {
+                        0.0
+                    } else {
+                        number("--speed", flight::FLY_SPEED)
+                    },
                     seconds: number("--seconds", 20.0),
                     fps: number("--fps", 60.0) as u32,
                     every: number("--every", 0.25),
                     size,
                     quality: far_streaming::FarQuality::High,
+                    seed: flag("--seed").map(|t| {
+                        t.parse().unwrap_or_else(|_| {
+                            eprintln!("--seed needs a whole number");
+                            std::process::exit(2);
+                        })
+                    }),
                 };
-                match flight::fly(&flight, flag("--frames").map(std::path::Path::new)) {
-                    Some(report) => log::info!("{}", report.line()),
-                    None => log::error!("FLIGHT: no GPU to fly on"),
+                let frames = flag("--frames").map(std::path::Path::new);
+                if still {
+                    match flight::stand(&flight, frames) {
+                        Some(report) => log::info!("{}", report.line()),
+                        None => log::error!("STILL: no GPU to render on"),
+                    }
+                } else {
+                    match flight::fly(&flight, frames) {
+                        Some(report) => log::info!("{}", report.line()),
+                        None => log::error!("FLIGHT: no GPU to fly on"),
+                    }
                 }
                 return;
             }

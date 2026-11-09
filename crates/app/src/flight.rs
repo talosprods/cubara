@@ -49,6 +49,8 @@ pub struct Flight {
     pub every: f32,
     pub size: (u32, u32),
     pub quality: FarQuality,
+    /// The world's seed; `None` is the default world.
+    pub seed: Option<u64>,
 }
 
 /// Where the eye is `t` seconds into `flight`.
@@ -161,7 +163,10 @@ impl Streamed {
             &crate::game::load_ore_registry(),
             move |name: &str| layers.layer_of(name),
         );
-        let world = Arc::new(World::new());
+        let world = Arc::new(match flight.seed {
+            Some(seed) => World::with_seed(seed),
+            None => World::new(),
+        });
         let far = FarStreaming::new(world.seed(), flight.quality);
         Some(Self {
             world,
@@ -230,11 +235,10 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     // nothing is a different question, with its own answer.
     let mut live = Streamed::new(flight)?;
     live.settle(flight, flight.start);
-    let budget = Duration::from_secs_f64(1.0 / flight.fps.max(1) as f64);
+    let mut pacer = Pacer::new(flight.fps);
     let mut kept: Vec<(f32, [f32; 3], Frame)> = Vec::new();
     let mut work_times = Vec::new();
     let start = Instant::now();
-    let mut next_frame = start;
     let mut next_keep = 0.0;
     loop {
         let t = start.elapsed().as_secs_f32();
@@ -255,14 +259,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
             kept.push((t, eye, live.renderer.read_frame()?));
             next_keep += flight.every;
         }
-        // Paced like a display showing `fps` frames a second: a frame that
-        // ran late starts the next at once rather than catching up.
-        next_frame += budget;
-        let now = Instant::now();
-        match next_frame.checked_duration_since(now) {
-            Some(rest) => std::thread::sleep(rest),
-            None => next_frame = now,
-        }
+        pacer.wait();
     }
     drop(live);
 
@@ -311,6 +308,199 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     })
 }
 
+/// Paces a loop like a display showing `fps` frames a second: a frame that
+/// ran late starts the next at once rather than catching up.
+struct Pacer {
+    budget: Duration,
+    next: Instant,
+}
+
+impl Pacer {
+    fn new(fps: u32) -> Self {
+        Self {
+            budget: Duration::from_secs_f64(1.0 / fps.max(1) as f64),
+            next: Instant::now(),
+        }
+    }
+
+    /// Call at the end of a frame.
+    fn wait(&mut self) {
+        self.next += self.budget;
+        let now = Instant::now();
+        match self.next.checked_duration_since(now) {
+            Some(rest) => std::thread::sleep(rest),
+            None => self.next = now,
+        }
+    }
+}
+
+/// A frame counts as matching the finished one, or as differing again, at
+/// this share of pixels (0.1%: a small triangle on a 3136x860 screen is
+/// 0.15% at a thousand pixels a side).
+const STILL_SHARE: f64 = 0.001;
+
+/// Per-channel tolerance when comparing two frames of a camera that did not
+/// move: the same scene draws the same, so this only absorbs rounding.
+const STILL_TOLERANCE: u8 = 4;
+
+/// Most memory the distinct frames of a still run may take.
+const STILL_FRAME_BYTES: usize = 3 << 30;
+
+/// What a still run found, per frame, in the order drawn.
+#[derive(Debug, Default, PartialEq)]
+pub struct StillReport {
+    pub frames: usize,
+    /// The first frame that matched the finished one.
+    pub first_match: Option<usize>,
+    /// Frames after `first_match` that differ again, with the share of pixels.
+    pub flicker: Vec<(usize, f64)>,
+    /// Frames before `first_match` with sky where the finished frame has none.
+    pub holes: Vec<(usize, f64)>,
+}
+
+impl StillReport {
+    pub fn line(&self) -> String {
+        let worst = |v: &[(usize, f64)]| v.iter().map(|&(_, x)| x).fold(0.0, f64::max) * 100.0;
+        format!(
+            "STILL: frames {}, after-settle flicker frames {} (worst {:.2}%), \
+             loading-hole frames {} (worst {:.2}%)",
+            self.frames,
+            self.flicker.len(),
+            worst(&self.flicker),
+            self.holes.len(),
+            worst(&self.holes)
+        )
+    }
+}
+
+/// Judge a run from, per frame, its share of pixels that differ from the
+/// finished frame and its share that are sky where the finished frame is not.
+/// Pure so that the rule -- what counts as flicker, what as a hole -- is
+/// tested without a GPU.
+pub fn judge_still(differs: &[f64], sky_holes: &[f64]) -> StillReport {
+    let first_match = differs.iter().position(|&d| d < STILL_SHARE);
+    let after = first_match.map_or(differs.len(), |m| m + 1);
+    let flicker = (after..differs.len())
+        .filter(|&i| differs[i] > STILL_SHARE)
+        .map(|i| (i, differs[i]))
+        .collect();
+    let holes = (0..after.min(differs.len()))
+        .filter(|&i| sky_holes[i] > STILL_SHARE)
+        .map(|i| (i, sky_holes[i]))
+        .collect();
+    StillReport {
+        frames: differs.len(),
+        first_match,
+        flicker,
+        holes,
+    }
+}
+
+/// The share of `live`'s pixels that are `sky` where `settled` is not.
+fn sky_hole_share(live: &Frame, settled: &Frame, sky: [u8; 3]) -> f64 {
+    let is_sky = |p: &[u8]| (0..3).all(|c| p[c].abs_diff(sky[c]) <= 3);
+    let n = live
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(settled.pixels.as_chunks::<4>().0.iter())
+        .filter(|(l, s)| is_sky(&l[..]) && !is_sky(&s[..]))
+        .count();
+    n as f64 / (live.pixels.len() / 4) as f64
+}
+
+/// `--bench still`: stand at `flight.start` looking along `flight.look` in a
+/// world that starts empty, as New World does, drawing every frame for
+/// `flight.seconds`; then load everything and take that as the reference. See
+/// [`judge_still`] for what is reported. With `frames`, the offending frames
+/// and `reference.png` are written there. `None` without a GPU.
+pub fn stand(flight: &Flight, frames: Option<&Path>) -> Option<StillReport> {
+    let mut game = Streamed::new(flight)?;
+    let eye = flight.start;
+    let mut pacer = Pacer::new(flight.fps);
+    // Frames that repeat the one before are stored once: loaded, a still
+    // camera draws the same frame for as long as it likes.
+    let mut distinct: Vec<Frame> = Vec::new();
+    let mut order: Vec<Option<usize>> = Vec::new();
+    let mut bytes = 0usize;
+    let start = Instant::now();
+    while start.elapsed().as_secs_f32() <= flight.seconds {
+        game.frame(flight, eye);
+        let frame = game.renderer.read_frame()?;
+        if distinct.last().is_some_and(|l| l.pixels == frame.pixels) {
+            order.push(Some(distinct.len() - 1));
+        } else if bytes + frame.pixels.len() <= STILL_FRAME_BYTES {
+            bytes += frame.pixels.len();
+            distinct.push(frame);
+            order.push(Some(distinct.len() - 1));
+        } else {
+            order.push(None);
+        }
+        pacer.wait();
+    }
+    if order.contains(&None) {
+        log::warn!("still: out of frame memory; later changing frames are not judged");
+    }
+    let loaded_at = start.elapsed().as_secs_f32();
+    game.settle(flight, eye);
+    let reference = game.renderer.read_frame()?;
+    log::info!(
+        "still: {} frames in {loaded_at:.1} s ({} distinct), settled after {:.1} s more",
+        order.len(),
+        distinct.len(),
+        start.elapsed().as_secs_f32() - loaded_at
+    );
+
+    // The sky is what the very first frame, of nothing, is.
+    let first = distinct.first()?;
+    let sky = [first.pixels[0], first.pixels[1], first.pixels[2]];
+    if first
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|p| p[..3] != sky)
+    {
+        log::warn!("still: the first frame is not all sky; holes are measured against its corner");
+    }
+    let measure = |f: &Frame| {
+        (
+            cubara_render::headless::compare(&f.pixels, &reference.pixels, STILL_TOLERANCE)
+                .differing_fraction,
+            sky_hole_share(f, &reference, sky),
+        )
+    };
+    let per_distinct: Vec<(f64, f64)> = distinct.iter().map(measure).collect();
+    let (differs, holes): (Vec<f64>, Vec<f64>) = order
+        .iter()
+        .map(|i| i.map_or((0.0, 0.0), |i| per_distinct[i]))
+        .unzip();
+    let report = judge_still(&differs, &holes);
+    if let Some(dir) = frames {
+        let _ = std::fs::create_dir_all(dir);
+        save(&dir.join("reference.png"), &reference);
+        let write = |kind: &str, picks: Vec<(usize, f64)>| {
+            for (i, share) in picks {
+                if let Some(Some(d)) = order.get(i) {
+                    let name = format!("f{i:05}-{kind}-{:.2}pct.png", share * 100.0);
+                    save(&dir.join(name), &distinct[*d]);
+                }
+            }
+        };
+        write("flicker", report.flicker.iter().take(60).copied().collect());
+        // The worst holes, and the last ones: the ones that outlive the rest.
+        let mut worst = report.holes.clone();
+        worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut picks: Vec<_> = worst.into_iter().take(5).collect();
+        picks.extend(report.holes.iter().rev().take(5).copied());
+        picks.sort_by_key(|p| p.0);
+        picks.dedup_by_key(|p| p.0);
+        write("hole", picks);
+    }
+    Some(report)
+}
+
 /// Keep `candidate` as the worst so far if it is: more of it was loading.
 fn keep_worst<T>(worst: &mut Option<(f64, T)>, loading: f64, candidate: T) {
     if worst.as_ref().is_none_or(|(l, _)| loading > *l) {
@@ -344,6 +534,7 @@ mod tests {
             every: 0.5,
             size: (64, 32),
             quality: FarQuality::High,
+            seed: None,
         }
     }
 
@@ -390,6 +581,32 @@ mod tests {
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
         assert_eq!(r.worst().unwrap().loading, 0.1);
+    }
+
+    #[test]
+    fn flicker_is_a_difference_after_the_first_match_and_a_hole_before_it() {
+        // Loading, loading, matches, flickers, matches, flickers a little.
+        let differs = [1.0, 0.5, 0.0, 0.01, 0.0, 0.0005];
+        let holes = [1.0, 0.2, 0.0, 0.01, 0.0, 0.0];
+        let r = judge_still(&differs, &holes);
+        assert_eq!(r.first_match, Some(2));
+        assert_eq!(r.flicker, vec![(3, 0.01)]);
+        assert_eq!(r.holes, vec![(0, 1.0), (1, 0.2)]);
+        // Never matching: everything is loading, nothing is flicker.
+        let r = judge_still(&[1.0, 0.9], &[1.0, 0.0]);
+        assert_eq!(
+            (r.first_match, r.flicker.len(), r.holes.len()),
+            (None, 0, 1)
+        );
+    }
+
+    #[test]
+    fn a_sky_hole_is_sky_where_the_finished_frame_is_not() {
+        let sky = [10, 20, 30];
+        let px = |c: [u8; 3]| [c[0], c[1], c[2], 255];
+        let live = frame([px(sky), px(sky), px([1, 1, 1])].concat());
+        let done = frame([px(sky), px([200, 0, 0]), px(sky)].concat());
+        assert!((sky_hole_share(&live, &done, sky) - 1.0 / 3.0).abs() < 1e-12);
     }
 
     #[test]

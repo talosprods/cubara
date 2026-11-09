@@ -719,6 +719,43 @@ mod tests {
         out
     }
 
+    /// The far shader's `visible_weights` has no `faces_away` guard before
+    /// `masked_top`, so an eye BELOW the terrain (a cave under the far
+    /// surface, `v.y < 0`) reaches the table lookup with `seen <= 0`. Pins
+    /// what that does on the CPU mirror: the lookup stays finite and in
+    /// `0..=1` (no NaN, so a white or black triangle is not explained by
+    /// it), but it is the table's clamped corner for a view the reference
+    /// calls `None`, not the "call it top" fallback the shader intends.
+    #[test]
+    fn the_masked_lookup_stays_finite_for_an_eye_below_the_ground() {
+        let table = MaskingTable::committed();
+        let mut unguarded = 0;
+        for (g, _) in grid(&[0.0], 90) {
+            for elevation in [-80.0, -45.0, -10.0, -1.0] {
+                for azimuth in (0..360).step_by(15) {
+                    let v = view(elevation, azimuth as f32 + 7.0);
+                    let (x_faces, z_faces) = (g[0] * v.x < 0.0, g[1] * v.z < 0.0);
+                    let (x_hides, z_hides) = (g[0] * v.x > 0.0, g[1] * v.z > 0.0);
+                    let top = if x_faces && z_hides {
+                        table.top_fraction(g[0].abs(), g[1].abs(), v.x.abs(), v.z.abs(), v.y)
+                    } else if z_faces && x_hides {
+                        table.top_fraction(g[1].abs(), g[0].abs(), v.z.abs(), v.x.abs(), v.y)
+                    } else {
+                        continue;
+                    };
+                    assert!(
+                        top.is_finite() && (-1e-4..=1.0001).contains(&top),
+                        "{g:?} {v}: {top}"
+                    );
+                    if faces_away(g, v) {
+                        unguarded += 1;
+                    }
+                }
+            }
+        }
+        assert!(unguarded > 0, "no below-ground view reached the lookup");
+    }
+
     #[test]
     fn the_reference_agrees_with_rays_cast_one_by_one() {
         let mut worst_seen = 0.0f64;

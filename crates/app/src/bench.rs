@@ -335,6 +335,9 @@ pub enum Target {
     /// `--bench flight`: how much of the screen is still loading while
     /// flying (`crate::flight`).
     Flight,
+    /// `--bench still`: a camera that does not move, from an empty world --
+    /// does anything flicker once it has loaded (`crate::flight::stand`).
+    Still,
     /// `--bench <radius>`: one scene of this chunk radius -- 12, a
     /// realistically heavy world, when none is given.
     Radius(i32),
@@ -346,6 +349,7 @@ pub fn parse_target(word: Option<&str>) -> Target {
         Some("gate") => Target::Gate,
         Some("tune") => Target::Tune,
         Some("flight") => Target::Flight,
+        Some("still") => Target::Still,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
     }
 }
@@ -1394,6 +1398,7 @@ mod tests {
         assert_eq!(parse_target(Some("gate")), Target::Gate);
         assert_eq!(parse_target(Some("tune")), Target::Tune);
         assert_eq!(parse_target(Some("flight")), Target::Flight);
+        assert_eq!(parse_target(Some("still")), Target::Still);
         assert_eq!(parse_target(Some("64")), Target::Radius(64));
         assert_eq!(parse_target(None), Target::Radius(12));
         // A flag straight after `--bench` is not a radius.
