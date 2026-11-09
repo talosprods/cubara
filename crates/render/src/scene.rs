@@ -200,6 +200,14 @@ pub struct HotbarView<'a> {
     pub selected: u8,
 }
 
+/// Whether `set_lighting(wanted)` must start a background rebuild: not when
+/// the landed pipeline already has `wanted`, and not when a rebuild for
+/// exactly `wanted` is already in flight. A different value supersedes
+/// whatever is in flight.
+fn rebuild_needed(landed: &Lighting, in_flight: Option<&Lighting>, wanted: &Lighting) -> bool {
+    wanted != landed && in_flight != Some(wanted)
+}
+
 /// Owns everything a frame needs that is not the geometry or the camera pose:
 /// the pipeline, the camera uniform, the depth buffer, and the debug-text overlay.
 ///
@@ -228,7 +236,14 @@ pub struct SceneRenderer {
     /// frame or two of stale lighting (a resized pipeline must match the new
     /// viewport immediately; a one-shot screenshot has only one frame to be
     /// right in).
-    lighting_rebuild: Option<std::sync::mpsc::Receiver<(Lighting, wgpu::RenderPipeline)>>,
+    ///
+    /// Stored with the `Lighting` it is building, so `set_lighting` can tell
+    /// "already on its way" from "needs a (new) rebuild" -- see
+    /// [`rebuild_needed`].
+    lighting_rebuild: Option<(
+        Lighting,
+        std::sync::mpsc::Receiver<(Lighting, wgpu::RenderPipeline)>,
+    )>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     /// `@group(2)` in `mesh.wgsl`: the block texture array + sampler.
@@ -430,16 +445,20 @@ impl SceneRenderer {
     /// exactly the "spread over frames, smooth on-the-go updates" the
     /// project owner asked for instead of pre-building every value up front.
     ///
-    /// A rebuild already in flight for a value that's since changed again is
-    /// simply superseded: replacing `lighting_rebuild` drops the old
-    /// receiver, so that thread's eventual `send` finds no one listening and
-    /// is silently discarded.
+    /// A rebuild already in flight for the *same* value is left alone (the
+    /// caller passes the value every frame; spawning a thread per frame
+    /// would pile up dozens of identical compiles and keep dropping the one
+    /// about to land). A rebuild in flight for a value that's since changed
+    /// to a *different* one is superseded: replacing `lighting_rebuild`
+    /// drops the old receiver, so that thread's eventual `send` finds no one
+    /// listening and is silently discarded.
     pub fn set_lighting(&mut self, device: &wgpu::Device, lighting: Lighting) {
-        if lighting == self.pipeline_lighting {
+        let in_flight = self.lighting_rebuild.as_ref().map(|(l, _)| l);
+        if !rebuild_needed(&self.pipeline_lighting, in_flight, &lighting) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        self.lighting_rebuild = Some(rx);
+        self.lighting_rebuild = Some((lighting, rx));
         let device = device.clone();
         let format = self.format;
         let shader = self.mesh_shader.clone();
@@ -459,7 +478,7 @@ impl SceneRenderer {
     /// actually in flight. Called from [`encode_scene`](Self::encode_scene)
     /// so no caller needs to remember to do this themselves.
     fn poll_lighting_rebuild(&mut self) {
-        let Some(rx) = &self.lighting_rebuild else {
+        let Some((_, rx)) = &self.lighting_rebuild else {
             return;
         };
         match rx.try_recv() {
@@ -484,7 +503,7 @@ impl SceneRenderer {
     /// already matches, the overwhelmingly common case once a scene's first
     /// frame has built its real pipeline).
     pub fn wait_for_lighting_rebuild(&mut self) {
-        let Some(rx) = self.lighting_rebuild.take() else {
+        let Some((_, rx)) = self.lighting_rebuild.take() else {
             return;
         };
         if let Ok((lighting, pipeline)) = rx.recv() {
@@ -966,5 +985,37 @@ impl SceneRenderer {
             const PAD: f32 = 8.0;
             self.queue_item(x, y, SLOT, PAD, *item);
         }
+    }
+}
+
+#[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+
+    fn lit(fog_end: f32) -> Lighting {
+        Lighting {
+            fog_end,
+            ..Lighting::default()
+        }
+    }
+
+    #[test]
+    fn same_value_as_in_flight_does_not_rebuild() {
+        assert!(!rebuild_needed(&lit(0.0), Some(&lit(100.0)), &lit(100.0)));
+    }
+
+    #[test]
+    fn same_value_as_landed_does_not_rebuild() {
+        assert!(!rebuild_needed(&lit(100.0), None, &lit(100.0)));
+    }
+
+    #[test]
+    fn new_value_while_another_is_in_flight_rebuilds() {
+        assert!(rebuild_needed(&lit(0.0), Some(&lit(100.0)), &lit(200.0)));
+    }
+
+    #[test]
+    fn new_value_after_landing_rebuilds() {
+        assert!(rebuild_needed(&lit(100.0), None, &lit(200.0)));
     }
 }
