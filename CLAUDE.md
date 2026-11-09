@@ -153,9 +153,21 @@ A screenshot someone looked at once proves nothing about the next commit.
 Rendering changes ship with a golden-image test; logic lives in pure functions
 with unit tests, outside the GPU path. See `CONTRIBUTING.md`.
 
-Do not drive the app with synthetic OS-level input (AppleScript keystrokes and
-similar) to "verify" something — it lands on the user's real desktop, not
-reliably in the app, and proves nothing either way.
+Playing the real game window is allowed — **the owner asked for it on
+2026-11-09** ("test ook in de echte GUI", and chose control over only looking)
+— through a tool that targets the game window (Claude's computer-use), never
+blind keystrokes such as AppleScript that land on whatever has focus. Three
+conditions:
+
+- **A separate test world**, never the owner's `saves/world` or
+  `saves/settings.ron`. Choose it with `--world <dir>` (the same flag as the
+  dedicated server's; settings go beside it, in `<dir>/../settings.ron`), e.g.
+  `cargo run --release -- --world "$TEMP/cubara-gui-test/world"`.
+- **Only a window you started yourself.** The owner may be playing in his.
+- **It finds things; it does not prove them.** What a play session turns up
+  becomes an automated test or a golden image before the fix lands. Playing
+  is how the two bugs in `ROADMAP.md`'s 2026-09-11 notes were found, and a test
+  is what keeps them fixed.
 
 ### A test that has never been seen to fail is not yet evidence
 

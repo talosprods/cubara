@@ -50,7 +50,7 @@ fn shot_with_fog(shot: Shot) -> Shot {
     }
 }
 
-pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
+pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::paths::SavePaths) {
     let world = World::new();
     let registry = load_registry();
     let layers = TextureLayers::from_registry(&registry);
@@ -98,7 +98,7 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>) {
                 max: max.map(|c| (c * 16) as f64),
             };
             // This PC's quality, as the game would draw it.
-            let quality = crate::settings::load(&crate::settings::settings_path())
+            let quality = crate::settings::load(&paths.settings)
                 .unwrap_or_default()
                 .far;
             let eye = v.eye.map(|c| c as f64);

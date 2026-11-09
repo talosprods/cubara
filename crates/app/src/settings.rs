@@ -6,7 +6,7 @@
 //! looks over frame rate or the other way round in the options. So the choice
 //! lives here, next to the saves but not in any one of them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -49,12 +49,6 @@ impl Settings {
             None => true,
         }
     }
-}
-
-/// Where this PC's settings live: beside the world, in the saves folder, which
-/// is not part of the project's source.
-pub fn settings_path() -> PathBuf {
-    cubara_server::assets::repo_root().join("saves/settings.ron")
 }
 
 /// The settings at `path`, or `None` when there are none yet or they do not

@@ -54,22 +54,14 @@ const REPLY_TICKS: u32 = (5.0 / TICK_DT) as u32;
 /// draws items and builds the same registries — so it says where they went
 /// rather than keeping a second copy.
 pub use cubara_server::assets::{
-    load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry, world_dir,
+    load_item_registry, load_ore_registry, load_recipe_book, load_structure_registry,
 };
 
-/// Where [`Game::save`] and [`Game::load`] keep the world: the player's
-/// `saves/world` -- except under `cargo test`, which gets a directory of its
-/// own. A test that called `save()` once wrote a fresh world over the owner's
-/// real save, player and inventory included; a test can no longer reach it.
-fn save_dir() -> std::path::PathBuf {
-    if cfg!(test) {
-        std::env::temp_dir().join("cubara-test-saves-world")
-    } else {
-        world_dir()
-    }
-}
-
 pub struct Game {
+    /// Where [`Game::save`] and [`Game::load`] keep the world: `--world`, or
+    /// the player's own `saves/world` (`paths.rs`) -- and under `cargo test` a
+    /// directory of its own, so no test can reach the owner's save.
+    paths: crate::paths::SavePaths,
     /// The authoritative half (`docs/RESEARCH_MULTIPLAYER.md` §8): the world,
     /// the simulation and the registries.
     ///
@@ -353,6 +345,11 @@ impl Game {
     /// you land in and walk, not one you start already flying over) -- gravity
     /// carries the player down onto the terrain below.
     pub fn new() -> Self {
+        Self::with_paths(crate::paths::SavePaths::default())
+    }
+
+    /// A game that saves to, and loads from, `paths`.
+    pub fn with_paths(paths: crate::paths::SavePaths) -> Self {
         // **No server yet, and no world.** A client is constructed before the
         // window exists, and a world cannot open until assets are loaded --
         // which happens once the renderer has validated its textures. Until
@@ -371,7 +368,7 @@ impl Game {
         // client would be. The world it hosts is empty until `set_assets`, which
         // is the same moment the old code stood the player on the ground.
         let cfg = Config {
-            world: save_dir(),
+            world: paths.world.clone(),
             autosave_ticks: 0,
             ..Config::default()
         };
@@ -388,6 +385,7 @@ impl Game {
         let me_id = welcome_id(&mut link).unwrap_or(PlayerId::LOCAL);
 
         Self {
+            paths,
             world: Arc::new(World::new()),
             me: Prediction::new(World::new().seed(), player),
             others: OtherPlayers::new(),
@@ -871,12 +869,13 @@ impl Game {
     /// Write the world to disk (#179). The server owns the world, so it owns
     /// the save; this is the client's shutdown reaching for it.
     pub fn save(&self) {
-        self.server().save_to(&save_dir());
+        self.server().save_to(&self.paths.world);
     }
 
     /// Replace this game's world with the one on disk, if there is one (#179).
     pub fn load(&mut self) -> bool {
-        self.load_from(&save_dir())
+        let dir = self.paths.world.clone();
+        self.load_from(&dir)
     }
 
     /// [`load`](Self::load) from a specific directory.
@@ -1703,7 +1702,8 @@ impl Game {
     /// Replace the world with a fresh one on `seed`, keeping the old one as
     /// `saves/world-<label>-<n>` -- see [`Self::new_world_in`].
     pub fn new_world(&mut self, seed: u64, label: &str) -> Option<std::path::PathBuf> {
-        self.new_world_in(&save_dir(), seed, label)
+        let dir = self.paths.world.clone();
+        self.new_world_in(&dir, seed, label)
     }
 
     /// [`new_world`](Self::new_world), with the save at `dir`.
@@ -4441,6 +4441,34 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// **New World uses the game's own paths**, and keeps the old world beside
+    /// the given one -- with `--world <dir>` that is `<dir>`'s sibling, never
+    /// `saves/`.
+    #[test]
+    fn new_world_keeps_the_old_one_beside_the_given_world_dir() {
+        let root = scratch_dir("new-world-paths");
+        let world = root.join("world");
+        let mut game = Game::with_paths(crate::paths::SavePaths::for_world(world.clone()));
+        let items = load_item_registry();
+        let recipes = load_recipe_book(&items);
+        game.set_assets(
+            std::sync::Arc::new(cubara_render::load_registry()),
+            items,
+            recipes,
+        );
+        game.settle();
+        let seed = game.world().seed().wrapping_add(1);
+        let kept = game.new_world(seed, "test").expect("replaced");
+
+        assert_eq!(kept.parent(), world.parent(), "kept beside the given world");
+        assert!(kept.starts_with(&root));
+        assert!(
+            world.exists(),
+            "the new world was not saved in the given dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Nothing happens unless the old world is safe.** A save that cannot be

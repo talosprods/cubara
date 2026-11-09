@@ -20,6 +20,7 @@ mod far_streaming;
 mod flight;
 mod game;
 mod options;
+mod paths;
 mod screenshot;
 mod settings;
 mod streaming;
@@ -87,6 +88,8 @@ struct App {
     /// The far terrain beyond the voxels (`docs/PROPOSAL_FAR_VIEW.md`), same
     /// lifecycle as `streaming`.
     far: Option<far_streaming::FarStreaming>,
+    /// Where the world and the settings live (`--world`, else the standard).
+    paths: paths::SavePaths,
     /// This PC's settings (`settings.rs`), read when the window opens.
     settings: settings::Settings,
     /// The options screen is open, over the pause menu.
@@ -283,6 +286,7 @@ impl App {
         let spawned = std::process::Command::new(exe)
             .args(["--bench", "tune", "--target", &self.target_fps.to_string()])
             .args(["--size", &format!("{w}x{h}")])
+            .args(self.paths.child_args())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -312,7 +316,7 @@ impl App {
             log::warn!("the benchmark did not finish ({status})");
             return;
         }
-        if let Some(chosen) = settings::load(&settings::settings_path()) {
+        if let Some(chosen) = settings::load(&self.paths.settings) {
             log::info!("the benchmark chose far terrain {}", chosen.far.name());
             self.settings = chosen;
             self.set_far_quality(self.settings.far);
@@ -351,7 +355,7 @@ impl App {
             lower.name()
         );
         self.settings.far = lower;
-        if let Err(e) = settings::save(&settings::settings_path(), &self.settings) {
+        if let Err(e) = settings::save(&self.paths.settings, &self.settings) {
             log::warn!("could not save the settings: {e}");
         }
         self.set_far_quality(lower);
@@ -376,7 +380,7 @@ impl App {
             return;
         };
         options::apply(&mut self.settings, key);
-        if let Err(e) = settings::save(&settings::settings_path(), &self.settings) {
+        if let Err(e) = settings::save(&self.paths.settings, &self.settings) {
             log::warn!("could not save the settings: {e}");
         }
         match key {
@@ -455,7 +459,7 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.settings = settings::load(&settings::settings_path()).unwrap_or_default();
+        self.settings = settings::load(&self.paths.settings).unwrap_or_default();
         self.far = Some(far_streaming::FarStreaming::new(
             self.game.world().seed(),
             self.settings.far,
@@ -817,6 +821,13 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
+    let paths = match paths::SavePaths::from_args(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
 
     // The dedicated server: `cubara server [options]`.
     //
@@ -969,7 +980,7 @@ fn main() {
                     }),
                     by_hand: false,
                 };
-                match settings::save(&settings::settings_path(), &chosen) {
+                match settings::save(&paths.settings, &chosen) {
                     Ok(()) => log::info!(
                         "TUNE: {} holds {target_fps} FPS on {}",
                         far.name(),
@@ -1031,7 +1042,7 @@ fn main() {
         // --menu "line one\nline two"`, `\n` unescaped since a shell arg
         // can't carry a real newline).
         let menu = value("--menu").map(|m| m.replace("\\n", "\n"));
-        screenshot::run(path, view, menu);
+        screenshot::run(path, view, menu, &paths);
         return;
     }
 
@@ -1054,6 +1065,8 @@ fn main() {
     let mut app = App {
         _profiler: Profiler::init(),
         connect_to,
+        game: Game::with_paths(paths.clone()),
+        paths,
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");
