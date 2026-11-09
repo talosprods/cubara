@@ -96,7 +96,7 @@ struct App {
     options_open: bool,
     /// A benchmark running in a child process (`--bench tune`), choosing the
     /// far-terrain quality that holds `target_fps`.
-    tuning: Option<std::process::Child>,
+    tuning: Option<TuneChild>,
     /// The frame rate to hold: the monitor's refresh rate.
     target_fps: u32,
     /// Steps the quality down when frames miss the refresh rate while playing.
@@ -138,7 +138,7 @@ struct App {
 /// top of `window_event`) -- borrowing only the one field this actually
 /// reads is what keeps those disjoint.
 fn any_screen_open(game: &Game) -> bool {
-    game.inventory_open() || game.pause_open() || game.console().is_some()
+    game.screen_open()
 }
 
 /// What pressing Escape does, decided from `Game`'s screen state alone -- no
@@ -296,7 +296,7 @@ impl App {
                     "benchmarking this PC for {} FPS in the background",
                     self.target_fps
                 );
-                self.tuning = Some(child);
+                self.tuning = Some(TuneChild(child));
             }
             Err(e) => log::warn!("could not start the benchmark: {e}"),
         }
@@ -305,7 +305,7 @@ impl App {
     /// Take a finished benchmark's answer: read the settings it wrote and draw
     /// the far terrain at the quality it chose.
     fn poll_tuning(&mut self) {
-        let Some(child) = self.tuning.as_mut() else {
+        let Some(child) = self.tuning.as_mut().map(|c| &mut c.0) else {
             return;
         };
         let Ok(Some(status)) = child.try_wait() else {
@@ -317,10 +317,20 @@ impl App {
             return;
         }
         if let Some(chosen) = settings::load(&self.paths.settings) {
-            log::info!("the benchmark chose far terrain {}", chosen.far.name());
-            self.settings = chosen;
-            self.set_far_quality(self.settings.far);
+            match settings::accept_tuned(&self.settings, chosen) {
+                Some(chosen) => {
+                    log::info!("the benchmark chose far terrain {}", chosen.far.name());
+                    self.settings = chosen;
+                    self.set_far_quality(self.settings.far);
+                }
+                None => log::info!("the benchmark finished, but the quality is the player's own"),
+            }
         }
+    }
+
+    /// Kill the benchmark child, if one is running, and reap it.
+    fn stop_tuning(&mut self) {
+        self.tuning = None; // dropping the `TuneChild` kills it
     }
 
     /// Draw the far terrain at `quality` from now on, and give the frame watch
@@ -424,6 +434,17 @@ impl App {
     }
 }
 
+/// The `--bench tune` child. Killed and reaped when dropped, so however the
+/// game ends -- window closed, loop exited, panic -- it does not outlive it.
+struct TuneChild(std::process::Child);
+
+impl Drop for TuneChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.renderer.is_some() {
@@ -506,6 +527,8 @@ impl ApplicationHandler for App {
                 // it", and until now closing it was exactly when it stopped
                 // being there.
                 self.game.save();
+                // The benchmark child is ours: it must not outlive the window.
+                self.stop_tuning();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -534,8 +557,9 @@ impl ApplicationHandler for App {
                 grab_cursor(renderer.window(), self.cursor_captured);
                 // A mouse button released outside the window never arrives
                 // (winit synthesises key releases, not button ones), so a dig
-                // in progress would carry on while you are away.
-                self.game.set_breaking(false);
+                // in progress would carry on while you are away. Held keys
+                // too: a release while unfocused may never reach us.
+                self.game.release_held_input();
                 self.alt_held = false;
             }
             WindowEvent::ModifiersChanged(mods) => {
@@ -696,11 +720,15 @@ impl ApplicationHandler for App {
                 // right-click is "take half", which is about a *slot* rather
                 // than about the world, and swapping it would make the screen
                 // disagree with every other game's screen for no reason.
-                if self.cursor_captured && hand_for(button) == Some(Hand::Mine) {
+                if hand_for(button) == Some(Hand::Mine)
+                    && (state == ElementState::Released || self.cursor_captured)
+                {
                     // Held state, not an edge: mining advances for as long as
                     // the button is down, and `Game::advance` reads it each
                     // tick. The break itself happens on the tick the block
-                    // gives way, not here.
+                    // gives way, not here. A *release* always counts, captured
+                    // or not: one that arrives over an open screen must still
+                    // end the dig.
                     self.game.set_breaking(state == ElementState::Pressed);
                 }
                 if self.cursor_captured
@@ -979,6 +1007,15 @@ fn main() {
                         gpu: bench::adapter_name().unwrap_or_default(),
                     }),
                     by_hand: false,
+                };
+                // The player may have picked a quality by hand while this ran;
+                // theirs stands, and the file is left as they wrote it.
+                let Some(chosen) = settings::accept_tuned(
+                    &settings::load(&paths.settings).unwrap_or_default(),
+                    chosen,
+                ) else {
+                    log::info!("TUNE: the quality was picked by hand; leaving it");
+                    return;
                 };
                 match settings::save(&paths.settings, &chosen) {
                     Ok(()) => log::info!(

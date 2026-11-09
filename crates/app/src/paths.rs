@@ -33,8 +33,23 @@ impl SavePaths {
 
     /// A game on `world`, with its settings "beside the world, in the saves
     /// folder": `<world>/../settings.ron`.
+    ///
+    /// Unless that file is the owner's own `saves/settings.ron` and this is not
+    /// the owner's world (`--world saves/gui-test`, or `--world .`): then the
+    /// settings go inside the world, `<world>/settings.ron`, so a test run
+    /// cannot overwrite the owner's tuned or hand-picked quality.
     pub fn for_world(world: PathBuf) -> Self {
-        let settings = world.join("..").join("settings.ron");
+        Self::for_world_against(world, &Self::standard())
+    }
+
+    fn for_world_against(world: PathBuf, standard: &SavePaths) -> Self {
+        let beside = world.join("..").join("settings.ron");
+        let owners = same_path(&beside, &standard.settings) && !same_path(&world, &standard.world);
+        let settings = if owners {
+            world.join("settings.ron")
+        } else {
+            beside
+        };
         Self { world, settings }
     }
 
@@ -68,6 +83,43 @@ impl SavePaths {
             vec!["--world".into(), self.world.to_string_lossy().into_owned()]
         }
     }
+}
+
+/// `p` made absolute with `.` and `..` resolved lexically, so a path that does
+/// not exist yet can still be compared.
+fn lexical(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether two paths name the same place: equal lexically, or after the
+/// filesystem resolves them (symlinks, Windows `\\?\` prefixes).
+fn same_path(a: &Path, b: &Path) -> bool {
+    let (la, lb) = (lexical(a), lexical(b));
+    if la == lb {
+        return true;
+    }
+    // The file itself may not exist yet; its directory usually does.
+    let resolve = |p: &Path| {
+        let dir = p.parent()?.canonicalize().ok()?;
+        Some(dir.join(p.file_name()?))
+    };
+    matches!((resolve(&la), resolve(&lb)), (Some(x), Some(y)) if x == y)
 }
 
 impl Default for SavePaths {
@@ -104,6 +156,27 @@ mod tests {
         assert_eq!(
             p.settings,
             PathBuf::from("X").join("..").join("settings.ron")
+        );
+    }
+
+    /// `--world saves/gui-test` must not make the game write the owner's
+    /// `saves/settings.ron`; the standard world itself still uses it.
+    #[test]
+    fn a_world_beside_the_owners_does_not_share_the_owners_settings() {
+        let root = cubara_server::assets::repo_root();
+        let standard = SavePaths::standard();
+        let test = SavePaths::for_world(root.join("saves/gui-test"));
+        assert_ne!(test.settings, standard.settings);
+        assert_eq!(test.settings, root.join("saves/gui-test/settings.ron"));
+        // The same through `..` and relative spellings.
+        let dotted = SavePaths::for_world(root.join("saves/./x/../gui-test"));
+        assert_eq!(dotted.settings, dotted.world.join("settings.ron"));
+        assert!(
+            same_path(
+                &SavePaths::for_world(root.join("saves/world")).settings,
+                &standard.settings
+            ),
+            "the owner's own world keeps the owner's settings"
         );
     }
 

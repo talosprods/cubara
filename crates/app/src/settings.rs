@@ -51,6 +51,19 @@ impl Settings {
     }
 }
 
+/// What to do with a benchmark's answer, given the settings as they stand now:
+/// `Some(answer)` to take it, `None` to ignore it because the player picked the
+/// quality by hand ("keys 1-4 pick a quality, which is then the player's own,
+/// so no benchmark or step-down overrules it", `PROPOSAL_FAR_VIEW.md` 6c).
+/// Used by the game when the child ends and by the child before it writes.
+pub fn accept_tuned(current: &Settings, tuned: Settings) -> Option<Settings> {
+    if current.by_hand {
+        None
+    } else {
+        Some(tuned)
+    }
+}
+
 /// The settings at `path`, or `None` when there are none yet or they do not
 /// read -- a broken settings file is a reason to benchmark again, not to
 /// refuse to start.
@@ -112,6 +125,23 @@ mod tests {
             };
             assert!(!s.needs_tuning(60, "Apple M3"), "{far:?}");
         }
+    }
+
+    /// A benchmark that lands after the player picked by hand is ignored, and
+    /// one that lands on an unpicked setting is taken.
+    #[test]
+    fn a_benchmark_result_never_overrules_a_hand_picked_quality() {
+        let by_hand = Settings {
+            far: FarQuality::High,
+            tuned: None,
+            by_hand: true,
+        };
+        assert_eq!(accept_tuned(&by_hand, tuned(60, "gpu")), None);
+        let auto = Settings::default();
+        assert_eq!(
+            accept_tuned(&auto, tuned(60, "gpu")),
+            Some(tuned(60, "gpu"))
+        );
     }
 
     #[test]

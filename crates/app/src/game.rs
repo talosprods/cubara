@@ -183,6 +183,9 @@ pub struct Game {
     /// Whether the break button is currently held. Read once per `advance`
     /// into [`InputFrame::breaking`].
     breaking: bool,
+    /// Whether a screen was open at the last `advance`: the edge on which held
+    /// input is let go of (`release_held_input`).
+    screen_was_open: bool,
     /// Wall-clock seconds not yet consumed by a fixed tick. `f64`, not `f32`
     /// like everything else here -- this is the one value that keeps being
     /// added to across a whole play session (thousands of frames), and
@@ -402,6 +405,7 @@ impl Game {
             console_reply: None,
             new_world_armed: false,
             breaking: false,
+            screen_was_open: false,
             accumulator: 0.0,
             forward: false,
             back: false,
@@ -757,6 +761,13 @@ impl Game {
     ///   one frame's mouse motion, or one key press, into N. So: clear them
     ///   after the first tick.
     pub fn advance(&mut self, dt: f32) -> Vec<ChunkCoord> {
+        // A screen has just opened: what was held stays held no longer.
+        let open = self.screen_open();
+        if open && !self.screen_was_open {
+            self.release_held_input();
+        }
+        self.screen_was_open = open;
+
         self.accumulator += dt as f64;
 
         // Not a tick's worth of time yet: leave the accumulated one-shot inputs
@@ -868,7 +879,16 @@ impl Game {
 
     /// Write the world to disk (#179). The server owns the world, so it owns
     /// the save; this is the client's shutdown reaching for it.
+    ///
+    /// A no-op when this client has joined somebody else's world: that world is
+    /// the server's to save, and the window closing or F5 must not be able to
+    /// panic through `server()`. Guarded here rather than at each call site so
+    /// no future caller has to remember it.
     pub fn save(&self) {
+        if !self.hosting() {
+            log::info!("not saving: this client has joined somebody else's world");
+            return;
+        }
         self.server().save_to(&self.paths.world);
     }
 
@@ -917,6 +937,28 @@ impl Game {
     /// abandon rule lives in one place.
     pub fn set_breaking(&mut self, held: bool) {
         self.breaking = held;
+    }
+
+    /// Whether any screen -- inventory, pause menu or console -- is open. The
+    /// one answer; the window's capture logic asks this too.
+    pub fn screen_open(&self) -> bool {
+        self.inventory_open || self.pause_open || self.console.is_some()
+    }
+
+    /// Let go of everything held: movement keys, the fly-toggle key and the
+    /// break button. A screen swallows the key and button *releases* that
+    /// follow, so whatever was held when it opened would otherwise stay held
+    /// after it closed. Called when a screen opens (from `advance`, which sees
+    /// every screen the same way) and when the window loses focus.
+    pub fn release_held_input(&mut self) {
+        self.forward = false;
+        self.back = false;
+        self.left = false;
+        self.right = false;
+        self.up = false;
+        self.down = false;
+        self.fly_toggle_held = false;
+        self.breaking = false;
     }
 
     /// Break (`place = false`) or place (`true`) the block the player is looking
@@ -4729,6 +4771,49 @@ mod tests {
         );
     }
 
+    /// Hold W, open the console, release W (the console swallows the release),
+    /// close it: the player must not still be walking.
+    #[test]
+    fn a_key_held_when_a_screen_opens_is_not_stuck_after_it_closes() {
+        let mut game = Game::new();
+        game.key_input(KeyCode::KeyW, true);
+        game.key_input(KeyCode::Space, true);
+        game.open_console();
+        game.advance(TICK_DT);
+        // The console eats the release: it never reaches `key_input`.
+        game.console_cancel();
+        game.advance(TICK_DT);
+        assert!(!game.forward && !game.up, "a held key survived the screen");
+        // A key pressed after the screen opened is held normally.
+        game.key_input(KeyCode::KeyW, true);
+        game.advance(TICK_DT);
+        assert!(game.forward);
+    }
+
+    /// Hold the break button, open a screen, release it there: nothing is dug.
+    #[test]
+    fn mining_stops_when_a_screen_opens() {
+        let mut game = Game::new();
+        game.set_breaking(true);
+        game.toggle_pause();
+        game.advance(TICK_DT);
+        assert!(
+            !game.breaking,
+            "the break button stayed held under a screen"
+        );
+    }
+
+    /// Losing focus lets go of everything held.
+    #[test]
+    fn release_held_input_lets_go_of_keys_and_the_break_button() {
+        let mut game = Game::new();
+        game.key_input(KeyCode::KeyA, true);
+        game.key_input(KeyCode::ShiftLeft, true);
+        game.set_breaking(true);
+        game.release_held_input();
+        assert!(!game.left && !game.down && !game.breaking);
+    }
+
     #[test]
     fn toggle_pause_refuses_while_the_inventory_or_console_is_open() {
         let mut game = Game::new();
@@ -4985,6 +5070,17 @@ mod connect_tests {
             "the client generates the server's world, from the seed it was sent"
         );
         let _ = cfg;
+    }
+
+    /// Closing the window or pressing F5 on a joined client saves nothing and
+    /// does not panic (`server()` is host-only).
+    #[test]
+    fn a_joined_client_can_save_without_panicking() {
+        let (mut remote, _cfg) = hosted_elsewhere();
+        let mut game = a_client();
+        game.join_over(remote.attach()).expect("joined");
+        assert!(!game.hosting());
+        game.save();
     }
 
     /// Cracks are drawn from the host's count, which a joined client does not
