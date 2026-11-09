@@ -43,6 +43,12 @@ gathered the same day and is summarised where it changed a choice (marked
   *"prima als het bij een meer uitkomt. een bergmeer is ook leuk. ik heb liever
   dat het consistent goed is, dan dat je vage fouten hebt en te erg probeert. het
   moet er vooral echt adembenemend uitzien. denk aan zwitserland enzo"*.
+- **The last open questions, answered the same day:** water flows, the classic voxel game
+  style (*"c"*). Climbing aids come later and peaks stay hard (*"een top is in
+  het echt ook niet makkelijk bereikbaar"*). We make the textures, with Gemini.
+  The current world may go. Caves may be under water and open under water, and
+  the underground is a later, larger phase. This proposal is **phase 3**
+  (`ROADMAP.md`).
 - **Night.** *"schaduwen en contouren zijn gaaf, maar het moet niet welkom voelen
   om naar buiten te gaan"*.
 - **Later, not now:** shadows (*"schaduwen komen op een gegeven moment wel"*),

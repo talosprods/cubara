@@ -20,8 +20,8 @@ applies to phases too: *a requirement that isn't enforced by machinery is a wish
 | Phase | Name | The one-sentence result | Status |
 |---|---|---|---|
 | **1** | The engine stands | A textured, walkable, cave-riddled world at render distance 64 that runs at 1000+ FPS — and is still there after you close it. | **Complete — 2026-08-24** (gate 12/12 on both machines) |
-| **2** | The first survival world | You can survive in it: gather, craft, smelt, eat, and be attacked — and it is still there tomorrow. | **Active** |
-| **3** | Modern depth, with synergy | The features of a full modern voxel game, each admitted only if it connects to what already exists. | Not started |
+| **2** | The first survival world | You can survive in it: gather, craft, smelt, eat, and be attacked — and it is still there tomorrow. | **Complete — 2026-09-10** (gate met; played 2026-09-11). Eating and being attacked (2.9b) were deferred by the owner on 2026-09-05. |
+| **3** | Modern depth, with synergy — **the world** | A breathtaking, Alpine-scale world: seas, rivers and lakes that flow, climates and biomes, a day and a year that change it — generated per chunk with no seams, at 1000+ FPS. | **Active — 2026-11-09** |
 
 Phases are strictly sequential. Phase *n+1* does not start until phase *n*'s gate
 passes **and** the project owner has played it.
@@ -455,6 +455,84 @@ a system, from that rule. Candidates already on the books —
 [#42](../../issues/42) occlusion culling, [#32](../../issues/32)/[#33](../../issues/33)
 GPU culling, shaders, multiplayer, the mod API — are engine work that will be
 scheduled against phase 3's needs rather than pursued on their own.
+
+### The feature set: the world (decided with the owner, 2026-11-09)
+
+The owner designed phase 3 with us in one conversation, from the admission rule:
+**world generation**, as one system. His words, the admission rule answered and
+the model are in [`docs/PROPOSAL_CLIMATE.md`](docs/PROPOSAL_CLIMATE.md). Asked
+whether the worldgen idea should be phase 3, he answered *"verder klinkt het
+goed"* to this structure and its gate. His answers to the last open questions,
+the same day:
+
+- **Water flows, as in the classic voxel game:** sources and flowing water (*"c"*).
+- **Climbing aids will come later** (*"zoals in een echt blokkenspel"*), and peaks
+  stay hard to reach on purpose. There are no guaranteed walkable routes.
+- **We make the textures**, with Gemini where it helps.
+- **The current world may go.** No compatibility with the old generator.
+- **Caves may sit under water and open under water.** The underground is a later,
+  larger phase.
+
+#### Ordered blocks
+
+| # | Block | Why here |
+|---|---|---|
+| **3.0** | **The engine first** (the owner: *"we zijn toch nog bezig met de engine … de bergdetails en lagen die renderen … en de random stotteringen … er moet nog wat engine werk en getest gedaan worden"*). (a) **Detail swaps while flying, the worst of it** (the owner: *"het wisselen van detailniveaus terwijl je vliegt … het is een laag detail niveau, dan is het weg en heel kort daarna laadt het in op een hoger niveau"*). Three goals: **never a hole**, meaning a coarse node leaves only when *all* of its replacements are resident (an atomic swap per group), pinned by zero sky-where-terrain-belongs frames in `--bench flight`; **mesh ahead along the flight direction**, so the finer level is ready before the ring edge reaches you; and the frame-time tail measured (p99.9, max, frames over the refresh budget), with whatever it names fixed. (b) **Detail layers:** the LOD transitions (`docs/PROPOSAL_LOD_TRANSITIONS.md`): the harness, R1 block-height coarse cells with the ring-3 decision and R3a, R2 trees beyond 160 m, then the swap cross-fade. (c) **Carry-over:** F5 haze (#299/#306), the play modes (#305), tests that can fail, and camera-relative rendering. | Nothing in the world blocks is worth building on visible rings and hitches. 3.1 starts when 3.0's criterion in the exit gate is green. |
+| **3.1** | **Water I:** water blocks (non-solid, transparent pass); sea level; the far terrain draws water surfaces | Everything else rests on it. |
+| **3.2** | **Water II:** flowing water, classic voxel-game style (sources and flow levels), deterministic, tick-driven and bounded; settles, so dormancy catch-up is bounded | The owner's answer: water flows. |
+| **3.3** | **Continents and seas:** continentalness, coasts, islands, ranges, plateaus, volcanoes | The large-scale shape. Seas are a journey. |
+| **3.4** | **Rivers and lakes:** local strict-descent drainage, levels, lakes that spill or end, carved beds, waterfalls, meanders; far terrain shows them; spawn near water | The backbone of the geography (`PROPOSAL_CLIMATE.md` §2.2a). |
+| **3.5** | **The Alpine forms:** U-valleys, hanging valleys, finger lakes, horns and arêtes, alpine meadows | The look: Switzerland (§2.2b). |
+| **3.6** | **Climate and biomes:** T/H fields, the lapse rate, rain shadow, a biome table in data, tree species that blend, textures for the new blocks; one column-material function for worldgen and the far terrain | Caricature biomes over an organic patchwork, with no hemispheres. |
+| **3.7** | **Time:** day and night (a 40–60 min day, a quarter of it dark), the calendar, game rules stored per world, the moving sun | The rhythm. Night does not feel welcoming. |
+| **3.8** | **Seasons in the world:** derived snow, leaf colour, ice and the snow line, per climate zone; walkable ice | Seasons change the biomes. |
+| **3.9** | **Years that differ:** the year anomaly | Snow in a desert once in 10–20 years. |
+| **3.10** | **Growth seasons** for trees (crops when the owner shapes them) | Seasons touch the survival loop. |
+
+#### Exit gate
+
+0. **No stutters, no visible rings (block 3.0, checked before 3.1 starts).**
+   - In `--bench flight` (low, high, down, and toward a mountain) and a
+     scripted walk, after loading:
+     - no frame exceeds 2× the refresh interval at 60 Hz, and p99.9 stays
+       under the interval;
+     - **no frame shows sky where the finished frame shows terrain** (a hole
+       during a detail swap).
+     Measured on each machine and recorded in `BENCHMARKS.md`.
+   - The LOD tests T1/T4 from `PROPOSAL_LOD_TRANSITIONS.md` pass: no ring edge
+     doubles a step on screen.
+1. **Performance.** `--bench gate` holds 1,000+ FPS on every machine, with that
+   machine's own far quality, as today. The eyes: three fixed eyes in the new
+   landscape (a valley floor, a pass, a peak) plus the flight eye. They are
+   chosen once from a fixed seed and recorded in `bench.rs` before the
+   terrain blocks land, so the gate measures the target before it is built.
+2. **No seams.** A chunk generated with a cold cache and with a cache warmed
+   from far away is bit-identical. Neighbouring chunks have identical borders.
+   The far terrain's rivers and water agree with the voxels at the join.
+3. **Hydrology.** Over many seeds and regions, every river bed descends and
+   ends in the sea or a lake, and there is water within N blocks of every spawn.
+4. **Flowing water is deterministic.** A replay with flowing water hashes the
+   same single- and multi-threaded, and every disturbance settles within a
+   bounded number of ticks.
+5. **Seasons and years.** Desert snow occurs between 1/20 and 1/10 over 1,000
+   sampled years. Seasonal snow lines follow the lapse rate.
+6. **The look.** Golden images at the valley, pass, peak and lake eyes in four
+   seasons, which the owner has looked at, and which his approval in the PR
+   pins.
+7. **Everything phases 1 and 2 gate on still passes:** the determinism replay,
+   the survival replay, multiplayer and persistence.
+
+#### Not in phase 3
+
+- The underground (caves at scale) is a later, larger phase.
+- Boats, villages and routes along the rivers, climbing aids, shadows, light
+  sources, weather events, and the game-rules screen.
+- Crops, until the owner shapes them.
+- **2.9b (hunger, food, the first hostile mobs): later.** The owner decided
+  this on 2026-11-09 (*"die kunnen later. we zijn toch nog bezig met de
+  engine"*). It was deferred from phase 2 "to phase 3" on 2026-09-05. It is not
+  in this phase.
+
 
 ### Recorded, 2026-09-18 — the owner's starting shape for the pause menu
 
