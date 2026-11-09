@@ -236,3 +236,133 @@ fn connections_beyond_the_limit_are_refused() {
         "connections that never introduced themselves became players"
     );
 }
+
+/// Reads until the far end closes, or `budget` passes. `true` if it closed.
+fn sees_hang_up(stream: &mut TcpStream, budget: std::time::Duration) -> bool {
+    use std::io::Read;
+    stream
+        .set_read_timeout(Some(budget))
+        .expect("a read timeout");
+    let mut buf = [0u8; 256];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(_) => return false, // timed out: the server never closed it
+        }
+    }
+}
+
+/// **A dropped connection is actually closed.** The deadline test above only
+/// checks the server's bookkeeping; the socket and its reader thread used to
+/// live on until the peer hung up, so a flood of silent connections leaked a
+/// thread and a descriptor each. The peer is the witness: it sees the hang-up
+/// only if the server really closed its end.
+#[test]
+fn a_connection_dropped_at_the_deadline_is_closed_for_real() {
+    let (mut s, cfg, addr) = listening();
+    let mut stream = TcpStream::connect(addr).expect("connected");
+    advance_until(&mut s, &cfg, SETTLE, |s| s.pending_count() == 1);
+    assert_eq!(s.pending_count(), 1, "nothing was waiting");
+
+    s.advance(u64::from(HELLO_DEADLINE_TICKS) + 1, &cfg);
+    assert_eq!(s.pending_count(), 0, "the connection was not dropped");
+
+    assert!(
+        sees_hang_up(&mut stream, SETTLE),
+        "the server dropped the connection but left the socket open"
+    );
+}
+
+/// The connection cap is enforced at accept: connections beyond it are closed
+/// before they ever reach the session's queue.
+#[test]
+fn connections_beyond_the_total_cap_are_closed_at_accept() {
+    use cubara_server::net::NetLimits;
+    let cfg = Config {
+        world: std::path::PathBuf::from("cubara-nonexistent-handshake-fixture"),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+    let mut s = Session::open(&cfg);
+    let addr = s
+        .listen_with(
+            "127.0.0.1:0",
+            NetLimits {
+                max_connections: 2,
+                ..NetLimits::default()
+            },
+        )
+        .expect("bound a port");
+
+    let mut held: Vec<TcpStream> = (0..5)
+        .map(|_| TcpStream::connect(addr).expect("connected"))
+        .collect();
+    advance_until(&mut s, &cfg, SETTLE, |s| s.refused_connections() >= 3);
+
+    assert_eq!(s.refused_connections(), 3, "the surplus was not refused");
+    assert_eq!(s.pending_count(), 2, "more than the cap was admitted");
+    let closed = held
+        .iter_mut()
+        .filter_map(|c| sees_hang_up(c, std::time::Duration::from_millis(300)).then_some(()))
+        .count();
+    assert_eq!(closed, 3, "refused connections were not actually closed");
+}
+
+/// **A client that never reads is dropped, and the tick never waits for it.**
+///
+/// The outbound queue used to be unbounded: the writer thread blocked once the
+/// socket's buffers filled and the tick loop kept queueing into memory
+/// forever, with the player never dropped. The budget is shrunk so the test
+/// reaches it quickly; what is asserted is the behaviour -- the player is gone
+/// and the world's tick count kept advancing the whole time.
+#[test]
+fn a_client_that_never_reads_is_dropped_without_stalling_the_tick() {
+    use cubara_server::net::NetLimits;
+    let cfg = Config {
+        world: std::path::PathBuf::from("cubara-nonexistent-handshake-fixture"),
+        autosave_ticks: 0,
+        ..Config::default()
+    };
+    let mut s = Session::open(&cfg);
+    let addr = s
+        .listen_with(
+            "127.0.0.1:0",
+            NetLimits {
+                max_queued: 64,
+                ..NetLimits::default()
+            },
+        )
+        .expect("bound a port");
+
+    // Says hello, then never reads a byte. Kept alive so the socket stays open.
+    let mut stalled = TcpStream::connect(addr).expect("connected");
+    let mut hello = Vec::new();
+    cubara_server::wire::ClientMessage::Hello(TEST_SHIRT).encode(&mut hello);
+    let mut framed = Vec::new();
+    cubara_server::wire::frame(&hello, &mut framed);
+    stalled.write_all(&framed).expect("hello sent");
+    advance_until(&mut s, &cfg, SETTLE, |s| s.client_count() == 1);
+    assert_eq!(s.client_count(), 1, "the client was never seated");
+
+    let start = std::time::Instant::now();
+    let first = s.server.sim.tick;
+    let mut ticks = 0u64;
+    while s.client_count() == 1 && ticks < 2_000_000 && start.elapsed() < SETTLE * 12 {
+        s.advance(1, &cfg);
+        ticks += 1;
+    }
+
+    assert_eq!(
+        s.client_count(),
+        0,
+        "a client that never reads was still connected after {ticks} ticks"
+    );
+    assert_eq!(
+        s.server.sim.tick,
+        first + ticks,
+        "the world stopped advancing while the client was stalled"
+    );
+    assert_eq!(s.server.sim.player_count(), 0, "its player was left behind");
+    drop(stalled);
+}

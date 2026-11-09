@@ -26,7 +26,7 @@
 
 use crate::assets;
 use crate::clock::Pacer;
-use crate::net::{Acceptor, Link};
+use crate::net::{Acceptor, Link, NetLimits};
 use crate::wire::{ClientMessage, ServerMessage};
 use crate::{Action, Server};
 use cubara_sim::{InputFrame, PlayerId, PlayerInputs};
@@ -85,10 +85,22 @@ pub const MAX_ACTIONS_PER_TICK: usize = 8;
 /// in the world and a per-client view. This is the bound on the first, and it
 /// exists because the second used to have no bound at all (#232).
 ///
-/// 64 is deliberately far above what a real join burst looks like and far
-/// below what would matter: the point is that the number exists, not where it
-/// sits.
-pub const MAX_PENDING: usize = 64;
+/// 16 is far above what a real join burst looks like (friends joining one
+/// server) and small enough that a flood of silent sockets costs 16 reader
+/// threads, not thousands.
+pub const MAX_PENDING: usize = 16;
+
+/// How many clients a session will seat at once.
+///
+/// A seated client costs a body, a view and a per-tick flush. Together with
+/// [`MAX_PENDING`] this fixes the connection cap handed to the acceptor
+/// ([`MAX_CONNECTIONS`]); both numbers live here so there is one place to
+/// read them.
+pub const MAX_CLIENTS: usize = 64;
+
+/// Most sockets open at once, pending and seated together. Beyond this the
+/// acceptor closes a connection before spawning any thread for it.
+pub const MAX_CONNECTIONS: usize = MAX_PENDING + MAX_CLIENTS;
 
 /// How many received-but-unapplied inputs one client may have queued.
 ///
@@ -268,7 +280,23 @@ impl Session {
     /// Returned rather than only logged because a caller that asked for port 0
     /// -- every test does -- has no other way to find out which port it got.
     pub fn listen(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
-        let acceptor = Acceptor::bind(addr)?;
+        self.listen_with(
+            addr,
+            NetLimits {
+                max_connections: MAX_CONNECTIONS,
+                ..NetLimits::default()
+            },
+        )
+    }
+
+    /// [`listen`](Self::listen) with explicit transport limits, so a test can
+    /// reach a limit without thousands of ticks.
+    pub fn listen_with(
+        &mut self,
+        addr: &str,
+        limits: NetLimits,
+    ) -> std::io::Result<std::net::SocketAddr> {
+        let acceptor = Acceptor::bind_with(addr, limits)?;
         let bound = acceptor.addr();
         self.acceptor = Some(acceptor);
         // A world that is served is not also played here. Done at `listen`
@@ -333,9 +361,10 @@ impl Session {
         self.pending.len()
     }
 
-    /// Connections refused for exceeding [`MAX_PENDING`].
+    /// Connections refused for exceeding [`MAX_PENDING`] or
+    /// [`MAX_CONNECTIONS`].
     pub fn refused_connections(&self) -> u64 {
-        self.refused_connections
+        self.refused_connections + self.acceptor.as_ref().map_or(0, |a| a.refused())
     }
 
     /// Connections dropped for never saying `Hello`.
@@ -423,6 +452,12 @@ impl Session {
 
         self.pending = waiting;
         for (link, shirt) in admitted {
+            if self.clients.len() >= MAX_CLIENTS {
+                // Dropping the link closes its socket.
+                self.refused_connections += 1;
+                log::warn!("refusing a client: {MAX_CLIENTS} already seated");
+                continue;
+            }
             self.seat(link, Some(shirt));
         }
     }

@@ -247,6 +247,13 @@ pub enum Action {
     Command(String),
 }
 
+/// How far from the origin, per axis, `/tp` will send a player: 262 144
+/// blocks, the radius of the far view (`FAR_VIEW_RADIUS` in the app), so a
+/// teleport can land anywhere the far terrain is drawn but not where the
+/// fixed-point range and the `i32` block coordinates stop being safe. The
+/// world has no height limit, so the same bound applies vertically.
+pub const TP_LIMIT_BLOCKS: f32 = 262_144.0;
+
 /// Which slot of a furnace a click landed on.
 ///
 /// The server's own vocabulary, deliberately not `cubara_render`'s
@@ -1505,6 +1512,19 @@ impl Server {
                     self.reply(who, "usage: /tp x y z".to_string());
                     return;
                 };
+                // Finite and inside the bound: `from_f32` saturates a huge
+                // value to the edge of the fixed-point range, where physics
+                // overflows (debug: panic; release: a hang).
+                if ![x, y, z]
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= TP_LIMIT_BLOCKS)
+                {
+                    self.reply(
+                        who,
+                        format!("/tp: coordinates must be within {TP_LIMIT_BLOCKS} blocks of the origin"),
+                    );
+                    return;
+                }
                 let player = self.sim.player_mut(who);
                 player.pos = FixedVec3::from_f32([x, y, z]);
                 player.velocity = FixedVec3::ZERO;
@@ -1705,6 +1725,16 @@ impl Server {
         };
         if self.sim.get(who).is_none() {
             return;
+        }
+        // Validated before anything is touched: `Crafting::click` on an
+        // inventory slot that does not exist would exchange the held stack
+        // into it and then lose it, so an out-of-range index from the wire
+        // must not reach it. Grid indices are already bounded there.
+        if let SlotRef::Inventory(i) = slot {
+            if i >= cubara_sim::SLOT_COUNT {
+                log::debug!("{who:?} clicked inventory slot {i}, which does not exist");
+                return;
+            }
         }
         let player = self.sim.player_mut(who);
         let (crafting, inventory) = (&mut player.crafting, &mut player.inventory);

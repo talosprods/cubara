@@ -216,3 +216,52 @@ fn time_and_unknown_commands_answer_rather_than_vanish() {
         ["unknown command /fly -- try /tp, /give, /gamemode or /seed"]
     );
 }
+
+/// `/tp` beyond the bound -- or to a value that is not a number at all -- is
+/// refused with a reason, and the player does not move. `1e30` used to
+/// saturate the fixed-point position and break physics.
+#[test]
+fn a_tp_beyond_the_world_bound_is_refused() {
+    let (mut s, who) = fixture();
+    let before = s.sim.player(who).pos;
+    for bad in [
+        "tp 1e30 0 0",
+        "tp 0 -1e30 0",
+        "tp 0 0 inf",
+        "tp NaN 0 0",
+        "tp 262145 0 0",
+    ] {
+        let replies = run(&mut s, who, bad);
+        assert_eq!(replies.len(), 1, "{bad}: no reply");
+        assert!(replies[0].starts_with("/tp:"), "{bad}: {replies:?}");
+        assert_eq!(s.sim.player(who).pos, before, "{bad} moved the player");
+    }
+    // The bound itself is allowed.
+    assert!(run(&mut s, who, "tp 262144 100 -262144").is_empty());
+    assert_ne!(s.sim.player(who).pos, before);
+}
+
+/// A click on an inventory slot that does not exist must not eat the cursor.
+#[test]
+fn an_out_of_range_slot_click_keeps_the_held_stack() {
+    let (mut s, who) = fixture();
+    let items = s.items.as_ref().expect("assets loaded");
+    let id = items.id_of("cubara:plank").expect("plank is an item");
+    let stack = items.new_stack(id, 5).expect("a stack");
+    s.sim.player_mut(who).crafting.set_held(Some(stack));
+
+    for index in [SLOT_COUNT, SLOT_COUNT + 1, 1_000_000] {
+        s.apply_as(
+            who,
+            Action::ClickSlot {
+                slot: cubara_sim::SlotRef::Inventory(index),
+                right: false,
+            },
+        );
+        assert_eq!(
+            s.sim.player(who).crafting.held(),
+            Some(stack),
+            "a click on slot {index} destroyed the held stack"
+        );
+    }
+}

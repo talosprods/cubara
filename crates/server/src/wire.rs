@@ -70,6 +70,10 @@ pub enum WireError {
     /// real Rust `String`, which cannot produce this -- it means a stranger's
     /// bytes, not this crate's own.
     BadUtf8,
+    /// A message decoded cleanly but bytes were left over. Malformed, like
+    /// everything else a stranger can get wrong: two peers that disagree about
+    /// where a message ends disagree about everything after it.
+    TrailingBytes(usize),
 }
 
 impl std::fmt::Display for WireError {
@@ -79,6 +83,7 @@ impl std::fmt::Display for WireError {
             WireError::BadTag(t) => write!(f, "unknown tag byte {t}"),
             WireError::BadLength(n) => write!(f, "length prefix {n} overruns the buffer"),
             WireError::BadUtf8 => write!(f, "string was not valid UTF-8"),
+            WireError::TrailingBytes(n) => write!(f, "{n} unread bytes after the message"),
         }
     }
 }
@@ -102,6 +107,14 @@ impl<'a> Cursor<'a> {
     /// How many bytes have been consumed.
     pub fn position(&self) -> usize {
         self.at
+    }
+
+    /// Succeeds only if every byte has been consumed.
+    pub fn finish(&self) -> Result<(), WireError> {
+        match self.buf.len() - self.at {
+            0 => Ok(()),
+            n => Err(WireError::TrailingBytes(n)),
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
@@ -195,8 +208,16 @@ fn put_pos(out: &mut Vec<u8>, p: [i32; 3]) {
 }
 
 /// A `u16`-length-prefixed UTF-8 string. See [`Cursor::str`].
+///
+/// A string longer than `u16::MAX` bytes is **truncated at a char boundary**
+/// rather than having its length silently wrapped (which wrote a prefix that
+/// disagreed with the bytes that followed, and desynchronised the stream).
 fn put_str(out: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
+    let mut end = s.len().min(u16::MAX as usize);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let bytes = &s.as_bytes()[..end];
     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     out.extend_from_slice(bytes);
 }
@@ -724,7 +745,7 @@ impl ClientMessage {
 
     pub fn decode(buf: &[u8]) -> Result<Self, WireError> {
         let c = &mut Cursor::new(buf);
-        Ok(match c.u8()? {
+        let msg = match c.u8()? {
             0 => ClientMessage::Hello([c.u8()?, c.u8()?, c.u8()?]),
             1 => ClientMessage::Input {
                 seq: c.u64()?,
@@ -732,7 +753,9 @@ impl ClientMessage {
             },
             2 => ClientMessage::Act(Action::decode(c)?),
             t => return Err(WireError::BadTag(t)),
-        })
+        };
+        c.finish()?;
+        Ok(msg)
     }
 }
 
@@ -769,7 +792,7 @@ impl ServerMessage {
 
     pub fn decode(buf: &[u8]) -> Result<Self, WireError> {
         let c = &mut Cursor::new(buf);
-        Ok(match c.u8()? {
+        let msg = match c.u8()? {
             0 => ServerMessage::Welcome {
                 seed: c.u64()?,
                 you: PlayerId(c.u64()?),
@@ -789,7 +812,9 @@ impl ServerMessage {
             }
             2 => ServerMessage::Tick(c.u64()?),
             t => return Err(WireError::BadTag(t)),
-        })
+        };
+        c.finish()?;
+        Ok(msg)
     }
 }
 
@@ -1141,5 +1166,54 @@ mod tests {
         let mut buf = (MAX_FRAME + 1).to_le_bytes().to_vec();
         buf.extend_from_slice(&[0; 8]);
         assert_eq!(unframe(&buf), Err(WireError::BadLength(MAX_FRAME + 1)));
+    }
+
+    /// A string too long for the u16 prefix is truncated at a char boundary,
+    /// not wrapped: the stream stays in step and the text stays valid UTF-8.
+    #[test]
+    fn an_overlong_string_is_truncated_at_a_char_boundary() {
+        // 2-byte chars: 65535 is odd, so a naive cut splits one.
+        let text = "\u{e9}".repeat(40_000);
+        let msg = ClientMessage::Act(Action::Command(text));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        let ClientMessage::Act(Action::Command(back)) =
+            ClientMessage::decode(&buf).expect("still decodes")
+        else {
+            panic!("wrong message came back");
+        };
+        assert_eq!(back.len(), 65_534);
+        assert!(back.chars().all(|c| c == '\u{e9}'));
+
+        // And one over the limit of plain ASCII must not wrap to a small length.
+        let msg = ClientMessage::Act(Action::Command("a".repeat(70_000)));
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        let ClientMessage::Act(Action::Command(back)) =
+            ClientMessage::decode(&buf).expect("still decodes")
+        else {
+            panic!("wrong message came back");
+        };
+        assert_eq!(back.len(), u16::MAX as usize);
+    }
+
+    /// Bytes after a complete message make it malformed, in both directions.
+    #[test]
+    fn trailing_bytes_make_a_message_malformed() {
+        let mut buf = Vec::new();
+        ClientMessage::Hello([1, 2, 3]).encode(&mut buf);
+        buf.push(0);
+        assert_eq!(
+            ClientMessage::decode(&buf),
+            Err(WireError::TrailingBytes(1))
+        );
+
+        let mut buf = Vec::new();
+        ServerMessage::Tick(9).encode(&mut buf);
+        buf.extend_from_slice(&[7, 7]);
+        assert_eq!(
+            ServerMessage::decode(&buf),
+            Err(WireError::TrailingBytes(2))
+        );
     }
 }

@@ -41,10 +41,84 @@
 //! internet. It is not.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 
 use crate::wire::{frame, unframe, ClientMessage, ServerMessage, WireError};
+
+/// How many messages may sit unwritten in one client's outbound queue before
+/// that client is dropped.
+///
+/// A client that stops reading fills its socket buffers, the writer thread
+/// blocks in `write_all`, and without a bound the tick loop keeps queueing
+/// into memory forever. A healthy client's queue is a handful of messages
+/// (two per tick, drained as fast as the socket takes them), so this is about
+/// a minute of total silence at 60 tps -- far beyond a lag spike, far below a
+/// memory problem.
+pub const MAX_QUEUED_MESSAGES: usize = 4096;
+
+/// How often a blocked reader wakes to check whether its link was shut down.
+const READ_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The limits an [`Acceptor`] and the links it hands out enforce.
+///
+/// Tests construct smaller ones so that hitting a limit does not take
+/// thousands of ticks. The session's own numbers are in `headless.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct NetLimits {
+    /// Most connections open at once (pending + seated). Excess connections
+    /// are closed at accept, before any thread is spawned for them.
+    pub max_connections: usize,
+    /// Most unwritten messages one client may have queued
+    /// ([`MAX_QUEUED_MESSAGES`]).
+    pub max_queued: usize,
+}
+
+impl Default for NetLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: usize::MAX,
+            max_queued: MAX_QUEUED_MESSAGES,
+        }
+    }
+}
+
+/// Decrements the acceptor's open-connection count when the link is dropped.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Sets a flag when dropped: how the reader thread says it has ended.
+struct Done(Arc<AtomicBool>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// What a socket-backed link holds beyond its channel ends.
+struct TcpState {
+    /// A handle on the socket, kept so the link can shut it down: the reader
+    /// thread blocks in `read`, and only closing the socket wakes it.
+    stream: TcpStream,
+    /// Messages sent but not yet written to the socket.
+    queued: Arc<AtomicUsize>,
+    budget: usize,
+    /// Set by the reader thread as it exits.
+    reader_done: Arc<AtomicBool>,
+    /// Asks the reader thread to end. A socket shutdown *usually* wakes a
+    /// blocked `read`, but not on every platform for a duplicated handle, so
+    /// the reader also polls this on a short read timeout.
+    stop: Arc<AtomicBool>,
+    slot: Option<ConnSlot>,
+}
 
 /// One end of a conversation: send `S`, receive `R`.
 ///
@@ -56,16 +130,60 @@ pub struct Link<S, R> {
     inbox: Receiver<R>,
     /// Set once the far end has gone. Sticky: a link does not come back.
     closed: bool,
+    /// `None` for an in-process link.
+    tcp: Option<TcpState>,
+}
+
+impl<S, R> Drop for Link<S, R> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl<S, R> Link<S, R> {
     /// Queue a message. Never blocks, and never fails loudly: a send to a link
     /// whose far end has gone marks it closed and drops the message, which is
     /// what actually happened.
+    ///
+    /// On a socket, a client whose backlog has reached its budget is closed
+    /// (and logged) instead of queued for: it is not reading.
     pub fn send(&mut self, msg: S) {
+        if self.closed {
+            return;
+        }
+        if let Some(t) = &self.tcp {
+            if t.queued.load(Ordering::SeqCst) >= t.budget {
+                log::warn!(
+                    "dropping a client that is not reading: {} messages unwritten",
+                    t.budget
+                );
+                self.shutdown();
+                return;
+            }
+            t.queued.fetch_add(1, Ordering::SeqCst);
+        }
         if self.out.send(msg).is_err() {
             self.closed = true;
         }
+    }
+
+    /// Close the link now: mark it closed and, on a socket, shut it down in
+    /// both directions so the blocking reader thread returns and the file
+    /// descriptor is released. Idempotent; also what dropping the link does.
+    pub fn shutdown(&mut self) {
+        self.closed = true;
+        if let Some(t) = &self.tcp {
+            t.stop.store(true, Ordering::SeqCst);
+            let _ = t.stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Whether the socket reader thread is still running. Always `false` for
+    /// an in-process link, which has none.
+    pub fn reader_running(&self) -> bool {
+        self.tcp
+            .as_ref()
+            .is_some_and(|t| !t.reader_done.load(Ordering::SeqCst))
     }
 
     /// Everything that has arrived since the last call. Never blocks.
@@ -111,11 +229,13 @@ pub fn local_pair() -> (
             out: to_client,
             inbox: from_client,
             closed: false,
+            tcp: None,
         },
         Link {
             out: to_server,
             inbox: from_server,
             closed: false,
+            tcp: None,
         },
     )
 }
@@ -134,6 +254,7 @@ fn wire_stream<S, R>(
     stream: TcpStream,
     encode: fn(&S) -> Vec<u8>,
     decode: fn(&[u8]) -> Result<R, WireError>,
+    budget: usize,
 ) -> std::io::Result<Link<S, R>>
 where
     S: Send + 'static,
@@ -143,12 +264,22 @@ where
     // trades latency for a bandwidth saving that does not matter here.
     stream.set_nodelay(true)?;
     let reader = stream.try_clone()?;
+    let handle = stream.try_clone()?;
     let mut writer = stream;
+    let queued = Arc::new(AtomicUsize::new(0));
+    let writer_queued = Arc::clone(&queued);
+    let reader_done = Arc::new(AtomicBool::new(false));
+    let reader_flag = Arc::clone(&reader_done);
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    reader.set_read_timeout(Some(READ_POLL))?;
 
     let (inbound_tx, inbox) = channel::<R>();
     let (out, outbound_rx) = channel::<S>();
 
     std::thread::spawn(move || {
+        // However this thread ends, say so.
+        let _done = Done(reader_flag);
         let mut reader = reader;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -156,6 +287,17 @@ where
             match reader.read(&mut chunk) {
                 Ok(0) => break, // the far end hung up
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if reader_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     log::debug!("connection read failed: {e}");
                     break;
@@ -196,7 +338,10 @@ where
         while let Ok(msg) = outbound_rx.recv() {
             framed.clear();
             frame(&encode(&msg), &mut framed);
+            writer_queued.fetch_sub(1, Ordering::SeqCst);
             if writer.write_all(&framed).is_err() {
+                // Wake the reader too: a link that cannot write is finished.
+                let _ = writer.shutdown(Shutdown::Both);
                 break;
             }
         }
@@ -207,6 +352,14 @@ where
         out,
         inbox,
         closed: false,
+        tcp: Some(TcpState {
+            stream: handle,
+            queued,
+            budget,
+            reader_done,
+            stop,
+            slot: None,
+        }),
     })
 }
 
@@ -224,7 +377,14 @@ fn encode_client(m: &ClientMessage) -> Vec<u8> {
 
 /// The server's side of one accepted connection.
 pub fn serve(stream: TcpStream) -> std::io::Result<Link<ServerMessage, ClientMessage>> {
-    wire_stream(stream, encode_server, ClientMessage::decode)
+    serve_with(stream, MAX_QUEUED_MESSAGES)
+}
+
+fn serve_with(
+    stream: TcpStream,
+    budget: usize,
+) -> std::io::Result<Link<ServerMessage, ClientMessage>> {
+    wire_stream(stream, encode_server, ClientMessage::decode, budget)
 }
 
 /// A client's side, connected to `addr`.
@@ -233,6 +393,9 @@ pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Link<ClientMessage, 
         TcpStream::connect(addr)?,
         encode_client,
         ServerMessage::decode,
+        // A client's own queue is bounded by what a person can type; only the
+        // server has a stranger on the other end.
+        usize::MAX,
     )
 }
 
@@ -245,18 +408,42 @@ pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Link<ClientMessage, 
 pub struct Acceptor {
     incoming: Receiver<Link<ServerMessage, ClientMessage>>,
     addr: std::net::SocketAddr,
+    refused: Arc<AtomicU64>,
 }
 
 impl Acceptor {
+    /// Listen with default limits (no connection cap).
     pub fn bind(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
+        Self::bind_with(addr, NetLimits::default())
+    }
+
+    /// Listen, refusing connections beyond `limits.max_connections` at accept
+    /// -- closed before a thread is spawned for them.
+    pub fn bind_with(addr: impl ToSocketAddrs, limits: NetLimits) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         let (tx, incoming) = channel();
+        let open = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicU64::new(0));
+        let refused_in = Arc::clone(&refused);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                match serve(stream) {
-                    Ok(link) => {
+                if open.load(Ordering::SeqCst) >= limits.max_connections {
+                    refused_in.fetch_add(1, Ordering::SeqCst);
+                    log::warn!(
+                        "refusing a connection: {} already open",
+                        limits.max_connections
+                    );
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                match serve_with(stream, limits.max_queued) {
+                    Ok(mut link) => {
+                        open.fetch_add(1, Ordering::SeqCst);
+                        if let Some(t) = link.tcp.as_mut() {
+                            t.slot = Some(ConnSlot(Arc::clone(&open)));
+                        }
                         if tx.send(link).is_err() {
                             return; // the server has shut down
                         }
@@ -265,7 +452,16 @@ impl Acceptor {
                 }
             }
         });
-        Ok(Self { incoming, addr })
+        Ok(Self {
+            incoming,
+            addr,
+            refused,
+        })
+    }
+
+    /// Connections closed at accept for exceeding the connection cap.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::SeqCst)
     }
 
     /// The address actually bound. Not the one asked for: a test binds port 0
@@ -413,5 +609,136 @@ mod tests {
             };
             assert_eq!(pos[0], i as i32, "messages arrived out of order");
         }
+    }
+
+    fn accept_one(acceptor: &mut Acceptor) -> Link<ServerMessage, ClientMessage> {
+        for _ in 0..400 {
+            if let Some(link) = acceptor.accepted().into_iter().next() {
+                return link;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("nothing was accepted");
+    }
+
+    /// `shutdown` ends the blocking reader thread and closes the socket; the
+    /// peer, which sent nothing, is the witness for the second half.
+    #[test]
+    fn shutting_a_link_down_ends_its_reader_thread() {
+        use std::io::Read;
+        let mut acceptor = Acceptor::bind("127.0.0.1:0").expect("bind");
+        let mut peer = std::net::TcpStream::connect(acceptor.addr()).expect("connect");
+        let mut server = accept_one(&mut acceptor);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            server.reader_running(),
+            "the reader was not running to begin with"
+        );
+
+        server.shutdown();
+
+        let mut ended = false;
+        for _ in 0..400 {
+            if !server.reader_running() {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ended, "the reader thread outlived the shutdown");
+        assert!(server.is_closed());
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(peer.read(&mut [0u8; 8]).expect("a clean EOF"), 0);
+    }
+
+    /// Dropping a link closes its socket too: nobody has to remember to call
+    /// `shutdown`.
+    #[test]
+    fn dropping_a_link_closes_its_socket() {
+        use std::io::Read;
+        let mut acceptor = Acceptor::bind("127.0.0.1:0").expect("bind");
+        let mut peer = std::net::TcpStream::connect(acceptor.addr()).expect("connect");
+        let server = accept_one(&mut acceptor);
+        drop(server);
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(peer.read(&mut [0u8; 8]).expect("a clean EOF"), 0);
+    }
+
+    /// Connections past the cap are closed at accept, and a slot is freed when
+    /// a link is dropped.
+    #[test]
+    fn the_acceptor_refuses_connections_past_its_cap() {
+        use std::io::Read;
+        let mut acceptor = Acceptor::bind_with(
+            "127.0.0.1:0",
+            NetLimits {
+                max_connections: 2,
+                ..NetLimits::default()
+            },
+        )
+        .expect("bind");
+        let mut peers: Vec<_> = (0..4)
+            .map(|_| std::net::TcpStream::connect(acceptor.addr()).expect("connect"))
+            .collect();
+        let mut links = Vec::new();
+        for _ in 0..200 {
+            links.extend(acceptor.accepted());
+            if acceptor.refused() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(links.len(), 2, "the cap let a different number through");
+        assert_eq!(acceptor.refused(), 2);
+        let mut closed = 0;
+        for p in &mut peers {
+            p.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .unwrap();
+            if matches!(p.read(&mut [0u8; 8]), Ok(0)) {
+                closed += 1;
+            }
+        }
+        assert_eq!(closed, 2, "refused connections were left open");
+
+        // A freed slot is reusable.
+        links.pop();
+        let _again = std::net::TcpStream::connect(acceptor.addr()).expect("connect");
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            got.extend(acceptor.accepted());
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(got.len(), 1, "a dropped link did not free its slot");
+    }
+
+    /// A peer that never reads: past the budget the link closes itself instead
+    /// of queueing without bound.
+    #[test]
+    fn a_link_to_a_peer_that_never_reads_closes_at_its_budget() {
+        let mut acceptor = Acceptor::bind_with(
+            "127.0.0.1:0",
+            NetLimits {
+                max_queued: 16,
+                ..NetLimits::default()
+            },
+        )
+        .expect("bind");
+        let _peer = std::net::TcpStream::connect(acceptor.addr()).expect("connect");
+        let mut server = accept_one(&mut acceptor);
+
+        let mut sent = 0u64;
+        while !server.is_closed() && sent < 50_000_000 {
+            server.send(ServerMessage::Tick(sent));
+            sent += 1;
+        }
+        assert!(
+            server.is_closed(),
+            "{sent} messages queued and it never closed"
+        );
     }
 }
