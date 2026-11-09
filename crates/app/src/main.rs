@@ -23,6 +23,8 @@ mod far_census;
 mod far_streaming;
 mod flight;
 mod game;
+#[cfg(test)]
+mod lod_probe;
 mod options;
 mod paths;
 mod screenshot;

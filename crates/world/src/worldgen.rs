@@ -373,6 +373,23 @@ pub(crate) struct PlacedTree {
     height: i32,
 }
 
+/// Where one tree stands and how big it is: the public face of the placement
+/// [`WorldGen::trees_near`] is built from, for a caller that wants the trees
+/// themselves rather than the blocks they make -- the LOD-transition probe
+/// (`docs/PROPOSAL_LOD_TRANSITIONS.md`, M6) counting trees per ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeSite {
+    /// Trunk column, in blocks.
+    pub x: i32,
+    pub z: i32,
+    /// The first trunk block's y (the surface block's y plus one).
+    pub base: i32,
+    /// Trunk height in blocks.
+    pub height: i32,
+    /// How far the canopy reaches from the trunk, in blocks.
+    pub canopy_radius: i32,
+}
+
 /// The at-most-nine trees that can reach one chunk column.
 ///
 /// A fixed array rather than a `Vec`: this is built per chunk (and per voxel
@@ -697,6 +714,21 @@ impl WorldGen {
             }
         }
         out
+    }
+
+    /// The tree that grows in chunk column `(chunk_x, chunk_z)`, if any: the
+    /// same placement `trees_near` collects nine of, so what this reports is
+    /// exactly what generation puts in the world.
+    pub fn tree_site(&self, chunk_x: i32, chunk_z: i32, blocks: TerrainBlocks) -> Option<TreeSite> {
+        let oak = blocks.oak?;
+        let t = self.tree_in_column(chunk_x, chunk_z, blocks)?;
+        Some(TreeSite {
+            x: t.x,
+            z: t.z,
+            base: t.base,
+            height: t.height,
+            canopy_radius: oak.canopy_radius,
+        })
     }
 
     /// The tree in one chunk column, if it has one.

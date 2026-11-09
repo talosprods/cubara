@@ -33,5 +33,5 @@ pub use chunk_state::{ChunkState, ChunkStates, Woken};
 pub use raycast::{raycast, RayHit};
 pub use world::{simulation_box, World};
 pub use worldgen::{
-    OreGen, OreSet, TerrainBlocks, WorldGen, MAX_ORES, SOIL_DEPTH, WORLDGEN_VERSION,
+    OreGen, OreSet, TerrainBlocks, TreeSite, WorldGen, MAX_ORES, SOIL_DEPTH, WORLDGEN_VERSION,
 };
