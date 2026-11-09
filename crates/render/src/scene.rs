@@ -268,6 +268,10 @@ pub struct SceneRenderer {
     text: TextRenderer,
     width: u32,
     height: u32,
+    /// What a frame clears to: [`CLEAR_COLOR`], the sky, unless a
+    /// measurement asked for a colour nothing else draws
+    /// ([`set_clear_color`](Self::set_clear_color)).
+    clear: wgpu::Color,
 }
 
 impl SceneRenderer {
@@ -376,7 +380,16 @@ impl SceneRenderer {
             text: TextRenderer::new(device, queue, format),
             width,
             height,
+            clear: CLEAR_COLOR,
         }
+    }
+
+    /// Clear frames to `color` instead of the sky. For measurement only: the
+    /// fog fades the land into [`CLEAR_COLOR`], so a frame cleared to a colour
+    /// the land never takes shows exactly where nothing was drawn
+    /// (`--bench flight`'s holes).
+    pub fn set_clear_color(&mut self, color: wgpu::Color) {
+        self.clear = color;
     }
 
     /// Replace the item icons [`HotbarSlot::icon`] indexes into: one 16x16
@@ -637,7 +650,7 @@ impl SceneRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(self.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

@@ -98,6 +98,52 @@ fn can_unload(node: NodeKey, visible: &HashSet<NodeKey>, resident: &HashSet<Node
     replacements.is_empty() || replacements.iter().all(|r| resident.contains(r))
 }
 
+/// A node's box, in chunks, `max` exclusive.
+fn node_box(node: NodeKey) -> ([i32; 3], [i32; 3]) {
+    let o = node.chunk_origin();
+    let e = node.extent_chunks();
+    ([o.x, o.y, o.z], [o.x + e, o.y + e, o.z + e])
+}
+
+/// The far terrain's next hole: `prev` cut down to `want` at once, and grown
+/// to all of `want` only once `drawn(kept)` says the voxels draw what lies
+/// outside `kept` -- or at once when nothing of `prev` is kept (a first frame,
+/// a jump). See [`NodeStreaming::far_hole`].
+fn next_far_hole(
+    prev: ([i32; 3], [i32; 3]),
+    want: ([i32; 3], [i32; 3]),
+    drawn: impl FnOnce(([i32; 3], [i32; 3])) -> bool,
+) -> ([i32; 3], [i32; 3]) {
+    let kept = intersect(prev, want);
+    if kept == EMPTY || kept == want || drawn(kept) {
+        want
+    } else {
+        kept
+    }
+}
+
+/// A box with nothing in it.
+const EMPTY: ([i32; 3], [i32; 3]) = ([0; 3], [0; 3]);
+
+/// The overlap of two boxes; [`EMPTY`] when there is none.
+fn intersect(a: ([i32; 3], [i32; 3]), b: ([i32; 3], [i32; 3])) -> ([i32; 3], [i32; 3]) {
+    let min = [0, 1, 2].map(|i| a.0[i].max(b.0[i]));
+    let max = [0, 1, 2].map(|i| a.1[i].min(b.1[i]));
+    if (0..3).all(|i| min[i] < max[i]) {
+        (min, max)
+    } else {
+        EMPTY
+    }
+}
+
+fn overlaps(a: ([i32; 3], [i32; 3]), b: ([i32; 3], [i32; 3])) -> bool {
+    (0..3).all(|i| a.0[i] < b.1[i] && b.0[i] < a.1[i])
+}
+
+fn contains(outer: ([i32; 3], [i32; 3]), inner: ([i32; 3], [i32; 3])) -> bool {
+    (0..3).all(|i| outer.0[i] <= inner.0[i] && inner.1[i] <= outer.1[i])
+}
+
 pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     NodeId {
         level: node.level,
@@ -173,6 +219,14 @@ pub struct NodeStreaming {
     /// made mountains flicker; they leave in the same `apply_node_updates` call
     /// that brings their replacement in.
     held: HashSet<NodeKey>,
+    /// The centre of the last search applied: what `visible` was worked out
+    /// around.
+    searched: Option<ChunkCoord>,
+    /// The box, in chunks, the far terrain currently leaves to these nodes
+    /// ([`far_hole`](Self::far_hole)), and the box it should leave once they
+    /// are drawn. Empty (`min == max`) before the first frame.
+    far_hole: ([i32; 3], [i32; 3]),
+    far_want: ([i32; 3], [i32; 3]),
     /// The nodes the camera could see ([`visibility::visible_nodes`]); the only
     /// ones meshed and drawn.
     visible: HashSet<NodeKey>,
@@ -286,6 +340,9 @@ impl NodeStreaming {
             mesh_pool: MeshPool::new(),
             resident: HashSet::new(),
             held: HashSet::new(),
+            searched: None,
+            far_hole: ([0; 3], [0; 3]),
+            far_want: ([0; 3], [0; 3]),
             center: None,
             links: Arc::new(HashMap::new()),
             visible: HashSet::new(),
@@ -406,6 +463,7 @@ impl NodeStreaming {
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
     fn follow_visibility(&mut self, renderer: &mut Renderer, world: &Arc<World>, done: SearchDone) {
+        self.searched = Some(done.center);
         let desired = done.desired;
         Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
         self.visible = done.visible;
@@ -451,6 +509,57 @@ impl NodeStreaming {
         }
     }
 
+    /// The box the far terrain may leave to the voxel nodes this frame, for
+    /// an eye at `eye` -- the owner's holes while flying (2026-11-09: "laag
+    /// detail niveau, dan is het weg, heel kort daarna laadt het op een hoger
+    /// niveau").
+    ///
+    /// The nodes' own box ([`node::covered_box_3d`]) moves the moment the eye
+    /// crosses a chunk, by a whole coarsest node on its far side -- 128 blocks
+    /// of ground about a kilometre ahead. Handing that to the voxels at once
+    /// sank the far terrain there while the nodes that draw it were still
+    /// being meshed: sky, then the finer ground. So the box the far terrain
+    /// leaves **shrinks at once** (where the voxels stop drawing, it draws
+    /// again) and **grows only when every node the search wants in the new
+    /// part is drawn**, which costs a few frames of both drawing that strip
+    /// and never a frame of neither.
+    ///
+    /// With nothing kept -- the first frame, or a jump such as `/tp` that
+    /// leaves the old box behind entirely -- the new box is taken at once, as
+    /// it always was: that is a loading moment, not a flight.
+    pub fn far_hole(&mut self, renderer: &Renderer, eye: [f32; 3]) -> cubara_world::far::Hole {
+        let center = ChunkCoord::from_world_pos(eye);
+        let want = node::covered_box_3d(center, node::DEFAULT_RING_SCHEDULE);
+        let hole = next_far_hole(self.far_hole, want, |kept| {
+            self.drawn_within(renderer, center, want, kept)
+        });
+        self.far_hole = hole;
+        self.far_want = want;
+        crate::far_streaming::hole_in_blocks(hole)
+    }
+
+    /// Whether every node the search around `center` wants inside `want` and
+    /// not wholly inside `have` is drawn: arrived from the mesh workers and
+    /// through the renderer's upload queue.
+    fn drawn_within(
+        &self,
+        renderer: &Renderer,
+        center: ChunkCoord,
+        want: ([i32; 3], [i32; 3]),
+        have: ([i32; 3], [i32; 3]),
+    ) -> bool {
+        self.searched == Some(center)
+            && renderer.uploads_pending() == 0
+            && self
+                .visible
+                .iter()
+                .filter(|n| {
+                    let b = node_box(**n);
+                    overlaps(b, want) && !contains(have, b)
+                })
+                .all(|n| self.resident.contains(n))
+    }
+
     /// How many nodes are drawn, held for a replacement, being meshed, and
     /// seen -- for a measurement's log (`crate::flight`).
     pub fn counts(&self) -> (usize, usize, usize, usize) {
@@ -470,6 +579,7 @@ impl NodeStreaming {
             && !self.visibility_stale
             && self.held.is_empty()
             && self.mesh_pool.in_flight().next().is_none()
+            && self.far_hole == self.far_want
     }
 
     /// Where `node` is in the rendering lifecycle (§11.1).
@@ -746,6 +856,37 @@ mod tests {
     /// (§11.1), and this is where that is asserted rather than only written
     /// down: the two enums are not convertible, and nothing here mentions a
     /// `ChunkCoord`.
+    /// The far terrain gives ground to the voxels only once they draw it, and
+    /// takes it back at once: never neither (the owner's holes while flying).
+    #[test]
+    fn the_far_hole_grows_only_when_the_voxels_are_drawn_and_shrinks_at_once() {
+        let old = ([0, 0, 0], [8, 8, 8]);
+        // The eye moved +x: the box gains x 8..16 and loses x 0..8.
+        let moved = ([8, 0, 0], [16, 8, 8]);
+        let shifted = ([4, 0, 0], [12, 8, 8]);
+        // Overlapping: keep the overlap until the new part is drawn...
+        assert_eq!(
+            next_far_hole(old, shifted, |_| false),
+            ([4, 0, 0], [8, 8, 8])
+        );
+        // ...and take all of it once it is, asked about exactly the overlap.
+        let mut asked = None;
+        let grown = next_far_hole(old, shifted, |kept| {
+            asked = Some(kept);
+            true
+        });
+        assert_eq!(grown, shifted);
+        assert_eq!(asked, Some(([4, 0, 0], [8, 8, 8])));
+        // Shrinking is never waited for.
+        assert_eq!(
+            next_far_hole(old, ([0, 0, 0], [4, 8, 8]), |_| false),
+            ([0, 0, 0], [4, 8, 8])
+        );
+        // Nothing kept (first frame, a jump): the new box at once.
+        assert_eq!(next_far_hole(EMPTY, old, |_| false), old);
+        assert_eq!(next_far_hole(old, moved, |_| false), moved);
+    }
+
     #[test]
     fn node_residency_names_the_states_that_already_existed() {
         let states = [

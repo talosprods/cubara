@@ -1266,6 +1266,27 @@ terrain at High. Details in ⁷⁴.
 | 2026-11-09 | **Linux**, before⁷⁷ | down, 2 runs | 22.80% / 21.81% | 97.9% / 97.9% | 42% / 37% | 3.4 / 3.3 ms | `bench/flight-before` |
 | 2026-11-09 | **Linux**, the same three⁷⁷ | down, 2 runs | **0.79% / 0.79%** | **24.0% / 24.0%** | **5% / 5%** | 3.6 / 4.3 ms | `5b29370` |
 
+### Holes while flying — nothing drawn where land belongs (`--bench flight`)
+
+The owner's worst complaint in phase 3 (block 3.0a): *"laag detail niveau, dan
+is het weg, heel kort daarna laadt het op een hoger niveau"*. The same flights,
+with frames cleared to magenta, a colour the land never takes. **Hole frames**
+counts every frame of the real-time pass in which a pixel that showed land
+shows nothing for at most half a second and then shows land again. **Visible**
+counts the frames where that is over 0.1% of the screen. **Kept** compares
+the kept frames (every 0.25 s) with the finished frame: nothing where the
+finished frame has land. Linux (GTX 1060 Max-Q), 1280×720, High. Details in ⁷⁹.
+
+| Date | Change | Flight | Hole frames | Visible (> 0.1%) | Worst frame | Kept with a hole, worst | Commit |
+|---|---|---|---|---|---|---|---|
+| 2026-11-09 | before⁷⁹ | low, 3 runs | 1,194 / 1,195 / 1,192 of ~1,196 | 25 / 27 / 24 | 0.23% | 18 / 17 / 17, 0.25% | `main` + measurement |
+| 2026-11-09 | **the far terrain gives ground to the voxels only once they draw it**⁷⁹ | low, 2 runs | 1,198 / 1,198 | **0 / 0** | **0.026%** | 14 / 15, 0.04% | *(this PR)* |
+| 2026-11-09 | before⁷⁹ | high: from (8, 400, 8) along (1, −0.35, 0.3), 3 runs | 673 / 663 / 653 of ~1,198 | 22 / 22 / 26 | **1.77%** | 1 / 1 / 1, 0.82% | `main` + measurement |
+| 2026-11-09 | **the same**⁷⁹ | high, 2 runs | 663 / 669 | **0 / 0** | **0.003%** | 1 / 1, 0.001% | *(this PR)* |
+| 2026-11-09 | before / after⁷⁹ | down, 3 / 2 runs | 890 / 888 / 892 / 897 / 893 of ~893 | 0 everywhere | 0.004–0.005% | 2–4, 0.002% | |
+| 2026-11-09 | before⁷⁹ | toward a peak: level at its top, from 900 blocks, 30 s (`--toward-peak`), 3 runs | 1,255 / 1,285 / 1,279 of ~1,790 | 0 / 0 / 0 | 0.024% | 1–2, 0.022% | `main` + measurement |
+| 2026-11-09 | **the same**⁷⁹ | toward a peak, 2 runs | 1,248 / 1,296 | 0 / 0 | **0.001%** | 2–3, 0.000% | *(this PR)* |
+
 ## Detailed run logs
 
 Kept for the notable/first runs; the tables above are the quick trend view.
@@ -2704,3 +2725,32 @@ a frame cost no CPU worth measuring. `prepare` writes fewer 20-byte records,
 and one `multi_draw_indexed_indirect` submits them all either way. GPU/frame is
 unchanged too (0.547–0.552 ms at ground). Whether a GPU's front end notices
 fewer draw records is for the M3 to measure.
+
+⁷⁹ **Holes while flying: the far terrain's hole moved before the voxels
+arrived (block 3.0a), Linux, 2026-11-09.** The far terrain leaves a box around
+the eye to the voxel nodes: inside it, it sinks its vertices out of sight. That
+box was `covered_box_3d` of the eye's chunk, worked out every frame. When the
+eye crosses a coarsest-node boundary it moves by a whole 128-block node on its
+far side, about a kilometre ahead. The far terrain sank there at once, while
+the nodes that draw that strip were still being meshed: sky, then the finer
+ground. `NodeStreaming::far_hole` now hands the box over. It **shrinks at once**,
+so the far terrain draws again wherever the voxels stop. It **grows only when
+every node the latest search wants in the new part is resident and the upload
+queue is empty**. The cost is a few frames of both drawing the strip, never a
+frame of neither. A first frame, or a jump that keeps nothing of the old box,
+takes the new box at once, as before. When the hole changes, the far terrain
+reselects at once.
+
+Measured with `--bench flight`, frames cleared to magenta (`set_clear_color`,
+measurement only), every frame of the real-time pass read back. Before is this
+branch with `far_hole` returning the nodes' own box (`main`'s behaviour plus
+the measurement). Separate binaries, the after runs alternating with the third
+before run. The CPU sat at 77–95 °C with the lid closed; the GPU at 55–76 °C.
+
+What is left is not swapping. In nearly every frame a few dozen pixels
+(0.001–0.03%) show nothing for a frame or two. Most likely these are cracks
+where neighbouring nodes or the far terrain meet, which a frame's motion opens
+and closes. They are the next step to the gate's "no frame shows sky where the
+finished frame shows terrain". The loading figures of the same runs match
+note ⁷⁷ (low 0.19–0.35% mean loading, down 0.70–0.73%), so the swap costs
+nothing measurable there.

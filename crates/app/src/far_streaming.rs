@@ -12,8 +12,10 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use cubara_render::aggregate::Materials;
 use cubara_render::{FarParams, FarPatch, FarSlot, Renderer};
+#[cfg(test)]
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
+#[cfg(test)]
 use cubara_world::node;
 use cubara_world::WorldGen;
 
@@ -113,16 +115,25 @@ pub fn far_view(
     })
 }
 
-/// The box the voxel nodes around `eye` draw themselves, in blocks
-/// ([`node::covered_box_3d`] for the game's own schedule).
-pub fn voxel_hole(eye: [f32; 3]) -> Hole {
-    let (min, max) =
-        node::covered_box_3d(ChunkCoord::from_world_pos(eye), node::DEFAULT_RING_SCHEDULE);
+/// A box of chunks (`max` exclusive) as the far terrain's hole, in blocks.
+pub fn hole_in_blocks((min, max): ([i32; 3], [i32; 3])) -> Hole {
     let blocks = |c: [i32; 3]| c.map(|v| (v * 16) as f64);
     Hole {
         min: blocks(min),
         max: blocks(max),
     }
+}
+
+/// The box the voxel nodes around `eye` draw once loaded, in blocks
+/// ([`node::covered_box_3d`] for the game's own schedule). What the hole
+/// becomes; the game hands it over as the nodes arrive
+/// (`NodeStreaming::far_hole`).
+#[cfg(test)]
+pub fn voxel_hole(eye: [f32; 3]) -> Hole {
+    hole_in_blocks(node::covered_box_3d(
+        ChunkCoord::from_world_pos(eye),
+        node::DEFAULT_RING_SCHEDULE,
+    ))
 }
 
 /// The renderer's form of a patch.
@@ -280,6 +291,8 @@ pub struct FarStreaming {
     slots: HashMap<PatchKey, FarSlot>,
     /// Where the eye was when the selection was last worked out.
     selected_at: Option<[f64; 3]>,
+    /// The hole the last selection left to the voxels.
+    hole: Option<Hole>,
     /// New patches arrived since then.
     stale: bool,
     materials: Materials,
@@ -299,6 +312,7 @@ impl FarStreaming {
             in_flight: HashSet::new(),
             slots: HashMap::new(),
             selected_at: None,
+            hole: None,
             stale: false,
             materials: far_materials(),
             warned_full: false,
@@ -353,7 +367,7 @@ impl FarStreaming {
     /// Bring the far terrain in line with the camera at `eye`: take in what
     /// has been generated, work the selection out again if the eye has moved
     /// or new patches arrived, and ask for what is missing.
-    pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3]) {
+    pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3], hole: Hole) {
         while let Ok((generation, patch)) = self.pool.done.try_recv() {
             if generation != self.generation {
                 continue;
@@ -370,9 +384,12 @@ impl FarStreaming {
                 .sqrt();
             d > RESELECT_BLOCKS
         });
-        let hole = voxel_hole(eye);
+        // The hole is the voxels' to say (`NodeStreaming::far_hole`): where it
+        // shrinks, patches it used to swallow are wanted at once.
+        let hole_moved = self.hole != Some(hole);
+        self.hole = Some(hole);
         renderer.set_far_params(to_far_params(hole, self.materials));
-        if !(moved || self.stale) {
+        if !(moved || hole_moved || self.stale) {
             return;
         }
         self.selected_at = Some(eye64);

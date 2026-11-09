@@ -784,7 +784,8 @@ impl ApplicationHandler for App {
                             w.settle();
                         }
                     }
-                    far.update(renderer, camera.eye.to_array());
+                    let hole = streaming.far_hole(renderer, camera.eye.to_array());
+                    far.update(renderer, camera.eye.to_array(), hole);
                 }
                 // Spectating hides the play HUD (#305): no hotbar, hearts or
                 // crosshair. The outline and cracks go too, because the sim
@@ -968,7 +969,7 @@ fn main() {
             // holds this PC's frame-rate target -- by default a 60 Hz monitor's
             // -- written to its settings. What the game runs on its own, with
             // its monitor's refresh rate and its window's size.
-            // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--seconds S]
+            // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--toward-peak] [--seconds S]
             // [--speed B] [--fps F] [--frames DIR]`: how much of the screen is
             // still loading while flying at the game's speed.
             bench::Target::Flight => {
@@ -986,8 +987,17 @@ fn main() {
                         std::process::exit(2);
                     })
                 });
+                // `--toward-peak`: the owner's flight toward a mountain, the one
+                // he sees holes on -- start and direction found, not typed.
+                let (start, look) = if args.iter().any(|a| a == "--toward-peak") {
+                    flight::toward_peak(&cubara_world::WorldGen::new(
+                        cubara_world::World::new().seed(),
+                    ))
+                } else {
+                    (eye.unwrap_or([8.0, 120.0, 8.0]), look)
+                };
                 let flight = flight::Flight {
-                    start: eye.unwrap_or([8.0, 120.0, 8.0]),
+                    start,
                     look,
                     speed: number("--speed", flight::FLY_SPEED),
                     seconds: number("--seconds", 20.0),

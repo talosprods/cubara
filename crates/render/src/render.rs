@@ -813,6 +813,12 @@ impl Renderer {
         self.far.set_params(&self.queue, params);
     }
 
+    /// Clear frames to `color` instead of the sky -- see
+    /// [`SceneRenderer::set_clear_color`]. For measurement only.
+    pub fn set_clear_color(&mut self, color: wgpu::Color) {
+        self.scene.set_clear_color(color);
+    }
+
     /// Meshes handed over and not yet uploaded: still to appear on screen.
     pub fn uploads_pending(&self) -> usize {
         self.uploads.len()

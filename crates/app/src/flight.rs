@@ -28,6 +28,79 @@ use crate::streaming::NodeStreaming;
 /// Blocks per second: `cubara_sim::player`'s free-fly speed.
 pub const FLY_SPEED: f32 = 24.0;
 
+/// What frames clear to while measuring: magenta, a colour the land never
+/// takes (the fog fades it into the sky's own colour), so a pixel showing it
+/// is a pixel nothing was drawn on.
+const NOTHING: wgpu::Color = wgpu::Color {
+    r: 1.0,
+    g: 0.0,
+    b: 1.0,
+    a: 1.0,
+};
+
+/// Whether an RGBA pixel shows [`NOTHING`].
+fn shows_nothing(p: &[u8]) -> bool {
+    p[0] >= 250 && p[1] <= 5 && p[2] >= 250
+}
+
+/// The longest run of frames, at the flight's 60 Hz, that a pixel may show
+/// nothing between two frames of land and still count as a hole rather than
+/// sky it really looks at: half a second. Longer gaps are caught by the kept
+/// frames' comparison with the finished frame.
+const HOLE_MAX_FRAMES: u32 = 30;
+
+/// Finds holes in a sequence of frames: pixels that showed land, then nothing
+/// for at most [`HOLE_MAX_FRAMES`], then land again -- the owner's "laag detail
+/// niveau, dan is het weg, heel kort daarna laadt het op een hoger niveau".
+///
+/// Sky that is really there is never counted: it does not go back to land
+/// within half a second on a straight flight, and a run still open when the
+/// flight ends is not counted either. Pure, so the rule is tested without a GPU.
+pub struct HoleTracker {
+    /// Per pixel: whether it showed land in the last frame.
+    land: Vec<bool>,
+    /// Per pixel: the frame its current run of nothing began after land, or
+    /// `u32::MAX`.
+    run_start: Vec<u32>,
+    frame: u32,
+    /// Per frame: the pixels that were holes in it.
+    pub per_frame: Vec<u32>,
+}
+
+impl HoleTracker {
+    pub fn new(pixels: usize) -> Self {
+        Self {
+            land: vec![false; pixels],
+            run_start: vec![u32::MAX; pixels],
+            frame: 0,
+            per_frame: Vec::new(),
+        }
+    }
+
+    /// Take the next frame: per pixel, whether it shows nothing.
+    pub fn push(&mut self, nothing: impl IntoIterator<Item = bool>) {
+        self.per_frame.push(0);
+        for (i, empty) in nothing.into_iter().enumerate() {
+            if empty {
+                if self.land[i] {
+                    self.run_start[i] = self.frame;
+                }
+                self.land[i] = false;
+            } else {
+                let start = self.run_start[i];
+                if start != u32::MAX && self.frame - start <= HOLE_MAX_FRAMES {
+                    for f in start..self.frame {
+                        self.per_frame[f as usize] += 1;
+                    }
+                }
+                self.run_start[i] = u32::MAX;
+                self.land[i] = true;
+            }
+        }
+        self.frame += 1;
+    }
+}
+
 /// A pixel counts as still loading when a channel is off by more than this
 /// from the finished frame. Far above what a far patch one level coarser or
 /// a node one level off moves a pixel by on open ground, far below ground
@@ -57,6 +130,37 @@ pub fn eye_at(flight: &Flight, t: f32) -> [f32; 3] {
     (glam::Vec3::from(flight.start) + dir * flight.speed * t).to_array()
 }
 
+/// How far from spawn [`toward_peak`] looks for a mountain, in blocks.
+const PEAK_SEARCH: i32 = 4096;
+
+/// How far before the peak the flight toward it starts, in blocks: inside the
+/// far terrain, so the flight crosses the voxel rings' edges on the way in.
+const PEAK_APPROACH: f32 = 900.0;
+
+/// The owner's flight toward a mountain: the tallest surface within
+/// [`PEAK_SEARCH`] of spawn, approached level at its summit's height from
+/// [`PEAK_APPROACH`] away on the side facing spawn. Returns the start and the
+/// direction. Deterministic for a seed: a 32-block grid, ties to the first.
+pub fn toward_peak(gen: &cubara_world::WorldGen) -> ([f32; 3], [f32; 3]) {
+    let mut best = (i32::MIN, 0, 0);
+    for x in (-PEAK_SEARCH..=PEAK_SEARCH).step_by(32) {
+        for z in (-PEAK_SEARCH..=PEAK_SEARCH).step_by(32) {
+            let h = gen.surface_height(x, z);
+            if h > best.0 {
+                best = (h, x, z);
+            }
+        }
+    }
+    let (h, px, pz) = best;
+    let peak = glam::vec2(px as f32, pz as f32);
+    let away = (-peak).normalize_or(glam::Vec2::X);
+    let start = peak + away * PEAK_APPROACH;
+    let y = h as f32 + 3.0;
+    let look = glam::vec3(peak.x - start.x, 0.0, peak.y - start.y).normalize();
+    log::info!("flight: toward the peak at ({px}, {h}, {pz}), from {start:.0}");
+    ([start.x, y, start.y], look.to_array())
+}
+
 /// The fraction of `live`'s pixels more than [`TOLERANCE`] off `settled`'s.
 pub fn loading_fraction(live: &Frame, settled: &Frame) -> f64 {
     cubara_render::headless::compare(&live.pixels, &settled.pixels, TOLERANCE).differing_fraction
@@ -68,6 +172,22 @@ pub struct Sample {
     pub t: f32,
     pub eye: [f32; 3],
     pub loading: f64,
+    /// The share of its pixels that showed nothing where the finished frame
+    /// shows land.
+    pub hole: f64,
+}
+
+/// The share of `live`'s pixels that show nothing where `settled` does not.
+pub fn hole_fraction(live: &Frame, settled: &Frame) -> f64 {
+    let n = live
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(settled.pixels.as_chunks::<4>().0.iter())
+        .filter(|(l, s)| shows_nothing(&l[..]) && !shows_nothing(&s[..]))
+        .count();
+    n as f64 / (live.pixels.len() / 4).max(1) as f64
 }
 
 /// What a flight found.
@@ -79,6 +199,11 @@ pub struct FlightReport {
     /// measurement's sleep standing in for a display, and a sleep wakes when
     /// it likes -- about 4 ms late at p99 on an idle M3.
     pub work_times: Vec<f32>,
+    /// Per frame of the real-time pass, the pixels that were holes
+    /// ([`HoleTracker`]).
+    pub holes: Vec<u32>,
+    /// Pixels in a frame.
+    pub pixels: usize,
 }
 
 impl FlightReport {
@@ -113,11 +238,18 @@ impl FlightReport {
             t: 0.0,
             eye: [0.0; 3],
             loading: 0.0,
+            hole: 0.0,
         });
         let (work_p99, work_max) = p99_and_max(&self.work_times);
+        let (any, visible, worst_px) = self.hole_frames();
+        let kept_holes = self.samples.iter().filter(|s| s.hole > 0.0).count();
+        let kept_worst = self.samples.iter().map(|s| s.hole).fold(0.0, f64::max);
         format!(
             "FLIGHT: loading mean {:.2}% worst {:.2}% (at {:.2} s, {:.0?}), \
-             frames over 1%: {:.0}%, work p99 {:.1} ms max {:.1} ms ({} kept frames)",
+             frames over 1%: {:.0}%, work p99 {:.1} ms max {:.1} ms ({} kept frames) | \
+             HOLES: {any} of {} frames show a hole, {visible} over 0.1% of the screen, \
+             worst {:.3}%; kept frames with nothing where the finished frame has land: \
+             {kept_holes}, worst {:.3}%",
             self.mean() * 100.0,
             worst.loading * 100.0,
             worst.t,
@@ -125,7 +257,21 @@ impl FlightReport {
             self.frames_over(0.01) * 100.0,
             work_p99 * 1000.0,
             work_max * 1000.0,
-            self.samples.len()
+            self.samples.len(),
+            self.holes.len(),
+            worst_px as f64 * 100.0 / self.pixels.max(1) as f64,
+            kept_worst * 100.0,
+        )
+    }
+
+    /// Frames of the real-time pass with any hole pixel, with holes over 0.1%
+    /// of the screen, and the most hole pixels in one frame.
+    pub fn hole_frames(&self) -> (usize, usize, u32) {
+        let visible = (self.pixels / 1000) as u32;
+        (
+            self.holes.iter().filter(|&&n| n > 0).count(),
+            self.holes.iter().filter(|&&n| n > visible).count(),
+            self.holes.iter().copied().max().unwrap_or(0),
         )
     }
 }
@@ -152,7 +298,8 @@ struct Streamed {
 impl Streamed {
     fn new(flight: &Flight) -> Option<Self> {
         let camera = pose(flight, flight.start);
-        let (renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
+        let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
+        renderer.set_clear_color(NOTHING);
         let layers = assets.layers;
         let registry = Arc::new(assets.registry);
         let nodes = NodeStreaming::new(
@@ -174,7 +321,8 @@ impl Streamed {
     /// Stream for `eye` and draw one frame, the way the game's frame does.
     fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
         self.nodes.update(&mut self.renderer, &self.world, eye);
-        self.far.update(&mut self.renderer, eye);
+        let hole = self.nodes.far_hole(&self.renderer, eye);
+        self.far.update(&mut self.renderer, eye, hole);
         self.renderer.render(
             pose(flight, eye),
             None,
@@ -233,6 +381,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     let budget = Duration::from_secs_f64(1.0 / flight.fps.max(1) as f64);
     let mut kept: Vec<(f32, [f32; 3], Frame)> = Vec::new();
     let mut work_times = Vec::new();
+    let mut holes: Option<HoleTracker> = None;
     let start = Instant::now();
     let mut next_frame = start;
     let mut next_keep = 0.0;
@@ -245,6 +394,19 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         let working = Instant::now();
         live.frame(flight, eye);
         work_times.push(working.elapsed().as_secs_f32());
+        // Every frame, for the holes: one lasts a few frames, and the kept
+        // ones are a quarter of a second apart. Read after the work is timed,
+        // so the readback is not counted as the game's.
+        let shown = live.renderer.read_frame()?;
+        let tracker = holes.get_or_insert_with(|| HoleTracker::new(shown.pixels.len() / 4));
+        tracker.push(
+            shown
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| shows_nothing(p)),
+        );
         if t >= next_keep {
             let (resident, held, meshing, visible) = live.nodes.counts();
             log::debug!(
@@ -252,7 +414,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
                  {visible} visible, {} uploads queued",
                 live.renderer.uploads_pending()
             );
-            kept.push((t, eye, live.renderer.read_frame()?));
+            kept.push((t, eye, shown));
             next_keep += flight.every;
         }
         // Paced like a display showing `fps` frames a second: a frame that
@@ -275,9 +437,11 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         settled.settle(flight, eye);
         let reference = settled.renderer.read_frame()?;
         let loading = loading_fraction(&frame, &reference);
+        let hole = hole_fraction(&frame, &reference);
         log::info!(
-            "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading",
-            loading * 100.0
+            "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading, {:.3}% nothing where land is",
+            loading * 100.0,
+            hole * 100.0
         );
         if let Some(dir) = frames.filter(|_| loading > 0.01) {
             for (kind, f) in [("live", &frame), ("settled", &reference)] {
@@ -285,7 +449,12 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
             }
         }
         keep_worst(&mut worst, loading, (frame, reference));
-        samples.push(Sample { t, eye, loading });
+        samples.push(Sample {
+            t,
+            eye,
+            loading,
+            hole,
+        });
     }
     // The measurement's own zero. The first kept frame is at the start, which
     // the live pass loaded completely before it set off, so it must match its
@@ -305,9 +474,12 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
             save(&dir.join(name), &frame);
         }
     }
+    let pixels = (flight.size.0 * flight.size.1) as usize;
     Some(FlightReport {
         samples,
         work_times,
+        holes: holes.map_or_else(Vec::new, |h| h.per_frame),
+        pixels,
     })
 }
 
@@ -382,14 +554,54 @@ mod tests {
             t: 0.0,
             eye: [0.0; 3],
             loading,
+            hole: 0.0,
         };
         let r = FlightReport {
             samples: vec![sample(0.0), sample(0.02), sample(0.005), sample(0.1)],
             work_times: vec![0.002; 10],
+            holes: Vec::new(),
+            pixels: 4,
         };
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
         assert_eq!(r.worst().unwrap().loading, 0.1);
+    }
+
+    /// Land, nothing for a few frames, land again: a hole, counted in every
+    /// frame it showed. Sky that stays sky, sky that becomes land, land that
+    /// becomes sky for good, and a gap longer than half a second are not.
+    #[test]
+    fn a_hole_is_land_then_briefly_nothing_then_land() {
+        let (l, n) = (false, true); // land, nothing
+                                    // Pixel 0: a 3-frame hole (frames 1..=3). Pixel 1: sky throughout.
+                                    // Pixel 2: sky, then land (the view tilting down). Pixel 3: land, then
+                                    // sky for good (a ridge passing below). Pixel 4: land, nothing for 31
+                                    // frames, land: longer than a hole may be.
+        let mut frames: Vec<[bool; 5]> = vec![[l, n, n, l, l]];
+        frames.extend([[n, n, n, n, n]; 3]);
+        frames.push([l, n, l, n, n]);
+        frames.extend([[l, n, l, n, n]; 27]);
+        frames.push([l, n, l, n, l]);
+        let mut t = HoleTracker::new(5);
+        for f in &frames {
+            t.push(f.iter().copied());
+        }
+        let mut want = vec![0u32; frames.len()];
+        for w in &mut want[1..=3] {
+            *w = 1;
+        }
+        assert_eq!(t.per_frame, want);
+    }
+
+    /// A hole is nothing in the live frame where the finished frame has land;
+    /// sky in both is not one.
+    #[test]
+    fn a_kept_hole_is_nothing_where_the_finished_frame_has_land() {
+        let nothing = [255, 0, 255, 255];
+        let land = [90, 120, 60, 255];
+        let live = frame([nothing, nothing, land, land].concat());
+        let done = frame([nothing, land, land, land].concat());
+        assert_eq!(hole_fraction(&live, &done), 0.25);
     }
 
     #[test]
