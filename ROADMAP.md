@@ -121,7 +121,12 @@ Passes only when **all** of the following hold, and it exits non-zero otherwise:
   flight eye, until `docs/PROPOSAL_FAR_VIEW.md`'s block F3). The orbit this
   used to be looked at the whole region from above at once, which no player
   does, so the same code reads about 2.5× higher now (`BENCHMARKS.md` ⁶²).
-  That is why the change is recorded here rather than quietly made.
+  That is why the change is recorded here rather than quietly made. The
+  `--bench 64` wording in the bullet above is the pre-amendment criterion;
+  `scripts/check-phase-gate.sh` runs `--bench gate`.
+
+  *2026-11-09: F3 has since landed, so the flight eye now draws far terrain
+  and counts toward the gate.*
 - The determinism replay test passes single-threaded and multi-threaded with an
   identical world-state hash.
 - Golden-image tests cover: all three block types visible and textured, a cave
@@ -464,6 +469,9 @@ from once phase 3 is actually scoped:
   toggleable off for survival later (none disabled yet). `/tp` is the one
   command wanted now.
 
+  *2026-11-09: Options is no longer empty. The far-terrain quality keys
+  (1–4 for the level, A for auto, B for the benchmark) live there (#289).*
+
 Creative mode and the options-menu shell that exposes it are being built ahead
 of this list, directly from the owner's request ("chill to be able to fly
 before we get to worldgen") — not as a phase-3 admission, the same way the
@@ -534,7 +542,14 @@ the gate is met when one with the far terrain on holds 1,000 at every eye.
 
 | Phase 1 | Phase 2 | Engine work, scheduled against phase 3 |
 |---|---|---|
-| #89, #83, #46, #54, #43, #44, #55, #48, #57, #53, #52, #90, #60, #38 | #56, #47, #58, #59 | #28, #32, #33, #42, #36 |
+| none open (all closed) | none open (all closed) | #28, #32, #33, #42, #130, #131, #132, #264, #271, #299 |
+
+*As of 2026-11-09, from `gh issue list --state open`.* Every phase 1 and phase 2
+issue that used to be listed here is closed. The open ones are all engine work
+scheduled against phase 3: #28, #32, #33, #42, #130, #131 and #132 (GPU culling,
+draw order, MSAA); #264, the far-view question (answered by the owner;
+`docs/PROPOSAL_FAR_VIEW.md` is the proposal, in progress); #271, the DX12 naga
+note; and #299, the haze (F5).
 
 Each phase is the GitHub milestone of the same name, and every open issue is
 filed under one — an issue that fits no phase is unscheduled work, not a reason

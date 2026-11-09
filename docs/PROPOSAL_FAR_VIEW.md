@@ -1,6 +1,6 @@
 # Proposal: seeing hundreds of kilometres
 
-**Status: proposed 2026-09-26. The direction is set, and nothing is built yet.**
+**Status: proposed 2026-09-26. The direction is set. F1–F4 are built (far terrain, block-aggregate shading, quality levels); F5, the haze, is in progress as #299.**
 The experiments behind the numbers are on the branch `exp/far-view-octree`: a
 few constants changed and one probe added, not for merging.
 
@@ -31,12 +31,14 @@ built. This is that proposal.
 
 ## §1 What exists now
 
+*A snapshot as of 2026-09-26, before F1. The values below are what the code held then; F3 since replaced the far plane and the fog.*
+
 | | Where | Value |
 |---|---|---|
 | Ring schedule | `crates/world/src/node.rs` `DEFAULT_RING_SCHEDULE` | levels 0–3, outer ring 64 chunks = **1,024 blocks** |
 | Far plane | `crates/render/src/render.rs` `FAR_PLANE` | 2,000 blocks |
 | Fog | `Lighting::fog_range(render_radius_blocks())` | ends inside 1,024 blocks, and exists to hide the edge |
-| Vertical reach | `desired_nodes_3d` | a cube: 1,024 blocks up or down (`VERTICAL_LOD_SQUASH` coarsens detail vertically, not reach), so **from 3 km up nothing is drawn** — *corrected 2026-09-26; this row first said 512* |
+| Vertical reach | `desired_nodes_3d` | a cube: 1,024 blocks up or down (`VERTICAL_LOD_SQUASH` coarsens detail vertically, not reach), so **from 1 km up nothing is drawn** — *corrected 2026-09-26; this row first said 512* |
 
 ## §2 What the measurements say
 

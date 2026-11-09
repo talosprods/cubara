@@ -78,9 +78,10 @@ links `wgpu` and `winit` even where it never opens a window:
 | `cubara` | Metal, AppKit, QuartzCore, CoreVideo | 6.8 MB |
 | `cubara-server` | `libSystem` only | 2.1 MB |
 
-**There is no network transport yet.** This runs a world; it does not yet serve
-one to anybody. See [`docs/RESEARCH_MULTIPLAYER.md`](docs/RESEARCH_MULTIPLAYER.md)
-for the design it is being built towards.
+**Network transport.** The server listens for clients with `--listen <addr>`,
+and the game window joins one with `--connect <addr>`; see `crates/server`
+(`net.rs`) and `crates/app/src/main.rs`. The design it follows is in
+[`docs/RESEARCH_MULTIPLAYER.md`](docs/RESEARCH_MULTIPLAYER.md).
 
 Stack: Rust + [`wgpu`](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows) +
 `winit`. See `PLAN.md` for architecture and the milestone roadmap.

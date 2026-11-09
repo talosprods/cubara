@@ -29,7 +29,7 @@ pub struct View {
     pub size: (u32, u32),
 }
 
-/// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_blocks()`
+/// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_chunks()` (chunks; times 16 for blocks)
 /// (the *window*'s fixed schedule), since `--screenshot --radius N` can ask
 /// for a region smaller or larger than the game streams: reusing a fixed
 /// number here would put fog past this shot's own meshed region exactly the

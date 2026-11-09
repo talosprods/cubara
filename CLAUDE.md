@@ -238,8 +238,9 @@ not just checked against the 1000-FPS gate**. After a feature is done:
   vs the previous row**, not just "gate MET".
 
 Measurement caveats to keep honest: at small/submit-bound scenes **FPS is noisy
-and ramps upward across back-to-back runs** (CPU/GPU clock boost — the 200-frame
-warmup is too short to reach steady clocks), so lean on **CPU/frame** as the
+and ramps upward across back-to-back runs** (CPU/GPU clock boost — the warm-up is now at
+least 200 frames and 1 s, #298, `BENCHMARKS.md` ⁷⁵, which gets most of the way
+to steady clocks), so lean on **CPU/frame** as the
 comparable metric until a feature makes the scene heavy enough to be CPU/GPU
 bound. Record Windows numbers automatically; the macOS M3 row is added when the
 user runs it there.

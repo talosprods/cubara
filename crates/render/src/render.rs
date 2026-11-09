@@ -26,8 +26,7 @@ use crate::uploads::{ArenaOp, Uploads};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Camera near/far planes. The far plane covers radius 64's diagonal
-/// (64 chunks x 16 blocks = 1,024, so ~1,448 corner to corner) with room over.
+/// Camera near/far planes. See `FAR_PLANE` for why the far one is so large.
 const NEAR_PLANE: f32 = 0.1;
 // Far enough for the far terrain (`docs/PROPOSAL_FAR_VIEW.md`), which reaches
 // hundreds of kilometres. Free with reversed-Z: depth precision is spent near
