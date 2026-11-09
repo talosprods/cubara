@@ -516,6 +516,83 @@ pub fn report(yaw_samples: usize) -> String {
     s
 }
 
+/// M2 (`PROPOSAL_LOD_TRANSITIONS.md` §5): what R1's block-height cells would
+/// cost in walls, from the height field alone. For every column of `level`
+/// cells (2^level blocks wide) in `nodes`, and its +x and +z neighbours, the
+/// cell's surface ([`WorldGen::cell_surface_height`]) quantized to `v` blocks:
+/// returns the edges whose heights differ (a riser) and the risers' material
+/// bands, each riser counting at most 3 (grass side, soil, stone). `v` =
+/// 2^level is today's coarse cell; `v` = 1 is R1.
+pub fn riser_counts(gen: &WorldGen, nodes: &[NodeKey], level: u32, v: i32) -> (u64, u64) {
+    let step = 1i32 << level;
+    let columns: HashSet<(i32, i32)> = nodes
+        .iter()
+        .filter(|n| n.level == level)
+        .map(|n| (n.pos[0], n.pos[2]))
+        .collect();
+    let (mut edges, mut bands) = (0u64, 0u64);
+    for &(nx, nz) in &columns {
+        let o = NodeKey::new(level, [nx, 0, nz]).world_origin();
+        let cell = |i: i32, j: i32| {
+            gen.cell_surface_height(o[0] + i * step, o[2] + j * step, step)
+                .div_euclid(v)
+        };
+        for i in 0..16 {
+            for j in 0..16 {
+                let here = cell(i, j);
+                for there in [cell(i + 1, j), cell(i, j + 1)] {
+                    let d = (here - there).unsigned_abs() as u64;
+                    if d > 0 {
+                        edges += 1;
+                        bands += d.min(3);
+                    }
+                }
+            }
+        }
+    }
+    (edges, bands)
+}
+
+/// M2's table at `eye`: per level, risers and bands at `v` = today's cell
+/// height, 4, 2 and 1, and the multiplier R1 (`v` = 1) puts on today's.
+pub fn format_m2(name: &str, eye: [f32; 3]) -> String {
+    let gen = WorldGen::new(World::new().seed());
+    let nodes = desired_nodes_3d(
+        ChunkCoord::from_world_pos(eye),
+        VERTICAL_LOD_SQUASH,
+        DEFAULT_RING_SCHEDULE,
+    );
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "M2 {name} eye {eye:?}: walls from the height field, per level"
+    );
+    let _ = writeln!(
+        out,
+        "| level | v (blocks) | edges with a riser | riser bands | bands vs today |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|");
+    for level in 1..LEVELS as u32 {
+        let today = 1i32 << level;
+        let (_, base) = riser_counts(&gen, &nodes, level, today);
+        for v in [today, 4, 2, 1]
+            .into_iter()
+            .filter(|&v| v <= today)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .rev()
+        {
+            let (e, b) = riser_counts(&gen, &nodes, level, v);
+            let _ = writeln!(
+                out,
+                "| {level} | {v} | {e} | {b} | {:.2}x |",
+                b as f64 / base.max(1) as f64
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,5 +864,38 @@ mod tests {
     #[ignore = "meshes the whole 64-chunk world three times"]
     fn print_the_gate_tables() {
         println!("\n{}", report(72));
+    }
+
+    /// M2 around the ground eye: what R1 would cost in walls. The columns
+    /// depend only on x and z, so the hill eye's table is the same. Seconds
+    /// in release, no meshing.
+    #[test]
+    #[ignore = "a measurement: prints M2's table"]
+    fn print_r1_wall_multipliers() {
+        let ground = GATE_EYES[0];
+        println!("\n{}", format_m2(ground.name, ground.eye));
+    }
+
+    /// Risers are counted where quantized heights differ: block-height cells
+    /// find strictly more than 4-block ones near spawn, some of them taller
+    /// than a block (more bands than risers), and nodes of another level are
+    /// not counted.
+    #[test]
+    fn finer_cells_find_more_risers_than_coarse_ones() {
+        let gen = WorldGen::new(World::new().seed());
+        let nodes: Vec<NodeKey> = (0..3).map(|x| NodeKey::new(2, [x, 0, 0])).collect();
+        let (_, coarse) = riser_counts(&gen, &nodes, 2, 4);
+        let (fine_edges, fine) = riser_counts(&gen, &nodes, 2, 1);
+        assert!(coarse > 0, "the default world near spawn has relief");
+        // Strictly more: block-height cells see the risers 4-block cells
+        // round away. Equal would mean `v` was not applied.
+        assert!(
+            fine > coarse,
+            "v = 1 found {fine} bands, v = 4 found {coarse}"
+        );
+        // Some risers are taller than a block, so carry more than one band.
+        assert!(fine > fine_edges, "{fine} bands on {fine_edges} risers");
+        // Nodes of another level are not counted at this one.
+        assert_eq!(riser_counts(&gen, &nodes, 1, 1), (0, 0));
     }
 }

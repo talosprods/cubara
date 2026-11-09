@@ -1,6 +1,6 @@
 # Proposal: LOD transitions that do not show
 
-Status: **proposal for block 3.0b** (`ROADMAP.md`, Phase 3, block 3.0 "The engine first", item (b)). Written 2026-11-09 as a design study, after a play test that day in which the owner found the detail layers clearly visible. Numbers marked *est.* are estimates; §5 names the measurement that replaces each one. M1, M6 and T1 have been measured since, by `crates/app/src/lod_probe.rs` (§5.1); the rest is still to be measured.
+Status: **proposal for block 3.0b** (`ROADMAP.md`, Phase 3, block 3.0 "The engine first", item (b)). Written 2026-11-09 as a design study, after a play test that day in which the owner found the detail layers clearly visible. Numbers marked *est.* are estimates; §5 names the measurement that replaces each one. M1, M2, M6 and T1 have been measured since, by `crates/app/src/lod_probe.rs` (§5.1); the rest is still to be measured.
 
 The owner's call is §7. Everything else is engineering, decided here and open to change only with a measurement.
 
@@ -333,6 +333,24 @@ M0 comes first, because that headroom number is the one everything is weighed ag
 | 3 | no | 887 | 235 | 5.5 (2.9-10.3) |
 
 The flight eye (8, 3,000, 8) draws no voxels: everything it sees is the far terrain.
+
+**M2**: R1's walls, from the height field. For each level, it counts the coarse columns in the rings around spawn (`desired_nodes_3d`; the columns depend only on x and z, so every eye gives the same table). Each column's surface (`cell_surface_height`) is quantized to v blocks. The count is the risers against the +x and +z neighbours, with each riser counting at most 3 material bands.
+
+| level | v (blocks) | edges with a riser | riser bands | bands vs today |
+|---|---|---|---|---|
+| 1 | 2 (today) | 36,642 | 36,643 | 1.00× |
+| 1 | 1 | 72,090 | 73,399 | **2.00×** |
+| 2 | 4 (today) | 40,963 | 44,874 | 1.00× |
+| 2 | 2 | 69,558 | 85,934 | 1.92× |
+| 2 | 1 | 104,102 | 153,602 | **3.42×** |
+| 3 | 8 (today) | 38,618 | 43,703 | 1.00× |
+| 3 | 4 | 63,436 | 84,961 | 1.94× |
+| 3 | 2 | 93,045 | 145,356 | 3.33× |
+| 3 | 1 | 117,070 | 226,655 | **5.19×** |
+
+R1's wall multipliers are therefore ×2.0 at level 1 and ×3.4 at level 2. §3 estimated ×2 and ×4; ring 3 at v = 4 is ×1.9.
+
+An upper bound on the cost at the ground eye: assume every drawn triangle at levels 1 and 2 (M1: 32k and 29k) were a wall, since tops do not multiply. Then R1 at v = 1 in rings 1–2 adds at most 32k + 2.42 × 29k ≈ **+102k** drawn triangles, against §3's estimate of +106k. Ring 3 at v = 4 (candidate (i)) adds at most 0.94 × 28k ≈ +27k. The real figures are lower by the top faces' share, which only meshing R1 will tell.
 
 ## 6. How it is tested
 
