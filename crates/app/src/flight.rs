@@ -49,14 +49,20 @@ fn shows_nothing(p: &[u8]) -> bool {
 /// frames' comparison with the finished frame.
 const HOLE_MAX_FRAMES: u32 = 30;
 
-/// Finds holes in a sequence of frames: pixels that showed land, then nothing
-/// for at most [`HOLE_MAX_FRAMES`], then land again -- the owner's "laag detail
-/// niveau, dan is het weg, heel kort daarna laadt het op een hoger niveau".
+/// Finds holes in a sequence of frames: pixels **inside** land -- land on
+/// all four sides -- that show nothing for at most [`HOLE_MAX_FRAMES`], then
+/// land again. The owner's "laag detail niveau, dan is het weg, heel kort
+/// daarna laadt het op een hoger niveau".
 ///
-/// Sky that is really there is never counted: it does not go back to land
-/// within half a second on a straight flight, and a run still open when the
-/// flight ends is not counted either. Pure, so the rule is tested without a GPU.
+/// Inside, because a silhouette is not a hole: a stepped ridge against the sky
+/// slides across pixel boundaries as the eye moves, and a pixel on its edge
+/// goes land, sky, land within a few frames without anything missing (seen in
+/// the first measurement: every such pixel was on a skyline). Sky that is
+/// really there is not counted either -- it does not go back to land within
+/// half a second on a straight flight -- nor is a run still open when the
+/// flight ends. Pure, so the rule is tested without a GPU.
 pub struct HoleTracker {
+    width: usize,
     /// Per pixel: whether it showed land in the last frame.
     land: Vec<bool>,
     /// Per pixel: the frame its current run of nothing began after land, or
@@ -68,8 +74,10 @@ pub struct HoleTracker {
 }
 
 impl HoleTracker {
-    pub fn new(pixels: usize) -> Self {
+    /// For frames `width` pixels wide and `pixels` in all.
+    pub fn new(width: usize, pixels: usize) -> Self {
         Self {
+            width: width.max(1),
             land: vec![false; pixels],
             run_start: vec![u32::MAX; pixels],
             frame: 0,
@@ -80,9 +88,24 @@ impl HoleTracker {
     /// Take the next frame: per pixel, whether it shows nothing.
     pub fn push(&mut self, nothing: impl IntoIterator<Item = bool>) {
         self.per_frame.push(0);
+        let before = self.land.clone();
+        let (w, n) = (self.width, before.len());
+        // Land last frame on all four sides: inside land, not on its edge.
+        // The screen's border has a side off screen, so it never counts.
+        let inside = |i: usize| {
+            let x = i % w;
+            x > 0
+                && x + 1 < w
+                && i >= w
+                && i + w < n
+                && before[i - 1]
+                && before[i + 1]
+                && before[i - w]
+                && before[i + w]
+        };
         for (i, empty) in nothing.into_iter().enumerate() {
             if empty {
-                if self.land[i] {
+                if before[i] && inside(i) {
                     self.run_start[i] = self.frame;
                 }
                 self.land[i] = false;
@@ -177,17 +200,40 @@ pub struct Sample {
     pub hole: f64,
 }
 
-/// The share of `live`'s pixels that show nothing where `settled` does not.
+/// The share of `live`'s pixels that show nothing where `settled` shows land
+/// on the pixel and on all four sides of it: inside land, so a skyline drawn a
+/// pixel differently (the live pass's far terrain was selected a little behind
+/// the eye) is not a hole. See [`HoleTracker`].
 pub fn hole_fraction(live: &Frame, settled: &Frame) -> f64 {
-    let n = live
+    let w = settled.width as usize;
+    let land: Vec<bool> = settled
         .pixels
         .as_chunks::<4>()
         .0
         .iter()
-        .zip(settled.pixels.as_chunks::<4>().0.iter())
-        .filter(|(l, s)| shows_nothing(&l[..]) && !shows_nothing(&s[..]))
+        .map(|p| !shows_nothing(&p[..]))
+        .collect();
+    let n = land.len();
+    let inside = |i: usize| {
+        !i.is_multiple_of(w)
+            && i % w + 1 < w
+            && i >= w
+            && i + w < n
+            && land[i]
+            && land[i - 1]
+            && land[i + 1]
+            && land[i - w]
+            && land[i + w]
+    };
+    let holes = live
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| shows_nothing(&l[..]) && inside(*i))
         .count();
-    n as f64 / (live.pixels.len() / 4).max(1) as f64
+    holes as f64 / n.max(1) as f64
 }
 
 /// What a flight found.
@@ -398,7 +444,8 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         // ones are a quarter of a second apart. Read after the work is timed,
         // so the readback is not counted as the game's.
         let shown = live.renderer.read_frame()?;
-        let tracker = holes.get_or_insert_with(|| HoleTracker::new(shown.pixels.len() / 4));
+        let tracker = holes
+            .get_or_insert_with(|| HoleTracker::new(shown.width as usize, shown.pixels.len() / 4));
         tracker.push(
             shown
                 .pixels
@@ -567,22 +614,31 @@ mod tests {
         assert_eq!(r.worst().unwrap().loading, 0.1);
     }
 
-    /// Land, nothing for a few frames, land again: a hole, counted in every
-    /// frame it showed. Sky that stays sky, sky that becomes land, land that
-    /// becomes sky for good, and a gap longer than half a second are not.
+    /// Land all round, nothing for a few frames, land again: a hole, counted
+    /// in every frame it showed. A pixel on a skyline, one on the screen's
+    /// border, and a gap longer than half a second are not.
     #[test]
-    fn a_hole_is_land_then_briefly_nothing_then_land() {
-        let (l, n) = (false, true); // land, nothing
-                                    // Pixel 0: a 3-frame hole (frames 1..=3). Pixel 1: sky throughout.
-                                    // Pixel 2: sky, then land (the view tilting down). Pixel 3: land, then
-                                    // sky for good (a ridge passing below). Pixel 4: land, nothing for 31
-                                    // frames, land: longer than a hole may be.
-        let mut frames: Vec<[bool; 5]> = vec![[l, n, n, l, l]];
-        frames.extend([[n, n, n, n, n]; 3]);
-        frames.push([l, n, l, n, n]);
-        frames.extend([[l, n, l, n, n]; 27]);
-        frames.push([l, n, l, n, l]);
-        let mut t = HoleTracker::new(5);
+    fn a_hole_is_land_all_round_then_briefly_nothing_then_land() {
+        // 5 x 3 pixels. Index 6 is inside land: a 3-frame hole (frames 1..=3).
+        // Index 7 sits under 2, which is sky throughout: a skyline pixel doing
+        // the same is not a hole. Index 3, on the top border, neither.
+        // Index 8 shows nothing for 32 frames: too long to be a hole.
+        let (n, l) = (true, false);
+        let base = |f: usize| {
+            let mut px = [l; 15];
+            px[2] = n;
+            if (1..=3).contains(&f) {
+                px[6] = n;
+                px[7] = n;
+                px[3] = n;
+            }
+            if (1..=32).contains(&f) {
+                px[8] = n;
+            }
+            px
+        };
+        let frames: Vec<[bool; 15]> = (0..=33).map(base).collect();
+        let mut t = HoleTracker::new(5, 15);
         for f in &frames {
             t.push(f.iter().copied());
         }
@@ -593,15 +649,30 @@ mod tests {
         assert_eq!(t.per_frame, want);
     }
 
-    /// A hole is nothing in the live frame where the finished frame has land;
-    /// sky in both is not one.
+    /// A kept hole is nothing in the live frame where the finished frame has
+    /// land on the pixel and on all four sides; a skyline pixel drawn
+    /// differently is not one, and neither is sky in both.
     #[test]
-    fn a_kept_hole_is_nothing_where_the_finished_frame_has_land() {
-        let nothing = [255, 0, 255, 255];
-        let land = [90, 120, 60, 255];
-        let live = frame([nothing, nothing, land, land].concat());
-        let done = frame([nothing, land, land, land].concat());
-        assert_eq!(hole_fraction(&live, &done), 0.25);
+    fn a_kept_hole_is_nothing_inside_the_finished_frames_land() {
+        let (nothing, land) = ([255u8, 0, 255, 255], [90u8, 120, 60, 255]);
+        let image = |px: [[u8; 4]; 9]| Frame {
+            width: 3,
+            height: 3,
+            pixels: px.concat(),
+        };
+        let done = image([land; 9]);
+        let mut live = [land; 9];
+        live[4] = nothing;
+        assert_eq!(hole_fraction(&image(live), &done), 1.0 / 9.0);
+        // The same pixel, but the finished frame has sky above it.
+        let mut skyline = [land; 9];
+        skyline[1] = nothing;
+        assert_eq!(hole_fraction(&image(live), &image(skyline)), 0.0);
+        // Sky in both.
+        assert_eq!(
+            hole_fraction(&image([nothing; 9]), &image([nothing; 9])),
+            0.0
+        );
     }
 
     #[test]

@@ -1286,6 +1286,10 @@ finished frame has land. Linux (GTX 1060 Max-Q), 1280×720, High. Details in ⁷
 | 2026-11-09 | before / after⁷⁹ | down, 3 / 2 runs | 890 / 888 / 892 / 897 / 893 of ~893 | 0 everywhere | 0.004–0.005% | 2–4, 0.002% | |
 | 2026-11-09 | before⁷⁹ | toward a peak: level at its top, from 900 blocks, 30 s (`--toward-peak`), 3 runs | 1,255 / 1,285 / 1,279 of ~1,790 | 0 / 0 / 0 | 0.024% | 1–2, 0.022% | `main` + measurement |
 | 2026-11-09 | **the same**⁷⁹ | toward a peak, 2 runs | 1,248 / 1,296 | 0 / 0 | **0.001%** | 2–3, 0.000% | *(this PR)* |
+| 2026-11-09 | *Holes counted only inside land from here on*⁸⁰ — before (`far_hole` reverted) / after | low, 1 run each | 703 / 695 | 19 / **0** | 0.19% / **0.005%** | 24 / 14, 0.21% / 0.016% | `main` |
+| 2026-11-09 | the same⁸⁰ | high | 652 / 654 | 23 / **0** | 1.76% / **0.002%** | 1 / 2, 0.82% / 0.001% | `main` |
+| 2026-11-09 | the same⁸⁰ | down | 897 / 895 | 0 / 0 | 0.004% / 0.004% | 2 / 2, 0.002% / 0.001% | `main` |
+| 2026-11-09 | the same⁸⁰ | toward a peak | 1,278 / 1,249 | 0 / 0 | 0.023% / 0.001% | 3 / 4, 0.022% / 0.000% | `main` |
 
 ## Detailed run logs
 
@@ -2754,3 +2758,21 @@ and closes. They are the next step to the gate's "no frame shows sky where the
 finished frame shows terrain". The loading figures of the same runs match
 note ⁷⁷ (low 0.19–0.35% mean loading, down 0.70–0.73%), so the swap costs
 nothing measurable there.
+
+⁸⁰ **A hole is inside land (block 3.0a), 2026-11-09.** The first hole count
+(⁷⁹) also counted skylines. Frames saved from the low flight showed every pixel
+that went land, nothing, land within four frames sitting on the edge of a ridge
+against the sky. A stepped ridge slides across pixel boundaries as the eye
+moves, and nothing is missing there. So `HoleTracker` and the kept-frame
+comparison now count a pixel only when it, and the pixels on all four sides of
+it, showed land: in the frame before, for the real-time pass, and in the
+finished frame, for the kept frames. Measured on `main` after #319 against the
+same build with `far_hole` reverted, one run each, alternating, on AC power,
+with the CPU at 53–92 °C. The swap holes are still caught: 19 and 23 visible
+frames before, none after.
+
+What is left is inside land. It is present in nearly every frame of the down
+flight, which looks at ground only: a few dozen pixels (about 0.004%) where
+the clear colour shows through the ground for a frame or two. These are cracks
+in the surface, the kind a viewer sees as sparkles. They are the next step in
+#318.
