@@ -24,6 +24,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The footnote alphabet is multibyte, so grep must read UTF-8. Git Bash on
+# Windows starts with no locale and printed `� �` instead of the markers; set
+# one only when the shell has none, because not every system has C.UTF-8.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8* | *utf8* | *UTF8* | *utf-8*) ;;
+    *) export LC_ALL=C.UTF-8 ;;
+esac
+
 file=BENCHMARKS.md
 fail=0
 
