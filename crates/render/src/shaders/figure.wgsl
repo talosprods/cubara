@@ -24,6 +24,7 @@ struct Frame {
     ambient: vec4<f32>,
     fog_color: vec4<f32>,
     fog: vec4<f32>,
+    haze: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -61,7 +62,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // ring fades the way the ground under them does, rather than staying a
     // crisp silhouette against faded terrain.
     let dist = distance(in.world_pos, frame.eye.xyz);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, in.world_pos, frame.haze));
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
 }

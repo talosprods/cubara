@@ -16,8 +16,20 @@
 // `mesh_pipeline_constants` is the one place these are derived from
 // `Lighting`; `SceneRenderer::set_lighting` rebuilds this pipeline in the
 // background whenever they actually change, not every frame.
+//
+// The vertex stage also reads `eye` and `haze` (the height haze, `haze.wgsl`),
+// per vertex; it reaches the fragment stage packed with AO in `ao_haze`, so
+// the fragment stage still reads no uniform. The struct is the prefix of
+// `FrameUniform` through `haze`.
 struct Frame {
     view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
+    sun_dir: vec4<f32>,
+    sun_color: vec4<f32>,
+    ambient: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog: vec4<f32>,
+    haze: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -87,7 +99,8 @@ struct VsOut {
     // varying carrying the already-resolved vector (isolated A/B/C
     // diagnostic in the package-4 research).
     @location(0) @interpolate(flat) normal: vec3<f32>,
-    @location(1) ao: f32,
+    // x: baked AO (0..1), y: height haze (0..1), both per vertex.
+    @location(1) ao_haze: vec2<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) layer: u32,
 };
@@ -127,7 +140,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao = f32(ao_raw) / 3.0;
+    out.ao_haze = vec2<f32>(f32(ao_raw) / 3.0, haze_amount(frame.eye.xyz, world_pos, frame.haze));
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
     return out;
@@ -146,7 +159,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
 
     // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(ao_floor, 1.0, in.ao);
+    let ao = mix(ao_floor, 1.0, in.ao_haze.x);
 
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
@@ -192,7 +205,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let off_axis_x = ndc_x * TAN_HALF_FOV * aspect;
     let off_axis_y = ndc_y * TAN_HALF_FOV;
     let radial = view_depth * sqrt(1.0 + off_axis_x * off_axis_x + off_axis_y * off_axis_y);
-    let fog_amount = select(0.0, smoothstep(fog_start, fog_end, radial), fog_end > fog_start);
+    let edge = select(0.0, smoothstep(fog_start, fog_end, radial), fog_end > fog_start);
+    let fog_amount = max(edge, in.ao_haze.y);
     let fog_color = vec3<f32>(fog_color_r, fog_color_g, fog_color_b);
     let color = mix(lit, fog_color, fog_amount);
     return vec4<f32>(color, 1.0);

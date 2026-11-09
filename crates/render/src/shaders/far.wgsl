@@ -18,6 +18,7 @@ struct Frame {
     ambient: vec4<f32>,
     fog_color: vec4<f32>,
     fog: vec4<f32>,
+    haze: vec4<f32>,
 };
 
 // One patch: its lowest corner, the width of one quad, and how far its skirt
@@ -220,7 +221,8 @@ fn shade(p: vec3<f32>, g: vec2<f32>) -> vec3<f32> {
         + riser_colour(g.y) * face_light(riser_z) * w.z;
 
     let dist = distance(p, frame.eye.xyz);
-    let fog_amount = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, p, frame.haze));
     return mix(lit, frame.fog_color.rgb, fog_amount);
 }
 

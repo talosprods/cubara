@@ -269,6 +269,8 @@ pub struct Lighting {
     /// package turns on the day/night cycle this only carries the plumbing
     /// for.
     pub time_of_day: f32,
+    /// The height haze (`haze.rs`); the edge fog above stays as its floor.
+    pub haze: crate::haze::Haze,
 }
 
 impl Default for Lighting {
@@ -287,6 +289,7 @@ impl Default for Lighting {
             fog_start: 0.0,
             fog_end: 0.0,
             time_of_day: 0.0,
+            haze: crate::haze::Haze::default(),
         }
     }
 }
@@ -329,6 +332,9 @@ pub struct FrameUniform {
     fog_color: [f32; 4],
     /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
     fog: [f32; 4],
+    /// [`crate::haze::Haze::uniform`]. Appended last so every shader's
+    /// prefix struct stays valid.
+    haze: [f32; 4],
 }
 
 impl FrameUniform {
@@ -366,6 +372,7 @@ impl FrameUniform {
                 lighting.time_of_day,
                 0.0,
             ],
+            haze: lighting.haze.uniform(),
         }
     }
 }
@@ -1320,7 +1327,7 @@ pub fn mesh_pipeline_constants(
 pub fn build_mesh_shader(device: &wgpu::Device) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mesh-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mesh.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(crate::haze::MESH_WGSL.into()),
     })
 }
 
@@ -1464,7 +1471,7 @@ pub fn build_figure_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("figure-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/figure.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(crate::haze::FIGURE_WGSL.into()),
     });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1573,7 +1580,7 @@ pub fn build_far_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("far-shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/far.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(crate::haze::FAR_WGSL.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("far-layout"),
@@ -1742,6 +1749,7 @@ mod tests {
         assert_eq!(f.ambient, [0.28, 0.42, 0.4, 0.0]);
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
+        assert_eq!(f.haze, Lighting::default().haze.uniform());
     }
 
     #[test]

@@ -102,6 +102,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁵ | 1,940 | 819,928 voxel + far | **~3,650** | **0.104 ms** | 0.253 ms | *(this PR)* |
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁵ | 869 | 436,690 voxel + far | **~3,617** | **0.088 ms** | 0.230 ms | *(this PR)* |
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁵ | 0 | far only | **~5,427** | **0.067 ms** | 0.191 ms | *(this PR)* |
+| 2026-11-09 | **Haze replaces the edge fog (F5)** — gate eye ground (High)⁷⁶ | 1,940 | 819,928 voxel + far | ~3,478 | within noise | within noise | *(this PR)* |
+| 2026-11-09 | Haze (F5) — gate eye hill (High)⁷⁶ | 869 | 436,690 voxel + far | ~3,601 | within noise | within noise | *(this PR)* |
+| 2026-11-09 | Haze (F5) — gate eye flight (High)⁷⁶ | 0 | far only | ~5,389 | within noise | within noise | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -2616,6 +2619,25 @@ and p99 CPU/frame falls from ~0.55 to ~0.23 ms. One second is 4,100–6,800 warm
 frames on this laptop, and the spread between runs narrows to about 1%. The
 M3 may move the other way (⁵⁵: a hot M3 read slower). It is re-measured when
 the Mac runs the gate next, and its rows before this date stay as they are.
+
+⁷⁶ **Haze replaces the edge fog (F5, #299).** The haze is one closed-form
+evaluation per vertex (`haze.wgsl`: an `exp`, a divide, a `distance`) in the
+voxel and far-terrain vertex stages, and per fragment for figures; the voxel
+fragment stage still reads no uniform. `--bench gate` at High, main (the
+warm-up build, ⁷⁵) against the branch, three runs each, alternating, on AC
+power. The branch was measured at density 1/40,000 and H=2,000; the final
+values (1/20,000, H=600) change two constants in the same formula, so they add
+no work.
+
+```
+             main                          haze (F5)                      GPU/frame
+ground   3,558 / 3,579 / 3,411 FPS   ->  3,483 / 3,457 / 3,493 FPS      0.232 -> 0.236 ms
+hill     3,554 / 3,662 / 3,536 FPS   ->  3,627 / 3,586 / 3,590 FPS      0.234 -> 0.232 ms
+flight   5,282 / 5,311 / 5,168 FPS   ->  5,352 / 5,409 / 5,405 FPS      0.150 -> 0.147 ms
+```
+
+FPS and GPU/frame move within the spread between runs (about 3%); CPU/frame is
+within noise. The F5 gate (at most 2% cost at every eye) is met.
 
 ⁷⁷ **The warm-up change (⁷⁵) on Linux, 2026-11-09.** The GTX 1060 Max-Q laptop
 from ⁵⁴, on AC power (charging, 75–99%), `--bench gate` at 1920×1080, High.

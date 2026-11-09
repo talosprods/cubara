@@ -19,6 +19,7 @@ pub mod culling;
 pub mod far;
 pub mod figure;
 mod gpu_timer;
+pub mod haze;
 pub mod headless;
 pub mod instance;
 pub mod materials;

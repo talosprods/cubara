@@ -1497,7 +1497,15 @@ fn far_shading_is_the_aggregate_reference() {
     };
     let table = MaskingTable::committed();
     let materials = far_materials();
-    let lighting = Lighting::default();
+    // The shading function alone: the shot stands 40 blocks away, and the
+    // haze (which `aggregate_colour` does not model) would tint it by a step.
+    let lighting = Lighting {
+        haze: cubara_render::haze::Haze {
+            density: 0.0,
+            ..Default::default()
+        },
+        ..Lighting::default()
+    };
     // (gradient, elevation, azimuth): what each exercises.
     let cases: [([f32; 2], f32, f32); 11] = [
         // x-risers face the eye, nothing hides.

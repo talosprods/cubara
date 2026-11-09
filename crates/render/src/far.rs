@@ -479,7 +479,7 @@ mod tests {
     /// patch reads its neighbour's heights.
     #[test]
     fn the_shader_agrees_on_the_patch_size() {
-        let wgsl = include_str!("shaders/far.wgsl");
+        let wgsl = crate::haze::FAR_WGSL;
         assert!(wgsl.contains(&format!("const QUADS: i32 = {FAR_QUADS};")));
         assert!(wgsl.contains(&format!("const VERTS: u32 = {FAR_VERTS}u;")));
         assert!(wgsl.contains(&format!("const GRID: u32 = {GRID}u;")));

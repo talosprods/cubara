@@ -474,6 +474,36 @@ is the monitor's refresh rate (`ROADMAP.md` has his words). What was built:
   at every eye. `Off` can never pass it, because the flight eye must see
   something.
 
+## §6d F5 — the haze (2026-11-09)
+
+**The model.** The edge fog is gone as the thing that carries distance; it stays
+only as a floor. Land fades into the sky colour through an exponential height
+haze, `amount = 1 − exp(−τ)`, with the optical depth in closed form along the
+eye-to-point ray: `τ = density · d · exp(−e.y / H) · g(Δ)`, `Δ = (p.y − e.y) / H`,
+`g = (1 − e^−Δ) / Δ` (a second-order series below `|Δ| = 1e-2`). It is one
+evaluation per vertex (voxels, far terrain) and per fragment (players), and
+every place takes `max(edge, haze)`, so with the far terrain `Off` the 1 km edge
+is hidden exactly as before. `crates/render/src/haze.rs` is the CPU reference
+the unit tests run; `shaders/haze.wgsl` mirrors it line for line.
+
+**The values: density 1/20,000 blocks⁻¹, scale height H = 600 blocks.** The
+first pair, 1/40,000 with H = 2,000 (the issue's start), was judged from the
+images and was too weak from the ground: mountains a few kilometres away
+stayed dark and sharp. A thinner, lower layer is the fix, because a grazing
+ray's optical depth scales with density × H. Near the ground the layer is
+thick enough to give depth (1,024 blocks stays clear, 0.047; 50 km is ~0.90),
+and a high eye is above most of it, so it sees farther (at y = 3,000 the haze
+over a 100 km ray is far lower than at y = 40). Tried and kept out: 1/80,000 and
+1/20,000 at H = 2,000, and 1/40,000 at H = 2,000.
+
+![The haze at the three gate eyes: before on the left, after on the right; rows hill, flight, ground](img/far-view-f5-haze.jpg)
+
+**The bench.** `--bench gate` at High, three alternating runs each: ground
+3,558 / 3,579 / 3,411 → 3,483 / 3,457 / 3,493 FPS, hill 3,554 / 3,662 / 3,536 →
+3,627 / 3,586 / 3,590, flight 5,282 / 5,311 / 5,168 → 5,352 / 5,409 / 5,405.
+GPU/frame 0.232 → 0.236, 0.234 → 0.232, 0.150 → 0.147 ms. No measurable cost
+(`BENCHMARKS.md` ⁷⁶).
+
 ## §7 How it is checked
 
 - **Geometric error:** a unit test that every drawn far-terrain quad projects to
