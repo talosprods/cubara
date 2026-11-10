@@ -150,6 +150,52 @@ mean speaking for him.
 A session that refuses on these grounds is doing its job. Do not press it —
 fetch the owner instead.
 
+## Standing permissions -- what not to ask again
+
+The owner asked for this section on 2026-11-10, after one evening in which he
+was asked three times for the same thing: *"pas ook de claude.md aan zodat ik
+niet steeds die vage permissies moet geven"*. The rule it states is narrow but
+load-bearing: **a permission he has given once, under conditions a session can
+check for itself, is a standing permission.** Checking the condition is the
+session's job. Asking him again is not, and neither is a session deciding on
+its own that the condition does not apply tonight.
+
+**Benchmark runs on the MacBook (Apple M3) need no fresh offer.** They were
+restricted while he was working on that machine, and [#386]'s owner constraint
+("nothing may run on the MacBook now", "the M3 runs happen only when he offers
+them himself") is superseded by this section. A session on the Mac may run
+`--bench` whenever all of these hold, and must not run it when any one of them
+does not:
+
+- the machine is not in use by him -- he says when it is, and that overrides
+  this list the moment he says it;
+- it is on AC power: `pmset -g ps` has to print `AC Power`. Not "the battery is
+  high enough". The 2026-09-27 M3 row was taken at 19% battery and the whole of
+  #386 exists because it had to be redone;
+- nothing has compiled or run tests for at least five minutes, and no other
+  process is holding a core (`mobileassetd` was, on the night this was
+  written). Wait for it rather than measuring into it;
+- both runs are recorded as they came out -- two runs of each, both in the row,
+  with the power state in the row itself and the thermal state said plainly
+  even when the platform does not report one. Never the better of two.
+
+He also allowed closing his other applications for a clean measurement, on the
+same day, on the same terms: it is for a measurement, and the session says
+afterwards what it closed.
+
+**What still goes to him, unchanged:** gameplay and roadmap decisions, the exit
+gate and whether a phase closes, installing anything, and anything that touches
+his `saves/`. The sections above own those and this one does not weaken them.
+A standing permission covers the *action* he allowed, not a decision that
+happens to need the same action.
+
+**Usage is one budget shared by every session** (his instruction, 2026-11-10).
+The weekly window resets Wednesday at 03:00 CET; the 5-hour window runs on its
+own cycle. Whatever is left of the weekly budget when it resets is gone, so the
+hours before a reset are the cheap ones and are worth spending, and a session
+close to the end of a 5-hour window slows down rather than stalling in the
+middle of a measurement.
+
 ## Design decisions are the project owner's
 
 Engineering process — crate layout, refactors, test strategy, CI — is yours to
