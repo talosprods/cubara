@@ -1,6 +1,8 @@
 //! The measurements `docs/PROPOSAL_LOD_TRANSITIONS.md` is decided by: what the
 //! voxel rings draw at each level (M1), how big a terrain step gets at a ring
-//! edge (T1, as a measurement), and where the trees are (M6).
+//! edge (T1, as a measurement), where the trees are (M6), and -- the newest
+//! one -- a CPU reference image deciding ring 3's own treatment (M4, issue
+//! #335).
 //!
 //! **CPU only, and it changes nothing the game draws.** It uses the real node
 //! selection (`desired_nodes_3d`, at the game's `VERTICAL_LOD_SQUASH`), the real
@@ -16,18 +18,32 @@
 //! ```
 //!
 //! The fast tests pin the counting on a tiny world and on hand-made nodes.
+//!
+//! **M4** (bottom of this file, `m4_*`) is a separate, smaller harness: it
+//! never meshes anything. It walks the *height field* only --
+//! `WorldGen::surface_height`/`cell_surface_height` for the exact-blocks
+//! reference and candidate (i), `cubara_world::far` (the production far
+//! terrain code, just with a nearer hole than the game uses today) for
+//! candidate (ii) -- and shades what it finds with `cubara_render::aggregate`
+//! (the same CPU reference `far.wgsl` is already checked against). See its
+//! module doc below for what it does and does not model.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+use cubara_render::aggregate::{
+    aggregate_colour, face_light, riser_colour, MaskingTable, Materials,
+};
 use cubara_render::materials::TextureLayers;
-use cubara_render::{faces_facing, Aabb, CameraUniform, Frustum};
+use cubara_render::{faces_facing, Aabb, CameraUniform, Frustum, Lighting};
 use cubara_voxel::ChunkCoord;
+use cubara_world::far::{self as far_world, FarView, Hole as FarHole, PatchHeights};
 use cubara_world::mesh::{build_node, BuiltNode};
 use cubara_world::node::{desired_nodes_3d, NodeKey, RingSchedule, DEFAULT_RING_SCHEDULE};
 use cubara_world::{TerrainBlocks, TreeSite, World, WorldGen};
 
 use crate::bench::{DEFAULT_SIZE, GATE_EYES};
+use crate::far_streaming::{self, FarQuality};
 use crate::streaming::VERTICAL_LOD_SQUASH;
 
 /// Levels a selection can hold: `NodeKey::containing` goes to 8 elsewhere, the
@@ -613,6 +629,1443 @@ pub fn format_m2(name: &str, eye: [f32; 3]) -> String {
     out
 }
 
+// ===========================================================================
+// M4 (`docs/PROPOSAL_LOD_TRANSITIONS.md` §5, issue #335): deciding ring 3
+// (512 m - 1,024 m) by a CPU reference image.
+// ===========================================================================
+//
+// Three variants, differing **only** in the height (and shading) lookup
+// beyond the eye's own rings 0-2, which every variant treats the same way
+// today already does (`m4::coarse_top`, `v = 1`):
+//
+// - **Reference**: the exact block height field everywhere
+//   (`WorldGen::surface_height`), with no coarsening at all -- the ground
+//   truth M4's numbers are measured against.
+// - **(i) ring 3 at `v`**: today's state at `v = 4`; `m4::coarse_top` also
+//   takes `v = 1, 2` (the same sensitivity M2 already prints; candidate
+//   (i) itself is `v = 4`).
+// - **(ii) the far terrain from 512 m**: `cubara_world::far` (the same
+//   `far::select`/`far::generate` the game calls beyond 1,024 m today,
+//   through `far_streaming::far_view`), just with a hole that stops 512 m
+//   out instead of 1,024 m. Nothing about the live game changes -- this
+//   harness builds its own patches and reads them, which is what the issue's
+//   "do not build (ii) itself" leaves alone.
+//
+// **R5 is not implemented.** The proposal's R5(a) asks for the risers'
+// block-scale roughness split both ways (`a± = (E|g| ± E[g]) / 2`) *and* a
+// re-derivation of the masking cases (`aggregate::MaskingTable`) against
+// real worldgen staircases instead of planes -- R5's own text calls that out
+// as separate work, not a shading tweak. Doing a partial version here (the
+// roughness correction without re-deriving the masking) would score
+// candidate (ii) against an invented model nobody has checked, which is a
+// worse risk than not doing it: the issue's own fallback is "emulate C and
+// say so" (Design decisions 1), so that is what this does. Candidate (ii) is
+// therefore measured as **C alone** -- which, per §3 R7, already has the
+// "lighter" defect R5 exists to fix, so a pass here is if anything a
+// stricter test of (ii) than the real R5-corrected version would face, and a
+// fail does not by itself rule out C+R5 (the decision rule's "(i) stays"
+// default is the safe outcome either way).
+//
+// **Row and column mapping is approximate, by design and on purpose.**
+// Columns span the camera's true horizontal FOV (tangent-correct, one-time
+// per column). Rows use the same small-angle approximation
+// [`ViewSpec::pixel_angle`] already stands for everywhere else in this file
+// (`max_step_px`, T1): `row = height_px / 2 - (elevation - pitch) /
+// pixel_angle`, not a full perspective divide. That is accurate to a few
+// percent near the frame's middle (documented on `pixel_angle` already) --
+// exactly where the 512 m edge sits (tens of rows off-centre, never near a
+// corner) -- and, because the *same* formula is used for the reference and
+// both variants, any residual bias is common to all three images and cancels
+// out of the comparison between them, which is what the decision actually
+// rests on.
+//
+// **The visibility search is a running-maximum sweep per azimuth column**,
+// not one ray per pixel: walk outward in ground distance, and whenever a
+// sample's row is smaller than every row reached so far (a higher point on
+// screen), it is newly visible and paints the rows between. That is the same
+// idea `aggregate::Staircase::scan` already uses to find which faces are
+// visible, one level up (whole columns of a height field instead of
+// sub-pixel face shares) -- and it is what lets one azimuth sweep produce a
+// whole column's pixels (and the skyline, for free, as the final minimum
+// row) in one pass over distance instead of one pass over distance *per
+// row*.
+mod m4 {
+    use super::*;
+
+    /// How far a sweep marches before giving up (open sky beyond this is
+    /// read as sky in every variant alike, so it does not bias the
+    /// comparison) -- a few times the 1,024 m outer ring, enough to find
+    /// most skylines without the cost of the full 262 km far view.
+    pub const MAX_DISTANCE: f32 = 3000.0;
+
+    /// Rows either side of the 512 m edge's own row that the band metric
+    /// looks at -- wide enough to hold the 4x4 low-pass's context and both
+    /// neighbouring rings, per the gate's own `rows below horizon` table
+    /// (`PROPOSAL_LOD_TRANSITIONS.md` §1.1: 10-64 rows at the gate eyes).
+    pub const BAND_HALF_HEIGHT: i32 = 90;
+
+    /// A camera for M4: yaw 0 (looking down +x; T4's own convention also
+    /// uses 45 degrees, left for a fuller harness -- see the module doc),
+    /// a `pitch` in `frustum_at`'s own raw-vector convention (the `y`
+    /// alongside `(cos, sin)` of unit horizontal magnitude, not a literal
+    /// radian angle, though for a small `pitch` the two nearly coincide).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Camera {
+        pub eye: [f32; 3],
+        pub pitch: f32,
+        pub view: ViewSpec,
+        pub aspect: f32,
+    }
+
+    impl Camera {
+        pub fn gate(eye: [f32; 3], pitch: f32) -> Self {
+            Self {
+                eye,
+                pitch,
+                view: ViewSpec::gate(),
+                aspect: DEFAULT_SIZE.0 as f32 / DEFAULT_SIZE.1 as f32,
+            }
+        }
+
+        /// The azimuth (world yaw, radians) of column `col` of `columns`,
+        /// tangent-correct across the camera's true horizontal FOV.
+        fn azimuth(self, columns: usize, col: usize) -> f32 {
+            let tan_x = (self.view.fov_y * 0.5).tan() * self.aspect;
+            let ndc = (col as f32 + 0.5) / columns as f32 * 2.0 - 1.0;
+            (ndc * tan_x).atan()
+        }
+
+        /// The screen row a point at ground distance `d` (blocks, along the
+        /// column's own azimuth) and world height `y` falls on -- see the
+        /// module doc on why this is a small-angle approximation, not a
+        /// projective divide.
+        fn row_for(self, d: f32, y: f32) -> f32 {
+            let elevation = (y - self.eye[1]) / d.max(0.05) - self.pitch;
+            self.view.height_px as f32 / 2.0 - elevation / self.view.pixel_angle()
+        }
+    }
+
+    /// `cell_surface_height`-based drawn top for a coarse ring node,
+    /// generalized from [`WorldGen::generate_aniso`]'s own
+    /// `block_at_on_surface_v` quantization -- **not**
+    /// [`WorldGen::drawn_top`], which samples the *exact* column for R2's
+    /// trees (that function's doc comment explains why trees and the node's
+    /// own mesh read two different surfaces, and §3 R2's own risk note is
+    /// exactly that mismatch). `step_h` is the node's horizontal cell width
+    /// (`2^level`); `v` is `NodeKey::cell_height_blocks()`, left as a
+    /// parameter so M2's `v` sweep (1, 2, 4) can reuse this too.
+    pub fn coarse_top(gen: &WorldGen, x: i32, z: i32, step_h: i32, v: i32) -> i32 {
+        let (cx, cz) = (x.div_euclid(step_h) * step_h, z.div_euclid(step_h) * step_h);
+        let surface = gen.cell_surface_height(cx, cz, step_h);
+        if v <= 1 {
+            return surface;
+        }
+        let bound = surface + 1 - (v - 1) / 2;
+        let row = (bound - 1).div_euclid(v);
+        row * v + (v - 1)
+    }
+
+    /// Which ring schedule entry (its level and its outer edge in blocks)
+    /// covers ground distance `d` from the eye -- `None` beyond every ring
+    /// in `schedule` (the far terrain's own territory, in every variant).
+    fn ring_level_for(schedule: &RingSchedule, d: f32) -> Option<(u32, i32)> {
+        schedule
+            .iter()
+            .find(|&&(_, r)| d < (r * 16) as f32)
+            .copied()
+    }
+
+    /// The exact per-block height field's drawn top FACE (one above the top
+    /// solid block) at `(x, z)` -- M4's reference, everywhere.
+    pub fn exact_face_height(gen: &WorldGen, x: i32, z: i32) -> f64 {
+        gen.surface_height(x, z) as f64 + 1.0
+    }
+
+    /// The inverse of a drawn top face's `+ 1.0`: the solid block a face at
+    /// `face_y` sits directly above. Named and called from both sides of a
+    /// riser comparison (`sweep_column`'s `top_blocks`/`new_top`) rather
+    /// than written out twice, so a wrong offset is one function to pin,
+    /// not two expressions that happen to read alike.
+    fn block_below_face(face_y: f64) -> i32 {
+        (face_y - 1.0).round() as i32
+    }
+
+    /// The row range `[lo, hi)` a sample landing on screen row `row` fills,
+    /// given everything is already painted down to `running_min` -- clamped
+    /// to the screen (`height_px` rows). Pulled out of `sweep_column`'s
+    /// `paint` closure so the clamp itself is directly testable: `row` is
+    /// almost always positive in practice (a riser far below the horizon),
+    /// so a `max`/`min` slip in the lower clamp would only show up on a
+    /// sample that goes negative -- exactly the case a test has to build by
+    /// hand, not one that turns up by chance.
+    fn paint_range(row: f32, running_min: f32, height_px: usize) -> (usize, usize) {
+        let lo = row.floor().max(0.0) as usize;
+        let hi = (running_min.min(height_px as f32).ceil() as usize).min(height_px);
+        (lo, hi)
+    }
+
+    /// Today's ring treatment (and candidate (i) at `ring3_v`): the drawn
+    /// top face at `(x, z)`, from whichever entry of `schedule` covers
+    /// ground distance `d` from `eye_xz`. `None` beyond every entry in
+    /// `schedule` -- the caller switches to the far terrain there.
+    /// `schedule` is handed in (rather than always `DEFAULT_RING_SCHEDULE`)
+    /// so candidate (ii) can pass a 3-entry schedule (levels 0-2 only,
+    /// ring 3 dropped) and get the far terrain from 512 m instead of 1,024.
+    fn ring_face_height(
+        gen: &WorldGen,
+        schedule: &RingSchedule,
+        eye_xz: (f32, f32),
+        x: i32,
+        z: i32,
+        ring3_v: i32,
+    ) -> Option<f64> {
+        let d = ((x as f32 - eye_xz.0).powi(2) + (z as f32 - eye_xz.1).powi(2)).sqrt();
+        let (level, _) = ring_level_for(schedule, d)?;
+        let step_h = 1i32 << level;
+        let v = if level < 3 { 1 } else { ring3_v };
+        Some(coarse_top(gen, x, z, step_h, v) as f64 + 1.0)
+    }
+
+    /// The far terrain's own footprint-mean height field
+    /// (`cubara_world::far`), built once for a hole of `hole_radius_blocks`
+    /// around `eye` -- the production machinery
+    /// (`far_streaming::far_view` + `far::build`, `FarQuality::High`, the
+    /// quality §3 R7's own measurements used), just with a nearer hole than
+    /// the game draws today (1,024 m), so candidate (ii) can sample it from
+    /// 512 m. Nothing about the live game changes: this is built and read
+    /// only inside this harness.
+    pub struct FarField {
+        patches: Vec<PatchHeights>,
+    }
+
+    impl FarField {
+        pub fn build(
+            gen: &WorldGen,
+            eye: [f64; 3],
+            hole_radius_blocks: f64,
+            scan_radius: f64,
+        ) -> Self {
+            let hole = FarHole {
+                min: [
+                    eye[0] - hole_radius_blocks,
+                    -8192.0,
+                    eye[2] - hole_radius_blocks,
+                ],
+                max: [
+                    eye[0] + hole_radius_blocks,
+                    8192.0,
+                    eye[2] + hole_radius_blocks,
+                ],
+            };
+            let base = far_streaming::far_view(eye, DEFAULT_SIZE.1, Some(hole), FarQuality::High)
+                .expect("FarQuality::High always returns a view");
+            let view = FarView {
+                radius: scan_radius,
+                ..base
+            };
+            Self {
+                patches: far_world::build(gen, &view),
+            }
+        }
+
+        /// The smooth face height at `(x, z)`, or `None` outside every
+        /// patch (shouldn't happen inside `scan_radius`).
+        pub fn height_at(&self, x: f64, z: f64) -> Option<f64> {
+            self.patches
+                .iter()
+                .find(|p| {
+                    let [ox, oz] = p.key.origin();
+                    let s = p.key.size() as f64;
+                    (ox as f64..ox as f64 + s).contains(&x)
+                        && (oz as f64..oz as f64 + s).contains(&z)
+                })
+                .map(|p| p.height_at(x, z))
+        }
+
+        /// Central-difference gradient at `(x, z)`, one block either side.
+        pub fn gradient_at(&self, x: f64, z: f64) -> Option<[f32; 2]> {
+            let h = |dx: f64, dz: f64| self.height_at(x + dx, z + dz);
+            let (hx0, hx1, hz0, hz1) = (h(-1.0, 0.0)?, h(1.0, 0.0)?, h(0.0, -1.0)?, h(0.0, 1.0)?);
+            Some([((hx1 - hx0) / 2.0) as f32, ((hz1 - hz0) / 2.0) as f32])
+        }
+    }
+
+    /// The ground truth plus the two candidates, as one closure-driving
+    /// enum -- the only thing a sweep has to switch on.
+    pub enum Variant<'a> {
+        /// The exact block height field, blocky, with no far terrain at all
+        /// (bounded by `MAX_DISTANCE` like everything else).
+        Reference,
+        /// Today's state (`ring3_v = 4`) or a sensitivity row (1, 2) --
+        /// blocky through 1,024 m, the real far terrain (today's hole)
+        /// beyond it.
+        RingThree { ring3_v: i32, far: &'a FarField },
+        /// Candidate (ii): blocky through 512 m (levels 0-2 only), the far
+        /// terrain (hole at 512 m) beyond it.
+        FarFromFiveTwelve { far: &'a FarField },
+    }
+
+    impl Variant<'_> {
+        fn blocky_limit(&self) -> f32 {
+            match self {
+                Variant::Reference => MAX_DISTANCE,
+                Variant::RingThree { .. } => 1024.0,
+                Variant::FarFromFiveTwelve { .. } => 512.0,
+            }
+        }
+
+        fn blocky_face_height(
+            &self,
+            gen: &WorldGen,
+            eye_xz: (f32, f32),
+            x: i32,
+            z: i32,
+        ) -> Option<f64> {
+            match self {
+                Variant::Reference => Some(exact_face_height(gen, x, z)),
+                Variant::RingThree { ring3_v, .. } => {
+                    ring_face_height(gen, DEFAULT_RING_SCHEDULE, eye_xz, x, z, *ring3_v)
+                }
+                Variant::FarFromFiveTwelve { .. } => {
+                    ring_face_height(gen, &DEFAULT_RING_SCHEDULE[..3], eye_xz, x, z, 1)
+                }
+            }
+        }
+
+        fn far(&self) -> Option<&FarField> {
+            match self {
+                Variant::Reference => None,
+                Variant::RingThree { far, .. } | Variant::FarFromFiveTwelve { far } => Some(far),
+            }
+        }
+    }
+
+    /// A grid DDA through integer `(x, z)` columns along `dir` from
+    /// `eye_xz`, out to `limit` blocks -- pulled out of `sweep_column`'s
+    /// blocky zone so the stepping itself (not just height-field-dependent
+    /// behaviour) can be pinned without a `WorldGen`.
+    struct Dda {
+        cx: i32,
+        cz: i32,
+        step: [i32; 2],
+        delta: [f32; 2],
+        next: [f32; 2],
+        d_enter: f32,
+        limit: f32,
+    }
+
+    impl Dda {
+        fn new(eye_xz: (f32, f32), dir: (f32, f32), limit: f32) -> Self {
+            let cx = eye_xz.0.floor() as i32;
+            let cz = eye_xz.1.floor() as i32;
+            let step = [
+                if dir.0 >= 0.0 { 1 } else { -1 },
+                if dir.1 >= 0.0 { 1 } else { -1 },
+            ];
+            let delta = [
+                if dir.0 == 0.0 {
+                    f32::INFINITY
+                } else {
+                    1.0 / dir.0.abs()
+                },
+                if dir.1 == 0.0 {
+                    f32::INFINITY
+                } else {
+                    1.0 / dir.1.abs()
+                },
+            ];
+            let next = [
+                if dir.0 > 0.0 {
+                    (cx as f32 + 1.0 - eye_xz.0) / dir.0
+                } else if dir.0 < 0.0 {
+                    (eye_xz.0 - cx as f32) / -dir.0
+                } else {
+                    f32::INFINITY
+                },
+                if dir.1 > 0.0 {
+                    (cz as f32 + 1.0 - eye_xz.1) / dir.1
+                } else if dir.1 < 0.0 {
+                    (eye_xz.1 - cz as f32) / -dir.1
+                } else {
+                    f32::INFINITY
+                },
+            ];
+            Self {
+                cx,
+                cz,
+                step,
+                delta,
+                next,
+                d_enter: 0.0,
+                limit,
+            }
+        }
+
+        /// The current column, and the ground distance it was entered at.
+        fn here(&self) -> (i32, i32, f32) {
+            (self.cx, self.cz, self.d_enter)
+        }
+
+        /// The ground distance the current column is exited at (the
+        /// nearer of the two axis boundaries, capped at `limit`).
+        fn exit_distance(&self) -> f32 {
+            let a = if self.next[0] < self.next[1] { 0 } else { 1 };
+            self.next[a].min(self.limit)
+        }
+
+        /// Advance to the next column. `None` once `limit` is reached (the
+        /// current column was the last one); otherwise the ground distance
+        /// the boundary was crossed at and which axis (0 = x, 1 = z).
+        fn advance(&mut self) -> Option<(f32, usize)> {
+            let a = if self.next[0] < self.next[1] { 0 } else { 1 };
+            if self.next[a] >= self.limit {
+                return None;
+            }
+            let d_boundary = self.next[a];
+            self.next[a] += self.delta[a];
+            if a == 0 {
+                self.cx += self.step[0];
+            } else {
+                self.cz += self.step[1];
+            }
+            self.d_enter = d_boundary;
+            Some((d_boundary, a))
+        }
+    }
+
+    /// `mesh.wgsl`'s lighting applied to a riser facing `normal`, shown
+    /// `rise` blocks tall (`aggregate::riser_colour`'s own material
+    /// banding -- grass side, then soil, then stone).
+    fn riser_colour_lit(
+        materials: &Materials,
+        lighting: &Lighting,
+        normal: glam::Vec3,
+        rise: i32,
+    ) -> glam::Vec3 {
+        riser_colour(materials, rise as f32) * face_light(normal, lighting)
+    }
+
+    /// One column's sweep: the row-indexed colours it paints (`None` where
+    /// nothing was visible -- open sky), and the skyline row (the smallest
+    /// row reached, i.e. the screen's own top rows if nothing was ever hit).
+    pub fn sweep_column(
+        cam: Camera,
+        azimuth: f32,
+        variant: &Variant,
+        gen: &WorldGen,
+        materials: &Materials,
+        lighting: &Lighting,
+    ) -> (Vec<Option<[f32; 3]>>, f32) {
+        let height_px = cam.view.height_px as usize;
+        let mut rows: Vec<Option<glam::Vec3>> = vec![None; height_px];
+        let mut running_min = f32::INFINITY;
+
+        let dir = (azimuth.cos(), azimuth.sin());
+        let eye_xz = (cam.eye[0], cam.eye[2]);
+
+        let mut paint = |d: f32, y: f32, colour: glam::Vec3| {
+            let row = cam.row_for(d, y);
+            if row < running_min {
+                let (lo, hi) = paint_range(row, running_min, height_px);
+                if lo < hi {
+                    for slot in &mut rows[lo..hi] {
+                        *slot = Some(colour);
+                    }
+                }
+                running_min = row;
+            }
+        };
+
+        let top_colour = materials.top * face_light(glam::Vec3::Y, lighting);
+
+        // --- The blocky zone: a column DDA along `dir`, from the eye out to
+        // this variant's own `blocky_limit` (512 m, 1,024 m, or the whole
+        // sweep for the reference). ---
+        let blocky_limit = variant.blocky_limit().min(MAX_DISTANCE);
+        {
+            let mut dda = Dda::new(eye_xz, dir, blocky_limit);
+            'blocky: loop {
+                let (cx, cz, d_enter) = dda.here();
+                let Some(face_y) = variant.blocky_face_height(gen, eye_xz, cx, cz) else {
+                    break 'blocky;
+                };
+                let top_blocks = block_below_face(face_y);
+                let d_exit = dda.exit_distance();
+                paint(d_enter.max(0.05), face_y as f32, top_colour);
+                paint(d_exit.max(0.05), face_y as f32, top_colour);
+                let Some((d_boundary, a)) = dda.advance() else {
+                    break 'blocky;
+                };
+                if let Some(new_face_y) = variant.blocky_face_height(gen, eye_xz, dda.cx, dda.cz) {
+                    let new_top = block_below_face(new_face_y);
+                    if new_top > top_blocks {
+                        let mut normal = glam::Vec3::ZERO;
+                        normal[a] = -(dda.step[a] as f32);
+                        let colour =
+                            riser_colour_lit(materials, lighting, normal, new_top - top_blocks);
+                        paint(d_boundary.max(0.05), new_face_y as f32, colour);
+                    }
+                }
+            }
+        }
+
+        // --- The smooth zone beyond it, if this variant has a far terrain
+        // (every variant but the reference). ---
+        if let Some(far) = variant.far() {
+            let table = MaskingTable::committed();
+            let eye3 = glam::Vec3::from(cam.eye);
+            // `.max(1.0)`, not `.min`: a mutation that starts `d` near 0
+            // instead of at `blocky_limit` has no test pinning it directly,
+            // and does not need one -- `measure_eye` always builds `far`'s
+            // hole at exactly `blocky_limit` (the two variants' own
+            // construction couples them), so `far.height_at` returns `None`
+            // for every `d` short of `blocky_limit` regardless (nothing is
+            // selected inside a far-terrain hole, `far::tests`), and
+            // nothing is painted there either way. Starting too early only
+            // wastes iterations on a region proven empty; it cannot change
+            // what the sweep shows.
+            let mut d = blocky_limit.max(1.0);
+            while d < MAX_DISTANCE {
+                let x = eye_xz.0 as f64 + d as f64 * dir.0 as f64;
+                let z = eye_xz.1 as f64 + d as f64 * dir.1 as f64;
+                if let (Some(h), Some(g)) = (far.height_at(x, z), far.gradient_at(x, z)) {
+                    let point = glam::vec3(x as f32, h as f32, z as f32);
+                    if let Some(view_dir) = (eye3 - point).try_normalize() {
+                        if let Some(colour) =
+                            aggregate_colour(&table, g, view_dir, lighting, materials)
+                        {
+                            paint(d, h as f32, colour);
+                        }
+                    }
+                }
+                d += (d * 0.02).max(2.0);
+            }
+        }
+
+        // The `else` arm (open sky, nothing ever painted) is unreachable
+        // through every variant this harness builds, not untested by
+        // oversight: the very first blocky column is the eye's own, which
+        // `exact_face_height`/`ring_face_height` always answer for (ring 0
+        // always covers distance 0) -- so `running_min` becomes finite on
+        // the sweep's first sample, before this line ever runs on an
+        // infinite value. It stays as a defensive fallback for a variant
+        // that might one day *not* have that guarantee, not as behaviour
+        // this harness exercises.
+        let skyline_row = if running_min.is_finite() {
+            running_min
+        } else {
+            height_px as f32
+        };
+        (
+            rows.into_iter().map(|c| c.map(|v| v.to_array())).collect(),
+            skyline_row,
+        )
+    }
+
+    /// One eye's rendered column set: every column's full row array (for
+    /// the band metric, sliced to the band afterwards) and skyline row (for
+    /// the skyline error), at `columns` azimuths spanning the camera's own
+    /// horizontal FOV.
+    pub struct ColumnSet {
+        pub rows: Vec<Vec<Option<[f32; 3]>>>,
+        pub skyline_rows: Vec<f32>,
+    }
+
+    pub fn render_eye(
+        cam: Camera,
+        variant: &Variant,
+        gen: &WorldGen,
+        materials: &Materials,
+        lighting: &Lighting,
+        columns: usize,
+    ) -> ColumnSet {
+        let mut rows = Vec::with_capacity(columns);
+        let mut skyline_rows = Vec::with_capacity(columns);
+        for c in 0..columns {
+            let az = cam.azimuth(columns, c);
+            let (col_rows, sky) = sweep_column(cam, az, variant, gen, materials, lighting);
+            rows.push(col_rows);
+            skyline_rows.push(sky);
+        }
+        ColumnSet { rows, skyline_rows }
+    }
+
+    // -----------------------------------------------------------------------
+    // The band metric (`PROPOSAL_LOD_TRANSITIONS.md` §6, T4's own recipe,
+    // reused here for M4): linear luminance (Rec. 709 weights), a 4x4 box
+    // low-pass, D(row) = mean |LP(F) - LP(R)| along a row, then the band's
+    // maximum and mean of D.
+    // -----------------------------------------------------------------------
+
+    /// Linear luminance of a linear-light RGB colour (Rec. 709 weights --
+    /// the file does not otherwise pick one, so this says which).
+    pub fn luminance(c: [f32; 3]) -> f32 {
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    }
+
+    /// A `None` pixel (sky/unpainted) reads as the sky colour's luminance --
+    /// both images agree on what sky looks like, so this cannot manufacture
+    /// a difference the metric would wrongly report.
+    fn pixel_luminance(c: Option<[f32; 3]>, lighting: &Lighting) -> f32 {
+        c.map_or_else(|| luminance(lighting.fog_color.to_array()), luminance)
+    }
+
+    /// A 4x4 box low-pass over a row-major `width` x `height` grid,
+    /// clamped at the edges (the box is shrunk rather than wrapping or
+    /// zero-padding, so an edge pixel is the mean of what actually exists
+    /// around it).
+    pub fn box_low_pass_4x4(grid: &[f32], width: usize, height: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; grid.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let y0 = y.saturating_sub(1);
+                let y1 = (y + 2).min(height);
+                let x0 = x.saturating_sub(1);
+                let x1 = (x + 2).min(width);
+                let mut sum = 0.0f32;
+                let mut n = 0u32;
+                for yy in y0..y1 {
+                    for xx in x0..x1 {
+                        sum += grid[yy * width + xx];
+                        n += 1;
+                    }
+                }
+                out[y * width + x] = sum / n.max(1) as f32;
+            }
+        }
+        out
+    }
+
+    /// `D(row)`, the band's maximum of `D` and its mean -- `F` and `R` are
+    /// row-major `width` x `height` luminance grids, already low-passed.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct BandMetric {
+        pub per_row: Vec<f32>,
+        pub max: f32,
+        pub mean: f32,
+    }
+
+    pub fn band_metric(lp_f: &[f32], lp_r: &[f32], width: usize, height: usize) -> BandMetric {
+        assert_eq!(lp_f.len(), width * height);
+        assert_eq!(lp_r.len(), width * height);
+        let mut per_row = Vec::with_capacity(height);
+        for y in 0..height {
+            let row = &lp_f[y * width..(y + 1) * width];
+            let row_r = &lp_r[y * width..(y + 1) * width];
+            let d: f32 = row
+                .iter()
+                .zip(row_r)
+                .map(|(f, r)| (f - r).abs())
+                .sum::<f32>()
+                / width.max(1) as f32;
+            per_row.push(d);
+        }
+        let max = per_row.iter().copied().fold(0.0f32, f32::max);
+        let mean = per_row.iter().sum::<f32>() / per_row.len().max(1) as f32;
+        BandMetric { per_row, max, mean }
+    }
+
+    /// The band metric between two [`ColumnSet`]s, over `band` rows
+    /// (absolute row indices), built from the per-column row arrays
+    /// directly (handles the low-pass and luminance conversion).
+    pub fn band_metric_between(
+        f: &ColumnSet,
+        r: &ColumnSet,
+        band: std::ops::Range<usize>,
+        lighting: &Lighting,
+    ) -> BandMetric {
+        let width = f.rows.len();
+        assert_eq!(width, r.rows.len());
+        let height = band.len();
+        let grid_of = |set: &ColumnSet| -> Vec<f32> {
+            // Row-major, but the natural storage is column-major (one Vec
+            // per azimuth) -- transpose on the way in.
+            let mut g = vec![0.0f32; width * height];
+            for (c, col) in set.rows.iter().enumerate() {
+                for (i, row) in band.clone().enumerate() {
+                    g[i * width + c] = pixel_luminance(col.get(row).copied().flatten(), lighting);
+                }
+            }
+            g
+        };
+        let (lf, lr) = (grid_of(f), grid_of(r));
+        let (lp_f, lp_r) = (
+            box_low_pass_4x4(&lf, width, height),
+            box_low_pass_4x4(&lr, width, height),
+        );
+        band_metric(&lp_f, &lp_r, width, height)
+    }
+
+    // -----------------------------------------------------------------------
+    // Skyline error per azimuth: pixels between a variant's skyline row and
+    // the reference's, at each azimuth column.
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SkylineError {
+        pub mean: f32,
+        pub p75: f32,
+        pub max: f32,
+    }
+
+    pub fn skyline_error(variant: &ColumnSet, reference: &ColumnSet) -> SkylineError {
+        assert_eq!(variant.skyline_rows.len(), reference.skyline_rows.len());
+        let mut errs: Vec<f32> = variant
+            .skyline_rows
+            .iter()
+            .zip(&reference.skyline_rows)
+            .map(|(v, r)| (v - r).abs())
+            .collect();
+        errs.sort_by(f32::total_cmp);
+        let n = errs.len().max(1);
+        let mean = errs.iter().sum::<f32>() / n as f32;
+        let p75 = errs[(errs.len() * 3 / 4).min(errs.len().saturating_sub(1))];
+        let max = errs.last().copied().unwrap_or(0.0);
+        SkylineError { mean, p75, max }
+    }
+
+    // -----------------------------------------------------------------------
+    // The decision rule (issue #335, Design decisions 2): (ii) wins only if
+    // its band metric is within a threshold of (i)'s **and** its skyline
+    // error is no worse. The threshold is the proposal's §6 calibration --
+    // "about 2.5x the reference-vs-reference noise" -- measured here as the
+    // band metric between the reference rendered at the eye and the
+    // reference rendered from an eye shifted by half a block (the CPU has no
+    // cross-backend noise to measure against, so this stands in for it: the
+    // same scene, a sub-block camera jitter, nothing about the decision).
+    pub const CALIBRATION_FACTOR: f32 = 2.5;
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Decision {
+        pub band_i: BandMetric,
+        pub band_ii: BandMetric,
+        pub skyline_i: SkylineError,
+        pub skyline_ii: SkylineError,
+        pub noise: BandMetric,
+        /// `2.5x` the noise's own max and mean -- two thresholds, not one,
+        /// so the band metric's `max` is judged against a max-shaped noise
+        /// figure and its `mean` against a mean-shaped one, rather than
+        /// blending the two into a single number.
+        pub threshold_max: f32,
+        pub threshold_mean: f32,
+        pub ii_wins: bool,
+    }
+
+    pub fn decide(
+        band_i: BandMetric,
+        band_ii: BandMetric,
+        skyline_i: SkylineError,
+        skyline_ii: SkylineError,
+        noise: BandMetric,
+    ) -> Decision {
+        let threshold_max = CALIBRATION_FACTOR * noise.max;
+        let threshold_mean = CALIBRATION_FACTOR * noise.mean;
+        let band_ok = band_ii.max <= band_i.max + threshold_max
+            && band_ii.mean <= band_i.mean + threshold_mean;
+        let skyline_ok = skyline_ii.mean <= skyline_i.mean && skyline_ii.max <= skyline_i.max;
+        Decision {
+            band_i,
+            band_ii,
+            skyline_i,
+            skyline_ii,
+            noise,
+            threshold_max,
+            threshold_mean,
+            ii_wins: band_ok && skyline_ok,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The eyes, the report, and the `#[ignore]`d test that prints it.
+    // -----------------------------------------------------------------------
+
+    /// The gate eyes' own pitch for M4: level (0), looking straight down +x
+    /// -- the 512 m edge then sits close to the frame's own middle rows
+    /// (§1.1's "rows below horizon" table is small at both gate eyes), which
+    /// is where the row approximation documented on [`Camera`] is most
+    /// accurate.
+    pub const GATE_PITCH: f32 = 0.0;
+
+    /// `docs/PROPOSAL_FAR_VIEW.md`'s F6 names no eye of its own -- it is
+    /// "whatever F1-F5's measurements say is still missing" -- and neither
+    /// it nor `BENCHMARKS.md` defines a numeric "low eye" anywhere in the
+    /// repository. Issue #335's own fallback is used here instead, and
+    /// recorded as exactly that: `[8, 60, 8]`, looking along +x pitched
+    /// `-0.15`.
+    pub const LOW_EYE: [f32; 3] = [8.0, 60.0, 8.0];
+    pub const LOW_EYE_PITCH: f32 = -0.15;
+
+    /// Columns for the report -- "a few hundred" per the issue.
+    pub const COLUMNS: usize = 240;
+
+    /// The row band around the 512 m edge, from the *reference's* own exact
+    /// height there (so the window is centred where the edge actually falls
+    /// in this scene, not where it would on perfectly flat ground).
+    fn band_window(cam: Camera, gen: &WorldGen, eye_xz: (f32, f32)) -> std::ops::Range<usize> {
+        let x = (eye_xz.0 + 512.0).round() as i32;
+        let z = eye_xz.1.round() as i32;
+        let y = exact_face_height(gen, x, z) as f32;
+        let row = cam.row_for(512.0, y);
+        let half = BAND_HALF_HEIGHT as f32;
+        let height_px = cam.view.height_px as usize;
+        let lo = (row - half).max(0.0) as usize;
+        let hi = ((row + half).max(0.0) as usize + 1).min(height_px);
+        lo.min(height_px.saturating_sub(1))..hi.max(lo + 1).min(height_px)
+    }
+
+    /// Everything measured at one eye: the three column sets, the band
+    /// metric and skyline error for each candidate against the reference,
+    /// the noise calibration, and the decision.
+    pub struct EyeReport {
+        pub name: &'static str,
+        pub eye: [f32; 3],
+        pub band_i: BandMetric,
+        pub band_ii: BandMetric,
+        pub skyline_i: SkylineError,
+        pub skyline_ii: SkylineError,
+        pub decision: Decision,
+    }
+
+    /// Measure one eye: build the reference, candidate (i) at `ring3_v`, and
+    /// candidate (ii), then the band metric, skyline error and decision.
+    pub fn measure_eye(
+        gen: &WorldGen,
+        name: &'static str,
+        eye: [f32; 3],
+        pitch: f32,
+        ring3_v: i32,
+    ) -> EyeReport {
+        let cam = Camera::gate(eye, pitch);
+        let materials = far_streaming::far_materials();
+        let lighting = Lighting::default();
+        let eye_xz = (eye[0], eye[2]);
+        let eye64 = [eye[0] as f64, eye[1] as f64, eye[2] as f64];
+
+        let reference = render_eye(
+            cam,
+            &Variant::Reference,
+            gen,
+            &materials,
+            &lighting,
+            COLUMNS,
+        );
+
+        let far_i = FarField::build(gen, eye64, 1024.0, MAX_DISTANCE as f64 + 64.0);
+        let variant_i = Variant::RingThree {
+            ring3_v,
+            far: &far_i,
+        };
+        let set_i = render_eye(cam, &variant_i, gen, &materials, &lighting, COLUMNS);
+
+        let far_ii = FarField::build(gen, eye64, 512.0, MAX_DISTANCE as f64 + 64.0);
+        let variant_ii = Variant::FarFromFiveTwelve { far: &far_ii };
+        let set_ii = render_eye(cam, &variant_ii, gen, &materials, &lighting, COLUMNS);
+
+        let band = band_window(cam, gen, eye_xz);
+        let band_i = band_metric_between(&set_i, &reference, band.clone(), &lighting);
+        let band_ii = band_metric_between(&set_ii, &reference, band.clone(), &lighting);
+        let skyline_i = skyline_error(&set_i, &reference);
+        let skyline_ii = skyline_error(&set_ii, &reference);
+
+        // The calibration noise: the same reference, rendered again from an
+        // eye jittered half a block sideways -- see `decide`'s doc comment.
+        let jittered_cam = Camera::gate([eye[0], eye[1], eye[2] + 0.5], pitch);
+        let jittered = render_eye(
+            jittered_cam,
+            &Variant::Reference,
+            gen,
+            &materials,
+            &lighting,
+            COLUMNS,
+        );
+        let noise = band_metric_between(&jittered, &reference, band, &lighting);
+
+        let decision = decide(
+            band_i.clone(),
+            band_ii.clone(),
+            skyline_i,
+            skyline_ii,
+            noise,
+        );
+        EyeReport {
+            name,
+            eye,
+            band_i,
+            band_ii,
+            skyline_i,
+            skyline_ii,
+            decision,
+        }
+    }
+
+    /// One eye's row, for the table [`report`] prints.
+    fn format_eye(r: &EyeReport) -> String {
+        format!(
+            "| {} {:?} | {:.4} / {:.4} | {:.4} / {:.4} | {:.2} / {:.2} / {:.2} | {:.2} / {:.2} / {:.2} | {:.4} / {:.4} | {} |",
+            r.name,
+            r.eye,
+            r.band_i.max,
+            r.band_i.mean,
+            r.band_ii.max,
+            r.band_ii.mean,
+            r.skyline_i.mean,
+            r.skyline_i.p75,
+            r.skyline_i.max,
+            r.skyline_ii.mean,
+            r.skyline_ii.p75,
+            r.skyline_ii.max,
+            r.decision.threshold_max,
+            r.decision.threshold_mean,
+            if r.decision.ii_wins { "(ii)" } else { "(i) stays" },
+        )
+    }
+
+    /// M4's results table, over the gate eyes plus the low eye, at ring 3's
+    /// candidate (i) = `v = 4` (today's).
+    pub fn report() -> String {
+        let gen = WorldGen::new(World::new().seed());
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "M4 ({COLUMNS} columns, {MAX_DISTANCE} m sweep): band D max/mean (i / ii), skyline mean/p75/max px (i / ii), threshold, decision"
+        );
+        let _ = writeln!(
+            s,
+            "| eye | band D max/mean (i) | band D max/mean (ii) | skyline mean/p75/max px (i) | skyline mean/p75/max px (ii) | threshold max/mean | decision |"
+        );
+        let _ = writeln!(s, "|---|---|---|---|---|---|---|");
+        // The issue's own eyes: ground and hill, not the flight eye -- at
+        // 3,000 m up the game already draws nothing but the far terrain
+        // (`GATE_EYES`' own doc comment), so ring 3 is moot there.
+        for g in GATE_EYES
+            .iter()
+            .filter(|g| g.name == "ground" || g.name == "hill")
+        {
+            let r = measure_eye(&gen, g.name, g.eye, GATE_PITCH, 4);
+            let _ = writeln!(s, "{}", format_eye(&r));
+        }
+        let low = measure_eye(&gen, "low (F6 fallback)", LOW_EYE, LOW_EYE_PITCH, 4);
+        let _ = writeln!(s, "{}", format_eye(&low));
+        s
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `Camera::azimuth` is 0 at the middle column and antisymmetric
+        /// around it -- the centre column looks straight down the camera's
+        /// own yaw (0 here), and column `columns - 1 - c` mirrors column
+        /// `c`. A mistake in the NDC mapping (an off-by-one, a wrong sign, a
+        /// wrong scale) breaks at least one of these.
+        ///
+        /// (The `< 0.2` bound's own `<`/`<=` is not pinned, and does not
+        /// need to be: `azimuth(3)` and `azimuth(4)` are `atan` of an
+        /// irrational ratio, never exactly `0.2`, so the two operators
+        /// agree on every real input -- true of any tolerance check,
+        /// `check-tests-can-fail.sh` included.)
+        #[test]
+        fn camera_azimuth_is_zero_at_the_centre_and_antisymmetric() {
+            let cam = Camera::gate([0.0, 0.0, 0.0], 0.0);
+            let columns = 8;
+            // Columns 0..8: the centre sits between columns 3 and 4 (NDC 0
+            // falls at col 3.5), so those two are closest to, and
+            // symmetric around, zero. Checked independently (not combined
+            // through a `max`/`min`) so a mix-up between the two can't
+            // hide behind the other column's own margin.
+            assert!(
+                cam.azimuth(columns, 3).abs() < 0.2,
+                "azimuth(3) = {}, too far from 0",
+                cam.azimuth(columns, 3)
+            );
+            assert!(
+                cam.azimuth(columns, 4).abs() < 0.2,
+                "azimuth(4) = {}, too far from 0",
+                cam.azimuth(columns, 4)
+            );
+            for c in 0..columns {
+                let mirror = columns - 1 - c;
+                assert!(
+                    (cam.azimuth(columns, c) + cam.azimuth(columns, mirror)).abs() < 1e-5,
+                    "column {c} and its mirror {mirror} are not antisymmetric"
+                );
+            }
+            // Monotonic across the frame: a later column is never a
+            // smaller azimuth (this camera's FOV is under 180 degrees).
+            let azimuths: Vec<f32> = (0..columns).map(|c| cam.azimuth(columns, c)).collect();
+            assert!(azimuths.is_sorted(), "{azimuths:?}");
+        }
+
+        /// `ring_face_height` is exactly `coarse_top(...) + 1` (the block
+        /// surface's top FACE, not the block itself) -- pinned at a known
+        /// point so a wrong offset (`+2`, or none at all) is caught.
+        #[test]
+        fn ring_face_height_is_one_above_coarse_top() {
+            let gen = WorldGen::new(World::new().seed());
+            let (x, z) = (20, -5);
+            let got = ring_face_height(&gen, DEFAULT_RING_SCHEDULE, (0.0, 0.0), x, z, 4)
+                .expect("inside the first ring");
+            // Both sides do the identical integer arithmetic on the same
+            // input, so this is an equality, not a tolerance.
+            let want = coarse_top(&gen, x, z, 1, 1) as f64 + 1.0;
+            assert_eq!(got, want);
+        }
+
+        /// `exact_face_height` is exactly `surface_height + 1` -- the exact
+        /// per-block reference's own version of the same "+1 for the top
+        /// face" offset `ring_face_height_is_one_above_coarse_top` pins for
+        /// the coarse path.
+        #[test]
+        fn exact_face_height_is_one_above_the_exact_surface() {
+            let gen = WorldGen::new(World::new().seed());
+            for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
+                let want = gen.surface_height(x, z) as f64 + 1.0;
+                assert_eq!(exact_face_height(&gen, x, z), want);
+            }
+        }
+
+        /// `block_below_face` undoes that `+ 1.0` exactly -- the inverse
+        /// `sweep_column`'s `top_blocks`/`new_top` both rely on.
+        #[test]
+        fn block_below_face_is_the_exact_inverse_of_the_plus_one() {
+            let gen = WorldGen::new(World::new().seed());
+            for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
+                let face = exact_face_height(&gen, x, z);
+                assert_eq!(block_below_face(face), gen.surface_height(x, z));
+            }
+            // And directly, for values with no world behind them.
+            for face_y in [1.0f64, 25.0, -8.0, 100.5] {
+                assert_eq!(block_below_face(face_y), (face_y - 1.0).round() as i32);
+            }
+        }
+
+        /// The DDA crosses *both* axes when `dir` points diagonally -- not
+        /// just the one it happens to start on. A delta stuck at infinity
+        /// on one axis (as if that axis never moved) would freeze that
+        /// axis after its first crossing; this counts how many distinct
+        /// values each axis actually reaches and requires both to move
+        /// close to what the direction's own ratio predicts.
+        #[test]
+        fn the_dda_advances_on_both_axes_for_a_diagonal_direction() {
+            // Every quadrant: `Dda::new`'s initial `next[]` has a separate
+            // branch per sign of `dir`, so a direction with both signs
+            // negative (or one of each) exercises branches the first,
+            // all-positive-only version of this test never reached.
+            for dir in [
+                (0.8f32, 0.6f32),
+                (-0.8f32, 0.6f32),
+                (0.8f32, -0.6f32),
+                (-0.8f32, -0.6f32),
+            ] {
+                let limit = 40.0;
+                let mut dda = Dda::new((0.0, 0.0), dir, limit);
+                let (mut x_crossings, mut z_crossings) = (0u32, 0u32);
+                loop {
+                    match dda.advance() {
+                        Some((_, 0)) => x_crossings += 1,
+                        Some((_, 1)) => z_crossings += 1,
+                        Some(_) => unreachable!("only two axes exist"),
+                        None => break,
+                    }
+                }
+                // Expected crossings are `limit * |dir|` per axis (a
+                // standard grid DDA): about 32 on x and 24 on z. A frozen
+                // axis (the mutation this pins against: one branch of
+                // `next[]`'s setup always taken) would stop at 0 or 1,
+                // nowhere near either bound.
+                assert!(
+                    (28..=34).contains(&x_crossings),
+                    "dir {dir:?}: x crossings {x_crossings}"
+                );
+                assert!(
+                    (20..=26).contains(&z_crossings),
+                    "dir {dir:?}: z crossings {z_crossings}"
+                );
+            }
+        }
+
+        /// Every boundary distance the DDA reports -- both `exit_distance`
+        /// (before advancing) and the distance `advance` itself returns --
+        /// is non-negative, for every quadrant of `dir`. The wrong branch
+        /// of `Dda::new`'s per-sign `next[]` setup produces a *negative*
+        /// initial threshold (worked out by hand for `dir.0 < 0`: the
+        /// always-taken `dir.0 > 0` formula divides by a negative number),
+        /// which the crossing-count test above cannot tell apart from the
+        /// correct, merely phase-shifted sequence.
+        #[test]
+        fn the_dda_never_reports_a_negative_distance() {
+            for dir in [
+                (0.8f32, 0.6f32),
+                (-0.8f32, 0.6f32),
+                (0.8f32, -0.6f32),
+                (-0.8f32, -0.6f32),
+            ] {
+                // Off a cell corner, so the very first threshold isn't
+                // trivially zero regardless of which branch ran.
+                let mut dda = Dda::new((0.3, 0.7), dir, 40.0);
+                for _ in 0..30 {
+                    let exit = dda.exit_distance();
+                    assert!(
+                        exit >= 0.0,
+                        "dir {dir:?}: exit_distance reported a negative distance {exit}"
+                    );
+                    let Some((d, _)) = dda.advance() else { break };
+                    assert!(
+                        d >= 0.0,
+                        "dir {dir:?}: advance reported a negative distance {d}"
+                    );
+                }
+            }
+        }
+
+        /// `exit_distance` predicts exactly the boundary `advance` is about
+        /// to use -- not the sweep's own distance limit. Swapping its
+        /// `min`/`max` against `limit` would make it report the limit on
+        /// almost every call instead.
+        #[test]
+        fn exit_distance_matches_the_boundary_advance_uses() {
+            let mut dda = Dda::new((0.0, 0.0), (0.8, 0.6), 40.0);
+            for _ in 0..20 {
+                let exit = dda.exit_distance();
+                assert!(exit < 40.0, "exit_distance reported the limit: {exit}");
+                let Some((d, _)) = dda.advance() else { break };
+                assert_eq!(exit, d, "exit_distance didn't predict advance's boundary");
+            }
+        }
+
+        /// The DDA's first two boundaries, against hand-worked values --
+        /// catches a wrong constant in *either* axis's `next[]` setup
+        /// (`+1.0` is "one block ahead of this column's own origin", not
+        /// `+2.0` or anything else) that a self-consistency check like the
+        /// one above, or a loose crossing-count range, cannot: both would
+        /// still agree with each other, and still land inside a wide
+        /// enough range, on a value that is simply wrong.
+        #[test]
+        fn the_dda_first_two_boundaries_match_hand_worked_values() {
+            // Eye at (0.3, 0.7), dir (0.8, 0.6): the x boundary is
+            // (1.0 - 0.3) / 0.8 = 0.875; the z boundary is
+            // (1.0 - 0.7) / 0.6 = 0.5. z is nearer, so it crosses first.
+            let mut dda = Dda::new((0.3, 0.7), (0.8, 0.6), 40.0);
+            assert!(
+                (dda.exit_distance() - 0.5).abs() < 1e-5,
+                "{}",
+                dda.exit_distance()
+            );
+            let (d, axis) = dda.advance().expect("well inside the limit");
+            assert!((d - 0.5).abs() < 1e-5, "{d}");
+            assert_eq!(axis, 1, "z should cross first");
+            assert!(
+                (dda.exit_distance() - 0.875).abs() < 1e-5,
+                "{}",
+                dda.exit_distance()
+            );
+        }
+
+        /// `paint_range`'s lower clamp keeps a positive row where it is (a
+        /// riser far below the horizon is the common case) and only floors
+        /// a negative one to 0 -- a `max`/`min` slip would instead clamp
+        /// *every* row to 0, including the common positive case.
+        #[test]
+        fn paint_range_only_clamps_a_negative_row_to_zero() {
+            assert_eq!(paint_range(50.0, 100.0, 1080), (50, 100));
+            assert_eq!(paint_range(-5.0, 100.0, 1080), (0, 100));
+        }
+
+        /// `band_window`'s range is centred and `2 * BAND_HALF_HEIGHT + 1`
+        /// rows wide away from the screen edges -- not collapsed to a
+        /// single row (a `max`/`min` slip in the clamp would do exactly
+        /// that).
+        #[test]
+        fn band_window_is_the_full_band_wide_away_from_the_edges() {
+            let gen = WorldGen::new(World::new().seed());
+            // The ground eye's own 512 m point sits well short of the
+            // screen's bottom edge (T1/§1.1: the 512 m edge is ~20-64 rows
+            // below the horizon at the gate eyes, nowhere near row 1080).
+            let cam = Camera::gate([8.0, 40.0, 8.0], 0.0);
+            let band = band_window(cam, &gen, (8.0, 8.0));
+            assert!(band.start < band.end, "{band:?}");
+            let width = band.end - band.start;
+            assert_eq!(
+                width,
+                (2 * BAND_HALF_HEIGHT + 1) as usize,
+                "band {band:?} is not the full window"
+            );
+        }
+
+        /// Identical images (after the low-pass) give zero everywhere --
+        /// the metric cannot manufacture a difference out of nothing.
+        #[test]
+        fn identical_images_give_zero_difference() {
+            let (width, height) = (6, 4);
+            let grid: Vec<f32> = (0..width * height)
+                .map(|i| ((i as f32) * 0.37).sin().abs())
+                .collect();
+            let lp = box_low_pass_4x4(&grid, width, height);
+            let m = band_metric(&lp, &lp, width, height);
+            assert_eq!(m.max, 0.0);
+            assert_eq!(m.mean, 0.0);
+            assert!(m.per_row.iter().all(|&d| d == 0.0));
+        }
+
+        /// A known step, worked out by hand: `F` is 0 for the first four
+        /// columns and 1 for the next four, `R` is flat 0, one row. After the
+        /// 4x4 low-pass (which shrinks to fit at the edges, since there is
+        /// only one row): `D` has a known value, exactly representable in
+        /// `f32`, so this is an exact assertion, not a tolerance.
+        #[test]
+        fn a_known_step_gives_a_known_difference() {
+            let f = [0.0f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+            let r = [0.0f32; 8];
+            let (lp_f, lp_r) = (box_low_pass_4x4(&f, 8, 1), box_low_pass_4x4(&r, 8, 1));
+            // By hand: a 4x4 box shrunk to fit a single row is a 3-wide
+            // (2-wide at the very edges) box along it alone. At x = 0, 1, 2
+            // the box never reaches the step (columns 0-3 are 0): 0. At
+            // x = 3 it first reaches one `1` (column 4) of its 3: 1/3. At
+            // x = 4 it holds two (columns 3, 5 besides the step... no,
+            // columns 3, 4, 5 = 0, 1, 1): 2/3. From x = 5 on, every column
+            // the box reaches is past the step: 1.
+            let expected = [0.0, 0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0, 1.0, 1.0];
+            for (got, want) in lp_f.iter().zip(expected) {
+                assert!((got - want).abs() < 1e-6, "{lp_f:?}");
+            }
+            // One row: the band's maximum of `D` and its mean coincide.
+            let m = band_metric(&lp_f, &lp_r, 8, 1);
+            let expected_mean = expected.iter().sum::<f32>() / expected.len() as f32;
+            assert!((m.max - expected_mean).abs() < 1e-6, "{m:?}");
+            assert!((m.mean - expected_mean).abs() < 1e-6, "{m:?}");
+            assert!((m.mean - 0.5).abs() < 1e-6, "{m:?}");
+        }
+
+        /// The band's maximum of `D` and its mean are genuinely different
+        /// quantities, not the same number read twice: two rows, one far
+        /// from the reference everywhere, one matching it exactly -- a
+        /// metric that silently averaged instead of taking a max (or vice
+        /// versa) would fail this even though the single-row test above
+        /// cannot tell the two apart.
+        ///
+        /// (`per_row[0]`'s own `< 1e-6` is summed from three copies of the
+        /// literal `0.8f32`, which floating addition is not guaranteed to
+        /// divide back to bit-for-bit -- unlike `per_row[1]`, below, which
+        /// sums literal zeros. A tolerance, not an equality, on purpose.)
+        #[test]
+        fn band_metric_reports_the_bands_max_separately_from_its_mean() {
+            let lp_f = [0.8f32, 0.8, 0.8, 0.0, 0.0, 0.0];
+            let lp_r = [0.0f32; 6];
+            let m = band_metric(&lp_f, &lp_r, 3, 2);
+            assert!((m.per_row[0] - 0.8).abs() < 1e-6, "{m:?}");
+            // Exactly representable (both rows are literally identical),
+            // so this is an equality, not a tolerance -- `<` vs `<=` on a
+            // tolerance can't tell `0.0` apart from itself either way.
+            assert_eq!(m.per_row[1], 0.0, "{m:?}");
+            assert!((m.max - 0.8).abs() < 1e-6, "{m:?}");
+            assert!((m.mean - 0.4).abs() < 1e-6, "{m:?}");
+        }
+
+        /// A uniform offset (no edge at all) gives that same offset
+        /// everywhere -- so the metric is not accidentally only sensitive to
+        /// edges.
+        #[test]
+        fn a_uniform_offset_gives_a_uniform_difference() {
+            let f = [0.3f32; 16];
+            let r = [0.1f32; 16];
+            let (lp_f, lp_r) = (box_low_pass_4x4(&f, 4, 4), box_low_pass_4x4(&r, 4, 4));
+            let m = band_metric(&lp_f, &lp_r, 4, 4);
+            assert!((m.max - 0.2).abs() < 1e-5, "{m:?}");
+            assert!((m.mean - 0.2).abs() < 1e-5, "{m:?}");
+        }
+
+        /// The low-pass of a uniform grid is that same value everywhere --
+        /// pins that the box filter does not shift or scale a flat input
+        /// (a broken normalization would). A tolerance, not an equality,
+        /// for the same reason as the test above: summing nine copies of
+        /// `0.42` and dividing by 9 is not guaranteed to land back on the
+        /// exact bit pattern.
+        #[test]
+        fn a_flat_grid_is_unchanged_by_the_low_pass() {
+            let grid = [0.42f32; 9];
+            let lp = box_low_pass_4x4(&grid, 3, 3);
+            assert!(lp.iter().all(|&v| (v - 0.42).abs() < 1e-6), "{lp:?}");
+        }
+
+        #[test]
+        fn skyline_error_is_zero_when_rows_match() {
+            let set = |rows: Vec<f32>| ColumnSet {
+                rows: vec![Vec::new(); rows.len()],
+                skyline_rows: rows,
+            };
+            let a = set(vec![10.0, 20.0, 30.0]);
+            let b = set(vec![10.0, 20.0, 30.0]);
+            let e = skyline_error(&a, &b);
+            assert_eq!(e, SkylineError::default());
+        }
+
+        /// A known offset in one column only: pins `mean`, `p75` and `max`
+        /// against a value worked out by hand, so a broken percentile or a
+        /// mean that silently became a sum cannot pass.
+        #[test]
+        fn skyline_error_reports_the_known_offsets() {
+            let set = |rows: Vec<f32>| ColumnSet {
+                rows: vec![Vec::new(); rows.len()],
+                skyline_rows: rows,
+            };
+            let a = set(vec![0.0, 10.0, 0.0, 0.0]);
+            let b = set(vec![0.0, 0.0, 0.0, 0.0]);
+            let e = skyline_error(&a, &b);
+            assert_eq!(e.max, 10.0);
+            // Exactly representable ((0 + 10 + 0 + 0) / 4), so an equality,
+            // not a tolerance.
+            assert_eq!(e.mean, 2.5, "{e:?}");
+            // Sorted errors: [0, 0, 0, 10]; `len * 3 / 4` = 3 -> the last one.
+            assert_eq!(e.p75, 10.0);
+        }
+
+        /// The decision rule as the issue states it: (ii) wins only within
+        /// the threshold on the band metric *and* no worse on skyline error.
+        /// Each of the four ways it can lose, pinned.
+        #[test]
+        fn the_decision_rule_requires_both_conditions() {
+            let good_band = BandMetric {
+                per_row: vec![],
+                max: 0.01,
+                mean: 0.005,
+            };
+            let bad_band = BandMetric {
+                per_row: vec![],
+                max: 0.5,
+                mean: 0.4,
+            };
+            let good_sky = SkylineError {
+                mean: 1.0,
+                p75: 1.0,
+                max: 1.0,
+            };
+            let bad_sky = SkylineError {
+                mean: 10.0,
+                p75: 10.0,
+                max: 10.0,
+            };
+            let noise = BandMetric {
+                per_row: vec![],
+                max: 0.02,
+                mean: 0.01,
+            };
+            assert!(
+                decide(
+                    good_band.clone(),
+                    good_band.clone(),
+                    good_sky,
+                    good_sky,
+                    noise.clone()
+                )
+                .ii_wins
+            );
+            assert!(
+                !decide(
+                    good_band.clone(),
+                    bad_band.clone(),
+                    good_sky,
+                    good_sky,
+                    noise.clone()
+                )
+                .ii_wins
+            );
+            assert!(
+                !decide(
+                    good_band.clone(),
+                    good_band.clone(),
+                    good_sky,
+                    bad_sky,
+                    noise.clone()
+                )
+                .ii_wins
+            );
+            assert!(!decide(good_band, bad_band, good_sky, bad_sky, noise).ii_wins);
+        }
+
+        /// `coarse_top` at `v = 1` is exactly `cell_surface_height` (no
+        /// vertical rounding at all); finer cells (smaller `step_h`) find
+        /// the same exact surface a plain level-0 query would.
+        #[test]
+        fn coarse_top_at_v_one_is_the_cell_surface_height() {
+            let gen = WorldGen::new(World::new().seed());
+            for (x, z) in [(0, 0), (37, -12), (900, 450)] {
+                assert_eq!(
+                    coarse_top(&gen, x, z, 1, 1),
+                    gen.surface_height(x, z),
+                    "step_h 1: exact"
+                );
+                assert_eq!(
+                    coarse_top(&gen, x, z, 4, 1),
+                    gen.cell_surface_height(x.div_euclid(4) * 4, z.div_euclid(4) * 4, 4)
+                );
+            }
+        }
+
+        /// `coarse_top` at a taller `v` rounds to the top of whichever
+        /// `v`-tall row holds the surface -- within half a cell either way
+        /// (never more, R2 decision 1's own bound, pinned for `drawn_top`
+        /// itself by `drawn_top_is_within_half_a_cell_at_v_four` in
+        /// `worldgen.rs`), and always the top block of a `v`-aligned row.
+        #[test]
+        fn coarse_top_quantizes_to_a_v_aligned_row_within_half_a_cell() {
+            let gen = WorldGen::new(World::new().seed());
+            for v in [2, 4, 8] {
+                for (x, z) in [(10, 10), (-500, 300), (123, 456)] {
+                    let top = coarse_top(&gen, x, z, 1, v);
+                    assert_eq!(top.rem_euclid(v), v - 1, "v {v} ({x},{z}): top {top}");
+                    let exact = gen.surface_height(x, z);
+                    assert!(
+                        (top - exact).abs() <= v / 2,
+                        "v {v} ({x},{z}): top {top} vs exact {exact}, more than half a cell off"
+                    );
+                }
+            }
+        }
+
+        /// One column, end to end, on the reference (exact blocks): the row
+        /// array is the view's full height, the skyline is finite and in
+        /// range, and something was actually painted (this is a real-world
+        /// world seed, not a hand-built one, so a broken sweep that paints
+        /// nothing would be silent without this).
+        #[test]
+        fn one_reference_column_paints_something_and_finds_a_skyline() {
+            let gen = WorldGen::new(World::new().seed());
+            let materials = Materials {
+                top: glam::Vec3::new(0.3, 0.5, 0.2),
+                side: glam::Vec3::new(0.35, 0.4, 0.2),
+                soil: glam::Vec3::new(0.4, 0.3, 0.18),
+                stone: glam::Vec3::new(0.45, 0.45, 0.45),
+                soil_depth: 3.0,
+            };
+            let lighting = Lighting::default();
+            let cam = Camera::gate([8.0, 40.0, 8.0], 0.0);
+            let (rows, sky) =
+                sweep_column(cam, 0.0, &Variant::Reference, &gen, &materials, &lighting);
+            assert_eq!(rows.len(), cam.view.height_px as usize);
+            assert!(sky.is_finite() && sky >= 0.0 && sky <= cam.view.height_px as f32);
+            assert!(rows.iter().any(|r| r.is_some()), "nothing was painted");
+        }
+
+        /// Candidate (ii)'s far field agrees with the real production
+        /// machinery it is built from: at a point well inside its hole,
+        /// nothing is covered (`height_at` returns `None`), and just beyond
+        /// it, the smooth height is within a few blocks of the exact one --
+        /// footprint-mean, not a copy of the exact field.
+        #[test]
+        fn the_far_field_from_512_m_matches_the_production_far_terrain() {
+            let gen = WorldGen::new(World::new().seed());
+            let far = FarField::build(&gen, [8.0, 40.0, 8.0], 512.0, 2000.0);
+            assert_eq!(far.height_at(8.0, 8.0), None, "inside the 512 m hole");
+            let h = far.height_at(600.0, 8.0).expect("600 m out, past the hole");
+            let exact = exact_face_height(&gen, 600, 8);
+            assert!(
+                (h - exact).abs() < 16.0,
+                "footprint-mean {h} vs exact {exact}: too far apart to be the same hill"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +2379,17 @@ mod tests {
     fn print_r1_wall_multipliers() {
         let ground = GATE_EYES[0];
         println!("\n{}", format_m2(ground.name, ground.eye));
+    }
+
+    /// M4 (issue #335): the band metric and skyline error deciding ring 3's
+    /// own treatment, at the gate eyes and the low (F6 fallback) eye.
+    /// Minutes in release -- it ray-marches a height field, not meshes, but
+    /// the reference variant's blocky DDA runs to `m4::MAX_DISTANCE` with no
+    /// far-terrain shortcut, at `m4::COLUMNS` azimuths, for every eye.
+    #[test]
+    #[ignore = "a measurement: prints M4's results table"]
+    fn print_m4_results() {
+        println!("\n{}", m4::report());
     }
 
     /// Risers are counted where quantized heights differ: block-height cells

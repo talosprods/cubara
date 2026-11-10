@@ -1,6 +1,6 @@
 # Proposal: LOD transitions that do not show
 
-Status: **proposal for block 3.0b** (`ROADMAP.md`, Phase 3, block 3.0 "The engine first", item (b)). Written 2026-11-09 as a design study, after a play test that day in which the owner found the detail layers clearly visible. Numbers marked *est.* are estimates; §5 names the measurement that replaces each one. M1, M2, M6 and T1 have been measured since, by `crates/app/src/lod_probe.rs` (§5.1); the rest is still to be measured.
+Status: **proposal for block 3.0b** (`ROADMAP.md`, Phase 3, block 3.0 "The engine first", item (b)). Written 2026-11-09 as a design study, after a play test that day in which the owner found the detail layers clearly visible. Numbers marked *est.* are estimates; §5 names the measurement that replaces each one. M1, M2, M4, M6 and T1 have been measured since, by `crates/app/src/lod_probe.rs` (§5.1); the rest is still to be measured. M4 (issue #335) decided ring 3: level 3 stays at v = 4 (§3 R1, §5.1).
 
 The owner's call is §7. Everything else is engineering, decided here and open to change only with a measurement.
 
@@ -129,6 +129,8 @@ At 1080p with a 60° vertical FOV, one pixel is 0.97 mrad.
 **Ring 3 must be decided in the same step.** With level 2 at v = 1 and level 3 left as it is, the 512 m step becomes 2 → 16 px risers, which is worse than today's 8 → 16. There are two candidates, and M4 decides between them:
 - (i) Level 3 at v = 4: 2 → 8 px risers, about +32k triangles.
 - (ii) C plus R5 (the corrected far shading): about −32k triangles. Its silhouettes are closer to the truth than 8-block columns: the far terrain's p99 is 2.7 px, while 8-block columns make 16-px jaggies at 512 m.
+
+**Decided (M4, issue #335, 2026-11-10): (i) stays.** The CPU reference image (§5.1) scores candidate (ii) -- measured as C alone, R5 not built (see §5.1's own note on why) -- against the decision rule's skyline condition and finds it fails at the ground and low eyes: the smooth footprint-mean height from 512 m loses real relief the blocky, still-per-block candidate (i) keeps, enough to move the skyline 44-78 px at its worst (against (i)'s 34-36 px, the same height field's own averaging error). The band metric alone would not have ruled (ii) out -- at two of the three eyes its band D is *lower* than (i)'s -- but the decision rule requires both conditions, and skyline is the one that holds. Ring 3 is level 3 at v = 4, as it is today; no change lands from this issue.
 
 ### R2. Trees beyond the first ring
 
@@ -353,6 +355,24 @@ The flight eye (8, 3,000, 8) draws no voxels: everything it sees is the far terr
 R1's wall multipliers are therefore ×2.0 at level 1 and ×3.4 at level 2. §3 estimated ×2 and ×4; ring 3 at v = 4 is ×1.9.
 
 An upper bound on the cost at the ground eye: assume every drawn triangle at levels 1 and 2 (M1: 32k and 29k) were a wall, since tops do not multiply. Then R1 at v = 1 in rings 1–2 adds at most 32k + 2.42 × 29k ≈ **+102k** drawn triangles, against §3's estimate of +106k. Ring 3 at v = 4 (candidate (i)) adds at most 0.94 × 28k ≈ +27k. The real figures are lower by the top faces' share, which only meshing R1 will tell.
+
+**M4** (issue #335, `lod_probe.rs`'s `m4` module): a CPU reference image, deciding ring 3 (512 m – 1,024 m) between candidate (i) (level 3 at v = 4, today's) and candidate (ii) (the far terrain's footprint-mean height from 512 m, R7/C). CPU only, no GPU, no meshing -- it walks the height field directly (`WorldGen::surface_height`/`cell_surface_height` for the exact-blocks reference and (i); `cubara_world::far` -- the production far-terrain code, just with a nearer hole than the game uses today -- for (ii)), shaded with `cubara_render::aggregate` (the same CPU reference `far.wgsl` is already checked against) and `mesh.wgsl`'s lighting.
+
+**(ii) is measured as C alone, without R5.** R5(a) asks for both a roughness-split riser share (`a± = (E|g| ± E[g]) / 2`) *and* a re-derivation of `aggregate::MaskingTable`'s masking cases against real worldgen staircases instead of planes -- R5's own text treats that as separate work, not a shading tweak folded into a measurement harness. A partial version (the roughness correction alone, against an un-rederived masking table nobody has checked) would score (ii) against an invented model, which is a worse risk than not doing it, so this harness falls back to the issue's own fallback: "emulate C and say so". That means a fail here does not by itself rule out C+R5 -- but a pass would have been a strong result, and the decision rule's default ("otherwise (i) stays") is the safe outcome either way.
+
+Ray-marched at 240 columns (azimuths spanning the camera's true horizontal FOV, yaw 0 only -- T4's own convention of 0°/45° is left for a fuller harness), a 3,000 m sweep, at the ground eye, the hill eye, and a low eye. `docs/PROPOSAL_FAR_VIEW.md`'s F6 names no eye of its own and neither it nor `BENCHMARKS.md` defines a numeric "low eye" anywhere in the repository, so this uses issue #335's own fallback: `[8, 60, 8]`, looking along +x pitched −0.15.
+
+Linux, 2026-11-10:
+
+| eye | band D max/mean (i) | band D max/mean (ii) | skyline mean/p75/max px (i) | skyline mean/p75/max px (ii) | threshold max/mean | decision |
+|---|---|---|---|---|---|---|
+| ground [8, 40, 8] | 0.0861 / 0.0178 | 0.0916 / 0.0172 | 8.48 / 11.96 / 33.92 | 11.01 / 14.10 / 77.80 | 0.0411 / 0.0219 | (i) stays |
+| hill [8, 300, 8] | 0.0565 / 0.0471 | 0.0471 / 0.0386 | 9.18 / 13.41 / 35.82 | 9.15 / 13.41 / 35.88 | 0.0487 / 0.0363 | (i) stays |
+| low [8, 60, 8] (F6 fallback) | 0.0656 / 0.0259 | 0.0411 / 0.0235 | 8.89 / 13.07 / 34.06 | 10.16 / 14.32 / 54.53 | 0.0471 / 0.0259 | (i) stays |
+
+"Band D" is the §6 band metric (linear luminance, 4×4 box low-pass, mean |LP(F) − LP(R)| per row, around the 512 m edge), (i)/(ii) against the exact-blocks reference. "Skyline" is pixels between a variant's skyline and the reference's, per azimuth. The threshold is 2.5× (the proposal's own §6 calibration figure, used because the issue gives no other value) the reference-vs-reference noise -- here, the same reference rendered again from an eye jittered half a block sideways, since the CPU has no cross-backend variance to measure against.
+
+**The decision (Design decisions 2): (ii) wins only within the threshold on the band metric *and* no worse on skyline error.** The band metric alone would not have ruled (ii) out: at the hill and low eyes its D is *lower* than (i)'s, i.e. closer to the exact-blocks reference, not farther. The skyline error is what decides it -- at the ground and low eyes (ii)'s worst-case skyline error (77.80 and 54.53 px) is more than twice (i)'s (33.92 and 34.06 px, which is itself just the height field's own footprint-averaging error); at the hill eye the two are close enough (35.88 vs 35.82 px) that it reads as a tie, not a win. **(i) stays**: ring 3 is level 3 at v = 4, as it is today. No change lands from this issue; §3 R1's ring-3 paragraph records the same decision.
 
 ## 6. How it is tested
 
