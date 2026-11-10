@@ -62,20 +62,27 @@ impl ViewSpec {
 }
 
 /// **T1, as a measurement.** The on-screen height, in pixels, of a vertical
-/// terrain step one cell of `level` tall, seen at `distance` blocks.
+/// terrain step one **cell** of `level` tall, seen at `distance` blocks.
 ///
-/// A coarse cell is `2^level` blocks tall (`worldgen.rs` judges a cell by its
-/// middle), so wherever the terrain climbs, the riser it draws is that tall.
-/// Just outside a ring edge this is the tallest step the ring draws.
+/// A coarse cell's height is [`NodeKey::cell_height_blocks`] for `level` --
+/// one source, read here rather than duplicated: `v = 1` at levels 0-2 and
+/// `v = 4` at level 3 (R1b/R1c, issue #327, landed in #329). Wherever the
+/// terrain climbs, the riser a node draws is that tall. Just outside a ring
+/// edge this is the tallest step the ring draws.
 ///
-/// **Today it doubles at every edge** (6.4 -> 12.9 px at 160 m). That is the
-/// diagnosis in `docs/PROPOSAL_LOD_TRANSITIONS.md` section 1, pinned below.
-/// **The fix (R1, block-height cells) turns this into the T1 assertion**:
-/// `no_ring_edge_doubles_a_step_on_screen`, where the cell height is the
-/// block's 1 and the outside figure may be at most 1.25x the inside one. It is
-/// a function of the view and the ring edges, so that test needs no GPU.
+/// **Before R1b/R1c this doubled at every edge** (a cell was `2^level` blocks
+/// tall regardless of level, so going up a level always doubled the riser:
+/// 6.4 -> 12.9 px at 160 m). That was the diagnosis in
+/// `docs/PROPOSAL_LOD_TRANSITIONS.md` section 1. Now that coarse cells keep
+/// block-height rows through level 2, the 160 m and 288 m edges (both bridge
+/// levels <= 2, so `v` is 1 on both sides) draw the *same* step on both
+/// sides: [`no_ring_edge_doubles_a_step_on_screen`] asserts that, at issue
+/// #327's Done-when bound (1.25x and 7 px). The 512 m edge (level 2's
+/// 1-block cell meeting level 3's 4-block one) still jumps -- that is ring
+/// 3's own decision (M4), measured by that test but not asserted by it.
 pub fn max_step_px(view: ViewSpec, level: u32, distance: f32) -> f32 {
-    (1u32 << level) as f32 / distance / view.pixel_angle()
+    let v = NodeKey::new(level, [0, 0, 0]).cell_height_blocks() as f32;
+    v / distance / view.pixel_angle()
 }
 
 /// A ring edge: where the level changes, in blocks.
@@ -482,16 +489,17 @@ pub fn report(yaw_samples: usize) -> String {
     );
     let _ = writeln!(
         s,
-        "| edge | cell inside -> outside (blocks) | step px inside -> outside |"
+        "| edge | cell height inside -> outside (blocks) | step px inside -> outside |"
     );
     let _ = writeln!(s, "|---|---|---|");
+    let cell_height = |level: u32| NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
     for e in edge_steps(view, schedule) {
         let _ = writeln!(
             s,
             "| {} m | {} -> {} | {:.1} -> {:.1} |",
             e.edge.edge_blocks,
-            1 << e.edge.inside,
-            1 << e.edge.outside,
+            cell_height(e.edge.inside),
+            cell_height(e.edge.outside),
             e.inside_px,
             e.outside_px
         );
@@ -603,26 +611,53 @@ mod tests {
         (a - b).abs() <= 0.2
     }
 
-    /// T1's three edges, as they are today. The R1 fix changes the outside
-    /// figures to equal the inside ones; this is the test that then moves.
+    /// **T1, turned around (R1d, issue #327's Done-when).** Before R1b/R1c
+    /// (#329) a coarse cell was `2^level` blocks tall, so every ring edge
+    /// doubled the riser (`a_coarse_step_doubles_at_every_ring_edge_today`,
+    /// this test's previous shape, pinned 6.4 -> 12.9 px at 160 m and so on).
+    /// Since then a cell's height is `NodeKey::cell_height_blocks`: 1 block at
+    /// levels 0-2, 4 at level 3. The 160 m and 288 m edges both bridge levels
+    /// <= 2, so the cell height is 1 on either side of them: the step drawn
+    /// just outside must be no taller on screen than the one just inside, at
+    /// most 1.25x and at most 7 px (the Done-when bound).
+    ///
+    /// **The 512 m edge is measured here but not asserted.** It bridges level
+    /// 2 (1 block) to level 3 (4 blocks), which still jumps 4x -- that is
+    /// ring 3's own decision (`PROPOSAL_LOD_TRANSITIONS.md` §3 R1, candidate
+    /// (i) level-3 `v = 4` versus candidate (ii) C+R5), owned by M4, not by
+    /// this issue. Printing it keeps the number on record without this test
+    /// pretending the decision has already been made.
     #[test]
-    fn a_coarse_step_doubles_at_every_ring_edge_today() {
+    fn no_ring_edge_doubles_a_step_on_screen() {
         let steps = edge_steps(ViewSpec::gate(), DEFAULT_RING_SCHEDULE);
-        let expect = [(160, 6.4, 12.9), (288, 7.2, 14.3), (512, 8.1, 16.1)];
-        assert_eq!(steps.len(), expect.len());
-        for (s, (edge, inside, outside)) in steps.iter().zip(expect) {
+        assert_eq!(steps.len(), 3, "160 m, 288 m and 512 m");
+
+        let asserted = [(160, 6.4), (288, 3.6)];
+        for (s, (edge, px)) in steps[..2].iter().zip(asserted) {
             assert_eq!(s.edge.edge_blocks, edge);
-            assert!(near(s.inside_px, inside), "{edge} m inside {}", s.inside_px);
+            assert!(near(s.inside_px, px), "{edge} m inside {}", s.inside_px);
+            assert!(near(s.outside_px, px), "{edge} m outside {}", s.outside_px);
             assert!(
-                near(s.outside_px, outside),
-                "{edge} m outside {}",
+                s.outside_px <= 1.25 * s.inside_px + 1e-3,
+                "{edge} m: outside {} is more than 1.25x inside {}",
+                s.outside_px,
+                s.inside_px
+            );
+            assert!(
+                s.outside_px <= 7.0,
+                "{edge} m: outside {} exceeds 7 px",
                 s.outside_px
             );
-            assert!(
-                (s.outside_px / s.inside_px - 2.0).abs() < 1e-3,
-                "it doubles"
-            );
         }
+
+        // The 512 m edge: level 2 (v = 1) meeting level 3 (v = 4). Recorded,
+        // not asserted against the Done-when ratio -- see the doc comment.
+        let edge_512 = &steps[2];
+        assert_eq!(edge_512.edge.edge_blocks, 512, "it is the third edge");
+        println!(
+            "512 m (M4/ring 3 owns this, not asserted here): inside {:.1} px, outside {:.1} px",
+            edge_512.inside_px, edge_512.outside_px
+        );
     }
 
     #[test]
@@ -634,7 +669,11 @@ mod tests {
             ..v
         };
         assert!((max_step_px(tall, 0, 100.0) / max_step_px(v, 0, 100.0) - 2.0).abs() < 1e-4);
-        assert!((max_step_px(v, 3, 100.0) / max_step_px(v, 0, 100.0) - 8.0).abs() < 1e-4);
+        // Level 3's cell is 4 blocks tall (`NodeKey::cell_height_blocks`);
+        // levels 0-2 are 1 block. Before R1b/R1c this ratio was 8.0 (`2^3`,
+        // `2^level` regardless of level); now it is the cell-height ratio,
+        // 4.0.
+        assert!((max_step_px(v, 3, 100.0) / max_step_px(v, 0, 100.0) - 4.0).abs() < 1e-4);
     }
 
     /// A node holding one box of geometry whose index runs are `faces`

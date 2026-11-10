@@ -288,13 +288,15 @@ M0 comes first, because that headroom number is the one everything is weighed ag
 
 `cargo test --release -p cubara --bin cubara lod_probe -- --ignored --nocapture`, CPU only, with the real node selection, meshing, visibility search, frustum and face-facing tests over the bench's yaw path. Linux, 2026-11-09:
 
-**T1** (a measurement here; the test pins today's values and is turned around when R1 lands):
+**T1** (turned around, R1d, #327: `no_ring_edge_doubles_a_step_on_screen` asserts the 160 m and 288 m rows below; the 512 m row is measured, not asserted -- ring 3's own decision, M4):
 
-| edge | cell inside -> outside (blocks) | step px inside -> outside |
+| edge | cell height inside -> outside (blocks) | step px inside -> outside |
 |---|---|---|
-| 160 m | 1 -> 2 | 6.4 -> 12.9 |
-| 288 m | 2 -> 4 | 7.2 -> 14.3 |
-| 512 m | 4 -> 8 | 8.1 -> 16.1 |
+| 160 m | 1 -> 1 | 6.4 -> 6.4 |
+| 288 m | 1 -> 1 | 3.6 -> 3.6 |
+| 512 m | 1 -> 4 | 2.0 -> 8.1 |
+
+The cell height is now `NodeKey::cell_height_blocks` (1 block at levels 0-2, 4 at level 3), not `2^level` -- which is why 288 m's step dropped from 7.2 to 3.6 px rather than staying level: it was never about the 288 m edge doubling, it was about every cell height matching its neighbour's up through level 2.
 
 **M1, ground eye** (8, 40, 8):
 
