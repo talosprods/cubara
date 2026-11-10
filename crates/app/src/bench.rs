@@ -993,6 +993,7 @@ pub fn run(
         avg_draws,
         avg_visible,
         total_nodes,
+        arena.usage(),
     );
     Outcome::Measured { fps }
 }
@@ -1156,6 +1157,7 @@ fn report(
     avg_draws: f64,
     avg_visible: f64,
     total_nodes: usize,
+    arena_usage: cubara_render::ArenaUsage,
 ) -> f64 {
     let throughput = frames as f64 / wall_secs;
 
@@ -1211,6 +1213,19 @@ fn report(
         Some(mib) => log::info!("peak RSS          : {mib:.0} MiB"),
         None => log::info!("peak RSS          : n/a"),
     }
+    // Arena occupancy -- issue #390 decision 4, the row R1b never got
+    // (BENCHMARKS.md). `visible_draws` is this run's actual per-frame draw
+    // count, not the resident node count (#390 fixed the two being
+    // conflated), so a draws-side regression shows up here even while nodes
+    // has headroom.
+    let vertex_pct =
+        100.0 * arena_usage.vertices_used as f64 / arena_usage.vertices_capacity as f64;
+    let index_pct = 100.0 * arena_usage.indices_used as f64 / arena_usage.indices_capacity as f64;
+    log::info!(
+        "arena occupancy   : vertices {vertex_pct:.1}%, indices {index_pct:.1}%, nodes {}/{}",
+        arena_usage.resident_nodes,
+        arena_usage.nodes_capacity,
+    );
     log::info!("========================================");
     // Lead with the numbers so every run is a data point for the performance
     // history in BENCHMARKS.md; the 1000-FPS gate is just a trailing tag now.
@@ -1233,6 +1248,11 @@ fn report(
         "SUMMARY: {throughput:.0} FPS | CPU/frame avg {cpu_avg:.3} ms (p99 {cpu_p99:.3}) | \
          {gpu_summary} | {avg_draws:.0} draws ({avg_visible:.0}/{total_nodes} nodes) | \
          1000-FPS gate {gate}"
+    );
+    log::info!(
+        "ARENA: vertices {vertex_pct:.1}%, indices {index_pct:.1}%, nodes {}/{}",
+        arena_usage.resident_nodes,
+        arena_usage.nodes_capacity,
     );
     throughput
 }

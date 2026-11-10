@@ -77,11 +77,12 @@ const INDEX_CAPACITY: u32 = 6_000_000;
 /// failure mode is "the benchmark looks better" is the worst kind, and it is why
 /// this is sized for the world now streamed rather than the one #109 measured.
 const MAX_DRAWS: u32 = 16_384;
-/// Max simultaneously *resident* nodes with an origin slot -- unlike
-/// `MAX_DRAWS` (the per-frame visible-set cap), this bounds the whole
-/// streamed set, and is kept at the same 4× multiple over `MAX_DRAWS` #89
+/// Max simultaneously *resident* nodes with an origin slot -- a different
+/// quantity from `MAX_DRAWS` (the per-frame visible-set cap, checked against
+/// its own count rather than this one -- issue #390), though this bounds the
+/// whole streamed set and is kept at the same 4× multiple over `MAX_DRAWS` #89
 /// originally used (65,536 / 16,384 = 4), so a resident-count regression
-/// still trips `ArenaUsage::exhausted`'s "draws" warning well before ever
+/// still trips `ArenaUsage::exhausted`'s "nodes" warning well before ever
 /// approaching this hard ceiling. Radius 64's tuned schedule measured
 /// 1,585-1,613 resident nodes across four different world positions
 /// (`BENCHMARKS.md` footnote 27) -- 16,384 leaves ~10× headroom, down from
@@ -127,25 +128,43 @@ impl NodeIndexAllocator {
     }
 }
 
-/// Capacity headroom for the arena's three fixed-size resources — vertices,
-/// indices and per-frame draws. `*_used` is a high-water mark (vertices/indices)
-/// or the resident node count (draws: any resident node could be visible in a
-/// single frame, so residency is the worst case a frame could ask for). This is
-/// the "requested vs available" figure issue #89 asks for, so a full arena is a
-/// reported number rather than a silently truncated frame.
+/// Capacity headroom for the arena's four fixed-size resources — vertices,
+/// indices, resident nodes and per-frame draws. `*_used` is a high-water mark
+/// (vertices/indices) or a plain count (resident nodes; draws -- see
+/// `visible_draws` below). This is the "requested vs available" figure issue
+/// #89 asks for, so a full arena is a reported number rather than a silently
+/// truncated frame.
+///
+/// Nodes and draws are **two different quantities, checked against two
+/// different capacities** (issue #390, Windows audit render #3): a resident
+/// node is a node with an arena slot at all, capped by `MAX_NODES`; a draw is
+/// one entry [`ChunkArena::prepare`] wrote to the indirect-draw buffer for
+/// *this frame's* visible set (a node can cost more than one draw -- see
+/// `facing_runs`), capped by `MAX_DRAWS`. `resident_nodes` is an upper bound
+/// on what a single frame's `visible_draws` could ever need (any resident
+/// node could be visible at once), but it is not the same number, and
+/// comparing it to `MAX_DRAWS` conflated the two -- it happened to read the
+/// same today only because both constants are set to the same value.
 #[derive(Clone, Copy, Debug)]
 pub struct ArenaUsage {
     pub vertices_used: u32,
     pub vertices_capacity: u32,
     pub indices_used: u32,
     pub indices_capacity: u32,
+    /// Nodes with an arena slot right now, against `MAX_NODES`
+    /// (`nodes_capacity`).
     pub resident_nodes: u32,
+    pub nodes_capacity: u32,
+    /// Draws the last [`ChunkArena::prepare`] call wrote, against
+    /// `MAX_DRAWS` (`max_draws`) -- zero if `prepare` has never run yet (e.g.
+    /// right after loading a scene, before the first frame).
+    pub visible_draws: u32,
     pub max_draws: u32,
 }
 
 impl ArenaUsage {
     /// Names of the resources at or over capacity — empty when the arena has
-    /// headroom on all three.
+    /// headroom on all four.
     pub fn exhausted(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.vertices_used >= self.vertices_capacity {
@@ -154,7 +173,10 @@ impl ArenaUsage {
         if self.indices_used >= self.indices_capacity {
             out.push("indices");
         }
-        if self.resident_nodes >= self.max_draws {
+        if self.resident_nodes >= self.nodes_capacity {
+            out.push("nodes");
+        }
+        if self.visible_draws >= self.max_draws {
             out.push("draws");
         }
         out
@@ -371,9 +393,13 @@ pub struct ChunkArena {
     multi_draw: bool,
     /// Per-frame scratch: the visible draw list built by [`prepare`](Self::prepare).
     visible: Vec<DrawIndexedIndirect>,
-    /// What the last [`prepare`](Self::prepare) drew: nodes, and triangles.
+    /// What the last [`prepare`](Self::prepare) drew: nodes, triangles, and
+    /// the draw-list entries themselves (`visible.len()` at the time --
+    /// `visible` is reused and cleared next frame, so this is kept
+    /// separately for [`usage`](Self::usage) to read back later; issue #390).
     visible_nodes: u32,
     visible_triangles: u64,
+    visible_draws: u32,
     /// Per-insert scratch: this node's vertices with `node_index` stamped in.
     /// Reused across inserts so streaming churn doesn't allocate and free a
     /// whole mesh's worth of vertices per node ([`insert`](Self::insert)).
@@ -444,6 +470,7 @@ impl ChunkArena {
             visible: Vec::new(),
             visible_nodes: 0,
             visible_triangles: 0,
+            visible_draws: 0,
             stamped: Vec::new(),
             warned_full: false,
         }
@@ -689,6 +716,8 @@ impl ChunkArena {
             indices_used: self.indices.high_water,
             indices_capacity: INDEX_CAPACITY,
             resident_nodes: self.slots.len() as u32,
+            nodes_capacity: MAX_NODES,
+            visible_draws: self.visible_draws,
             max_draws: MAX_DRAWS,
         }
     }
@@ -776,7 +805,8 @@ impl ChunkArena {
                 bytemuck::cast_slice(&self.visible),
             );
         }
-        self.visible.len() as u32
+        self.visible_draws = self.visible.len() as u32;
+        self.visible_draws
     }
 
     /// Nodes the last [`prepare`](Self::prepare) found in view.
@@ -847,28 +877,30 @@ impl ChunkArena {
         }
         let usage = arena.usage();
         log::info!(
-            "{} nodes meshed, {total_tris} triangles (arena v {}/{}, i {}/{}, d {}/{})",
+            "{} nodes meshed, {total_tris} triangles (arena v {}/{}, i {}/{}, n {}/{})",
             usage.resident_nodes,
             usage.vertices_used,
             usage.vertices_capacity,
             usage.indices_used,
             usage.indices_capacity,
             usage.resident_nodes,
-            usage.max_draws,
+            usage.nodes_capacity,
         );
+        // `visible_draws` is still 0 here -- `prepare` (and so the real
+        // per-frame draw count) hasn't run yet for this freshly-built arena,
+        // so only vertices/indices/nodes can be exhausted at this point.
         let exhausted = usage.exhausted();
         if !exhausted.is_empty() {
             log::warn!(
-                "region exceeds arena capacity: {} — requested {} resident nodes (worst case \
-                 {} draws) against {} vertices/{} indices/{} draws available; excess nodes are \
-                 silently dropped from whichever frame's visible set overflows first (arena.rs \
-                 MAX_DRAWS/VERTEX_CAPACITY/INDEX_CAPACITY). See issue #89.",
+                "region exceeds arena capacity: {} — requested {} resident nodes against {} \
+                 vertices/{} indices/{} nodes available; excess nodes are silently dropped from \
+                 whichever frame's visible set overflows first (arena.rs \
+                 MAX_NODES/VERTEX_CAPACITY/INDEX_CAPACITY). See issue #89.",
                 exhausted.join(", "),
-                usage.resident_nodes,
                 usage.resident_nodes,
                 usage.vertices_capacity,
                 usage.indices_capacity,
-                usage.max_draws,
+                usage.nodes_capacity,
             );
         }
         arena
@@ -902,6 +934,91 @@ pub struct MeshedNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A usage snapshot with headroom everywhere, so each test below only
+    /// has to change the one field it's exercising.
+    fn roomy_usage() -> ArenaUsage {
+        ArenaUsage {
+            vertices_used: 0,
+            vertices_capacity: 100,
+            indices_used: 0,
+            indices_capacity: 100,
+            resident_nodes: 0,
+            nodes_capacity: 100,
+            visible_draws: 0,
+            max_draws: 100,
+        }
+    }
+
+    #[test]
+    fn exhausted_is_empty_with_headroom_on_all_four() {
+        assert_eq!(roomy_usage().exhausted(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn exhausted_names_vertices_at_capacity() {
+        let usage = ArenaUsage {
+            vertices_used: 100,
+            ..roomy_usage()
+        };
+        assert_eq!(usage.exhausted(), vec!["vertices"]);
+    }
+
+    #[test]
+    fn exhausted_names_indices_at_capacity() {
+        let usage = ArenaUsage {
+            indices_used: 100,
+            ..roomy_usage()
+        };
+        assert_eq!(usage.exhausted(), vec!["indices"]);
+    }
+
+    /// Issue #390: resident nodes are checked against the *node* capacity,
+    /// not `max_draws` -- a scene that fills every node slot is "nodes"
+    /// exhausted even while this frame drew nothing (`visible_draws: 0`,
+    /// `roomy_usage`'s default), which the old code (comparing
+    /// `resident_nodes` to `max_draws`) would have gotten right only by the
+    /// two constants happening to share a value.
+    #[test]
+    fn exhausted_names_nodes_at_capacity_against_node_capacity_not_max_draws() {
+        let usage = ArenaUsage {
+            resident_nodes: 100,
+            nodes_capacity: 100,
+            max_draws: 9_999, // deliberately different from nodes_capacity
+            ..roomy_usage()
+        };
+        assert_eq!(usage.exhausted(), vec!["nodes"]);
+    }
+
+    /// The companion half of #390: a frame's real visible-draw count is
+    /// checked against `max_draws`, independently of node residency -- a
+    /// scene with plenty of free node slots can still truncate its draw
+    /// list if one node costs several draws (`facing_runs`).
+    #[test]
+    fn exhausted_names_draws_at_capacity_independently_of_node_capacity() {
+        let usage = ArenaUsage {
+            visible_draws: 100,
+            max_draws: 100,
+            nodes_capacity: 9_999, // plenty of room on the node side
+            ..roomy_usage()
+        };
+        assert_eq!(usage.exhausted(), vec!["draws"]);
+    }
+
+    #[test]
+    fn exhausted_names_every_resource_at_once() {
+        let usage = ArenaUsage {
+            vertices_used: 100,
+            indices_used: 100,
+            resident_nodes: 100,
+            visible_draws: 100,
+            ..roomy_usage()
+        };
+        assert_eq!(
+            usage.exhausted(),
+            vec!["vertices", "indices", "nodes", "draws"]
+        );
+    }
 
     #[test]
     fn alloc_is_contiguous_and_bump_style_when_empty() {
