@@ -13,6 +13,7 @@
 //! block 1.6).
 
 pub mod aggregate;
+pub mod anchor;
 mod arena;
 pub mod crack;
 pub mod culling;
@@ -31,6 +32,7 @@ mod text;
 mod trees;
 mod uploads;
 
+pub use anchor::Anchor;
 pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};
@@ -44,7 +46,7 @@ pub use profiling::Profiler;
 pub use render::{
     camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose, CameraUniform,
-    FrameUniform, Lighting, Renderer,
+    FrameUniform, Lighting, RebaseReport, Renderer,
 };
 pub use scene::HealthView;
 pub use scene::{

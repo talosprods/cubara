@@ -224,7 +224,7 @@ pub(crate) fn to_meshed_node(built: BuiltNode) -> Option<MeshedNode> {
         origin: geometry.origin,
         scale: geometry.scale,
         mesh: geometry.mesh,
-        aabb: geometry.aabb,
+        local_aabb: geometry.local_aabb,
         trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
         tree_model,
     })

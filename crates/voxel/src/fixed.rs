@@ -84,6 +84,16 @@ impl Fixed {
         self.0 as f32 / ONE as f32
     }
 
+    /// To `f64`, exactly: every position in the world fits in 53 bits of
+    /// sub-units (`i32` blocks times 2^16), and dividing by a power of two
+    /// only moves the exponent. What the renderer's camera starts from
+    /// (issue #379: it subtracts its anchor from this before anything is
+    /// `f32`), and still presentation only -- nothing that decides anything
+    /// may call it.
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64 / ONE as f64
+    }
+
     /// The block this position is inside — **floor**, not truncation.
     ///
     /// An arithmetic shift right rounds toward negative infinity, which is what
@@ -219,6 +229,11 @@ impl FixedVec3 {
 
     pub fn to_f32(self) -> [f32; 3] {
         [self.x.to_f32(), self.y.to_f32(), self.z.to_f32()]
+    }
+
+    /// Exact (see [`Fixed::to_f64`]); presentation only.
+    pub fn to_f64(self) -> [f64; 3] {
+        [self.x.to_f64(), self.y.to_f64(), self.z.to_f64()]
     }
 
     /// The block containing this position.

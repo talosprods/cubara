@@ -113,7 +113,7 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
             })
             .collect();
 
-        let mut arena = ChunkArena::new(&device, false);
+        let mut arena = ChunkArena::new(&device, false, cubara_render::anchor::ORIGIN);
         for built in sort_batch(batch) {
             if let Some(geometry) = built.geometry {
                 let id = cubara_render::NodeId {
@@ -126,7 +126,7 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
                     geometry.origin,
                     geometry.scale,
                     &geometry.mesh,
-                    geometry.aabb,
+                    geometry.local_aabb,
                 );
             }
         }
@@ -175,7 +175,7 @@ fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
     let schedule = [(0u32, 3i32)];
     let nodes = desired_nodes(ChunkCoord::new(0, 0, 0), 0..=1, &schedule);
 
-    let mut arena = ChunkArena::new(&device, false);
+    let mut arena = ChunkArena::new(&device, false, cubara_render::anchor::ORIGIN);
     for node in nodes {
         let built = cubara_world::mesh::build_node(
             &world,
@@ -195,7 +195,7 @@ fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
                 geometry.origin,
                 geometry.scale,
                 &geometry.mesh,
-                geometry.aabb,
+                geometry.local_aabb,
             );
         }
     }

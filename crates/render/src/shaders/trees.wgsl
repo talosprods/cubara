@@ -27,6 +27,9 @@ struct Frame {
     // .x fog_start, .y fog_end, .z time_of_day (unused here).
     fog: vec4<f32>,
     haze: vec4<f32>,
+    // The render anchor (issue #379): every position in this shader, `eye`
+    // included, is relative to it; only the height haze wants it back.
+    anchor: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -100,7 +103,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // fading into `fog_color`, plus the height haze.
     let dist = distance(in.world_pos, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
-    let fog_amount = max(edge, haze_amount(frame.eye.xyz, in.world_pos, frame.haze));
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, in.world_pos, frame.haze, frame.anchor.y));
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
 }

@@ -838,7 +838,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
             nodes.invalidate(game.world(), cc);
         }
         let camera = game.camera_pose();
-        let eye = camera.eye.to_array();
+        let eye = camera.eye.as_vec3().to_array();
         nodes.update(renderer, game.world(), eye);
         let hole = nodes.far_hole(renderer, eye);
         far.update(renderer, eye, hole);
@@ -906,7 +906,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     Some(WalkReport {
         frame_times,
         ticks: game.sim_tick() - ticks_before,
-        distance: (game.camera_pose().eye - start_pos).length(),
+        distance: (game.camera_pose().eye - start_pos).length() as f32,
     })
 }
 
@@ -988,7 +988,7 @@ impl Streamed {
 
 fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
     CameraPose {
-        eye: glam::Vec3::from(eye),
+        eye: glam::Vec3::from(eye).as_dvec3(),
         look_dir: glam::Vec3::from(flight.look).normalize_or_zero(),
     }
 }
@@ -1125,7 +1125,10 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         // changed inside the leavers' screen boxes since the frame before.
         let swapped = live.renderer.swapped_out();
         if let (false, Some(before)) = (swapped.is_empty(), recent.back()) {
-            let vp = pose(flight, eye).view_proj(aspect);
+            // The leavers' boxes are relative to the renderer's anchor
+            // (issue #379), so they project through the same matrix it drew
+            // with.
+            let vp = pose(flight, eye).view_proj(aspect, live.renderer.anchor());
             let boxes: Vec<ScreenBox> = swapped
                 .iter()
                 .filter_map(|b| screen_box(b.min.to_array(), b.max.to_array(), vp, width, height))
@@ -1221,7 +1224,10 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         settled.far.reselect();
         settled.settle(flight, eye);
         let reference = settled.renderer.read_frame()?;
-        let vp = pose(flight, eye).view_proj(aspect);
+        // `open_swaps` holds world-space boxes (the streaming side has no
+        // render anchor), so they project through the matrix against the
+        // world origin; the flights run near it.
+        let vp = pose(flight, eye).view_proj(aspect, cubara_render::anchor::ORIGIN);
         let open = &open_swaps[frame as usize];
         let late_boxes: Vec<ScreenBox> = open
             .iter()
@@ -1649,10 +1655,10 @@ mod tests {
     #[test]
     fn a_world_box_projects_to_the_screen_box_around_its_corners() {
         let vp = CameraPose {
-            eye: glam::Vec3::ZERO,
+            eye: glam::DVec3::ZERO,
             look_dir: glam::Vec3::NEG_Z,
         }
-        .view_proj(16.0 / 9.0);
+        .view_proj(16.0 / 9.0, cubara_render::anchor::ORIGIN);
         let centred = screen_box([-1.0, -1.0, -11.0], [1.0, 1.0, -9.0], vp, 1600, 900).unwrap();
         assert!(centred.x0 < 800 && 800 < centred.x1, "{centred:?}");
         assert!(centred.y0 < 450 && 450 < centred.y1, "{centred:?}");

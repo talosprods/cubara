@@ -17,10 +17,11 @@
 // `Lighting`; `SceneRenderer::set_lighting` rebuilds this pipeline in the
 // background whenever they actually change, not every frame.
 //
-// The vertex stage also reads `eye` and `haze` (the height haze, `haze.wgsl`),
-// per vertex; it reaches the fragment stage packed with AO in `ao_haze`, so
-// the fragment stage still reads no uniform. The struct is the prefix of
-// `FrameUniform` through `haze`.
+// The vertex stage also reads `eye`, `haze` (the height haze, `haze.wgsl`)
+// and `anchor` (the render anchor, issue #379), per vertex; the haze reaches
+// the fragment stage packed with AO in `ao_haze`, so the fragment stage
+// still reads no uniform. The struct is the prefix of `FrameUniform`
+// through `anchor`.
 struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
@@ -30,6 +31,9 @@ struct Frame {
     fog_color: vec4<f32>,
     fog: vec4<f32>,
     haze: vec4<f32>,
+    // The render anchor (issue #379): every position in this shader, `eye`
+    // included, is relative to it; only the height haze wants it back.
+    anchor: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -67,9 +71,11 @@ override aspect: f32 = 1.7777777777777777;
 // varied FOV, so there is nothing to rebuild for.
 const TAN_HALF_FOV: f32 = 0.5773502691896257;
 
-// One world-space origin per resident node, indexed by the node_index packed
-// into word 2 of each vertex (see crates/render/src/arena.rs). xyz is the
-// node's world-space min corner; w is its scale -- world units per lattice
+// One origin per resident node, indexed by the node_index packed into word 2
+// of each vertex (see crates/render/src/arena.rs). xyz is the node's min
+// corner **relative to the render anchor** (issue #379: an exact integer
+// subtraction on the CPU, so a node a million blocks out lands where a node
+// at the origin does); w is its scale -- world units per lattice
 // step (1.0 at level 0, 2^level above it, since a node's mesh is always a
 // fixed 16^3 lattice regardless of how many chunks it spans, §6.2).
 //
@@ -182,7 +188,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(ao, haze_amount(frame.eye.xyz, world_pos, frame.haze));
+    out.ao_haze = vec2<f32>(ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
     return out;
