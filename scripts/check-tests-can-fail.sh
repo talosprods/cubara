@@ -56,6 +56,16 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# `restore_all` puts every crates/*/src/*.rs back to what is committed. With
+# uncommitted edits there it would throw those away along with the mutations,
+# and it did once: a whole fix, mid-review (#332). So refuse rather than guess
+# which changes are ours.
+if ! git diff --quiet -- 'crates/*/src/*.rs' || ! git diff --cached --quiet -- 'crates/*/src/*.rs'; then
+    echo "check-tests-can-fail: uncommitted changes under crates/*/src/ -- commit them first." >&2
+    echo "  This script restores those files from git when it finishes, which would discard them." >&2
+    exit 2
+fi
+
 base="${1:-origin/main}"
 budget="${2:-8}"
 
