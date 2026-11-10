@@ -674,7 +674,10 @@ note; and #299, the haze (F5).
 Each phase is the GitHub milestone of the same name, and every open issue is
 filed under one — an issue that fits no phase is unscheduled work, not a reason
 to start. Issue titles carry their block number, and **`./scripts/next-block.sh`
-prints what to work on next** so that ordering is read rather than judged.
+prints what to work on next** so that ordering is read rather than judged. An
+issue labelled `blocked` (waiting on an owner's answer) is never offered as
+next — `next-block.sh` lists it separately, under "Waiting for the owner",
+until the label comes off (`CLAUDE.md`: "Nobody waits on a question").
 
 [#52](../../issues/52) (selected-block highlight) rides along with phase 1's
 player work — you cannot aim at a block you cannot see you are aiming at.

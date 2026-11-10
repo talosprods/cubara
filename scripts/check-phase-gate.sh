@@ -131,27 +131,93 @@ perf_gate() {
     esac
 }
 
-# not_implemented <label> -- always FAIL, explicitly, for a criterion whose test
-# does not exist in the repo yet.
-not_implemented() {
-    echo "FAIL  $1 (not implemented)"
+# frame_terms <p99.9 ms> <frames over 33.3 ms> -- phase 3 item 0's
+# frame terms on one bench line: p99.9 under one 60 Hz interval, and no frame
+# over two. The numbers come printed to 0.1 ms, so "under 16.7" is read as at
+# most 16.6: a printed 16.7 may be 16.65 or 16.74, and a gate does not round
+# in its own favour.
+frame_terms() {
+    awk -v p="$1" -v n="$2" 'BEGIN { exit !(p != "" && n != "" && p + 0 < 16.65 && n + 0 == 0) }'
+}
+
+# bench_line <label> <prefix> <cmd...> -- run a bench, print its last
+# "<prefix>: ..." line into $line; a crash with no line is a FAIL with the
+# output shown, never a PASS (perf_gate's rule).
+bench_line() {
+    local label="$1" prefix="$2" bench_out
+    shift 2
+    bench_out=$("$@" 2>&1 || true)
+    line=$(printf '%s\n' "$bench_out" | grep -oE "$prefix: .*" | tail -1)
+    if [ -z "$line" ]; then
+        echo "FAIL  $label (no $prefix line -- see output below)"
+        printf '%s\n' "$bench_out" | tail -20 | sed 's/^/      /'
+        fail=$((fail + 1))
+        return 1
+    fi
+}
+
+# flight_gate <label> <flight args...> -- one of block 3.0a's flights (#318):
+# the frame terms on the work per frame, and no hole -- neither a pixel that
+# shows land, then nothing, then land again (every frame), nor a kept frame
+# with nothing where the finished frame has land.
+flight_gate() {
+    local label="$1" line p999 over2 holes kept
+    shift
+    if [ -n "${GATE_ONLY_TESTS:-}" ]; then
+        return
+    fi
+    bench_line "$label" FLIGHT cargo run --release -- --bench flight "$@" || return
+    p999=$(printf '%s' "$line" | sed -nE 's/.*work p99 [0-9.]+ ms p99\.9 ([0-9.]+) ms.*/\1/p')
+    over2=$(printf '%s' "$line" | sed -nE 's/.*over 33\.3 ms ([0-9]+) \(.*/\1/p')
+    holes=$(printf '%s' "$line" | sed -nE 's/.*HOLES: ([0-9]+) of [0-9]+ frames.*/\1/p')
+    kept=$(printf '%s' "$line" | sed -nE 's/.*has land: ([0-9]+),.*/\1/p')
+    local numbers="p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?}, frames with a hole ${holes:-?}, kept frames with one ${kept:-?}"
+    if frame_terms "$p999" "$over2" && [ "${holes:-x}" = 0 ] && [ "${kept:-x}" = 0 ]; then
+        echo "PASS  $label ($numbers)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  $label ($numbers)"
+        fail=$((fail + 1))
+    fi
+}
+
+# walk_gate <label> <walk args...> -- the scripted walk (#323): the whole
+# frame, game loop to GPU done, under the same frame terms.
+walk_gate() {
+    local label="$1" line p999 over2
+    shift
+    if [ -n "${GATE_ONLY_TESTS:-}" ]; then
+        return
+    fi
+    bench_line "$label" WALK cargo run --release -- --bench walk "$@" || return
+    p999=$(printf '%s' "$line" | sed -nE 's/.*frame p99 [0-9.]+ ms p99\.9 ([0-9.]+) ms.*/\1/p')
+    over2=$(printf '%s' "$line" | sed -nE 's/.*over 33\.3 ms ([0-9]+).*/\1/p')
+    if frame_terms "$p999" "$over2"; then
+        echo "PASS  $label (p99.9 $p999 ms, over 33.3 ms $over2)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  $label (p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?})"
+        fail=$((fail + 1))
+    fi
+}
+
+# not_yet <label> <block> <issue> -- always FAIL, explicitly, for a criterion
+# whose test does not exist in the repo yet. Never prints PASS, never skips:
+# the gate's job is to say what is missing before the work is done (block
+# 1.0's rule), and a criterion silently omitted is indistinguishable from one
+# nobody remembered to wire up.
+not_yet() {
+    local label="$1" block="$2" issue="$3"
+    echo "FAIL  $label (not implemented -- block $block, #$issue)"
     fail=$((fail + 1))
 }
 
-if [ "$phase" != "1" ] && [ "$phase" != "2" ]; then
-    echo "phase $phase's gate is not wired up yet -- only phases 1 and 2 are." >&2
-    echo "(ROADMAP.md's phase $phase exit gate exists on paper; this script doesn't answer it yet.)" >&2
-    exit 2
-fi
-
-if [ "$phase" = "2" ]; then
-    echo "Phase 2 exit gate (ROADMAP.md) ------------------------------------------"
-    echo
-    echo "  Wired up while block 2.7a was landing, deliberately RED: the point of a"
-    echo "  gate is to say what is missing before the work is done, which is what"
-    echo "  block 1.0 established when it shipped phase 1's gate failing."
-    echo
-
+# phase2_criteria -- every criterion phase 2's gate checks. Its own function so
+# that phase 3's exit gate item 7 ("everything phases 1 and 2 gate on still
+# passes") and phase 2's own `check-phase-gate.sh 2` call exactly one
+# implementation (ARCHITECTURE.md Rule 5) rather than a copy that can drift
+# from the original the way the two gates would otherwise.
+phase2_criteria() {
     # "Everything phase 1's gate checks, still passing -- a perf regression
     # blocks the phase (Rule 7), it is not noted and forgotten."
     run "cargo test --all" cargo test --all
@@ -211,6 +277,94 @@ if [ "$phase" = "2" ]; then
     run_n "a real socket, two processes (block 2.12)" 6         cargo test -p cubara-server --test two_processes
     run_n "a region simulated elsewhere lands where it would have locally (block 2.16)" 1 \
         cargo test -p cubara-server --test sharding a_region_simulated_elsewhere_lands_where_it_would_have_locally
+}
+
+if [ "$phase" != "1" ] && [ "$phase" != "2" ] && [ "$phase" != "3" ]; then
+    echo "phase $phase's gate is not wired up yet -- only phases 1, 2 and 3 are." >&2
+    echo "(ROADMAP.md's phase $phase exit gate exists on paper; this script doesn't answer it yet.)" >&2
+    exit 2
+fi
+
+if [ "$phase" = "3" ]; then
+    echo "Phase 3 exit gate (ROADMAP.md) ------------------------------------------"
+    echo
+    echo "  Wired up by block 3.1a (#339), deliberately RED: almost none of phase 3"
+    echo "  is built yet, so almost every item below prints FAIL (not implemented)"
+    echo "  naming the block that will build it, rather than being skipped --"
+    echo "  exactly the discipline block 1.0 and 2.7a's gates used on landing."
+    echo
+
+    # Item 0: block 3.0's own criterion, checked before 3.1 starts. The frame
+    # terms and the holes are what #318 built `--bench flight` (#319-#322) and
+    # `--bench walk` (#323) to print; the flights are #318's four, at the eyes
+    # BENCHMARKS.md's flight rows use. T1 is CPU-only; T4 does not exist yet.
+    flight_gate "item 0: flight low" --eye 8,120,8 --look 1,-0.15,0.3 --seconds 20
+    flight_gate "item 0: flight high" --eye 8,400,8 --look 1,-0.35,0.3 --seconds 20
+    flight_gate "item 0: flight down" --eye 8,450,8 --look 0.4,-0.8,0.2 --seconds 15
+    flight_gate "item 0: flight toward a mountain" --toward-peak --seconds 30
+    walk_gate "item 0: scripted walk" --seconds 30
+    walk_gate "item 0: scripted flight (F4)" --fly --seconds 30
+    run_n "item 0: T1 no ring edge doubles a step on screen" 1 \
+        cargo test --release -p cubara --bin cubara no_ring_edge_doubles_a_step_on_screen
+    not_yet "item 0: T4 ring edges match a finer ring" "3.0b" "381"
+
+    # Item 1: unchanged mechanism from phases 1 and 2 -- the owner's three
+    # fixed first-person eyes at the game's own view distance. The eyes
+    # themselves move to the new landscape in block 3.3a (#349); this line does
+    # not change when they do.
+    perf_gate "item 1: performance -- 1,000 FPS at every gate eye"
+
+    # Item 2: no seams -- cold/warm cache agreement and the far-terrain join,
+    # built by 3.4b (carved rivers/lakes) and 3.4c (far terrain to the
+    # horizon).
+    not_yet "item 2: no seams" "3.4b" "354"
+    not_yet "item 2: no seams" "3.4c" "355"
+
+    # Item 3: hydrology -- the drainage network (3.4a) and water within N
+    # blocks of every spawn (3.4d).
+    not_yet "item 3: hydrology" "3.4a" "353"
+    not_yet "item 3: hydrology" "3.4d" "356"
+
+    # Item 4: flowing water is deterministic and bounded -- 3.2b.
+    not_yet "item 4: flowing water is deterministic" "3.2b" "346"
+
+    # Item 5: seasons and years -- the seasonal windows/snow line (3.8a) and
+    # the year anomaly/desert snow (3.9).
+    not_yet "item 5: seasons and years" "3.8a" "370"
+    not_yet "item 5: seasons and years" "3.9" "372"
+
+    # Item 6: the look -- the four-season golden images at the valley, pass,
+    # peak and lake eyes, pinned by the owner's approval. Built in 3.8b.
+    not_yet "item 6: the look (golden images, owner-approved)" "3.8b" "371"
+
+    # Item 7: everything phases 1 and 2 gate on still passes. Shares
+    # `phase2_criteria` with `check-phase-gate.sh 2` rather than copying it
+    # (ARCHITECTURE.md Rule 5) -- its own lines print below, which is why this
+    # script's phase-3 output is described as "8 item groups", not 8 lines.
+    echo
+    echo "  item 7: everything phases 1 and 2 gate on still passes"
+    phase2_criteria
+
+    echo
+    echo "$pass passed, $fail failed."
+    if [ "$fail" -gt 0 ]; then
+        echo
+        echo "Phase 3 is NOT finished. See the FAIL lines above."
+        exit 1
+    fi
+    echo "OK: phase 3 exit gate met."
+    exit 0
+fi
+
+if [ "$phase" = "2" ]; then
+    echo "Phase 2 exit gate (ROADMAP.md) ------------------------------------------"
+    echo
+    echo "  Wired up while block 2.7a was landing, deliberately RED: the point of a"
+    echo "  gate is to say what is missing before the work is done, which is what"
+    echo "  block 1.0 established when it shipped phase 1's gate failing."
+    echo
+
+    phase2_criteria
 
     echo
     echo "$pass passed, $fail failed."

@@ -13,7 +13,7 @@ phase="${1:-1}"
 case "$phase" in
     1) milestone="Phase 1 — The engine stands" ;;
     2) milestone="Phase 2 — The first survival world" ;;
-    3) milestone="Phase 3 — Modern depth, with synergy" ;;
+    3) milestone="Phase 3 — The world" ;;
     *) echo "unknown phase: $phase (expected 1, 2 or 3)" >&2; exit 2 ;;
 esac
 
@@ -22,10 +22,37 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 2
 fi
 
-open=$(gh issue list --milestone "$milestone" --state open --limit 100 \
-        --json number,title --jq '.[] | "\(.title)\t#\(.number)"' | sort -V)
+# A milestone name that does not exist on GitHub must be a loud error, not
+# "no open blocks left" -- found while planning phase 3 (#339): the milestone
+# was renamed from "Phase 3 — Modern depth, with synergy" to "Phase 3 — The
+# world", this script still had the old name, and `gh issue list --milestone
+# <a name that does not exist>` silently returns nothing and exits 0. An
+# autonomous session told to "go ahead" would have concluded the phase was
+# finished before block 3.1 had even started.
+#
+# `state=all` (not just open): a *finished* phase's milestone is closed, and
+# that must still count as existing -- only a genuinely wrong name (a typo, or
+# a rename this script was not updated for) is the error this guards against.
+all_milestones=$(gh api 'repos/{owner}/{repo}/milestones?state=all' --paginate --jq '.[].title')
+if ! grep -qxF "$milestone" <<<"$all_milestones"; then
+    cat <<EOF >&2
+error: no milestone named "$milestone" (phase $phase) exists on GitHub.
+Milestones that do exist:
+EOF
+    sed 's/^/  - /' <<<"$all_milestones" >&2
+    exit 2
+fi
 
-if [ -z "$open" ]; then
+# One row per open issue: title, "#N", and whether it carries the `blocked`
+# label (an issue waiting on the project owner's answer -- CLAUDE.md: "Nobody
+# waits on a question"). Sorted by title so the block number in the title
+# drives the order, as it always has.
+issues=$(gh issue list --milestone "$milestone" --state open --limit 100 \
+        --json number,title,labels \
+        --jq '.[] | [.title, "#\(.number)", (if (.labels | any(.name == "blocked")) then "blocked" else "unblocked" end)] | @tsv' \
+        | sort -V)
+
+if [ -z "$issues" ]; then
     cat <<EOF
 No open blocks left in "$milestone".
 
@@ -39,8 +66,25 @@ EOF
     exit 0
 fi
 
-next=$(printf '%s\n' "$open" | head -1)
-rest=$(printf '%s\n' "$open" | tail -n +2)
+unblocked=$(awk -F'\t' '$3 == "unblocked" { print $1 "\t" $2 }' <<<"$issues")
+blocked=$(awk -F'\t' '$3 == "blocked" { print $1 "\t" $2 }' <<<"$issues")
+
+if [ -z "$unblocked" ]; then
+    cat <<EOF
+No unblocked issues left in "$milestone" -- every remaining one is waiting for
+the owner:
+
+$(sed 's/^/    /' <<<"$blocked")
+
+That is not the same as the phase being finished, and it is not a reason to
+sit idle: send the question to the contact session (CLAUDE.md) and pick up
+other work. Re-run this once an answer unblocks one of the above.
+EOF
+    exit 0
+fi
+
+next=$(head -1 <<<"$unblocked")
+rest=$(tail -n +2 <<<"$unblocked")
 
 cat <<EOF
 Phase $phase — next block:
@@ -56,4 +100,13 @@ Then: branch, implement, test, PR, wait for CI, merge. One block, one arc.
 
 Remaining after this one:
 EOF
-printf '%s\n' "$rest" | sed 's/^/    /'
+sed 's/^/    /' <<<"$rest"
+
+if [ -n "$blocked" ]; then
+    cat <<EOF
+
+Waiting for the owner (not offered as next -- CLAUDE.md: "Nobody waits on a
+question"):
+EOF
+    sed 's/^/    /' <<<"$blocked"
+fi

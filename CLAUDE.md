@@ -49,8 +49,13 @@ also has a full design in
 touching blocks, meshing, LOD or the tick loop; it has already made those
 decisions, with the reasons. Phase 2's blocks 2.1 – 2.4 have the same thing in
 [`docs/PHASE2_ARCHITECTURE.md`](docs/PHASE2_ARCHITECTURE.md) — items, inventory,
-crafting, drops and tool tiers, trees, and the furnace. **The active phase has a
-design doc; read that one.**
+crafting, drops and tool tiers, trees, and the furnace. Phase 3 (active) has
+the same thing, started in
+[`docs/PHASE3_ARCHITECTURE.md`](docs/PHASE3_ARCHITECTURE.md) — the cross-block
+decisions from [#337](https://github.com/talosprods/cubara/issues/337): sea
+level, the column record, purity and the cache rule, integer climate,
+seasonal windows, and the per-issue cost budgets; each later block's PR adds
+its own section. **The active phase has a design doc; read that one.**
 
 This is written here for the same reason the architecture standard is: the file
 that gets read at the start of the work is the only place a rule actually holds.
