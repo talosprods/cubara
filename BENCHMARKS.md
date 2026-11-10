@@ -185,6 +185,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-09-27 | **Gate eye: ground + far terrain** — High / Medium / **Low** (F3c)⁶⁷ | 1,940 | 819,928 voxel + far | 597 / 907 / **1,090** | -- | -- | `44c62b0` |
 | 2026-09-27 | **Gate eye: hill + far terrain** — High / Medium / **Low**⁶⁷ | 869 | 436,690 voxel + far | 809 / 1,225 / **1,563** | -- | -- | `44c62b0` |
 | 2026-09-27 | **Gate eye: flight + far terrain** — High / Medium / **Low**⁶⁷ | 0 | far only | 1,542 / 2,175 / **4,039** | -- | -- | `44c62b0` |
+| 2026-11-10 | **Gate eye: ground — `GATE: MET at Medium`**, 2 runs, AC power (67→71%, charging), no thermal warning recorded, machine idle since the build; 836 draws (464/1,568 nodes)⁸⁸ | -- | -- | **1,118 / 1,148** | **0.444 / 0.424 ms** | 1.350 / 1.223 ms | `874c771` |
+| 2026-11-10 | Gate eye: hill — `MET at Medium`, 2 runs, AC power, no thermal warning recorded; 446 draws (230/779 nodes)⁸⁸ | -- | -- | 1,113 / 1,130 | 0.429 / 0.422 ms | 1.478 / 1.256 ms | `874c771` |
+| 2026-11-10 | Gate eye: flight — `MET at Medium`, 2 runs, AC power, no thermal warning recorded; 0 draws⁸⁸ | 0 | far only | 3,269 / 3,404 | 0.149 / 0.145 ms | 0.543 / 0.400 ms | `874c771` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1277,6 +1280,8 @@ the whole frame in the game's own loop (`--bench walk`) in ⁸³.
 | 2026-11-10 | the same⁸⁷ | high | 0.21% | 7.34% | 2% | 2.8 ms | `8699d1d` |
 | 2026-11-10 | the same⁸⁷ | down | 0.57% | 21.35% | 3% | 3.2 ms | `8699d1d` |
 | 2026-11-10 | the same⁸⁷ | toward a peak (`--toward-peak`), 30 s | 0.20% | 2.21% | 6% | 2.5 ms | `8699d1d` |
+| 2026-11-10 | **macOS, Apple M3** (8 GB, Metal), item 0's low flight, 1280×720 to sit beside the rows above⁸⁸ | low, 2 runs | **0.10% / 0.11%** | **1.46% / 1.47%** | **4% / 4%** | 2.7 / 2.9 ms | `874c771` |
+| 2026-11-10 | **macOS, Apple M3**, the same flight at 1920×1080 — what `check-phase-gate.sh` itself runs⁸⁸ | low, 2 runs | 0.10% / 0.09% | 1.49% / 1.50% | 4% / 4% | 2.7 / 2.8 ms | `874c771` |
 
 ### Holes while flying — nothing drawn where land belongs (`--bench flight`)
 
@@ -3001,3 +3006,70 @@ A first measurement on this branch, taken while other sessions compiled
 Both were artefacts: the quiet runs above count 21,822 swaps in the high
 flight, and low's lag was its work time (p99 18.1 ms against 2.1 ms here)
 under contention. A measurement taken on a loaded machine is not one.
+
+⁸⁸ **The M3's gate and item 0's low flight (block 3.0, #386), macOS,
+2026-11-10.** The first M3 numbers since 2026-09-27, and the ones #386 was
+blocked on: the owner offered the runs himself, in the session he was typing
+in, which is what that issue asks for. Conditions, because the last M3 row was
+taken on 19% battery: AC power throughout (67% to 76%, charging), lid open,
+Chrome, VS Code, Slack, Spotify and Google Drive closed, the release build
+finished at 20:52 with nothing compiled or tested after it, and the machine
+quiet from 20:59 -- `mobileassetd` was using a core when the session began, so
+the script waited for it to finish rather than measure into it. Two runs of
+each, both in the row: keeping the better of two is how ⁵⁵'s factor of 2.3
+hides. `pmset -g therm` reports "No thermal warning level has been recorded" on
+Apple Silicon, so the thermal evidence here is the idle protocol and the power
+state, not a throttle level anyone read off the machine.
+
+**The gate holds at Medium**, a quality step above the last M3 row: on
+2026-09-27 the ground eye held 1,000 only at Low (1,090 FPS, ⁶⁷), and `--bench
+gate` now picks Medium itself and reads 1,118 and 1,148 FPS there. Read that as
+the state of the machine, not as a 3.0b delta. #298's warm-up change landed in
+between, and ⁷⁵ says rows before 2026-11-09 read FPS low and CPU/frame high, so
+part of the difference is the measurement and part is the engine, and nothing
+here separates them. Run to run: ground +2.7%, hill +1.5%, flight +4.1%, the
+second run higher each time -- the upward ramp that ⁵⁵ and ⁷⁵ describe, well
+inside the 10% that would have meant throwing the pair away. The commit,
+874c771, is #403, part 1 of 3 of #379's split; the session doing that split
+says part 1 changes nothing that is drawn, so this is 3.0 with part 1 in rather
+than a clean 3.0b number.
+
+**Chunks and triangles are `--` on purpose.** This binary's `--bench gate`
+SUMMARY prints draws and nodes, not chunks and triangles, so those cells would
+have had to borrow a number from another machine's row -- which is what ³⁰ is
+about. What the M3 measured is in the milestone cell instead: 836 draws over
+464 of 1,568 nodes at the ground eye, 446 over 230 of 779 at the hill. Both
+draw counts are identical to the Linux rows at ⁸⁵ and ⁸⁶, which is what rule 1
+predicts for the same fixed eyes.
+
+**There is no GPU/frame figure, and it is not an oversight.** Every run printed
+`GPU/frame n/a (disabled after warmup: 2 to 13 valid but about 1,020 invalid
+warmup samples (a working backend produces zero invalid))`. That is the Metal
+behaviour `bench.rs` already documents where it decides to disable timing
+("found on Metal: every sample invalid, and the pass-scoped machinery itself
+cost ~20% FPS and +30% CPU/frame there"), and `--gpu-timing auto` turning it
+off is the deliberate response, not a failure of this run. `--caps` on this
+adapter reports `Apple M3 (IntegratedGpu, Metal)`, `[yes] TIMESTAMP_QUERY`,
+`[NO ] TIMESTAMP_QUERY_INSIDE_ENCODERS`, `[NO ]
+TIMESTAMP_QUERY_INSIDE_PASSES`: the base tier the bench uses is advertised and
+still returns unusable values. The consequence for this block is the part worth
+remembering -- ⁸⁴, ⁸⁵ and ⁸⁶ express 3.0b's cost as GPU/frame, and the Mac
+cannot be compared on that metric at all while this holds, which is why this
+row argues from FPS and CPU/frame only.
+
+**The flight** is item 0's low flight, run twice at 1280×720 so it sits beside
+the Windows and Linux rows in the flight table, and twice at 1920×1080, which
+is what `check-phase-gate.sh` measures (it passes no `--size`, and
+`DEFAULT_SIZE` is 1080p). `--bench flight` prints no far-terrain quality and
+none was given on the command line, so unlike the gate rows these two do not
+record one. Against item 0's terms, at 1080p: the frame terms pass (p99.9 5.5
+ms in both runs and nothing over 33.3 ms; run 2 had one frame over 16.7 ms, max
+21.8 ms, which the term allows), the pop silhouette p99 is 0 against a limit of
+2, and HOLES (7 and 6 frames) and STALE (12 and 11 kept frames) both miss their
+`= 0` terms. Two things to weigh before reading that as an M3 failure. The
+Linux low flight misses the same two terms at the nearest commit measured --
+330 hole frames and 10 to 13 kept, ⁸¹ -- so it is not a machine difference. And
+the term is resolution-sensitive: the same flight on this machine at 720p
+counts 1 and 0 hole frames, while the gate script measures at 1080p and every
+row in the holes table above was taken at 720p. Whether 3.0 closes on that is
+the owner's call, not this row's.
