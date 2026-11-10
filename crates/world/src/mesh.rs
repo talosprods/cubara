@@ -29,18 +29,34 @@ use crate::node::{desired_nodes, NodeKey, RingSchedule};
 use crate::worldgen::TreeSite;
 use crate::{TerrainBlocks, World};
 
-/// A meshed node's geometry, in world space and ready to hand to a renderer:
-/// the triangle mesh (still node-local, §5.2 -- placing it is a GPU-side
-/// per-node origin add), its world-space bounds for frustum culling, and the
-/// origin/scale pair a vertex shader needs to do that placement (§5.2/§5.3).
+/// A meshed node's geometry, ready to hand to a renderer: the triangle mesh
+/// (node-local, §5.2 -- placing it is a GPU-side per-node origin add), its
+/// node-local bounds for frustum culling, and the origin/scale pair a vertex
+/// shader needs to do that placement (§5.2/§5.3).
+///
+/// Nothing in here is an absolute `f32` position (issue #379): the origin is
+/// the integer block it is, and the bounds are relative to it, so a renderer
+/// re-expresses them against its render anchor with one exact integer
+/// subtraction and no `f32` round trip through world space.
 pub struct NodeGeometry {
     pub mesh: Mesh,
-    pub aabb: Aabb,
+    /// The mesh's bounds **relative to `origin`**, in blocks.
+    pub local_aabb: Aabb,
     /// The node's minimum-corner block ([`NodeKey::world_origin`]): kept as
     /// the integer it is, so the renderer's render anchor (issue #379) is
     /// subtracted from it exactly.
     pub origin: [i32; 3],
     pub scale: f32,
+}
+
+impl NodeGeometry {
+    /// The bounds in world space -- `local_aabb` moved to `origin` -- for a
+    /// CPU-side consumer that frames or culls in absolute coordinates
+    /// (`--bench`'s orbit, the LOD probe). Exact below 2^24 blocks; a
+    /// renderer should not use this but subtract its anchor from `origin`.
+    pub fn world_aabb(&self) -> Aabb {
+        self.local_aabb.at_block(self.origin)
+    }
 }
 
 /// A finished meshing job: the node and its geometry — or `None` if it was empty
@@ -145,25 +161,18 @@ fn mesh_chunk(
     chunk: &NodeChunk,
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
-    let world_origin = node.world_origin();
-    let origin = [
-        world_origin[0] as f32,
-        world_origin[1] as f32,
-        world_origin[2] as f32,
-    ];
+    let origin = node.world_origin();
     let scale = 1.0f32;
-    let origin_blocks = world_origin;
     let surfaces = std::cell::RefCell::new(HashMap::new());
     let covered =
         |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
     let may_be_solid =
         |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::Any);
-    let (mesh, aabb) =
-        build_mesh_bounded_occluded_node(chunk, &ctx, origin, covered, may_be_solid)?;
+    let (mesh, local_aabb) = build_mesh_bounded_occluded_node(chunk, &ctx, covered, may_be_solid)?;
     Some(NodeGeometry {
         mesh,
-        aabb,
-        origin: origin_blocks,
+        local_aabb,
+        origin,
         scale,
     })
 }

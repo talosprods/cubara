@@ -626,7 +626,7 @@ impl Game {
             // seam for it: a wrong last bit in a camera matrix is a sub-pixel
             // difference (§3.5, presentation may be float). `f64`, exact from
             // the fixed-point position (issue #379 decision 3): the renderer
-            // decides where it becomes `f32`.
+            // subtracts its anchor before anything becomes `f32`.
             eye: glam::DVec3::from_array(player.view_pos().to_f64()),
             look_dir: player.view_dir_f32(),
         }

@@ -87,9 +87,9 @@ impl Fixed {
     /// To `f64`, exactly: every position in the world fits in 53 bits of
     /// sub-units (`i32` blocks times 2^16), and dividing by a power of two
     /// only moves the exponent. What the renderer's camera starts from
-    /// (issue #379: it will subtract its render anchor from this before
-    /// anything is `f32`), and still presentation only -- nothing that
-    /// decides anything may call it.
+    /// (issue #379: it subtracts its anchor from this before anything is
+    /// `f32`), and still presentation only -- nothing that decides anything
+    /// may call it.
     pub fn to_f64(self) -> f64 {
         self.0 as f64 / ONE as f64
     }

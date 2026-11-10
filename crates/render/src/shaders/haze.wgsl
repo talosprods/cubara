@@ -10,7 +10,13 @@
 // argument is clamped to [-30, 30] so deep caves and very high eyes stay finite.
 //
 // `haze.x` is the density (blocks^-1), `haze.y` is 1 / scale_height (blocks^-1).
-fn haze_amount(eye: vec3<f32>, p: vec3<f32>, haze: vec4<f32>) -> f32 {
+//
+// `eye` and `p` are relative to the render anchor (issue #379), and only the
+// extinction's *absolute* height needs the anchor back: `anchor_y` is the
+// anchor's y (`Frame.anchor.y`), so `eye.y + anchor_y` is the eye's true
+// height (decision 4). Distance and the rise `p.y - eye.y` are relative
+// already. Near the origin `anchor_y` is 0 and this is the old formula.
+fn haze_amount(eye: vec3<f32>, p: vec3<f32>, haze: vec4<f32>, anchor_y: f32) -> f32 {
     let d = distance(p, eye);
     let delta = (p.y - eye.y) * haze.y;
     let g = select(
@@ -18,6 +24,6 @@ fn haze_amount(eye: vec3<f32>, p: vec3<f32>, haze: vec4<f32>) -> f32 {
         1.0 - 0.5 * delta + delta * delta / 6.0,
         abs(delta) < 1e-2,
     );
-    let tau = haze.x * d * exp(clamp(-eye.y * haze.y, -30.0, 30.0)) * g;
+    let tau = haze.x * d * exp(clamp(-(eye.y + anchor_y) * haze.y, -30.0, 30.0)) * g;
     return 1.0 - exp(-tau);
 }

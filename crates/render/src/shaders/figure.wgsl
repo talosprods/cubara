@@ -1,9 +1,10 @@
 // Other players, as blocky figures (block 2.12b's goal: see the person on the
 // other laptop).
 //
-// The vertices arrive already in world space and already coloured -- a figure
-// is six boxes and there are a handful of players, so building the triangles on
-// the CPU costs nothing and buys a pure function that can be tested with no GPU
+// The vertices arrive already placed (relative to the render anchor, issue
+// #379, like everything the GPU sees) and already coloured -- a figure is six
+// boxes and there are a handful of players, so building the triangles on the
+// CPU costs nothing and buys a pure function that can be tested with no GPU
 // (see `figure.rs`). That is why there is no model uniform here: nothing to
 // bind, nothing to keep in step with the vertex buffer.
 //
@@ -25,6 +26,9 @@ struct Frame {
     fog_color: vec4<f32>,
     fog: vec4<f32>,
     haze: vec4<f32>,
+    // The render anchor (issue #379): every position in this shader, `eye`
+    // included, is relative to it; only the height haze wants it back.
+    anchor: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -63,7 +67,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // crisp silhouette against faded terrain.
     let dist = distance(in.world_pos, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
-    let fog_amount = max(edge, haze_amount(frame.eye.xyz, in.world_pos, frame.haze));
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, in.world_pos, frame.haze, frame.anchor.y));
     let color = mix(lit, frame.fog_color.rgb, fog_amount);
     return vec4<f32>(color, 1.0);
 }
