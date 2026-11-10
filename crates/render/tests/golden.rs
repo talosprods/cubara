@@ -616,7 +616,7 @@ fn distance_fog_fades_the_far_ring_into_the_sky() {
         height: 540,
         region_radius,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -664,7 +664,7 @@ fn a_cave_mouth_is_visible() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -706,7 +706,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -808,6 +808,8 @@ fn no_crack_at_a_real_lod_boundary() {
 fn render_frustum_nodes(world: &World, shot: Shot, schedule: &[(u32, i32)]) -> Option<Frame> {
     use cubara_render::{Aabb, CameraUniform, Frustum};
     let (eye, dir) = shot.camera.expect("a T4 shot has an explicit camera");
+    // Near the origin, so the `f64` eye is the `f32` one.
+    let eye = eye.as_vec3();
     let frustum = Frustum::from_view_proj(CameraUniform::look_view_proj(
         shot.width as f32 / shot.height as f32,
         eye,
@@ -869,7 +871,7 @@ fn the_288_m_edge_matches_a_finer_ring_on_screen() {
     let eye = glam::Vec3::new(8.0, 300.0, 8.0);
     let shot = Shot {
         region_radius: 32,
-        camera: Some((eye, glam::Vec3::new(1.0, -0.976, 0.0))),
+        camera: Some((eye.as_dvec3(), glam::Vec3::new(1.0, -0.976, 0.0))),
         ..Shot::default()
     };
     // The real schedule out to ring 2's end (512 m): rings 0-2, so both sides
@@ -1060,7 +1062,7 @@ fn the_selected_block_shows_an_outline() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: Some(hit.block),
         cracking: None,
@@ -1135,7 +1137,7 @@ fn a_block_being_dug_shows_cracks() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: Some(hit.block),
         cracking: Some((hit.block, 0.75)),
@@ -2018,7 +2020,7 @@ fn three_players_stand_in_front_of_the_camera() {
         height: 540,
         region_radius: 2,
         orbit_t: 0.0,
-        camera: Some((eye, glam::vec3(0.0, -0.15, -1.0))),
+        camera: Some((eye.as_dvec3(), glam::vec3(0.0, -0.15, -1.0))),
         players: vec![
             cubara_render::PlayerView {
                 eye: [-1.8, 40.0, -1.0],
@@ -2164,7 +2166,7 @@ fn the_far_terrain_reaches_the_horizon() {
     let eye = glam::Vec3::new(8.0, 120.0, 8.0);
     let shot = Shot {
         region_radius: 4,
-        camera: Some((eye, glam::Vec3::new(1.0, -0.12, 0.35))),
+        camera: Some((eye.as_dvec3(), glam::Vec3::new(1.0, -0.12, 0.35))),
         ..Shot::default()
     };
     let far = far_terrain(&world, eye, shot.region_radius, &shot, 20_000.0);
@@ -2278,7 +2280,7 @@ fn far_shading_is_the_aggregate_reference() {
             // Odd, so the centre pixel's ray is the look direction itself.
             width: 65,
             height: 65,
-            camera: Some((centre + v * 40.0, -v)),
+            camera: Some(((centre + v * 40.0).as_dvec3(), -v)),
             lighting,
             ..Shot::default()
         };

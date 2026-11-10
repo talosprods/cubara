@@ -491,7 +491,7 @@ fn two_clients_see_each_other_move() {
     // through `OtherPlayers`, not by reading the messages by hand, so this
     // covers the client-side half as well as the wire.
     let mut others = OtherPlayers::new();
-    let mut first: Option<[f32; 3]> = None;
+    let mut first: Option<[f64; 3]> = None;
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         for msg in watcher.poll() {

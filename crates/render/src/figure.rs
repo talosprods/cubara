@@ -35,8 +35,11 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerView {
     /// Eye position, which is what the simulation tracks — the figure is built
-    /// downward from it, so a player's head is where their camera is.
-    pub eye: [f32; 3],
+    /// downward from it, so a player's head is where their camera is. In
+    /// `f64`, like the camera's own eye (`crate::CameraPose`): an `f32`
+    /// absolute position a million blocks out has already lost the fraction
+    /// of a block the render anchor (issue #379) is there to keep.
+    pub eye: [f64; 3],
     /// Heading, radians. 0 looks toward −Z, matching `Angle`.
     pub yaw: f32,
     /// Shirt colour: torso and arms.
@@ -146,7 +149,8 @@ fn parts() -> [Part; 6] {
 /// below assert where an arm is without an adapter.
 pub fn figure_vertices(view: PlayerView, out: &mut Vec<FigureVertex>) {
     let (sin, cos) = view.yaw.sin_cos();
-    let crown = [view.eye[0], view.eye[1] + EYE_BELOW_CROWN, view.eye[2]];
+    let eye = glam::DVec3::from_array(view.eye).as_vec3();
+    let crown = [eye.x, eye.y + EYE_BELOW_CROWN, eye.z];
 
     for part in parts() {
         let color = match part.color {

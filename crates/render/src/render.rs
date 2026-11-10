@@ -412,15 +412,23 @@ impl FrameUniform {
 /// by interpolating the sim's previous and current tick
 /// (`docs/PHASE1_ARCHITECTURE.md` §9) and hands it in; headless callers
 /// (bench, screenshot, golden tests) build one directly.
+///
+/// The eye is `f64` (issue #379 decision 3): it comes from a `FixedVec3`,
+/// which `f64` holds exactly, so the renderer gets the position the
+/// simulation has -- an `f32` eye a million blocks out has already lost the
+/// fraction of a block. Where it becomes `f32` is the renderer's business
+/// (today at [`view_proj`](Self::view_proj); the render anchor of #379
+/// subtracts itself first). The look direction is a unit vector and stays
+/// `f32`.
 #[derive(Clone, Copy, Debug)]
 pub struct CameraPose {
-    pub eye: glam::Vec3,
+    pub eye: glam::DVec3,
     pub look_dir: glam::Vec3,
 }
 
 impl CameraPose {
     pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
-        CameraUniform::look_view_proj(aspect, self.eye, self.look_dir)
+        CameraUniform::look_view_proj(aspect, self.eye.as_vec3(), self.look_dir)
     }
 }
 
@@ -1072,7 +1080,8 @@ impl Renderer {
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
-        self.far.prepare(&self.queue, &self.frustum, camera.eye);
+        self.far
+            .prepare(&self.queue, &self.frustum, camera.eye.as_vec3());
         // Trees beyond the first ring (issue #332 decision 2): the same
         // frustum, re-filtering which resident node's trees actually draw
         // this frame -- cheap even every frame, since what it re-uploads is
@@ -1163,7 +1172,7 @@ impl Renderer {
         } else {
             0.0
         };
-        let c = ChunkCoord::from_world_pos(p.to_array());
+        let c = ChunkCoord::from_world_pos(p.as_vec3().to_array());
         let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
         format!(
             "Cubara  (F3)\n\
@@ -1213,7 +1222,7 @@ impl Renderer {
             &self.device,
             &self.queue,
             vp,
-            camera.eye,
+            camera.eye.as_vec3(),
             Lighting {
                 fog_start,
                 fog_end,
@@ -1934,7 +1943,7 @@ mod tests {
     #[test]
     fn a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot() {
         let pose = CameraPose {
-            eye: glam::Vec3::new(8.0, 80.0, 8.0),
+            eye: glam::DVec3::new(8.0, 80.0, 8.0),
             look_dir: glam::Vec3::NEG_Z,
         };
         let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose) else {

@@ -77,7 +77,8 @@ pub struct Shot {
     /// scale (shrinking the region shrinks the eye's height by the same factor
     /// as its distance, so the angle never changes) — which a shot that needs to
     /// look *into* something at ground level, like a cave mouth, needs.
-    pub camera: Option<(glam::Vec3, glam::Vec3)>,
+    /// The eye is `f64`, as [`crate::CameraPose`]'s is (issue #379).
+    pub camera: Option<(glam::DVec3, glam::Vec3)>,
     /// Other players to draw as figures, or empty for none (block 2.12b).
     ///
     /// Explicit rather than derived: a headless shot has no simulation to ask,
@@ -417,8 +418,8 @@ fn render_arena(
 
     let (vp, eye) = match camera {
         Some((eye, look_dir)) => (
-            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir),
-            eye,
+            CameraUniform::look_view_proj(width as f32 / height as f32, eye.as_vec3(), look_dir),
+            eye.as_vec3(),
         ),
         None => {
             // The orbit frames the voxels; with none there is nothing to frame.

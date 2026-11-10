@@ -838,7 +838,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
             nodes.invalidate(game.world(), cc);
         }
         let camera = game.camera_pose();
-        let eye = camera.eye.to_array();
+        let eye = camera.eye.as_vec3().to_array();
         nodes.update(renderer, game.world(), eye);
         let hole = nodes.far_hole(renderer, eye);
         far.update(renderer, eye, hole);
@@ -906,7 +906,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     Some(WalkReport {
         frame_times,
         ticks: game.sim_tick() - ticks_before,
-        distance: (game.camera_pose().eye - start_pos).length(),
+        distance: (game.camera_pose().eye - start_pos).length() as f32,
     })
 }
 
@@ -988,7 +988,7 @@ impl Streamed {
 
 fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
     CameraPose {
-        eye: glam::Vec3::from(eye),
+        eye: glam::Vec3::from(eye).as_dvec3(),
         look_dir: glam::Vec3::from(flight.look).normalize_or_zero(),
     }
 }
@@ -1649,7 +1649,7 @@ mod tests {
     #[test]
     fn a_world_box_projects_to_the_screen_box_around_its_corners() {
         let vp = CameraPose {
-            eye: glam::Vec3::ZERO,
+            eye: glam::DVec3::ZERO,
             look_dir: glam::Vec3::NEG_Z,
         }
         .view_proj(16.0 / 9.0);

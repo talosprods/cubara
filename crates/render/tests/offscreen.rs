@@ -41,7 +41,7 @@ fn an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped() {
     let world = World::new();
     let surface = world.surface_height(8, 8) as f32;
     let camera = CameraPose {
-        eye: glam::Vec3::new(8.0, surface + 24.0, 8.0),
+        eye: glam::DVec3::new(8.0, surface as f64 + 24.0, 8.0),
         look_dir: glam::Vec3::new(0.05, -1.0, 0.03),
     };
     let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera) else {
