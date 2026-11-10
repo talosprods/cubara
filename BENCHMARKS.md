@@ -3032,7 +3032,9 @@ second run higher each time -- the upward ramp that ⁵⁵ and ⁷⁵ describe, 
 inside the 10% that would have meant throwing the pair away. The commit,
 874c771, is #403, part 1 of 3 of #379's split; the session doing that split
 says part 1 changes nothing that is drawn, so this is 3.0 with part 1 in rather
-than a clean 3.0b number.
+than a clean 3.0b number. Parts 2 and 3 -- ec0cae0 and 9c60b14, the f64 eye
+and the render anchor -- landed within the hour after these runs, so the
+split as a whole is unmeasured on the M3 even now.
 
 **Chunks and triangles are `--` on purpose.** This binary's `--bench gate`
 SUMMARY prints draws and nodes, not chunks and triangles, so those cells would
