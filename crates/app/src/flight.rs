@@ -604,6 +604,43 @@ pub struct FlightReport {
     /// different level of detail (issue #378) -- the live pass only; the
     /// settled pass jumps around and is not what a player experiences.
     pub swap_lags: SwapLagStats,
+    /// How often the world was copied while this ran, and what one copy
+    /// weighs (issue #387).
+    pub world_clones: WorldClones,
+}
+
+/// `World` clones over a run: the count, what one clone copies, and the run's
+/// length -- the `clones/s` and `bytes/s` of issue #387, which asked for them
+/// to be measured before the snapshot was redesigned. A clone is paid by an
+/// `Arc::make_mut` that finds its `Arc` shared, so the count says how often
+/// the tick met a mesh job's held snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorldClones {
+    pub clones: u64,
+    pub bytes_each: usize,
+    pub seconds: f32,
+}
+
+impl WorldClones {
+    pub fn clones_per_second(&self) -> f64 {
+        self.clones as f64 / f64::from(self.seconds.max(f32::EPSILON))
+    }
+
+    pub fn bytes_per_second(&self) -> f64 {
+        self.clones_per_second() * self.bytes_each as f64
+    }
+
+    /// The `WORLD CLONES` term of a bench line.
+    pub fn term(&self) -> String {
+        format!(
+            "WORLD CLONES: {} in {:.1} s = {:.1} clones/s, {:.0} bytes/s ({} bytes each)",
+            self.clones,
+            self.seconds,
+            self.clones_per_second(),
+            self.bytes_per_second(),
+            self.bytes_each,
+        )
+    }
 }
 
 impl FlightReport {
@@ -673,7 +710,7 @@ impl FlightReport {
              STALE: {stale_frames} kept frames with nothing where the finished frame \
              has land, worst {:.3}%, of which under a late swap {:.0}% | \
              SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
-             ({:.2}/{:.2}/{:.2}/{:.2} blocks)",
+             ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {}",
             self.mean() * 100.0,
             worst.loading * 100.0,
             worst.t,
@@ -706,6 +743,7 @@ impl FlightReport {
             s.p90_blocks,
             s.p99_blocks,
             s.max_blocks,
+            self.world_clones.term(),
         )
     }
 
@@ -783,6 +821,9 @@ pub struct WalkReport {
     pub frame_times: Vec<f32>,
     pub ticks: u64,
     pub distance: f32,
+    /// The game's own loop ticks the world and meshes it at once, so this is
+    /// where the tick meets a held mesh snapshot (issue #387).
+    pub world_clones: WorldClones,
 }
 
 impl WalkReport {
@@ -790,7 +831,7 @@ impl WalkReport {
         let t = WorkTail::of(&self.frame_times);
         format!(
             "WALK: {} frames, {} ticks, walked {:.0} blocks | frame p99 {:.1} ms p99.9 {:.1} ms \
-             max {:.1} ms, over 16.7 ms {} over 33.3 ms {}",
+             max {:.1} ms, over 16.7 ms {} over 33.3 ms {} | {}",
             self.frame_times.len(),
             self.ticks,
             self.distance,
@@ -799,6 +840,7 @@ impl WalkReport {
             t.max * 1000.0,
             t.over_one,
             t.over_two,
+            self.world_clones.term(),
         )
     }
 }
@@ -870,6 +912,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     }
     let start_pos = game.camera_pose().eye;
     let ticks_before = game.sim_tick();
+    let clones_before = game.world().clone_generation();
     if fly {
         game.key_input(KeyCode::F4, true);
         frame(&mut game, budget.as_secs_f32(), &mut renderer);
@@ -907,6 +950,11 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         frame_times,
         ticks: game.sim_tick() - ticks_before,
         distance: (game.camera_pose().eye - start_pos).length() as f32,
+        world_clones: WorldClones {
+            clones: game.world().clone_generation() - clones_before,
+            bytes_each: game.world().clone_bytes(),
+            seconds: start.elapsed().as_secs_f32(),
+        },
     })
 }
 
@@ -1084,6 +1132,9 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     // nothing is a different question, with its own answer.
     let mut live = Streamed::new(flight)?;
     live.settle(flight, flight.start);
+    // The flight ticks no simulation: nothing here calls `Arc::make_mut` on
+    // the world, so this can only count a clone something else makes.
+    let clones_before = live.world.clone_generation();
     let budget = Duration::from_secs_f64(1.0 / flight.fps.max(1) as f64);
     let (width, height) = flight.size;
     let aspect = width as f32 / height.max(1) as f32;
@@ -1192,6 +1243,11 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     // waits on.
     let achieved = work_times.len() as f64 / flight.seconds.max(1e-3) as f64;
     let swap_lags = SwapLagStats::of(live.nodes.swap_lags(), achieved, flight.speed);
+    let world_clones = WorldClones {
+        clones: live.world.clone_generation() - clones_before,
+        bytes_each: live.world.clone_bytes(),
+        seconds: start.elapsed().as_secs_f32(),
+    };
     drop(live);
     let (candidates, counts) = holes.map_or((Vec::new(), Vec::new()), |h| {
         let counts = h.counts();
@@ -1331,6 +1387,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         pixels,
         pops,
         swap_lags,
+        world_clones,
     })
 }
 
@@ -1418,6 +1475,7 @@ mod tests {
             pixels: 4,
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
+            world_clones: WorldClones::default(),
         };
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
@@ -1760,6 +1818,11 @@ mod tests {
                 silhouette: 3,
             }],
             swap_lags: SwapLagStats::default(),
+            world_clones: WorldClones {
+                clones: 30,
+                bytes_each: 140,
+                seconds: 10.0,
+            },
         };
         let line = r.line();
         assert!(
@@ -1777,6 +1840,12 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("sampled"));
+        assert!(
+            line.contains(
+                "WORLD CLONES: 30 in 10.0 s = 3.0 clones/s, 420 bytes/s (140 bytes each)"
+            ),
+            "{line}"
+        );
         let sampled = FlightReport {
             checked_every: 3,
             ..r

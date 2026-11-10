@@ -3,21 +3,25 @@
 //! The base world is a deterministic function of position, so any chunk is
 //! generated on demand from its [`ChunkCoord`] alone. On top of that sits a small
 //! **edit overlay** — blocks the player has placed or broken — so
-//! [`World::chunk_at`] returns terrain *plus* edits.
+//! [`WorldSnapshot::chunk_at`] returns terrain *plus* edits.
 //!
 //! A [`World`] is a plain value that owns its overlay (`ARCHITECTURE.md` Rule 2):
 //! there is no global, so a process can hold several worlds and tests are
-//! independent of each other. Meshing workers read a world through an
-//! [`Arc`](std::sync::Arc) snapshot rather than reaching for shared mutable state
-//! — see [`crate::World::set_block`] on how edits publish a new snapshot.
+//! independent of each other. Meshing workers read a world through a
+//! [`WorldSnapshot`] rather than reaching for shared mutable state -- see
+//! [`World::snapshot`] and [`World::set_block`] on what a snapshot shares with
+//! the world it was taken from, and what an edit copies while one is held.
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use cubara_voxel::{BlockId, Chunk, ChunkCoord, NodeChunk};
 
 use crate::block_entity::{BlockEntities, Furnace};
 use crate::chunk_state::{ChunkStates, Woken};
 use crate::node::NodeKey;
+use crate::region::region_of;
 use crate::worldgen::{TerrainBlocks, TreeSite, WorldGen};
 
 /// The seed [`World::new`] uses -- a fixed constant, so callers that don't
@@ -39,28 +43,179 @@ const DEFAULT_SEED: u64 = 0x5EED_0000_C0FF_EE;
 /// affordable.
 const SIM_VERTICAL_CHUNK_RADIUS: i32 = 2;
 
+/// The region an edit is filed under: save/load's region
+/// ([`crate::region::region_of`], 32 chunks a side, 512 blocks), reused
+/// rather than a second notion of "nearby" (issue #387 decision 3).
+pub type RegionKey = (i32, i32, i32);
+
+/// One region's edits: world block coord → the block placed there.
+///
+/// `BTreeMap`, not `HashMap`: iteration order is part of the world's
+/// observable state once this is saved or hashed, and `ARCHITECTURE.md` Rule 1
+/// forbids results that depend on unordered iteration.
+pub type RegionEdits = BTreeMap<[i32; 3], BlockId>;
+
+/// Every edit in the world, filed by region, each region's map behind its own
+/// `Arc` -- **structural sharing** (issue #387 decision 3).
+///
+/// A [`WorldSnapshot`] holds the same `Arc`s the [`World`] does. Editing while
+/// one is held copies the outer map (one entry per edited region) and the one
+/// region's map the edit lands in, never the whole set; the untouched
+/// regions stay shared. Before this, a mesh job's snapshot was a whole
+/// `Arc<World>`, and the next tick's `Arc::make_mut` copied every edit ever
+/// made -- linear in the world's history, sixty times a second while meshing
+/// was in flight (critical review F4).
+///
+/// Both levels are `BTreeMap`s, so iteration is a total order fixed by the
+/// positions alone (Rule 1): regions ascending, positions ascending within
+/// each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditMap {
+    regions: BTreeMap<RegionKey, Arc<RegionEdits>>,
+}
+
+impl EditMap {
+    /// The region `pos` is filed under.
+    pub fn region_key(pos: [i32; 3]) -> RegionKey {
+        region_of(ChunkCoord::from_block(pos[0], pos[1], pos[2]))
+    }
+
+    /// The edit at `pos`, if any.
+    pub fn get(&self, pos: &[i32; 3]) -> Option<&BlockId> {
+        self.regions.get(&Self::region_key(*pos))?.get(pos)
+    }
+
+    /// Record `block` at `pos`, copying that region's map first if a snapshot
+    /// still shares it. Returns what was there.
+    pub fn insert(&mut self, pos: [i32; 3], block: BlockId) -> Option<BlockId> {
+        let region = self.regions.entry(Self::region_key(pos)).or_default();
+        Arc::make_mut(region).insert(pos, block)
+    }
+
+    /// How many edits there are, over every region.
+    pub fn len(&self) -> usize {
+        self.regions.values().map(|r| r.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.regions.values().all(|r| r.is_empty())
+    }
+
+    /// Every edit: regions ascending, positions ascending within each.
+    pub fn iter(&self) -> impl Iterator<Item = (&[i32; 3], &BlockId)> {
+        self.regions.values().flat_map(|r| r.iter())
+    }
+
+    /// Each region's map, with its key, ascending -- so a test can check
+    /// which ones an edit copied (`Arc::ptr_eq`) and which it left shared.
+    pub fn regions(&self) -> impl Iterator<Item = (RegionKey, &Arc<RegionEdits>)> {
+        self.regions.iter().map(|(k, r)| (*k, r))
+    }
+
+    /// Whether any edit lies in the box `lo..hi` (exclusive on every axis).
+    /// Only the regions the box overlaps are looked at, and within each, only
+    /// the x span -- edits are ordered by x first, so that is one range scan.
+    pub fn any_in_box(&self, lo: [i32; 3], hi: [i32; 3]) -> bool {
+        if lo.iter().zip(&hi).any(|(l, h)| l >= h) {
+            return false;
+        }
+        let first = Self::region_key(lo);
+        let last = Self::region_key([hi[0] - 1, hi[1] - 1, hi[2] - 1]);
+        self.regions
+            .range((first.0, i32::MIN, i32::MIN)..=(last.0, i32::MAX, i32::MAX))
+            .filter(|(k, _)| (first.1..=last.1).contains(&k.1) && (first.2..=last.2).contains(&k.2))
+            .any(|(_, region)| {
+                region
+                    .range([lo[0], i32::MIN, i32::MIN]..[hi[0], i32::MIN, i32::MIN])
+                    .any(|(p, _)| (lo[1]..hi[1]).contains(&p[1]) && (lo[2]..hi[2]).contains(&p[2]))
+            })
+    }
+}
+
+/// What a reader of the world needs and nothing more: the terrain generator
+/// and the edit overlay (issue #387 decision 2). Block entities and chunk
+/// states are the simulation's, and nothing that meshes reads them.
+///
+/// **The one implementation of every read** (Rule 5): [`World`] derefs to the
+/// snapshot of itself, so `world.node_at(..)` and `snapshot.node_at(..)` are
+/// the same function on the same kind of value. A mesh job holds an
+/// `Arc<WorldSnapshot>` taken by [`World::snapshot`]: a copy of the seed and a
+/// reference count, whatever the world's history. It is immutable -- an edit
+/// made after it was taken is not in it, by design: a job meshes the world
+/// as it was when the node was requested, and the edit's own re-mesh
+/// requests the node again with a newer snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldSnapshot {
+    worldgen: WorldGen,
+    /// Shared with the world this was taken from until the next edit to a
+    /// region copies that region (see [`EditMap`]).
+    edits: Arc<EditMap>,
+}
+
 /// Deterministic terrain source, overlaid with player [edits](World::set_block).
 ///
-/// Cloning is how an edit publishes a new snapshot to readers; the overlay is the
-/// only owned state, so a clone costs one map copy.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// **What a clone costs**, as of issue #387: the block entities and chunk
+/// states in full, the edit overlay by reference (one `Arc`), the seed, and a
+/// bump of [`clone_generation`]. Before #387 it also copied every edit, and
+/// `Arc::make_mut` in the tick paid that clone whenever a mesh job held the
+/// `Arc<World>` -- which is why mesh jobs now hold a [`WorldSnapshot`]
+/// instead, and why nothing should hold an `Arc<World>` across a tick.
+/// [`clone_generation`] counts the clones so a bench can print them; it is a
+/// field, not a static (Rule 2), and it is **not** part of equality or the
+/// world hash -- how often a world happened to be copied is not world state.
+///
+/// [`clone_generation`]: Self::clone_generation
+#[derive(Debug, Eq)]
 pub struct World {
-    worldgen: WorldGen,
-    /// World block coord → solid?, overriding terrain.
-    ///
-    /// `BTreeMap`, not `HashMap`: iteration order is part of the world's
-    /// observable state once this is saved or hashed, and `ARCHITECTURE.md` Rule 1
-    /// forbids results that depend on unordered iteration.
-    edits: BTreeMap<[i32; 3], BlockId>,
+    /// The terrain and the edits -- what a reader sees. `World` derefs to
+    /// it, so its methods are this type's.
+    terrain: WorldSnapshot,
     /// Blocks that own state over time, by world position
-    /// (`PHASE2_ARCHITECTURE.md` §7). `BTreeMap` for the same reason `edits`
-    /// is one; see [`crate::block_entity`] for why they live beside `edits`
-    /// rather than on the chunk.
+    /// (`PHASE2_ARCHITECTURE.md` §7). `BTreeMap` for the same reason the
+    /// edits are one; see [`crate::block_entity`] for why they live beside
+    /// the edits rather than on the chunk.
     block_entities: BlockEntities,
     /// Where each chunk is in its simulation lifecycle
     /// (`PHASE2_ARCHITECTURE.md` §11). Sparse: a chunk with no entry is
     /// `Generated`, which is what an untouched chunk is.
     chunk_states: ChunkStates,
+    /// How many clones separate this value from the `World::new` it descends
+    /// from: a clone's is its source's plus one. Instrumentation for issue
+    /// #387 -- see the type's doc comment.
+    clone_generation: u64,
+}
+
+/// Hand-written so the clone can count itself; otherwise field by field what
+/// `derive(Clone)` would do.
+impl Clone for World {
+    fn clone(&self) -> Self {
+        Self {
+            terrain: self.terrain.clone(),
+            block_entities: self.block_entities.clone(),
+            chunk_states: self.chunk_states.clone(),
+            clone_generation: self.clone_generation + 1,
+        }
+    }
+}
+
+/// Everything but [`World::clone_generation`]: a world and its clone are the
+/// same world.
+impl PartialEq for World {
+    fn eq(&self, other: &Self) -> bool {
+        self.terrain == other.terrain
+            && self.block_entities == other.block_entities
+            && self.chunk_states == other.chunk_states
+    }
+}
+
+/// Every read of terrain and edits is [`WorldSnapshot`]'s (Rule 5); a `World`
+/// is one of those plus the state only the simulation owns.
+impl Deref for World {
+    type Target = WorldSnapshot;
+
+    fn deref(&self) -> &WorldSnapshot {
+        &self.terrain
+    }
 }
 
 impl Default for World {
@@ -78,98 +233,53 @@ impl World {
     /// An unedited world with a specific seed.
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            worldgen: WorldGen::new(seed),
-            edits: BTreeMap::new(),
+            terrain: WorldSnapshot {
+                worldgen: WorldGen::new(seed),
+                edits: Arc::new(EditMap::default()),
+            },
             block_entities: BlockEntities::new(),
             chunk_states: ChunkStates::new(),
+            clone_generation: 0,
         }
     }
 
-    /// The generated ground's height at a column, in blocks -- before caves,
-    /// trees and edits.
-    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
-        self.worldgen.surface_height(x, z)
+    /// The world as it is now, for a reader that outlives this call -- a mesh
+    /// job on a worker thread. Costs a seed and a reference count, however
+    /// many edits there are; see [`WorldSnapshot`].
+    pub fn snapshot(&self) -> WorldSnapshot {
+        self.terrain.clone()
     }
 
-    /// [`WorldGen::cell_surface_height`]: the ground height a cell of `step`
-    /// blocks is judged against.
-    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
-        self.worldgen.cell_surface_height(x, z, step)
+    /// How many times this world has been cloned along the way to this value
+    /// (see the type's doc comment). A bench reads it before and after a run:
+    /// the difference is the clones the run paid for.
+    pub fn clone_generation(&self) -> u64 {
+        self.clone_generation
     }
 
-    /// The seed this world's terrain is generated from.
-    pub fn seed(&self) -> u64 {
-        self.worldgen.seed()
-    }
-
-    /// How many blocks the player has placed or broken. The only owned state, so
-    /// this is also what a clone costs.
-    pub fn edit_count(&self) -> usize {
-        self.edits.len()
-    }
-
-    /// Whether the block at world coordinates `(x, y, z)` is solid — a player edit if
-    /// one exists there, otherwise the terrain. Samples a single block without
-    /// generating a whole chunk; the primitive [`raycast`](crate::raycast) queries
-    /// the world through this.
-    /// Takes `blocks` because trees are solid and a tree is made of specific
-    /// ids (block 2.3a): the density field alone cannot answer this any more.
-    pub fn is_solid_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> bool {
-        match self.edits.get(&[x, y, z]) {
-            // Solidity is derived from the recorded block rather than stored
-            // beside it: one source of truth, so an edit cannot be solid here
-            // and air three lines down in `block_at`. Anything that is not AIR
-            // is solid -- this crate has no registry to ask, deliberately (the
-            // caller owns that, see `chunk_at`), and every block a player can
-            // place is solid in phase 2.
-            Some(&block) => block != BlockId::AIR,
-            None => self.worldgen.is_solid_with_trees(x, y, z, blocks),
-        }
-    }
-
-    /// Whether a node of `level` *certainly* draws the cell at corner
-    /// `(x, y, z)` solid, given the column's `surface` height -- for deciding
-    /// what may be hidden, where "not sure" must come out as "no".
-    ///
-    /// Level 0 is the real world as far as edits go; coarser levels are the
-    /// generator sampled the way [`node_at`](Self::node_at) samples it.
-    /// **Without trees**: a
-    /// tree only ever makes a cell more solid, so leaving it out can only keep
-    /// a face that could have gone, never drop one that is needed. It is what
-    /// makes this cheap -- finding the trees near a block costs more than the
-    /// terrain. Edits do count: a dug-out block is air, and treating it as rock
-    /// would hide the hole.
-    pub fn certainly_solid_at(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
-        if level == 0 {
-            if let Some(&block) = self.edits.get(&[x, y, z]) {
-                return block != BlockId::AIR;
-            }
-        }
-        self.worldgen.solid_at_step_on(x, y, z, 1 << level, surface)
-    }
-
-    /// [`certainly_solid_at`](Self::certainly_solid_at), for R1b's anisotropic
-    /// coarse nodes: `level`'s cell is `2^level` blocks wide but only
-    /// [`NodeKey::cell_height_blocks`](crate::node::NodeKey::cell_height_blocks)
-    /// tall, so this is what `border_samples`
-    /// (`cubara_world::mesh`) must ask instead of
-    /// [`certainly_solid_at`](Self::certainly_solid_at) once R1b lands --
-    /// the two agree exactly at level 0 (always the exact, never-approximated
-    /// path; `cell_height_blocks(0)` is 1 but is never consulted here) and
-    /// diverge above it, where a coarse node's actual lattice is this
-    /// function's vertical window, not `1 << level`.
-    pub fn certainly_solid_at_v(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
-        if level == 0 {
-            return self.certainly_solid_at(x, y, z, 0, surface);
-        }
-        let v = crate::node::NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
-        self.worldgen.solid_at_v_on(x, y, z, v, surface)
+    /// An estimate of what a copy of the whole overlay weighs, in bytes: each
+    /// edit's key and block (`12 + 2`), and each block entity's key and
+    /// state. Chunk states are left out -- few, and not what #387 is about.
+    /// Multiplied by [`clone_generation`](Self::clone_generation)'s rate, it
+    /// is the `bytes/s` the benches print: what the tick used to copy per
+    /// second, and what it would again if something held an `Arc<World>`.
+    pub fn clone_bytes(&self) -> usize {
+        const EDIT: usize = std::mem::size_of::<[i32; 3]>() + std::mem::size_of::<BlockId>();
+        const ENTITY: usize = std::mem::size_of::<[i32; 3]>() + std::mem::size_of::<Furnace>();
+        self.edit_count() * EDIT + self.block_entities.len() * ENTITY
     }
 
     /// Put `block` at world `(x, y, z)`, recording it in the edit overlay so
-    /// future [`chunk_at`](Self::chunk_at) / [`is_solid_at`](Self::is_solid_at)
-    /// reflect it. [`BlockId::AIR`] is a break. Returns the [`ChunkCoord`] that
-    /// contains the block, so the caller can re-mesh it.
+    /// future [`chunk_at`](WorldSnapshot::chunk_at) /
+    /// [`is_solid_at`](WorldSnapshot::is_solid_at) reflect it. [`BlockId::AIR`]
+    /// is a break. Returns the [`ChunkCoord`] that contains the block, so the
+    /// caller can re-mesh it.
+    ///
+    /// **What this copies while a [`WorldSnapshot`] is held:** the outer map
+    /// (one entry per edited region) and the map of the one region the edit
+    /// lands in -- `Arc::make_mut` on each, so nothing is copied when no
+    /// snapshot shares them (issue #387 decision 3). The snapshot keeps the
+    /// old maps and does not see the edit.
     ///
     /// This took a `bool` until block 2.1c (#141). "Solid or not" was enough
     /// while breaking and placing were a debug affordance, but it cannot say
@@ -177,11 +287,10 @@ impl World {
     /// an oak log" nor "place the stone you are holding", which is the loop
     /// block 2.1 exists to build.
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockId) -> ChunkCoord {
-        self.edits.insert([x, y, z], block);
+        Arc::make_mut(&mut self.terrain.edits).insert([x, y, z], block);
         ChunkCoord::from_block(x, y, z)
     }
 
-    /// The furnace at `pos`, if one has been placed there.
     pub fn furnace_at(&self, pos: [i32; 3]) -> Option<&Furnace> {
         self.block_entities.get(&pos)
     }
@@ -312,7 +421,92 @@ pub fn simulation_box(centre: ChunkCoord, radius: i32) -> std::collections::BTre
     want
 }
 
-impl World {
+impl WorldSnapshot {
+    /// The generated ground's height at a column, in blocks -- before caves,
+    /// trees and edits.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        self.worldgen.surface_height(x, z)
+    }
+
+    /// [`WorldGen::cell_surface_height`]: the ground height a cell of `step`
+    /// blocks is judged against.
+    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
+        self.worldgen.cell_surface_height(x, z, step)
+    }
+
+    /// The seed this world's terrain is generated from.
+    pub fn seed(&self) -> u64 {
+        self.worldgen.seed()
+    }
+
+    /// How many blocks the player has placed or broken.
+    pub fn edit_count(&self) -> usize {
+        self.edits.len()
+    }
+
+    /// Each region's edits, with its key, ascending (see [`EditMap::regions`]).
+    pub fn edit_regions(&self) -> impl Iterator<Item = (RegionKey, &Arc<RegionEdits>)> {
+        self.edits.regions()
+    }
+
+    /// Whether the block at world coordinates `(x, y, z)` is solid — a player edit if
+    /// one exists there, otherwise the terrain. Samples a single block without
+    /// generating a whole chunk; the primitive [`raycast`](crate::raycast) queries
+    /// the world through this.
+    /// Takes `blocks` because trees are solid and a tree is made of specific
+    /// ids (block 2.3a): the density field alone cannot answer this any more.
+    pub fn is_solid_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> bool {
+        match self.edits.get(&[x, y, z]) {
+            // Solidity is derived from the recorded block rather than stored
+            // beside it: one source of truth, so an edit cannot be solid here
+            // and air three lines down in `block_at`. Anything that is not AIR
+            // is solid -- this crate has no registry to ask, deliberately (the
+            // caller owns that, see `chunk_at`), and every block a player can
+            // place is solid in phase 2.
+            Some(&block) => block != BlockId::AIR,
+            None => self.worldgen.is_solid_with_trees(x, y, z, blocks),
+        }
+    }
+
+    /// Whether a node of `level` *certainly* draws the cell at corner
+    /// `(x, y, z)` solid, given the column's `surface` height -- for deciding
+    /// what may be hidden, where "not sure" must come out as "no".
+    ///
+    /// Level 0 is the real world as far as edits go; coarser levels are the
+    /// generator sampled the way [`node_at`](Self::node_at) samples it.
+    /// **Without trees**: a
+    /// tree only ever makes a cell more solid, so leaving it out can only keep
+    /// a face that could have gone, never drop one that is needed. It is what
+    /// makes this cheap -- finding the trees near a block costs more than the
+    /// terrain. Edits do count: a dug-out block is air, and treating it as rock
+    /// would hide the hole.
+    pub fn certainly_solid_at(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
+        if level == 0 {
+            if let Some(&block) = self.edits.get(&[x, y, z]) {
+                return block != BlockId::AIR;
+            }
+        }
+        self.worldgen.solid_at_step_on(x, y, z, 1 << level, surface)
+    }
+
+    /// [`certainly_solid_at`](Self::certainly_solid_at), for R1b's anisotropic
+    /// coarse nodes: `level`'s cell is `2^level` blocks wide but only
+    /// [`NodeKey::cell_height_blocks`](crate::node::NodeKey::cell_height_blocks)
+    /// tall, so this is what `border_samples`
+    /// (`cubara_world::mesh`) must ask instead of
+    /// [`certainly_solid_at`](Self::certainly_solid_at) once R1b lands --
+    /// the two agree exactly at level 0 (always the exact, never-approximated
+    /// path; `cell_height_blocks(0)` is 1 but is never consulted here) and
+    /// diverge above it, where a coarse node's actual lattice is this
+    /// function's vertical window, not `1 << level`.
+    pub fn certainly_solid_at_v(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
+        if level == 0 {
+            return self.certainly_solid_at(x, y, z, 0, surface);
+        }
+        let v = crate::node::NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
+        self.worldgen.solid_at_v_on(x, y, z, v, surface)
+    }
+
     /// Cast a ray through the world (terrain + edits) and return the first solid
     /// block hit (see [`raycast`](crate::raycast)) — the basis for targeting a block
     /// to break/place.
@@ -411,13 +605,9 @@ impl World {
             return false;
         }
         let size = Chunk::SIZE as i32 * node.extent_chunks();
-        // Edits are ordered by x first, so the x span is one range scan.
         !self
             .edits
-            .range([o[0], i32::MIN, i32::MIN]..[o[0] + size, i32::MIN, i32::MIN])
-            .any(|(p, _)| {
-                (o[1]..o[1] + size).contains(&p[1]) && (o[2]..o[2] + size).contains(&p[2])
-            })
+            .any_in_box(o, [o[0] + size, o[1] + size, o[2] + size])
     }
 
     fn build_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
@@ -434,7 +624,7 @@ impl World {
     /// of growing back after a reload.
     ///
     /// [`build_chunk`]: Self::build_chunk
-    /// [`load_chunk_edits`]: Self::load_chunk_edits
+    /// [`load_chunk_edits`]: World::load_chunk_edits
     pub fn unedited_chunk(&self, coord: ChunkCoord, blocks: TerrainBlocks) -> Chunk {
         self.chunk_with(coord, blocks, false)
     }
@@ -469,14 +659,14 @@ impl World {
         })
     }
 
-    /// Every chunk touched by at least one edit, in ascending order -- what
-    /// save/load (block 1.9, §7.4) writes to disk; everything else
-    /// regenerates from the seed instead. Derived from the edit overlay
-    /// itself rather than tracked separately, so there is nothing to keep
-    /// in sync: a chunk is dirty exactly when [`set_block`](Self::set_block)
-    /// has ever touched a voxel inside it.
-    /// Every block edited away from what the terrain generates, in position
-    /// order.
+    /// Every block edited away from what the terrain generates, in a fixed
+    /// order: regions ascending, then position within each ([`EditMap`]).
+    /// Fixed by the contents alone, never by insertion (Rule 1) -- but not
+    /// plain position order any more, since #387 filed the edits by region.
+    /// Nothing depends on that: [`dirty_chunks`](Self::dirty_chunks) sorts,
+    /// the world hash reads chunks rather than this list, and a client that
+    /// applies these one by one ends in the same world whatever their order,
+    /// since no two name the same block.
     ///
     /// What a client's opening snapshot is made of
     /// (`RESEARCH_MULTIPLAYER.md` §8.3): terrain is a pure function of the seed
@@ -486,17 +676,44 @@ impl World {
         self.edits.iter().map(|(pos, block)| (*pos, *block))
     }
 
+    /// Every chunk touched by at least one edit, in ascending order -- what
+    /// save/load (block 1.9, §7.4) writes to disk; everything else
+    /// regenerates from the seed instead. Derived from the edit overlay
+    /// itself rather than tracked separately, so there is nothing to keep
+    /// in sync: a chunk is dirty exactly when
+    /// [`set_block`](World::set_block) has ever touched a voxel inside it.
     pub fn dirty_chunks(&self) -> Vec<ChunkCoord> {
         let mut coords: Vec<ChunkCoord> = self
             .edits
-            .keys()
-            .map(|&[x, y, z]| ChunkCoord::from_block(x, y, z))
+            .iter()
+            .map(|(&[x, y, z], _)| ChunkCoord::from_block(x, y, z))
             .collect();
         coords.sort();
         coords.dedup();
         coords
     }
 
+    /// The block at world `(x, y, z)`: a player edit if one exists there,
+    /// otherwise this world's [`WorldGen`] at that position. Since #141 an
+    /// edit carries the block it placed, so this is a plain lookup rather
+    /// than a bool resolved to one fixed material.
+    ///
+    /// Kept as a per-cell method (not built from [`WorldGen::generate`],
+    /// which knows nothing about edits) so `chunk_at`'s edit overlay stays a
+    /// single per-cell lookup, matching how [`is_solid_at`](Self::is_solid_at)
+    /// already does it -- not a second pass over `self.edits` per chunk.
+    pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
+        match self.edits.get(&[x, y, z]) {
+            Some(&block) => block,
+            None => self
+                .worldgen
+                .block_at(x, y, z, blocks)
+                .unwrap_or(BlockId::AIR),
+        }
+    }
+}
+
+impl World {
     /// Record `chunk`'s content at `coord` as edits, but only the voxels
     /// that actually differ from pure, edit-free generation -- save/load's
     /// (block 1.9) load path, reconstructing exactly the overlay entries a
@@ -506,6 +723,8 @@ impl World {
     /// show there -- itself just the regenerated value, but there's no
     /// reason to store it as an edit). Lossless for anything
     /// [`set_block`](Self::set_block) can produce -- and since #141 that is
+    /// any block (and the one `unedited_chunk` it diffs against is the
+    /// snapshot's, through `Deref`); it is
     /// *any* block, not just stone-or-air, because the overlay now records
     /// which one. The loaded voxel is written straight through rather than
     /// being flattened to a solid/air bool on the way in, which is what made
@@ -527,25 +746,6 @@ impl World {
                     }
                 }
             }
-        }
-    }
-
-    /// The block at world `(x, y, z)`: a player edit if one exists there,
-    /// otherwise this world's [`WorldGen`] at that position. Since #141 an
-    /// edit carries the block it placed, so this is a plain lookup rather
-    /// than a bool resolved to one fixed material.
-    ///
-    /// Kept as a per-cell method (not built from [`WorldGen::generate`],
-    /// which knows nothing about edits) so `chunk_at`'s edit overlay stays a
-    /// single per-cell lookup, matching how [`is_solid_at`](Self::is_solid_at)
-    /// already does it -- not a second pass over `self.edits` per chunk.
-    pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> BlockId {
-        match self.edits.get(&[x, y, z]) {
-            Some(&block) => block,
-            None => self
-                .worldgen
-                .block_at(x, y, z, blocks)
-                .unwrap_or(BlockId::AIR),
         }
     }
 }
@@ -836,7 +1036,7 @@ mod tests {
         for c in [[-3, 9, 4], [5, 1, 2], [0, 0, 0]] {
             b.set_block(c[0], c[1], c[2], BlockId::STONE);
         }
-        let keys = |w: &World| w.edits.keys().copied().collect::<Vec<_>>();
+        let keys = |w: &World| w.edits().map(|(pos, _)| pos).collect::<Vec<_>>();
         assert_eq!(keys(&a), keys(&b));
         assert_eq!(a, b, "same edits in any order produce equal worlds");
     }
@@ -1271,5 +1471,269 @@ mod tests {
         let world = World::new();
         let node = NodeKey::new(2, [0, 100, 0]); // far above any plausible surface
         assert!(world.node_at(node, stone_blocks()).is_none());
+    }
+
+    // ── issue #387: the snapshot a mesh job holds ───────────────────────────
+
+    /// A small deterministic generator for the tests below -- no `rand`, and
+    /// the same 200 nodes every run (Rule 1 applies to tests' inputs too).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % (hi - lo) as u64) as i32
+        }
+    }
+
+    /// The regions the edits of one world are filed under, each map by its
+    /// `Arc`, so a test can see which ones an edit copied.
+    fn region_maps(w: &WorldSnapshot) -> Vec<(RegionKey, Arc<RegionEdits>)> {
+        w.edit_regions().map(|(k, m)| (k, Arc::clone(m))).collect()
+    }
+
+    /// Done-when (b): ten regions edited, a snapshot held, one more edit --
+    /// exactly one region's map is copied; the other nine stay the very
+    /// same allocation the snapshot holds.
+    #[test]
+    fn an_edit_while_a_snapshot_is_held_copies_only_its_region() {
+        let mut world = World::new();
+        // 512 blocks apart on x: one edit per region, ten regions.
+        for region in 0..10 {
+            world.set_block(region * 512, -40, 0, BlockId::STONE);
+        }
+        let snapshot = world.snapshot();
+        let before = region_maps(&snapshot);
+        assert_eq!(before.len(), 10);
+
+        world.set_block(3 * 512 + 7, -40, 7, BlockId::STONE);
+
+        let after = region_maps(&world);
+        assert_eq!(after.len(), 10, "no new region: the edit was inside one");
+        let changed: Vec<RegionKey> = before
+            .iter()
+            .zip(&after)
+            .filter(|((_, b), (_, a))| !Arc::ptr_eq(b, a))
+            .map(|((k, _), _)| *k)
+            .collect();
+        assert_eq!(changed, vec![(3, -1, 0)], "exactly one region was copied");
+        assert_eq!(after[3].1.len(), 2, "the copy has the new edit");
+        assert_eq!(before[3].1.len(), 1, "the snapshot's region does not");
+        assert_eq!(snapshot.edit_count(), 10);
+        assert_eq!(world.edit_count(), 11);
+    }
+
+    /// Without a snapshot held, an edit copies nothing at all: the maps are
+    /// uniquely owned and `make_mut` writes in place.
+    #[test]
+    fn an_edit_with_no_snapshot_held_copies_nothing() {
+        let mut world = World::new();
+        for region in 0..3 {
+            world.set_block(region * 512, -40, 0, BlockId::STONE);
+        }
+        let before: Vec<*const RegionEdits> =
+            world.edit_regions().map(|(_, m)| Arc::as_ptr(m)).collect();
+        world.set_block(1, -40, 1, BlockId::STONE);
+        let after: Vec<*const RegionEdits> =
+            world.edit_regions().map(|(_, m)| Arc::as_ptr(m)).collect();
+        assert_eq!(before, after, "an unshared region was reallocated");
+    }
+
+    /// Done-when (c): the snapshot and `World::node_at` agree on 200 random
+    /// level-0 nodes whose borders carry edits -- the shared implementation
+    /// (Rule 5) sees the same overlay from both sides.
+    #[test]
+    fn the_snapshot_and_the_world_agree_on_200_nodes_with_edits_on_their_borders() {
+        let blocks = stone_blocks();
+        let mut rng = Lcg(0x387);
+        let mut world = World::new();
+        let mut nodes = Vec::new();
+        for _ in 0..200 {
+            let node = NodeKey::new(0, [rng.range(-6, 6), rng.range(-2, 5), rng.range(-6, 6)]);
+            let o = node.world_origin();
+            let s = Chunk::SIZE as i32;
+            // One edit on each of two opposite faces of the node, and one just
+            // outside it (its neighbour's border cell), alternating solid and
+            // air so both kinds of edit are exercised.
+            let block = if rng.next().is_multiple_of(2) {
+                BlockId::STONE
+            } else {
+                BlockId::AIR
+            };
+            world.set_block(o[0], o[1] + rng.range(0, s), o[2] + rng.range(0, s), block);
+            world.set_block(
+                o[0] + s - 1,
+                o[1] + rng.range(0, s),
+                o[2] + rng.range(0, s),
+                block,
+            );
+            world.set_block(
+                o[0] - 1,
+                o[1] + rng.range(0, s),
+                o[2] + rng.range(0, s),
+                block,
+            );
+            nodes.push(node);
+        }
+        let snapshot = Arc::new(world.snapshot());
+        assert_eq!(snapshot.edit_count(), world.edit_count());
+        let mut differed = 0;
+        for node in nodes {
+            let from_world = world.node_at(node, blocks);
+            let from_snapshot = snapshot.node_at(node, blocks);
+            assert_eq!(from_world, from_snapshot, "{node:?}");
+            // The edits on this node's borders changed it from unedited
+            // terrain somewhere, or the test is comparing two generators.
+            let unedited = world.unedited_chunk(node.chunk_origin(), blocks);
+            if from_world != (!unedited.is_empty()).then_some(NodeChunk::Uniform(unedited)) {
+                differed += 1;
+            }
+        }
+        assert!(
+            differed > 100,
+            "only {differed} of 200 nodes were changed by their edits: the test sees nothing"
+        );
+    }
+
+    /// Done-when (d): a snapshot taken, then 1,000 edits, then the snapshot's
+    /// `node_at` -- the old blocks. The snapshot is immutable; the edits are
+    /// the world's alone.
+    #[test]
+    fn a_snapshot_does_not_see_edits_made_after_it_was_taken() {
+        let blocks = stone_blocks();
+        let mut world = World::new();
+        let node = NodeKey::new(0, [0, 40, 0]); // sky: y 640..655
+        let o = node.world_origin();
+        world.set_block(o[0], o[1], o[2], BlockId::STONE); // so neither side is "empty"
+        let snapshot = Arc::new(world.snapshot());
+        let before = snapshot.node_at(node, blocks);
+
+        let s = Chunk::SIZE as i32;
+        let mut placed = 0;
+        'fill: for y in 1..s {
+            for z in 0..s {
+                for x in 0..s {
+                    if placed == 1000 {
+                        break 'fill;
+                    }
+                    world.set_block(o[0] + x, o[1] + y, o[2] + z, BlockId::STONE);
+                    placed += 1;
+                }
+            }
+        }
+        assert_eq!(placed, 1000);
+        assert_eq!(world.edit_count(), 1001);
+        assert_eq!(snapshot.edit_count(), 1, "the snapshot grew");
+
+        assert_eq!(
+            snapshot.node_at(node, blocks),
+            before,
+            "the snapshot changed"
+        );
+        let after = world
+            .node_at(node, blocks)
+            .expect("the world has 1,001 blocks here");
+        assert_ne!(before.as_ref(), Some(&after), "the world did not change");
+        assert_eq!(
+            snapshot.block_at(o[0] + 5, o[1] + 1, o[2] + 5, blocks),
+            BlockId::AIR,
+            "an old block in the snapshot"
+        );
+        assert_eq!(
+            world.block_at(o[0] + 5, o[1] + 1, o[2] + 5, blocks),
+            BlockId::STONE
+        );
+    }
+
+    /// A clone of the world counts itself and nothing else: the edits come by
+    /// reference, equality ignores the count, and the hash never sees it.
+    #[test]
+    fn a_clone_bumps_the_generation_and_shares_the_edits() {
+        let mut world = World::new();
+        world.set_block(0, -40, 0, BlockId::STONE);
+        world.set_block(512, -40, 0, BlockId::STONE);
+        assert_eq!(world.clone_generation(), 0);
+        let copy = world.clone();
+        assert_eq!(copy.clone_generation(), 1);
+        assert_eq!(copy.clone().clone_generation(), 2);
+        assert_eq!(copy, world, "a clone is the same world");
+        for ((_, a), (_, b)) in world.edit_regions().zip(copy.edit_regions()) {
+            assert!(Arc::ptr_eq(a, b), "a clone copied the edits");
+        }
+        assert_eq!(world.clone_bytes(), 2 * 14);
+    }
+
+    /// `certainly_solid_at`'s own contract: "level 0 is the real world as far
+    /// as edits go" -- a coarser level samples the generator and ignores the
+    /// overlay, the same rule `node_at` follows for coarse nodes.
+    #[test]
+    fn certainly_solid_at_consults_edits_at_level_0_only() {
+        let mut world = World::new();
+        let surface = world.surface_height(16, 16);
+        let deep = [16, surface - 30, 16];
+        assert!(
+            world.certainly_solid_at(deep[0], deep[1], deep[2], 0, surface),
+            "deep rock is solid before the edit"
+        );
+        world.set_block(deep[0], deep[1], deep[2], BlockId::AIR);
+        assert!(
+            !world.certainly_solid_at(deep[0], deep[1], deep[2], 0, surface),
+            "level 0 sees the dug-out block"
+        );
+        assert!(
+            world.certainly_solid_at(deep[0], deep[1], deep[2], 1, surface),
+            "level 1 is the generator alone: the hole is not in it"
+        );
+    }
+
+    /// `EditMap::any_in_box`, the sky test's primitive, looks across region
+    /// boundaries and respects every axis's bounds.
+    #[test]
+    fn any_in_box_finds_edits_across_regions_and_respects_the_bounds() {
+        let mut edits = EditMap::default();
+        assert!(!edits.any_in_box([0, 0, 0], [16, 16, 16]));
+        edits.insert([511, 700, 5], BlockId::STONE); // region (0, 1, 0)
+        edits.insert([512, 700, 5], BlockId::STONE); // region (1, 1, 0)
+        assert!(
+            edits.any_in_box([500, 700, 0], [520, 701, 16]),
+            "spans two regions"
+        );
+        assert!(
+            edits.any_in_box([511, 700, 5], [512, 701, 6]),
+            "exactly one cell"
+        );
+        // The box's last cell is the first cell of its region: the upper
+        // bound's own region must be looked at, not stopped short of.
+        assert!(
+            edits.any_in_box([512, 700, 5], [513, 701, 6]),
+            "a one-cell box at the start of a region"
+        );
+        assert!(
+            edits.any_in_box([400, 690, 0], [513, 710, 16]),
+            "a box whose last x cell is exactly the second region's first"
+        );
+        assert!(
+            !edits.any_in_box([511, 701, 5], [512, 702, 6]),
+            "y just above"
+        );
+        assert!(
+            !edits.any_in_box([511, 700, 6], [512, 701, 7]),
+            "z just beside"
+        );
+        assert!(
+            !edits.any_in_box([0, 700, 0], [511, 701, 16]),
+            "x just short"
+        );
+        assert!(!edits.any_in_box([520, 0, 0], [500, 1, 1]), "an empty box");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(EditMap::region_key([-1, -1, -1]), (-1, -1, -1));
+        assert_eq!(EditMap::region_key([511, 0, 512]), (0, 0, 1));
     }
 }

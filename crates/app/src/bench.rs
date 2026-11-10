@@ -339,6 +339,10 @@ pub enum Target {
     /// `--bench walk`: the whole frame's time -- the game's tick, streaming,
     /// drawing and the GPU -- while a scripted player walks (`crate::flight::walk`).
     Walk,
+    /// `--bench edits`: the tick's CPU cost against how many blocks the world
+    /// has ever had edited, with a mesh job's snapshot held across every
+    /// tick (`crate::tick_cost`, issue #387). No GPU.
+    Edits,
     /// `--bench <radius>`: one scene of this chunk radius -- 12, a
     /// realistically heavy world, when none is given.
     Radius(i32),
@@ -351,6 +355,7 @@ pub fn parse_target(word: Option<&str>) -> Target {
         Some("tune") => Target::Tune,
         Some("flight") => Target::Flight,
         Some("walk") => Target::Walk,
+        Some("edits") => Target::Edits,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
     }
 }
@@ -1466,6 +1471,7 @@ mod tests {
         assert_eq!(parse_target(Some("gate")), Target::Gate);
         assert_eq!(parse_target(Some("tune")), Target::Tune);
         assert_eq!(parse_target(Some("flight")), Target::Flight);
+        assert_eq!(parse_target(Some("edits")), Target::Edits);
         assert_eq!(parse_target(Some("64")), Target::Radius(64));
         assert_eq!(parse_target(None), Target::Radius(12));
         // A flag straight after `--bench` is not a radius.

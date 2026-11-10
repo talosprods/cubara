@@ -30,6 +30,7 @@ mod paths;
 mod screenshot;
 mod settings;
 mod streaming;
+mod tick_cost;
 
 use std::sync::Arc;
 
@@ -980,6 +981,16 @@ fn main() {
             // `--bench walk [--seconds S] [--fps F] [--fly]`: the whole frame's
             // time while a scripted player walks (or, with `--fly`, spectates
             // flying forward).
+            // `--bench edits [--ticks N]`: the tick's CPU cost with 0 and
+            // 10,000 edits, a mesh job's snapshot held across every tick
+            // (issue #387). No GPU.
+            bench::Target::Edits => {
+                let ticks = flag("--ticks")
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(tick_cost::DEFAULT_TICKS);
+                log::info!("{}", tick_cost::compare(ticks).line());
+                return;
+            }
             bench::Target::Walk => {
                 let seconds = flag("--seconds")
                     .and_then(|t| t.parse().ok())
