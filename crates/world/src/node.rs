@@ -255,10 +255,20 @@ fn select_nodes(center: ChunkCoord, vertical: Vertical, schedule: &RingSchedule)
         Vertical::Band(r) => (*r.start(), *r.end(), 0),
         Vertical::Squash(k) => (center.y - top_radius, center.y + top_radius, *k),
     };
-    // What is drawn at all is a cube in 3D (vertical distance counted once);
-    // how finely it is drawn uses the squash.
+    // What is drawn at all is a cube in 3D (vertical distance counted once),
+    // measured the old way (Chebyshev) so the outer reach -- and therefore
+    // `covered_box_3d` and the far terrain's hole -- does not move (R3a keeps
+    // the cube reach, issue #327 §3). How finely it is drawn, horizontally,
+    // is measured by Euclidean distance instead: Chebyshev rings are
+    // squares, reaching `sqrt(2)` further on the diagonals than straight
+    // ahead, so a node there split by mistake. A circle doesn't -- see
+    // `node_distance_components`'s doc comment for why only the horizontal
+    // half changes shape, with the vertical one still combined by `max`.
     let reach = |node: NodeKey| node_distance(node, center, squash.min(1));
-    let distance = |node: NodeKey| node_distance(node, center, squash);
+    let splits_within = |node: NodeKey, r: i32| {
+        let (h_sq, v) = node_distance_components(node, center, squash);
+        v <= r && h_sq <= i64::from(r) * i64::from(r)
+    };
 
     let extent = 1i32 << top;
     let first = |c: i32| (c - top_radius).div_euclid(extent);
@@ -280,7 +290,7 @@ fn select_nodes(center: ChunkCoord, vertical: Vertical, schedule: &RingSchedule)
         let finer = node.level.checked_sub(1).filter(|&l| l >= finest);
         let split = finer
             .and_then(radius_of)
-            .is_some_and(|r| distance(node) <= r);
+            .is_some_and(|r| splits_within(node, r));
         if !split {
             nodes.push(node);
             continue;
@@ -316,6 +326,14 @@ fn select_nodes(center: ChunkCoord, vertical: Vertical, schedule: &RingSchedule)
 /// Chebyshev distance in chunks from `center` to the nearest chunk of `node`,
 /// with vertical distance counted `squash` times -- `0` ignores height, which
 /// is what a band selection wants.
+///
+/// Used only for [`select_nodes`]'s outer cube (`reach`): the top-level
+/// radius that bounds the whole selection, and therefore [`covered_box_3d`]
+/// and the far terrain's hole, stays exactly what it is today (R3a keeps the
+/// cube reach, issue #327 §3 R3a). [`node_distance_components`] below is the split
+/// test's own distance, and the two are deliberately different functions
+/// rather than one with a flag, so a future change to one cannot silently
+/// reach into the other.
 fn node_distance(node: NodeKey, center: ChunkCoord, squash: i32) -> i32 {
     let o = node.chunk_origin();
     let e = node.extent_chunks();
@@ -323,6 +341,52 @@ fn node_distance(node: NodeKey, center: ChunkCoord, squash: i32) -> i32 {
     axis(center.x, o.x)
         .max(axis(center.z, o.z))
         .max(axis(center.y, o.y) * squash)
+}
+
+/// `(horizontal distance squared, squashed vertical distance)` from `center`
+/// to the nearest chunk of `node`'s box -- the split test's own distance
+/// (R3a, issue #327 §3 R3a), split into its two components rather than
+/// combined into one number.
+///
+/// [`node_distance`]'s Chebyshev distance makes a horizontal ring a square: a
+/// node on the diagonal is still "within radius `r`" at up to `r * sqrt(2)`
+/// out, so the finer ring reaches further there than straight ahead --
+/// diagonal views get more detail than the schedule intends, for free.
+/// Comparing the squared horizontal distance against `r * r` instead makes
+/// the ring a circle: the worst-case (on-axis) cell size the schedule
+/// promises is unchanged, and about `1 - pi/4` (~21%) of each inner ring's
+/// *area* -- the part only the diagonals were reaching -- splits one level
+/// coarser instead.
+///
+/// The vertical component stays linear and un-squared, combined with the
+/// horizontal one by [`select_nodes`] via **`max`, exactly as
+/// [`node_distance`] combines all three axes** -- not folded into one 3D
+/// Euclidean sum. A full 3D Euclidean distance was tried first and measured
+/// to break `nodes_that_share_a_face_differ_by_at_most_one_level`'s 3D
+/// counterpart (`in_three_dimensions_the_rings_still_tile_and_stay_balanced`)
+/// at `squash` 4: a vertical and a horizontal gap that each individually sit
+/// right at a ring's radius add enough under Euclidean's sum-of-squares to
+/// push a node past it when neither alone would, pulling the split boundary
+/// in by more than one level between some vertically- and
+/// horizontally-adjacent nodes. Circular *only* on the horizontal plane (what
+/// the proposal's R3a actually measures -- it is about the ground-level
+/// diagonal view, not the squash) keeps the vertical axis's contribution
+/// exactly as it was, which keeps that test passing.
+///
+/// The horizontal half is returned squared, and in `i64`, so comparing it
+/// against `r * r` is exact integer arithmetic with no `sqrt` and no risk of
+/// a 32-bit overflow (a chunk-space gap can reach into the low thousands once
+/// squared) -- matching Rule 1's "no floating-point where integers will do":
+/// `sqrt` is IEEE-754 exact, but squaring both sides of the comparison avoids
+/// it entirely rather than relying on that.
+fn node_distance_components(node: NodeKey, center: ChunkCoord, squash: i32) -> (i64, i32) {
+    let o = node.chunk_origin();
+    let e = node.extent_chunks();
+    let axis = |c: i32, lo: i32| (lo - c).max(c - (lo + e - 1)).max(0);
+    let dx = i64::from(axis(center.x, o.x));
+    let dz = i64::from(axis(center.z, o.z));
+    let dy = axis(center.y, o.y) * squash;
+    (dx * dx + dz * dz, dy)
 }
 
 /// Compute the [`NodeStreamUpdates`] that move `resident` to exactly the
@@ -688,6 +752,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **R3a, pinned directly** (issue #327 §3 R3a): splitting by Euclidean
+    /// distance instead of Chebyshev leaves an on-axis node's level exactly
+    /// where it was, and coarsens a diagonal one that used to split under
+    /// the old square-ring rule.
+    ///
+    /// Schedule `[(0, 4), (1, 8)]`: level 1 (extent 2) splits a child into
+    /// level 0 when the child's nearest chunk is within 4. Band mode (no
+    /// squash) isolates the horizontal effect R3a changes -- `squash = 0`
+    /// zeroes the vertical component of `node_distance_components`, so the
+    /// split test below is exactly the horizontal one.
+    ///
+    /// - On-axis: the level-1 node at chunk origin (4, 0, 0) is exactly 4
+    ///   chunks out along x alone. Chebyshev and Euclidean agree at a pure
+    ///   axis offset (`dz = 0`), so this still splits to level 0, same as
+    ///   today -- R3a's "the worst-case cell size is unchanged" claim.
+    /// - Diagonal: the level-1 node at chunk origin (4, 0, 4) is 4 chunks out
+    ///   on *both* x and z. Chebyshev distance is `max(4, 4) = 4`, so today
+    ///   this also splits to level 0. Euclidean distance is
+    ///   `sqrt(4^2 + 4^2) ~= 5.66`, outside radius 4, so under R3a it is left
+    ///   one level coarser (level 1) -- exactly the ~21% of the inner ring's
+    ///   diagonal area the proposal says this reclaims.
+    #[test]
+    fn circular_splitting_keeps_the_axis_but_coarsens_the_diagonal() {
+        let schedule = [(0u32, 4i32), (1, 8)];
+        let center = ChunkCoord::new(0, 0, 0);
+        let map = coverage(&desired_nodes(center, 0..=0, &schedule));
+        assert_eq!(
+            map[&(4, 0, 0)][0].level,
+            0,
+            "on-axis at the inner radius: unchanged, still finest"
+        );
+        assert_eq!(
+            map[&(4, 0, 4)][0].level,
+            1,
+            "on the diagonal at the same Chebyshev distance: now left coarser"
+        );
+    }
+
+    /// **R3a keeps the cube reach** (issue #327 §3 R3a): the *outer* radius
+    /// that bounds the whole selection -- and therefore `covered_box_3d` and
+    /// the far terrain's hole -- is unaffected by the split test becoming
+    /// circular. Computed independently of node selection (the same formula
+    /// `covered_box_3d` uses), so a reach that quietly became circular too
+    /// would show up as a mismatch against `desired_nodes_3d`'s actual
+    /// coverage, exactly as `covered_box_3d_is_exactly_what_the_nodes_cover`
+    /// (above) already checks generally -- this pins the same property with
+    /// a schedule small enough to read by hand.
+    #[test]
+    fn the_outer_reach_is_still_the_chebyshev_cube() {
+        let schedule = [(0u32, 4i32), (1, 8)];
+        let center = ChunkCoord::new(0, 0, 0);
+        let nodes = desired_nodes_3d(center, 2, &schedule);
+        let map = coverage(&nodes);
+        let (min, max) = covered_box_3d(center, &schedule);
+        // The formula `covered_box_3d` uses: every level-1 node (extent 2)
+        // whose chunk-origin corner is within Chebyshev 8 is kept whole, so
+        // the box rounds the radius-8 cube out to the next extent-2
+        // boundary past it (`max` is exclusive): [-8, 10) on every axis.
+        assert_eq!(min, [-8, -8, -8]);
+        assert_eq!(max, [10, 10, 10]);
+        // A corner at exactly the old Chebyshev reach (8, 0, 8) -- which a
+        // *circular* reach of radius 8 would have excluded, since
+        // `sqrt(8^2 + 8^2) ~= 11.3 > 8` -- is still covered by exactly one
+        // node: the reach test did not change shape even though the split
+        // test (above) did.
+        assert_eq!(map.get(&(8, 0, 8)).map_or(0, Vec::len), 1);
     }
 
     #[test]

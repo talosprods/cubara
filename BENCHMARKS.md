@@ -213,9 +213,11 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
 | 2026-11-09 | **Face groups in `Face::DRAW_ORDER`** (D1) — gate eye ground (High): 1,055 draws for 592 nodes, was 1,325⁷⁸ | 1,940 | 819,928 voxel + far | ~1,622 (+0.1%) | 0.169 ms (within noise) | 0.762 ms | *(this PR)* |
 | 2026-11-09 | Face groups in `DRAW_ORDER` (D1) — gate eye hill (High): 530 draws for 277 nodes, was 644⁷⁸ | 869 | 436,690 voxel + far | ~1,798 (+0.7%) | 0.159 ms (within noise) | 0.509 ms | *(this PR)* |
-| 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | *(this PR)* |
-| 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | *(this PR)* |
-| 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ | 0 | far only | ~2,417 (−0.7%) | -- | -- | *(this PR)* |
+| 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | `79ceb55` |
+| 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | `79ceb55` |
+| 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ | 0 | far only | ~2,417 (−0.7%) | -- | -- | `79ceb55` |
+| 2026-11-10 | **Circular rings for the split** (R3a, #327) — gate eye ground (High): 836 draws and 213,381 voxel triangles, were 1,046 and 259,850⁸⁵ | 1,940 | 819,928 voxel + far | ~1,504 (+5.0%) | **0.172 ms** (−4.2%) | -- | *(this PR)* |
+| 2026-11-10 | R3a — gate eye hill (High): 446 draws, 160,291 triangles, were 530 and 196,619⁸⁵ | 869 | 436,690 voxel + far | ~1,624 (+4.8%) | **0.162 ms** (−4.4%) | -- | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2895,3 +2897,32 @@ would cost more than its 0.083 ms of headroom at Low on the ground (proposal
 §2). Before this holds there, R3a (circular rings, about −35k triangles at
 ground) and the ring-3 decision have to pay part of it back, and the Mac has
 to measure it.
+
+⁸⁵ **Circular rings for the split (block 3.0b, R3a, #327), Linux,
+2026-11-10.** Rings were Chebyshev squares, so detail reached √2 farther
+along the diagonals than along the axes. A node now splits by its horizontal
+Euclidean distance. The vertical part stays `max`-combined, as in
+`node_distance`, because folding it into the sum broke the one-level balance
+under the vertical squash. The outer reach, and with it `covered_box_3d` and
+the far terrain's hole, is the Chebyshev cube as before. `--bench gate`:
+`main` at `79ceb55` (R1b+R1c) against this branch, separate binaries,
+alternating, 2 runs each. The CPU was at 60–89 °C with the lid closed.
+
+```
+          draws          voxel triangles        FPS             CPU/frame        GPU/frame
+ground    1,046 -> 836   259,850 -> 213,381     1,433 -> 1,504   0.179 -> 0.172   0.624 -> 0.593 ms
+hill        530 -> 446   196,619 -> 160,291     1,550 -> 1,624   0.170 -> 0.162   0.591 -> 0.559 ms
+```
+
+That is −18% triangles and −19% draws, which pays back about half of R1b's
++94k at ground. `lod_probe`'s M1 over the full 72-yaw turn gives −35,514
+drawn triangles at ground, which is the proposal's estimate of −35k. One
+flight-eye run read 2,100 FPS with a GPU p99 of 1.16 ms, against 2,404–2,426
+in every other run; the flight eye draws no voxel nodes, so this is most
+likely heat. `--bench flight` (`main` → this branch, one run each): low has
+loading 0.19% → 0.20%, frames with a hole pixel 277 → 220, and work p99.9
+5.2 → 2.3 ms. Toward the peak has loading 0.19% → 0.24%, no holes in either,
+and work max 8.7 → 5.6 ms. One golden changed, `lod_boundary` (3.52%): the
+level-0/level-1 seam moves, and fewer trees stand in the diagonal corners,
+because trees grow at level 0 only (M6 at the ground eye: 40 → 31). R2 (trees
+beyond the first ring) answers that.
