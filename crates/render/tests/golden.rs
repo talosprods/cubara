@@ -2227,3 +2227,316 @@ fn far_shading_is_the_aggregate_reference() {
         "no case tells the aggregate shading from plain shading"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Camera-relative rendering (issue #379): the same frame at the origin and a
+// million blocks away.
+// ---------------------------------------------------------------------------
+
+/// Everything issue #379 makes anchor-relative, in one small scene: level-0
+/// nodes meshed from the default world around the origin, three oak
+/// instances stood on its surface (a level-0 node carries none of its own,
+/// so these are placed by hand -- what the renderer draws does not care
+/// which level asked for them), one far tile beyond the region with the
+/// region as its hole, the outline on one block, cracks on another, one
+/// other player, and a first-person eye looking across all of it.
+struct AnchoredScene {
+    nodes: Vec<MeshedNode>,
+    far_origin: [i64; 2],
+    far_heights: Vec<f32>,
+    hole: ([i32; 3], [i32; 3]),
+    shot: Shot,
+}
+
+/// How many blocks a bench or screenshot of this scene would have to
+/// travel to reach the issue's test offset: 256 anchor-grid steps.
+const FAR_SHIFT: i64 = 1_048_576;
+
+/// The scene, with every position moved by `shift` blocks -- the nodes and
+/// their ids, the trees, the far tile, the hole, the outline and crack
+/// blocks, the player, the eye. A shift of zero is the scene as the world
+/// generated it. A shift must keep the level-0 nodes on their 16-block
+/// grid (it is applied to `NodeId::pos` too, so draw order is the same).
+fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
+    assert!(
+        shift.iter().all(|s| s % 16 == 0),
+        "a shift must keep the nodes on the chunk grid: {shift:?}"
+    );
+    let world = World::new();
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    // Radius 3: 7 x 7 chunks, three layers -- level 0 only
+    // (`schedule_for_radius` collapses under the first ring), so the nodes'
+    // own origins are exactly the 16-block grid the shift is checked against.
+    let region_radius = 3;
+    let schedule = schedule_for_radius(region_radius);
+    let mut nodes: Vec<MeshedNode> = mesh_region(
+        &world,
+        &registry,
+        &layer_of,
+        ChunkCoord::new(0, 0, 0),
+        0..=2,
+        &schedule,
+        real_blocks(),
+    )
+    .into_iter()
+    .filter_map(to_meshed_node)
+    .collect();
+    assert!(nodes.len() > 50, "only {} nodes", nodes.len());
+
+    // Three trees on the surface, each given to the node whose chunk holds
+    // its base block.
+    let mut planted = 0;
+    for (x, z) in [(20, 20), (-24, 8), (4, -30)] {
+        let base = world.surface_height(x, z) + 1;
+        let chunk = ChunkCoord::from_block(x, base, z);
+        if let Some(node) = nodes
+            .iter_mut()
+            .find(|n| n.id.level == 0 && n.id.pos == [chunk.x, chunk.y, chunk.z])
+        {
+            node.trees.push([x, base, z]);
+            node.tree_model = TreeModel::Oak;
+            planted += 1;
+        }
+    }
+    assert_eq!(planted, 3, "a tree's chunk is not in the region");
+
+    let h0 = world.surface_height(8, 8);
+    let eye = glam::DVec3::new(8.5, h0 as f64 + 24.0, 8.5);
+    let look = glam::vec3(0.55, -0.5, 0.7);
+
+    // One far tile beyond the region's +x/+z corner, a gentle slope a little
+    // under the surface here, 128 blocks a side.
+    let far_origin = [64i64, 64i64];
+    let far_quad = 4.0f32;
+    let far_heights: Vec<f32> = (0..cubara_render::FAR_VERTS * cubara_render::FAR_VERTS)
+        .map(|k| {
+            let (i, j) = (
+                (k % cubara_render::FAR_VERTS) as f32,
+                (k / cubara_render::FAR_VERTS) as f32,
+            );
+            h0 as f32 - 6.0 + 0.15 * i + 0.4 * j
+        })
+        .collect();
+    let edge = region_radius * 16;
+    let hole = ([-edge, 0, -edge], [edge + 16, 48, edge + 16]);
+
+    // Thirty-odd blocks down the look direction, where each is a dozen
+    // pixels: enough that leaving any of them out shows.
+    let outline_block = [30, world.surface_height(30, 36), 36];
+    let crack_block = [24, world.surface_height(24, 30), 30];
+    let player_eye = [36.0, world.surface_height(36, 40) as f64 + 2.62, 40.0];
+
+    // Apply the shift to everything that is a position.
+    let s32 = shift.map(|v| v as i32);
+    let s64 = glam::DVec3::new(shift[0] as f64, shift[1] as f64, shift[2] as f64);
+    let s_f32 = glam::Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
+    for node in &mut nodes {
+        let extent = 16i64 << node.id.level;
+        for a in 0..3 {
+            node.id.pos[a] += (shift[a] / extent) as i32;
+            node.origin[a] += s32[a];
+        }
+        node.aabb = cubara_render::Aabb::new(node.aabb.min + s_f32, node.aabb.max + s_f32);
+        for t in &mut node.trees {
+            for a in 0..3 {
+                t[a] += s32[a];
+            }
+        }
+    }
+    let far_origin = [far_origin[0] + shift[0], far_origin[1] + shift[2]];
+    let far_heights = far_heights
+        .into_iter()
+        .map(|h| h + shift[1] as f32)
+        .collect();
+    let add3 = |p: [i32; 3]| [p[0] + s32[0], p[1] + s32[1], p[2] + s32[2]];
+    let hole = (add3(hole.0), add3(hole.1));
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        region_radius,
+        orbit_t: 0.0,
+        camera: Some((eye + s64, look)),
+        anchor: None,
+        players: vec![cubara_render::PlayerView {
+            eye: (glam::DVec3::from_array(player_eye) + s64).to_array(),
+            yaw: 0.7,
+            shirt: [0.8, 0.16, 0.16],
+        }],
+        highlighted_block: Some(add3(outline_block)),
+        cracking: Some((add3(crack_block), 0.6)),
+        hotbar: None,
+        panel: None,
+        health: None,
+        crosshair: false,
+        tooltip: None,
+        gauges: None,
+        icons: Vec::new(),
+        menu: None,
+        lighting: Lighting::default(),
+    };
+    let _ = far_quad;
+    AnchoredScene {
+        nodes,
+        far_origin,
+        far_heights,
+        hole,
+        shot,
+    }
+}
+
+/// Render an [`AnchoredScene`], or `None` without a GPU.
+fn render_anchored(scene: AnchoredScene, anchor: Option<cubara_render::Anchor>) -> Option<Frame> {
+    use cubara_render::far::{FarParams, FarPatch};
+    let patch = FarPatch {
+        origin: scene.far_origin,
+        quad: 4.0,
+        heights: &scene.far_heights,
+        skirt: 8.0,
+    };
+    let params = FarParams {
+        hole: Some(scene.hole),
+        materials: far_materials(),
+    };
+    let shot = Shot {
+        anchor,
+        ..scene.shot
+    };
+    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    headless::render_with_far(scene.nodes, &[patch], Some(params), shot)
+}
+
+/// How much of `frame` is not the sky: the share of pixels that differ from
+/// an empty render of the same shot. Guards the tests below against a scene
+/// that draws nothing and so trivially matches itself.
+fn drawn_fraction(frame: &Frame, shot: &Shot) -> f64 {
+    let empty = Shot {
+        players: Vec::new(),
+        highlighted_block: None,
+        cracking: None,
+        ..shot.clone()
+    };
+    let sky = {
+        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        headless::render_with_far(Vec::new(), &[], None, empty)
+    }
+    .expect("adapter was available a moment ago");
+    headless::compare(&frame.pixels, &sky.pixels, 0).differing_fraction
+}
+
+/// **Decision 1 and 6's test: a scene moved by a multiple of the anchor grid
+/// renders byte-identically** (issue #379). At 2^20 blocks an `f32` steps
+/// in 1/8 of a block, so an absolute `f32` renderer visibly breaks the
+/// shifted scene up (`without_the_anchor_the_shifted_scene_falls_apart`
+/// below is that renderer, and the proof this test can fail). With every
+/// position relative to the anchor -- which is (2^20, 0, 2^20) for the
+/// shifted eye and (0, 0, 0) for the original -- the GPU sees the same
+/// numbers both times, so the two frames are the same bytes: nodes, trees,
+/// far tile, hole, outline, cracks, figure, haze and all.
+///
+/// Exactly equal, not within the golden tolerance: the point of the anchor
+/// is that the arithmetic is identical, and the existing
+/// `the_same_scene_renders_byte_identically` measured this GPU's
+/// run-to-run noise at 1-2 pixels of delta 1 roughly one run in three, so
+/// the bound is the same one that test settled on.
+#[test]
+fn a_scene_moved_by_a_grid_multiple_renders_byte_identically() {
+    let here = anchored_scene([0; 3]);
+    let shot = here.shot.clone();
+    let Some(a) = render_anchored(here, None) else {
+        headless::skip_or_require_gpu("a_scene_moved_by_a_grid_multiple_renders_byte_identically");
+        return;
+    };
+    let drawn = drawn_fraction(&a, &shot);
+    assert!(
+        drawn > 0.3,
+        "the scene covers only {:.1}% of the frame",
+        drawn * 100.0
+    );
+    let b = render_anchored(anchored_scene([FAR_SHIFT, 0, FAR_SHIFT]), None)
+        .expect("adapter was available a moment ago");
+
+    let differing = differing_pixels(&a, &b);
+    let max_delta = differing.iter().map(|p| p.delta).max().unwrap_or(0);
+    eprintln!(
+        "a_scene_moved_by_a_grid_multiple_renders_byte_identically: {} of {} pixels differ, \
+         max channel delta {max_delta}",
+        differing.len(),
+        a.pixels.len() / 4
+    );
+    assert!(
+        max_delta <= 1 && differing.len() <= 4,
+        "the scene 2^20 blocks out is not the scene at the origin:\n{}",
+        describe(&differing)
+    );
+}
+
+/// **The same at an offset that is not a multiple of the grid**: the eye
+/// lands 1,160 blocks from its anchor instead of 8, so every anchor-relative
+/// number has a different magnitude and `f32` rounds its last bits
+/// differently -- the frame may move by a pixel here and there, and must
+/// stay inside the golden tolerance. The forced-origin renderer below is
+/// well outside it at the same offset.
+#[test]
+fn a_scene_moved_off_the_grid_renders_within_the_golden_tolerance() {
+    let Some(a) = render_anchored(anchored_scene([0; 3]), None) else {
+        headless::skip_or_require_gpu(
+            "a_scene_moved_off_the_grid_renders_within_the_golden_tolerance",
+        );
+        return;
+    };
+    // 1,152 and -896 are multiples of 16 (the nodes stay on their grid) and
+    // not of 4,096 (the anchor stays at 2^20, so the eye is off-centre).
+    let c = render_anchored(anchored_scene([FAR_SHIFT + 1152, 0, FAR_SHIFT - 896]), None)
+        .expect("adapter was available a moment ago");
+    let diff = headless::compare(&a.pixels, &c.pixels, TOLERANCE);
+    eprintln!(
+        "a_scene_moved_off_the_grid_renders_within_the_golden_tolerance: {:.4}% differ \
+         (tolerance {TOLERANCE}, max delta {}), threshold {:.4}%",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta,
+        MAX_DIFFERING * 100.0
+    );
+    assert!(
+        diff.differing_fraction <= MAX_DIFFERING,
+        "{:.4}% of pixels differ between the scene at the origin and the scene \
+         {} blocks out with its eye off the anchor's centre -- more than the \
+         golden tolerance allows",
+        diff.differing_fraction * 100.0,
+        FAR_SHIFT + 1152
+    );
+}
+
+/// **The proof the two tests above can fail**: the same shifted scene drawn
+/// with the anchor forced to the world origin is what `origin/main`'s
+/// renderer drew -- absolute `f32` positions and an absolute `f32` eye --
+/// and it is visibly not the scene at the origin. Kept as a test rather than
+/// a one-off so the anchor cannot be quietly made a no-op (an `anchor_for`
+/// that always returns the origin passes everything else in this file).
+#[test]
+fn without_the_anchor_the_shifted_scene_falls_apart() {
+    let Some(a) = render_anchored(anchored_scene([0; 3]), None) else {
+        headless::skip_or_require_gpu("without_the_anchor_the_shifted_scene_falls_apart");
+        return;
+    };
+    let broken = render_anchored(
+        anchored_scene([FAR_SHIFT, 0, FAR_SHIFT]),
+        Some(cubara_render::anchor::ORIGIN),
+    )
+    .expect("adapter was available a moment ago");
+    let diff = headless::compare(&a.pixels, &broken.pixels, TOLERANCE);
+    eprintln!(
+        "without_the_anchor_the_shifted_scene_falls_apart: {:.4}% differ (tolerance \
+         {TOLERANCE}, max delta {})",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta
+    );
+    assert!(
+        diff.differing_fraction > 4.0 * MAX_DIFFERING,
+        "with the anchor forced to the origin only {:.4}% of pixels differ -- the \
+         absolute-f32 breakage this issue exists for is not showing, so the tests \
+         above are not evidence",
+        diff.differing_fraction * 100.0
+    );
+}

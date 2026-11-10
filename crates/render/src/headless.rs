@@ -461,13 +461,18 @@ fn render_arena(
     let draw_count = arena.prepare(&queue, &frustum);
     trees.prepare(&device, &queue, &frustum);
     let far_terrain = (!far.is_empty()).then(|| {
-        let mut terrain = crate::far::FarTerrain::new(&device, &queue, far.len() as u32, anchor);
+        // Built against the origin and rebased, like the arenas above: the
+        // one-shot path then runs the same `FarTerrain::rebase` the window
+        // runs at a grid line, so a shot far from the origin tests it.
+        let mut terrain =
+            crate::far::FarTerrain::new(&device, &queue, far.len() as u32, anchor::ORIGIN);
         for patch in far {
             terrain.insert(&queue, *patch);
         }
         if let Some(params) = far_params {
             terrain.set_params(&queue, params);
         }
+        terrain.rebase(&queue, anchor);
         terrain.prepare(&queue, &frustum, eye_rel);
         terrain
     });
