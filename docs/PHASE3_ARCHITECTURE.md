@@ -106,10 +106,42 @@ anomalies).
 same numbers read by the simulation (ice, growth) and by the shader (the
 seasonal look), so the two cannot disagree about what season it is.
 
-The vertex format's 12 spare bits (`PHASE1_ARCHITECTURE.md` §5) carry the
+The vertex format's 13 spare bits (`PHASE1_ARCHITECTURE.md` §5) carry the
 season window directly; this is why a later per-vertex need — a climate tint
 for grass, say — would cost a fourth vertex word rather than fitting in what
-seasons leave over ([#365](../../issues/365)'s note on the budget).
+seasons leave over ([#337](../../issues/337) risk 7: "the vertex bit budget is
+used up by seasons").
+
+**The bit budget**, every spare bit assigned, from [#371](../../issues/371)
+(seasons), [#341](../../issues/341) and [#347](../../issues/347) (water,
+block 3.1–3.2) as they stand today. Opaque and water vertices are two
+disjoint meshes (`NodeMesh { opaque, water }`, #341 decision 1), never the
+same vertex, so the same bit range carries a different, non-conflicting
+meaning in each:
+
+| bit           | opaque-vertex owner                     | water-vertex owner           | issue              |
+|---------------|------------------------------------------|-------------------------------|--------------------|
+| word 1 bit 31 | season kind (0 = ground, 1 = foliage)    | unused                         | #371 decision 1    |
+| word 2 bit 20 | window `on` bit 0 (of `on:6`, bits 20–25)| `drop_16ths` bit 0 (of bits 20–23) | #371 d1 / #341 d2 |
+| word 2 bit 21 | window `on` bit 1                        | `drop_16ths` bit 1             | #371 d1 / #341 d2  |
+| word 2 bit 22 | window `on` bit 2                        | `drop_16ths` bit 2             | #371 d1 / #341 d2  |
+| word 2 bit 23 | window `on` bit 3                        | `drop_16ths` bit 3             | #371 d1 / #341 d2  |
+| word 2 bit 24 | window `on` bit 4                        | `flow_dir` bit 0 (of bits 24–27)| #371 d1 / #347 d2  |
+| word 2 bit 25 | window `on` bit 5                        | `flow_dir` bit 1               | #371 d1 / #347 d2  |
+| word 2 bit 26 | window `len` bit 0 (of `len:6`, bits 26–31)| `flow_dir` bit 2             | #371 d1 / #347 d2  |
+| word 2 bit 27 | window `len` bit 1                       | `flow_dir` bit 3               | #371 d1 / #347 d2  |
+| word 2 bit 28 | window `len` bit 2                       | unused                         | #371 decision 1    |
+| word 2 bit 29 | window `len` bit 3                       | unused                         | #371 decision 1    |
+| word 2 bit 30 | window `len` bit 4                       | unused                         | #371 decision 1    |
+| word 2 bit 31 | window `len` bit 5                       | unused                         | #371 decision 1    |
+
+That accounts for the 13 bits named above (1 + 12), all of them, with no two
+owners claiming the same bit for the same vertex kind. The ice window is a
+separate case, not one of these spare bits: the top water face's `tex_layer`
+field (word 1, 12 bits — unused for water because water has one texture, a
+pipeline constant) carries it as `on:6`/`len:6` instead (#371 decision 2).
+Opaque vertices keep using `tex_layer` for its original purpose, the texture
+array layer.
 
 Decided in [#370](../../issues/370)/[#371](../../issues/371) (blocks 3.8a,
 3.8b).

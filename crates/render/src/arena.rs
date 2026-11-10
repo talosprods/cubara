@@ -662,13 +662,17 @@ impl ChunkArena {
         true
     }
 
-    /// Free a node's slots back to the arenas. No-op if not resident.
-    pub fn remove(&mut self, id: NodeId) {
-        if let Some(slot) = self.slots.remove(&id) {
-            self.vertices.free(slot.base_vertex, slot.vertex_len);
-            self.indices.free(slot.first_index, slot.index_count);
-            self.nodes.free(slot.node_index);
-        }
+    /// Free a node's slots back to the arenas, returning the bounds it was
+    /// drawn with -- **relative to the arena's anchor**, the space
+    /// `view_proj` is in (issue #379), so a caller projecting them uses the
+    /// renderer's anchor (`--bench flight`'s pops). `None`, and a no-op, if
+    /// not resident.
+    pub fn remove(&mut self, id: NodeId) -> Option<Aabb> {
+        let slot = self.slots.remove(&id)?;
+        self.vertices.free(slot.base_vertex, slot.vertex_len);
+        self.indices.free(slot.first_index, slot.index_count);
+        self.nodes.free(slot.node_index);
+        Some(slot.aabb)
     }
 
     /// Free every node.

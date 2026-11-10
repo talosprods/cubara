@@ -20,7 +20,7 @@ use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 
 use crate::anchor::{self, Anchor};
 use crate::arena::{ChunkArena, MeshedNode, NodeId};
-use crate::culling::Frustum;
+use crate::culling::{Aabb, Frustum};
 use crate::materials::{self, MeshAssets};
 use crate::scene::{SceneFrame, SceneRenderer};
 use crate::uploads::{Sink, Uploads};
@@ -642,6 +642,10 @@ pub struct Renderer {
     /// ([`crate::uploads`]): drained a share of each frame's time at a time
     /// ([`crate::uploads::upload_budget`]) to avoid upload spikes.
     uploads: Uploads<MeshedNode>,
+    /// The bounds of the nodes the last [`drain_uploads`](Self::drain_uploads)
+    /// stopped drawing -- the swaps that frame applied. Read by a measurement
+    /// (`--bench flight`'s pops, issue #384); the renderer itself never looks.
+    swapped_out: Vec<Aabb>,
 
     last_frame: Instant,
     visible_chunks: usize,
@@ -856,6 +860,7 @@ impl Renderer {
             far,
             trees: crate::trees::TreeArena::new(tree_local_bounds, anchor),
             uploads: Uploads::new(),
+            swapped_out: Vec::new(),
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -932,6 +937,14 @@ impl Renderer {
     /// Meshes handed over and not yet uploaded: still to appear on screen.
     pub fn uploads_pending(&self) -> usize {
         self.uploads.len()
+    }
+
+    /// The world-space bounds of every node the last frame stopped drawing:
+    /// the swaps it applied, the point where the outgoing nodes leave
+    /// ([`crate::uploads`]). What `--bench flight` measures a pop against
+    /// (issue #384). Empty on a frame that dropped nothing.
+    pub fn swapped_out(&self) -> &[Aabb] {
+        &self.swapped_out
     }
 
     /// Far-terrain patches drawn in the last frame.
@@ -1046,10 +1059,12 @@ impl Renderer {
         puffin::profile_function!();
         let started = Instant::now();
         let budget = crate::uploads::upload_budget(last_frame);
+        self.swapped_out.clear();
         let mut sink = ArenaSink {
             arena: &mut self.arena,
             trees: &mut self.trees,
             queue: &self.queue,
+            swapped_out: &mut self.swapped_out,
         };
         self.uploads.drain(
             MIN_UPLOADS_PER_FRAME,
@@ -1960,18 +1975,25 @@ struct ArenaSink<'a> {
     arena: &'a mut ChunkArena,
     trees: &'a mut crate::trees::TreeArena,
     queue: &'a wgpu::Queue,
+    /// The bounds of every node this drain stopped drawing
+    /// ([`Renderer::swapped_out`]): a leaver is recorded when its
+    /// Remove actually applies -- after its batch's Inserts, by
+    /// [`Uploads::drain`]'s rules -- never when it is only queued.
+    swapped_out: &'a mut Vec<Aabb>,
 }
 
 impl Sink<MeshedNode> for ArenaSink<'_> {
     fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
         // Free any prior slot first -- and the trees that pointed
-        // at it, together, as `remove` below does. A tree instance
-        // carries its node's slot in `node_origins`
-        // (`TreeInstance::node_index`); if the insert below fails
-        // and another node takes the freed slot before this one is
-        // retried, instances left behind here would be drawn at
-        // that node's origin (#379 review finding S1).
-        self.remove(id);
+        // at it, together. A tree instance carries its node's slot
+        // in `node_origins` (`TreeInstance::node_index`); if the
+        // insert below fails and another node takes the freed slot
+        // before this one is retried, instances left behind here
+        // would be drawn at that node's origin (#379 review finding
+        // S1). Not through `remove`: an edit's replacement is not a
+        // swap-out (`swapped_out`).
+        self.arena.remove(id);
+        self.trees.remove(id);
         // Cloned, not moved: `node` (the whole `MeshedNode`) is
         // still needed whole if this insert fails and has to be
         // requeued. Cheap either way -- a node's own tree list
@@ -2009,7 +2031,9 @@ impl Sink<MeshedNode> for ArenaSink<'_> {
     }
 
     fn remove(&mut self, id: NodeId) {
-        self.arena.remove(id);
+        if let Some(aabb) = self.arena.remove(id) {
+            self.swapped_out.push(aabb);
+        }
         self.trees.remove(id);
     }
 }
@@ -2058,10 +2082,12 @@ mod tests {
             trees,
             tree_model: crate::trees::TreeModel::Oak,
         };
+        let mut swapped_out = Vec::new();
         let mut sink = ArenaSink {
             arena: &mut r.arena,
             trees: &mut r.trees,
             queue: &r.queue,
+            swapped_out: &mut swapped_out,
         };
         assert!(sink
             .try_insert(id, node(id, quad(4), vec![[5, 7, 9]]))
@@ -2083,6 +2109,10 @@ mod tests {
             sink.trees.node_count(),
             0,
             "the node's trees survived its slot {slot} being freed, and still index it"
+        );
+        assert!(
+            sink.swapped_out.is_empty(),
+            "an edit's re-insert is not a swap-out"
         );
 
         // Whoever takes that slot next must not inherit them either.

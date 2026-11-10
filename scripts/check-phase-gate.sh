@@ -19,6 +19,20 @@ export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
 phase="${1:-1}"
 
+# Item 0's thresholds for the two terms that are not simply zero (issue
+# #384 decision 4). PROVISIONAL: chosen, not derived -- they are the owner's
+# to set (review question 1: "when the detail level of a hill changes while
+# you fly, its outline moves by a pixel or two -- acceptable if it slides
+# smoothly over a quarter of a second, or must it never move at all?"), and
+# these stand in until he answers.
+#   POP_P99_PX: the largest allowed p99, over a flight's swaps, of the
+#   vertical shift in pixels of the land/sky boundary inside the swapped
+#   nodes' screen boxes (`POPS: ... silhouette px p50/p99/max`).
+#   STALE_KEPT_FRAMES: the most kept frames that may show nothing where the
+#   finished frame has land (`STALE: N kept frames ...`).
+POP_P99_PX=2
+STALE_KEPT_FRAMES=0
+
 pass=0
 fail=0
 out=$(mktemp)
@@ -157,11 +171,14 @@ bench_line() {
 }
 
 # flight_gate <label> <flight args...> -- one of block 3.0a's flights (#318):
-# the frame terms on the work per frame, and no hole -- neither a pixel that
-# shows land, then nothing, then land again (every frame), nor a kept frame
-# with nothing where the finished frame has land.
+# the frame terms on the work per frame, and the three terms of issue #384
+# read from the same line: HOLES = 0 (a pixel that showed land, then nothing,
+# then land again, where the finished frame shows land), POPS' silhouette
+# p99 <= POP_P99_PX, and STALE's kept frames <= STALE_KEPT_FRAMES. A term
+# missing from the line (the wording changed, or an older binary) fails the
+# item rather than passing it: every parse must produce a number.
 flight_gate() {
-    local label="$1" line p999 over2 holes kept
+    local label="$1" line p999 over2 holes pops stale
     shift
     if [ -n "${GATE_ONLY_TESTS:-}" ]; then
         return
@@ -170,9 +187,13 @@ flight_gate() {
     p999=$(printf '%s' "$line" | sed -nE 's/.*work p99 [0-9.]+ ms p99\.9 ([0-9.]+) ms.*/\1/p')
     over2=$(printf '%s' "$line" | sed -nE 's/.*over 33\.3 ms ([0-9]+) \(.*/\1/p')
     holes=$(printf '%s' "$line" | sed -nE 's/.*HOLES: ([0-9]+) of [0-9]+ frames.*/\1/p')
-    kept=$(printf '%s' "$line" | sed -nE 's/.*has land: ([0-9]+),.*/\1/p')
-    local numbers="p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?}, frames with a hole ${holes:-?}, kept frames with one ${kept:-?}"
-    if frame_terms "$p999" "$over2" && [ "${holes:-x}" = 0 ] && [ "${kept:-x}" = 0 ]; then
+    pops=$(printf '%s' "$line" | sed -nE 's/.*POPS: .*silhouette px p50\/p99\/max [0-9]+\/([0-9]+)\/[0-9]+.*/\1/p')
+    stale=$(printf '%s' "$line" | sed -nE 's/.*STALE: ([0-9]+) kept frames.*/\1/p')
+    local numbers="p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?}, holes ${holes:-?} frames, pop silhouette p99 ${pops:-?} px (<= $POP_P99_PX), stale ${stale:-?} kept frames (<= $STALE_KEPT_FRAMES)"
+    if frame_terms "$p999" "$over2" \
+        && [ "${holes:-x}" = 0 ] \
+        && [ -n "$pops" ] && [ "$pops" -le "$POP_P99_PX" ] \
+        && [ -n "$stale" ] && [ "$stale" -le "$STALE_KEPT_FRAMES" ]; then
         echo "PASS  $label ($numbers)"
         pass=$((pass + 1))
     else
@@ -295,9 +316,18 @@ if [ "$phase" = "3" ]; then
     echo
 
     # Item 0: block 3.0's own criterion, checked before 3.1 starts. The frame
-    # terms and the holes are what #318 built `--bench flight` (#319-#322) and
-    # `--bench walk` (#323) to print; the flights are #318's four, at the eyes
-    # BENCHMARKS.md's flight rows use. T1 is CPU-only; T4 does not exist yet.
+    # terms are what #318 built `--bench flight` (#319-#322) and `--bench
+    # walk` (#323) to print; the flights are #318's four, at the eyes
+    # BENCHMARKS.md's flight rows use. The flight line's three other terms
+    # (#384): HOLES counts frames in which a pixel inside land showed nothing
+    # for under half a second and the finished frame at that eye shows land
+    # there -- geometry missing. POPS measures, per detail swap, how many
+    # pixels inside the swapped nodes' screen boxes changed and how far the
+    # land/sky boundary there moved between the frame before and the frame of
+    # the swap -- a silhouette moving. STALE counts kept frames showing
+    # nothing where the finished frame has land inside land -- a coarse node
+    # still drawn late -- and says how much of it lay under a swap whose lag
+    # (#378) was open.
     flight_gate "item 0: flight low" --eye 8,120,8 --look 1,-0.15,0.3 --seconds 20
     flight_gate "item 0: flight high" --eye 8,400,8 --look 1,-0.35,0.3 --seconds 20
     flight_gate "item 0: flight down" --eye 8,450,8 --look 0.4,-0.8,0.2 --seconds 15

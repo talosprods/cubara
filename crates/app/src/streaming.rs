@@ -783,6 +783,23 @@ impl NodeStreaming {
     pub fn swap_lags(&self) -> &[u64] {
         &self.swap_lags
     }
+
+    /// The boxes, in blocks (`max` exclusive), of the nodes whose swap lag
+    /// is open right now: found stale by a search, still drawn because what
+    /// replaces them has not landed. What `--bench flight` attributes a kept
+    /// frame's stale terrain to (issue #384 decision 3). Sorted, so the
+    /// `HashMap`'s order never reaches a result.
+    pub fn open_swaps(&self) -> Vec<([f32; 3], [f32; 3])> {
+        let mut nodes: Vec<NodeKey> = self.swap_pending.keys().copied().collect();
+        nodes.sort();
+        nodes
+            .into_iter()
+            .map(|n| {
+                let (min, max) = node_box(n);
+                (min.map(|c| (c * 16) as f32), max.map(|c| (c * 16) as f32))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

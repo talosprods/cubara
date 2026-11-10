@@ -35,7 +35,7 @@ SIM_CRATES="crates/voxel/src crates/world/src crates/sim/src crates/server/src"
 # name**, so a second file reaching for the clock fails here rather than
 # quietly becoming precedent.
 for d in $SIM_CRATES; do [ -d "$d" ] || continue
-    grep -rn --include='*.rs' --exclude='clock.rs' -E "Instant::now|SystemTime::now" "$d"
+    grep -rn --include='*.rs' --exclude='clock.rs' -E "Instant::now|SystemTime::now|UNIX_EPOCH" "$d"
 done | report "Rule 1" "wall-clock time in a simulation crate — advance by tick instead"
 
 for d in $SIM_CRATES; do [ -d "$d" ] || continue
@@ -63,6 +63,16 @@ done | report "Rule 1" "floating-point trigonometry in a simulation crate — us
 # elsewhere in this same file, still fails here.
 grep -rn --include='*.rs' --exclude='golden.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLock)|static mut |lazy_static" crates \
     | report "Rule 2" "global mutable state — pass state in, do not reach for it"
+
+# An `AtomicU64`/`AtomicBool`/etc. held in a `static` is ambient mutable state
+# just as much as a `Mutex` is -- the rule's wording ("no ... singletons")
+# does not carve out lock-free ones. #393 (critical review 2026-11-10, F10):
+# this gap is real, not hypothetical -- the check above only recognised the
+# four lock-based shapes. Same `golden.rs` exclusion as the check above, for
+# the same reason (a second `static` anywhere else, including elsewhere in
+# that file, still fails here).
+grep -rn --include='*.rs' --exclude='golden.rs' -E "static +[A-Z_]+ *: *(std::sync::atomic::)?Atomic[A-Za-z0-9]+" crates \
+    | report "Rule 2" "a static Atomic* — ambient mutable state, pass it in instead"
 
 # ── Rule 3 / 4 — dependency direction, and the sim runs without a GPU ────────
 # Data and simulation crates must not know the GPU exists.
