@@ -140,6 +140,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
         SceneFrame {
             arena: &arena,
             draw_count: 0,
+            anchor: cubara_render::anchor::ORIGIN,
             selected_block: None,
             cracking: None,
             players: &[],

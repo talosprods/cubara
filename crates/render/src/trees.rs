@@ -477,9 +477,11 @@ impl TreeArena {
     /// trunk's base block, in world blocks), stored relative to the node's
     /// `origin` -- an exact integer subtraction -- alongside `node_index`,
     /// the node's slot in the arena's `node_origins` buffer that
-    /// `trees.wgsl` adds back ([`TreeInstance`]). `node_aabb` is the node's
-    /// own (terrain) bounds; the AABB actually stored is `node_aabb` grown
-    /// by [`local_bounds`](Self::local_bounds) around every tree, so a tall
+    /// `trees.wgsl` adds back ([`TreeInstance`]). `node_local_aabb` is the
+    /// node's own (terrain) bounds **relative to `origin`**, as the mesher
+    /// gives them; the box actually stored is that grown by
+    /// [`local_bounds`](Self::local_bounds) around every tree -- all of it
+    /// node-local, so no absolute `f32` position is formed -- so a tall
     /// canopy standing near a node's edge is never culled while the node's
     /// own ground is still in view, or vice versa. An empty `trees` is the
     /// same as having none -- removed outright, so a node that grows no
@@ -492,27 +494,29 @@ impl TreeArena {
         origin: [i32; 3],
         model: TreeModel,
         trees: Vec<[i32; 3]>,
-        node_aabb: crate::culling::Aabb,
+        node_local_aabb: crate::culling::Aabb,
     ) {
         if trees.is_empty() {
             self.remove(id);
             return;
         }
         let (local_min, local_max) = self.local_bounds;
-        let mut min = node_aabb.min;
-        let mut max = node_aabb.max;
+        let mut min = node_local_aabb.min;
+        let mut max = node_local_aabb.max;
         let instances = trees
             .iter()
             .map(|&t| {
-                let p = glam::Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32);
-                min = min.min(p + local_min);
-                max = max.max(p + local_max);
+                // Where the tree stands relative to its node: integers, so
+                // exact, and small, so exact in `f32` too.
+                let rel = glam::Vec3::new(
+                    (t[0] as i64 - origin[0] as i64) as f32,
+                    (t[1] as i64 - origin[1] as i64) as f32,
+                    (t[2] as i64 - origin[2] as i64) as f32,
+                );
+                min = min.min(rel + local_min);
+                max = max.max(rel + local_max);
                 TreeInstance {
-                    position: [
-                        (t[0] - origin[0]) as f32,
-                        (t[1] - origin[1]) as f32,
-                        (t[2] - origin[2]) as f32,
-                    ],
+                    position: rel.to_array(),
                     node_index,
                 }
             })
@@ -531,6 +535,13 @@ impl TreeArena {
 
     pub fn remove(&mut self, id: NodeId) {
         self.by_node.remove(&id);
+    }
+
+    /// The render anchor every culling box here is relative to. Carried in
+    /// [`crate::scene::TreeDraw`] so the one scene pass can check it against
+    /// the `ChunkArena` whose `node_origins` the instances index.
+    pub fn anchor(&self) -> Anchor {
+        self.anchor
     }
 
     /// Re-express every node's culling box against `anchor` (issue #379
@@ -610,12 +621,13 @@ impl TreeArena {
     }
 
     /// How many nodes are currently recorded, resident or not -- a white-box
-    /// accessor for this module's own (GPU-free) unit tests, which can check
-    /// `insert`/`remove`'s bookkeeping without a device to call
-    /// [`prepare`](Self::prepare) through. The frustum-culling behaviour
-    /// itself is proven in `tests/tree_culling.rs`, which does have one.
+    /// accessor for this crate's tests, which can check `insert`/`remove`'s
+    /// bookkeeping (and `ArenaSink::try_insert`'s, `crate::render`) without
+    /// a device to call [`prepare`](Self::prepare) through. The
+    /// frustum-culling behaviour itself is proven in
+    /// `tests/tree_culling.rs`, which does have one.
     #[cfg(test)]
-    fn node_count(&self) -> usize {
+    pub(crate) fn node_count(&self) -> usize {
         self.by_node.len()
     }
 
@@ -895,9 +907,9 @@ mod tests {
     /// origin, with the node's slot in `node_origins`, so `trees.wgsl` adds
     /// the origin back from the same buffer `mesh.wgsl` reads -- and a
     /// rebase of that buffer moves the trees with their node, touching no
-    /// instance. The culling box, by contrast, stays in world blocks: it is
-    /// what the frustum tests, and that box is in the same space as the
-    /// node's own AABB.
+    /// instance. The culling box is built from the node-local bounds and
+    /// the same node-relative offsets, then placed against the anchor (the
+    /// origin here, so it comes out in world blocks).
     #[test]
     fn instances_are_relative_to_their_node_and_carry_its_slot() {
         let mut arena = no_local_bounds();
@@ -906,15 +918,15 @@ mod tests {
             pos: [3, 0, -1],
         };
         let origin = [192, 0, -64];
-        let node_aabb =
-            crate::culling::Aabb::new(glam::vec3(192.0, 0.0, -64.0), glam::vec3(256.0, 20.0, 0.0));
+        let node_local_aabb =
+            crate::culling::Aabb::new(glam::vec3(0.0, 0.0, 0.0), glam::vec3(64.0, 20.0, 64.0));
         arena.insert(
             id,
             17,
             origin,
             TreeModel::Oak,
             vec![[200, 12, -60], [255, 9, -1]],
-            node_aabb,
+            node_local_aabb,
         );
         assert_eq!(
             arena.instances_of(id),
@@ -934,8 +946,9 @@ mod tests {
         let stored = arena.aabb_of(id).expect("just inserted");
         assert_eq!(
             (stored.min, stored.max),
-            (node_aabb.min, node_aabb.max),
-            "with no local reach, trees inside the node leave its box as it is"
+            (glam::vec3(192.0, 0.0, -64.0), glam::vec3(256.0, 20.0, 0.0)),
+            "with no local reach, trees inside the node leave its box as it is, \
+             placed at the node's origin"
         );
     }
 }

@@ -54,7 +54,7 @@ pub struct NodeId {
 /// picked early and left to absorb terrain growth since; measured against
 /// the real worst case for the first time here, it's still comfortably
 /// covered without needing to move.
-const VERTEX_CAPACITY: u32 = 4_000_000;
+pub(crate) const VERTEX_CAPACITY: u32 = 4_000_000;
 /// Index-arena capacity, in indices (4 bytes/index). Same story as
 /// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
 /// 6,000,000 is ~2.4× headroom, unchanged from #89.
@@ -492,6 +492,15 @@ impl ChunkArena {
     /// `write_buffer` of the used prefix, and the culling boxes. Nothing
     /// per vertex, nothing per tree instance. A no-op for the anchor the
     /// arena already has.
+    ///
+    /// **`origins` is the truth for `origins_buffer`.** This rewrites every
+    /// resident entry from `NodeSlot`, so anything that later modifies a
+    /// node's origin per frame -- #380's R6 cross-fade lifts
+    /// `node_origins[i].y` by up to a cell -- must live in `NodeSlot` and be
+    /// applied here *and* in [`insert`](Self::insert) through an arena
+    /// method (say `set_origin_lift(id, dy)` writing `origins[i]` and the
+    /// buffer); a `write_buffer` into `origins_buffer` from outside would
+    /// be silently undone by the next rebase and leave the mirror stale.
     pub fn rebase(&mut self, queue: &wgpu::Queue, anchor: Anchor) {
         if anchor == self.anchor {
             return;
@@ -528,22 +537,22 @@ impl ChunkArena {
         chunk: &Chunk,
         ctx: &MeshContext,
     ) -> bool {
-        let origin_f32 = [origin[0] as f32, origin[1] as f32, origin[2] as f32];
-        match build_mesh_bounded(chunk, ctx, origin_f32, scale) {
-            Some((mesh, aabb)) => self.insert(queue, id, origin, scale, &mesh, aabb),
+        match build_mesh_bounded(chunk, ctx, scale) {
+            Some((mesh, local_aabb)) => self.insert(queue, id, origin, scale, &mesh, local_aabb),
             None => false,
         }
     }
 
-    /// Sub-allocate an already-built node-local `mesh` (with precomputed
-    /// world-space `aabb`) into the shared arenas and upload it, plus a
-    /// node-origins slot recording `origin`/`scale` for the vertex shader to
-    /// add/multiply back (§5.2 -- vertices themselves stay node-local). The
-    /// origin is a block position, an integer: it is what the trees
-    /// (`TreeArena::insert`) and the render anchor (issue #379) subtract
-    /// from, and an integer subtraction is exact where a float one is not.
-    /// No-op if `id` is already resident. Returns whether the geometry was
-    /// added.
+    /// Sub-allocate an already-built node-local `mesh` (with its precomputed
+    /// bounds `local_aabb`, **relative to `origin`**) into the shared arenas
+    /// and upload it, plus a node-origins slot recording `origin`/`scale`
+    /// for the vertex shader to add/multiply back (§5.2 -- vertices
+    /// themselves stay node-local). The origin is a block position, an
+    /// integer: it is what the trees (`TreeArena::insert`) and the render
+    /// anchor (issue #379) subtract from, and an integer subtraction is
+    /// exact where a float one is not; the bounds being local is what keeps
+    /// an absolute `f32` position out of this crate altogether. No-op if
+    /// `id` is already resident. Returns whether the geometry was added.
     /// This is the GPU-side step, kept separate from meshing so the latter
     /// can run on a worker thread or in a different crate entirely
     /// (`cubara_world::mesh`, since #110) -- `pub`, not `pub(crate)`, because
@@ -555,7 +564,7 @@ impl ChunkArena {
         origin: [i32; 3],
         scale: f32,
         mesh: &Mesh,
-        aabb: Aabb,
+        local_aabb: Aabb,
     ) -> bool {
         if self.slots.contains_key(&id) {
             return false;
@@ -624,7 +633,7 @@ impl ChunkArena {
         // local position before adding the origin. `.xyz` is the origin
         // relative to the render anchor (issue #379): an exact integer
         // subtraction, then a small number the GPU's `f32` holds exactly.
-        let place = NodeBox::new(origin, aabb);
+        let place = NodeBox::new(origin, local_aabb);
         let o = anchor::offset(origin, self.anchor);
         self.origins[node_index as usize] = [o.x, o.y, o.z, scale];
         queue.write_buffer(
@@ -868,7 +877,7 @@ impl ChunkArena {
                 node.origin,
                 node.scale,
                 &node.mesh,
-                node.aabb,
+                node.local_aabb,
             ) {
                 if let Some(slot) = arena.slots.get(&node.id) {
                     total_tris += slot.index_count / 3;
@@ -919,7 +928,11 @@ pub struct MeshedNode {
     pub origin: [i32; 3],
     pub scale: f32,
     pub mesh: Mesh,
-    pub aabb: Aabb,
+    /// The mesh's bounds **relative to `origin`** (what the mesher
+    /// produces, `cubara_voxel::build_mesh_bounded`): the renderer places
+    /// them against its anchor with one exact integer subtraction, so no
+    /// absolute `f32` position ever enters this crate (issue #379).
+    pub local_aabb: Aabb,
     /// The blocks the trees this node's footprint grows stand on (the
     /// trunk's base block, in world blocks; issue #332, R2 decision 2) --
     /// empty for a node with none, which is every level-0 node (its trees

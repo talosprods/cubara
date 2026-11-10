@@ -78,7 +78,7 @@ fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
         origin: geometry.origin,
         scale: geometry.scale,
         mesh: geometry.mesh,
-        aabb: geometry.aabb,
+        local_aabb: geometry.local_aabb,
         trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
         tree_model,
     })
@@ -2333,17 +2333,16 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     let crack_block = [-24, world.surface_height(-24, -30), -30];
     let player_eye = [-36.0, world.surface_height(-36, -40) as f64 + 2.62, -40.0];
 
-    // Apply the shift to everything that is a position.
+    // Apply the shift to everything that is a position. A node's bounds are
+    // local to its origin and so do not move.
     let s32 = shift.map(|v| v as i32);
     let s64 = glam::DVec3::new(shift[0] as f64, shift[1] as f64, shift[2] as f64);
-    let s_f32 = glam::Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
     for node in &mut nodes {
         let extent = 16i64 << node.id.level;
         for a in 0..3 {
             node.id.pos[a] += (shift[a] / extent) as i32;
             node.origin[a] += s32[a];
         }
-        node.aabb = cubara_render::Aabb::new(node.aabb.min + s_f32, node.aabb.max + s_f32);
         for t in &mut node.trees {
             for a in 0..3 {
                 t[a] += s32[a];
@@ -2495,6 +2494,78 @@ fn a_scene_moved_by_a_grid_multiple_renders_byte_identically() {
     assert!(
         max_delta <= 1 && differing.len() <= 4,
         "the scene 2^20 blocks out is not the scene at the origin:\n{}",
+        describe(&differing)
+    );
+}
+
+/// **And up a grid step** (review finding B1): the same scene 4,096 blocks
+/// higher, so the anchor's `y` is 4,096 rather than 0. Everything the GPU
+/// sees is anchor-relative except one buffer -- the far terrain's heights,
+/// which stay absolute -- so `far.wgsl` must take `anchor.y` off them, the
+/// far culling boxes likewise (`PlacedPatch::aabb`), and the haze must get
+/// the eye's absolute height back. Without the first two the far tile here
+/// draws 4,096 blocks too high, its hole test compares a relative box to an
+/// absolute vertex, and this frame is not the frame at the origin. The
+/// x/z-only test above cannot see any of that: its anchor has `y = 0`.
+///
+/// The height haze is turned off for this pair, and only this pair: it
+/// depends on absolute height *by design* (decision 4 -- the air 4,096
+/// blocks up really is thinner, `Haze::scale_height` is 600), so with it on
+/// the two frames legitimately differ by a few shades everywhere. What this
+/// test pins is everything else that carries the anchor's `y`.
+#[test]
+fn a_scene_moved_up_a_grid_step_renders_byte_identically() {
+    let no_haze = Lighting {
+        haze: cubara_render::haze::Haze {
+            density: 0.0,
+            ..Default::default()
+        },
+        ..Lighting::default()
+    };
+    let mut here = anchored_scene([0; 3]);
+    here.shot.lighting = no_haze;
+    let shot = here.shot.clone();
+    let Some(a) = render_anchored(here, None, false) else {
+        headless::skip_or_require_gpu("a_scene_moved_up_a_grid_step_renders_byte_identically");
+        return;
+    };
+    // The far tile has to be in the frame for its height to matter.
+    let no_far = {
+        let scene = anchored_scene([0; 3]);
+        let shot = Shot {
+            anchor: None,
+            lighting: no_haze,
+            ..scene.shot
+        };
+        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        headless::render_with_far(scene.nodes, &[], None, shot)
+    }
+    .expect("adapter was available a moment ago");
+    let far_is_in_the_frame = differing_pixels(&a, &no_far).len();
+    assert!(
+        far_is_in_the_frame > 500,
+        "the far tile changes only {far_is_in_the_frame} pixels -- not in view"
+    );
+    let mut moved = anchored_scene([FAR_SHIFT, 4096, FAR_SHIFT]);
+    moved.shot.lighting = no_haze;
+    let up = render_anchored(moved, None, false).expect("adapter was available a moment ago");
+    let differing = differing_pixels(&a, &up);
+    let max_delta = differing.iter().map(|p| p.delta).max().unwrap_or(0);
+    eprintln!(
+        "a_scene_moved_up_a_grid_step_renders_byte_identically: {} of {} pixels differ, \
+         max channel delta {max_delta}",
+        differing.len(),
+        shot.width as usize * shot.height as usize
+    );
+    // Not quite byte-identical, and for a stated reason: the far heights are
+    // stored as absolute `f32`s, and at 4,096 + h an `f32` has 1/2,048 of a
+    // block left, so `(h + 4096) - 4096` is `h` to within that -- enough to
+    // flip the odd silhouette pixel of the far tile against the sky (one,
+    // measured). A far tile drawn a grid step too high moves hundreds of
+    // thousands.
+    assert!(
+        differing.len() <= 8,
+        "the scene 4,096 blocks up is not the scene at the origin:\n{}",
         describe(&differing)
     );
 }

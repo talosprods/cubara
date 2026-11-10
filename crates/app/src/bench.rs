@@ -517,8 +517,9 @@ pub fn run(
     let mut lo = glam::Vec3::splat(f32::MAX);
     let mut hi = glam::Vec3::splat(f32::MIN);
     for g in meshed.iter().filter_map(|b| b.geometry.as_ref()) {
-        lo = lo.min(g.aabb.min);
-        hi = hi.max(g.aabb.max);
+        let aabb = g.world_aabb();
+        lo = lo.min(aabb.min);
+        hi = hi.max(aabb.max);
     }
     let look_target = ((lo + hi) * 0.5).to_array();
     let view_radius = (hi.x - lo.x).max(hi.z - lo.z) * 0.75;
@@ -804,6 +805,7 @@ pub fn run(
             SceneFrame {
                 arena,
                 draw_count,
+                anchor,
                 selected_block: None,
                 cracking: None,
                 players: &[],
@@ -811,6 +813,7 @@ pub fn run(
                 trees: Some(TreeDraw {
                     oak: trees.oak_instances(),
                     boxed: trees.box_instances(),
+                    anchor: trees.anchor(),
                 }),
                 overlay: overlay_text.as_deref(),
                 health: None,

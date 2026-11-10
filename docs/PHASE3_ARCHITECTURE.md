@@ -148,7 +148,7 @@ depend on how far the eye is from the world origin. Decided in
 [#379](../../issues/379); the test is the frame itself: a synthetic scene
 rendered at the origin and again shifted by (2^20, 0, 2^20) is byte-identical
 (`golden.rs`, `a_scene_moved_by_a_grid_multiple_renders_byte_identically`),
-and with the anchor forced to the origin — `origin/main`'s arithmetic — 23%
+and with the anchor forced to the origin — `origin/main`'s arithmetic — 47%
 of its pixels move.
 
 Why this had to come before the continents (`ROADMAP.md` 3.0 (c),
@@ -173,7 +173,21 @@ The decisions, as built:
   the CPU frustum, built from the same anchor-relative `view_proj`, tests
   the box re-expressed through the one function `NodeBox::relative_to`.
   `Frustum::eye` is therefore the relative eye, and `faces_facing`'s 0.05
-  margin is meaningful again at any distance.
+  margin is meaningful again at any distance. The local bounds come from
+  the mesher as such (`cubara_voxel::build_mesh_bounded` returns node-local
+  bounds, `NodeGeometry::local_aabb`, `MeshedNode::local_aabb`): no
+  absolute `f32` box is ever formed and subtracted from again, so the cull
+  is as exact at 2^30 blocks as at the origin. Every frame hands the anchor
+  it draws against to the one scene pass explicitly (`SceneFrame::anchor`),
+  which checks it against the arena's, the far terrain's and the tree
+  arena's in debug builds — the anchor is held in four places and this is
+  what fails when they disagree.
+- **The one buffer that stays absolute.** The far terrain's heights are
+  absolute world heights (a rebase never touches them), so `far.wgsl` takes
+  `Frame.anchor.y` off every vertex and `PlacedPatch::aabb` off every cull
+  box. Found in review (B1) and by the gate's flight eye at y = 3,000, where
+  the anchor's y is 4,096 and the far terrain drew a grid step too high;
+  pinned by `a_scene_moved_up_a_grid_step_renders_byte_identically`.
 - **Rebase rarely, and cheaply** (decision 2, amended after review finding
   F16). The anchor moves only when the eye is more than 2,304 blocks from
   it on some axis — `anchor::next_anchor`, a pure function with its own
@@ -188,10 +202,29 @@ The decisions, as built:
   are node-relative** (`TreeInstance` carries a position relative to its
   node plus the node's slot in `node_origins`; `trees.wgsl` adds the origin
   from the same storage buffer `mesh.wgsl` reads), so a rebase touches no
-  instance. Between rebases the cost per frame is zero.
+  instance. Between rebases the cost per frame is zero: the check is three
+  subtractions, and the clock is only read on the frame that rebases. What
+  node-relative instances cost instead: `TreeInstance` is 16 bytes rather
+  than 12, `trees.wgsl` reads one `vec4` from `node_origins` per tree
+  vertex, and the tree pipeline binds a third bind group — the arena's
+  origins, shared with `mesh.wgsl`.
   `anchor::rebase_if_needed` is the one place a rebase touches everything;
-  the window and `--bench` both call it. Measured with a forced rebase in
-  `--bench flight` (the PR has the number).
+  the window and `--bench` both call it. A tree instance indexes its node's
+  slot, so the slot and the trees are freed together — also when an edit's
+  re-insert frees the slot and then fails on a full arena
+  (`ArenaSink::try_insert`; review finding S1, pinned by
+  `a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot`). The
+  arena's CPU mirror of `node_origins` is the truth for the buffer: #380's
+  R6 lift of `node_origins[i].y` must live in `NodeSlot` and go through an
+  arena method that `insert` and `rebase` both apply, never a
+  `write_buffer` from outside. Measured by `Renderer::last_rebase` through
+  the ignored `rebase_cost_report` in `tests/offscreen.rs`
+  (`cargo test -p cubara-render --release --test offscreen -- --ignored
+  --nocapture rebase_cost_report`): 781 resident nodes (216 with trees) plus
+  the far terrain's full 4,096 patches rewritten in **0.09–0.10 ms** on a GTX
+  1060 (0.13 µs per node, so about 0.25 ms at the gate's ~1,940 nodes),
+  against the 1 ms the decision allows. The lead's quiet-machine `--bench
+  gate` A/B is the number of record in `BENCHMARKS.md`.
 - **Absolute height where a shader needs it** (decision 4). The frame
   uniform carries the anchor; `haze.wgsl` adds its `y` back to the relative
   eye for the extinction's absolute height. Fog distance is relative

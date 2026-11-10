@@ -81,11 +81,13 @@ pub struct Shot {
     pub camera: Option<(glam::DVec3, glam::Vec3)>,
     /// The render anchor to draw against (issue #379), or `None` for the
     /// one the renderer itself would pick for this eye
-    /// ([`crate::anchor::anchor_for`]) -- which is every real shot. `Some`
-    /// exists for the tests that pin the anchor: forcing it to the origin
-    /// for a scene a million blocks away is how a test shows the frame
-    /// falling apart *without* the anchor, which is what proves the test
-    /// can fail.
+    /// ([`crate::anchor::anchor_for`]) -- which is every real shot.
+    /// **Tests only:** `Some` exists so a test can pin the anchor, and its
+    /// one use is to make the renderer wrong on purpose -- forcing the
+    /// origin for a scene a million blocks away is how `golden.rs` shows
+    /// the frame falling apart *without* the anchor, which is what proves
+    /// the byte-identical test can fail. No measurement or screenshot sets
+    /// it.
     pub anchor: Option<Anchor>,
     /// Other players to draw as figures, or empty for none (block 2.12b).
     ///
@@ -321,7 +323,8 @@ pub struct NodeTrees {
     pub origin: [i32; 3],
     pub model: crate::trees::TreeModel,
     pub trees: Vec<[i32; 3]>,
-    pub aabb: crate::culling::Aabb,
+    /// The node's bounds relative to `origin` ([`MeshedNode::local_aabb`]).
+    pub local_aabb: crate::culling::Aabb,
 }
 
 impl NodeTrees {
@@ -331,7 +334,7 @@ impl NodeTrees {
             origin: node.origin,
             model: node.tree_model,
             trees: node.trees.clone(),
-            aabb: node.aabb,
+            local_aabb: node.local_aabb,
         }
     }
 
@@ -347,7 +350,7 @@ impl NodeTrees {
                 self.origin,
                 self.model,
                 self.trees,
-                self.aabb,
+                self.local_aabb,
             );
         }
     }
@@ -533,6 +536,7 @@ fn render_arena(
         SceneFrame {
             arena: &arena,
             draw_count,
+            anchor,
             selected_block: highlighted_block,
             cracking,
             players: &players,
@@ -540,6 +544,7 @@ fn render_arena(
             trees: Some(TreeDraw {
                 oak: trees.oak_instances(),
                 boxed: trees.box_instances(),
+                anchor: trees.anchor(),
             }),
             overlay: menu.as_deref(),
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {

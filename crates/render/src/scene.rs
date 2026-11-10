@@ -47,6 +47,14 @@ pub struct SceneFrame<'a> {
     /// From [`ChunkArena::prepare`], which the caller runs first so it can
     /// also report how many chunks survived the cull.
     pub draw_count: u32,
+    /// The render anchor this frame draws against (issue #379,
+    /// [`crate::anchor`]): what the outline, the cracks and the figures are
+    /// placed relative to, and what `arena`, `far` and `trees` must have
+    /// been rebased to -- the same value that went into
+    /// [`SceneRenderer::set_camera`]'s uniform. Passed, not remembered, so
+    /// a frame drawn from several views (#394) or after a rebase cannot
+    /// pick up a stale one.
+    pub anchor: Anchor,
     /// A block to draw the selection outline around (issue #52), or `None`.
     pub selected_block: Option<[i32; 3]>,
     /// A block being dug and how far along, `0.0..1.0`, to draw cracks on
@@ -125,6 +133,10 @@ pub struct GpuTimestamps<'a> {
 pub struct TreeDraw<'a> {
     pub oak: Option<(&'a wgpu::Buffer, u32)>,
     pub boxed: Option<(&'a wgpu::Buffer, u32)>,
+    /// The anchor the tree arena's culling boxes are relative to
+    /// ([`crate::TreeArena::anchor`]), checked against
+    /// [`SceneFrame::anchor`] in the pass.
+    pub anchor: Anchor,
 }
 
 /// Everything drawn over the world in screen space, as the window hands it to
@@ -263,11 +275,6 @@ pub struct SceneRenderer {
     )>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    /// The render anchor the last [`set_camera`](Self::set_camera) was for
-    /// (issue #379): what the outline, the cracks and the figures are placed
-    /// against in [`encode_scene`](Self::encode_scene), so they land in the
-    /// same space as the `view_proj` uploaded with it.
-    anchor: Anchor,
     /// `@group(2)` in `mesh.wgsl`: the block texture array + sampler.
     texture_bind_group: wgpu::BindGroup,
     /// The selected-block wireframe (issue #52): a dedicated line-list
@@ -407,7 +414,6 @@ impl SceneRenderer {
             lighting_rebuild: None,
             camera_buffer,
             camera_bind_group,
-            anchor: anchor::ORIGIN,
             texture_bind_group,
             figure_pipeline,
             far_pipeline,
@@ -580,9 +586,10 @@ impl SceneRenderer {
     /// Both are relative to `anchor`, the render anchor (issue #379,
     /// [`crate::anchor`]): `view_proj` built from `eye - anchor`
     /// ([`crate::CameraPose::view_proj`]) and `eye` that same difference
-    /// ([`crate::anchor::relative_eye`]). The anchor is kept for
-    /// [`encode_scene`](Self::encode_scene) to place the outline, cracks and
-    /// figures against.
+    /// ([`crate::anchor::relative_eye`]). The anchor goes into the uniform
+    /// for the height haze; nothing is cached here -- the frame hands the
+    /// anchor it draws against to [`encode_scene`](Self::encode_scene)
+    /// explicitly ([`SceneFrame::anchor`]).
     pub fn set_camera(
         &mut self,
         device: &wgpu::Device,
@@ -594,7 +601,6 @@ impl SceneRenderer {
     ) {
         let uniform = FrameUniform::new(view_proj, eye, anchor, lighting);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        self.anchor = anchor;
         self.set_lighting(device, lighting);
     }
 
@@ -618,6 +624,7 @@ impl SceneRenderer {
         let SceneFrame {
             arena,
             draw_count,
+            anchor,
             selected_block,
             cracking,
             players,
@@ -630,15 +637,31 @@ impl SceneRenderer {
             crosshair,
             gpu_timestamps,
         } = frame;
+        // Everything this pass draws is relative to one anchor (issue #379):
+        // the arena's origins, the far terrain's records, the tree boxes and
+        // what is built below. The arena is the one the vertices index, so
+        // it had better be the frame's.
+        debug_assert_eq!(
+            arena.anchor(),
+            anchor,
+            "the arena was rebased to a different anchor than the frame draws with"
+        );
+        if let Some(far) = far {
+            debug_assert_eq!(
+                far.anchor(),
+                anchor,
+                "the far terrain was rebased to a different anchor than the frame draws with"
+            );
+        }
 
         // Build this frame's figures and upload them. Done before the pass so
         // the write is ordered against the draw that reads it. Placed
-        // against the anchor `set_camera` gave (issue #379), like every
-        // other position this pass draws.
+        // against the frame's anchor (issue #379), like every other position
+        // this pass draws.
         let mut figure_vertices: Vec<crate::figure::FigureVertex> =
             Vec::with_capacity(players.len() * crate::figure::VERTICES_PER_FIGURE);
         for &view in players {
-            crate::figure::figure_vertices(view, self.anchor, &mut figure_vertices);
+            crate::figure::figure_vertices(view, anchor, &mut figure_vertices);
         }
         // Cracks share the figures' buffer and draw: both are coloured,
         // depth-tested triangles built on the CPU. The block is handed over
@@ -646,7 +669,7 @@ impl SceneRenderer {
         // crack builder stays a pure function of a block.
         if let Some((block, progress)) = cracking {
             crate::crack::crack_vertices(
-                anchor::block_offset(block, self.anchor),
+                anchor::block_offset(block, anchor),
                 progress,
                 &mut figure_vertices,
             );
@@ -677,7 +700,7 @@ impl SceneRenderer {
             queue.write_buffer(
                 &self.outline_uniform_buffer,
                 0,
-                bytemuck::bytes_of(&OutlineUniform::new(block, self.anchor)),
+                bytemuck::bytes_of(&OutlineUniform::new(block, anchor)),
             );
         }
         {
@@ -748,10 +771,17 @@ impl SceneRenderer {
             // alone cost CPU/frame even with zero instances, which is
             // exactly the fixed cost this skips.
             if let Some(trees) = trees.filter(|t| t.oak.is_some() || t.boxed.is_some()) {
+                // An instance is relative to its node and indexes the
+                // arena's origins (issue #379 decision 2), so the tree
+                // arena's culling boxes must be against the same anchor as
+                // the origins it draws through.
+                debug_assert_eq!(
+                    trees.anchor, anchor,
+                    "the tree arena was rebased to a different anchor than the frame draws with"
+                );
                 pass.set_pipeline(&self.tree_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                // The arena's origins: an instance is relative to its node
-                // (issue #379 decision 2), and this is where the node is.
+                // The arena's origins: this is where an instance's node is.
                 pass.set_bind_group(1, arena.origins_bind_group(), &[]);
                 pass.set_bind_group(2, &self.texture_bind_group, &[]);
                 if let (Some(oak), Some((instances, count))) = (&self.tree_models.oak, trees.oak) {

@@ -234,13 +234,11 @@ impl PlacedPatch {
         }
     }
 
-    /// The `(x, z)` origin relative to `anchor`: an exact integer
-    /// subtraction, then a small `f32`.
+    /// The `(x, z)` origin relative to `anchor`: the one exact integer
+    /// subtraction ([`anchor::offset_i64`]), then a small `f32`.
     fn origin_relative(&self, anchor: Anchor) -> [f32; 2] {
-        [
-            (self.origin[0] - anchor[0] as i64) as f32,
-            (self.origin[1] - anchor[2] as i64) as f32,
-        ]
+        let o = anchor::offset_i64([self.origin[0], 0, self.origin[1]], anchor);
+        [o.x, o.z]
     }
 
     fn gpu(&self, anchor: Anchor) -> PatchGpu {
@@ -252,13 +250,16 @@ impl PlacedPatch {
     }
 
     /// The patch's box relative to `anchor`: its square of ground, from the
-    /// bottom of its skirt to its highest vertex.
+    /// bottom of its skirt to its highest vertex. The heights are absolute
+    /// (the `heights` buffer is untouched by a rebase), so the anchor's `y`
+    /// comes off here, as `far.wgsl` takes it off every vertex.
     fn aabb(&self, anchor: Anchor) -> Aabb {
         let [ox, oz] = self.origin_relative(anchor);
         let size = self.quad * FAR_QUADS as f32;
+        let dy = anchor[1] as f32;
         Aabb {
-            min: Vec3::new(ox, self.lo - self.skirt, oz),
-            max: Vec3::new(ox + size, self.hi, oz + size),
+            min: Vec3::new(ox, self.lo - self.skirt - dy, oz),
+            max: Vec3::new(ox + size, self.hi - dy, oz + size),
         }
     }
 }
@@ -368,8 +369,9 @@ impl FarTerrain {
     }
 
     /// Re-express every patch, the hole and their boxes against `anchor`
-    /// (issue #379 decision 2). The heights are untouched; what is
-    /// rewritten is one 16-byte record per slot -- all of them, in **one**
+    /// (issue #379 decision 2). The heights are untouched -- they stay
+    /// absolute, and `far.wgsl` subtracts `Frame.anchor.y` from each; what
+    /// is rewritten is one 16-byte record per slot -- all of them, in **one**
     /// `write_buffer` of `capacity * 16` bytes (64 KiB at the window's
     /// `FAR_PATCH_CAPACITY`), which costs less than a frame's own indirect
     /// upload. Not spread over frames: a patch drawn against the old anchor
@@ -661,6 +663,22 @@ mod tests {
         );
         assert_eq!(h.min, Vec3::new(-64.0, 0.0, -64.0));
         assert_eq!(h.max, Vec3::new(80.0, 48.0, 80.0));
+
+        // Up a grid step too (review finding B1): the heights are absolute,
+        // so a patch 4,096 blocks higher against an anchor 4,096 higher is
+        // the same box -- the anchor's y comes off the heights, as it does
+        // off the hole and, in `far.wgsl`, off every vertex.
+        let up: Vec<f32> = heights.iter().map(|h| h + 4096.0).collect();
+        let high = PlacedPatch::of(&FarPatch {
+            origin: [64 + shift, -128 - shift],
+            quad: 4.0,
+            heights: &up,
+            skirt: 8.0,
+        });
+        let anchor_up = [shift as i32, 4096, -shift as i32];
+        assert_eq!(high.gpu(anchor_up).origin, here.gpu(anchor::ORIGIN).origin);
+        let c = high.aabb(anchor_up);
+        assert_eq!((c.min, c.max), (b.min, b.max));
     }
 
     /// Patches wholly inside the voxels' hole are not drawn; the rest are,

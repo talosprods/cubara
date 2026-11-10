@@ -53,20 +53,28 @@ pub const REBASE_DISTANCE: f64 = ANCHOR_GRID as f64 / 2.0 + REBASE_HYSTERESIS;
 /// An integer block position on the [`ANCHOR_GRID`].
 pub type Anchor = [i32; 3];
 
+/// The largest anchor coordinate: the last grid line inside `i32`, so a
+/// saturated anchor is still a grid multiple (and so still exact in `f32`,
+/// [`anchor_f32`]).
+pub const MAX_ANCHOR: i32 = (i32::MAX / ANCHOR_GRID) * ANCHOR_GRID;
+
 /// The origin of the world as an anchor: what every renderer starts with
 /// near spawn, and the value under which every subtraction here is the
 /// identity.
 pub const ORIGIN: Anchor = [0; 3];
 
 /// The grid point nearest `eye` -- the anchor a renderer adopts when it
-/// rebases (or starts). Saturates into `i32` rather than wrapping.
+/// rebases (or starts). Saturates to [`MAX_ANCHOR`] (a grid line, never
+/// `i32::MAX` itself) rather than wrapping; a NaN becomes the origin.
 pub fn anchor_for(eye: DVec3) -> Anchor {
     let grid = ANCHOR_GRID as f64;
+    let lines = (MAX_ANCHOR / ANCHOR_GRID) as f64;
     let snap = |v: f64| {
         // Round to the nearest grid line in f64 (exact: grid lines are
-        // integers well inside f64's range), then saturate into i32 -- `as`
-        // saturates for float-to-int, and a NaN becomes 0.
-        ((v / grid).round() * grid) as i32
+        // integers well inside f64's range), clamp to the last line that
+        // fits, then convert -- `as` saturates for float-to-int and maps a
+        // NaN to 0, but by then the value is an in-range integer anyway.
+        ((v / grid).round().clamp(-lines, lines) * grid) as i32
     };
     [snap(eye.x), snap(eye.y), snap(eye.z)]
 }
@@ -87,17 +95,21 @@ pub fn next_anchor(anchor: Anchor, eye: DVec3) -> Option<Anchor> {
 }
 
 /// `eye - anchor`, as the `f32` the GPU gets. Small by construction (see
-/// [`needs_rebase`]), so the conversion loses at most 1/4,096 of a block.
+/// [`needs_rebase`]: under 2,304 on every axis), so the conversion rounds by
+/// at most half an `f32` step at that magnitude, 1/8,192 of a block.
 pub fn relative_eye(anchor: Anchor, eye: DVec3) -> Vec3 {
     (eye - DVec3::new(anchor[0] as f64, anchor[1] as f64, anchor[2] as f64)).as_vec3()
 }
 
-/// `block - anchor` for an integer block position, exact: the one
-/// subtraction every integer origin (a node's, a far tile's, the outline's,
-/// a crack's) goes through. In `i64` so two `i32`s at opposite ends of the
-/// world cannot overflow on the way to a difference that is small.
-pub fn offset(block: [i32; 3], anchor: Anchor) -> Vec3 {
-    let d = |a: i32, b: i32| (a as i64 - b as i64) as f32;
+/// `block - anchor` for an integer block position, exact: **the one
+/// subtraction** every integer origin goes through -- a node's
+/// (`crate::arena`), a far tile's (`crate::far`, whose origins are `i64`,
+/// hence the parameter type), the outline's, a crack's. In `i64` so two
+/// coordinates at opposite ends of the world cannot overflow on the way to
+/// a difference that is small; the result is an `f32` the GPU holds exactly
+/// whenever the difference is below 2^24 blocks.
+pub fn offset_i64(block: [i64; 3], anchor: Anchor) -> Vec3 {
+    let d = |a: i64, b: i32| (a - b as i64) as f32;
     Vec3::new(
         d(block[0], anchor[0]),
         d(block[1], anchor[1]),
@@ -105,8 +117,16 @@ pub fn offset(block: [i32; 3], anchor: Anchor) -> Vec3 {
     )
 }
 
+/// [`offset_i64`] for an `i32` block, which is what every block coordinate
+/// in the world is (`ChunkCoord`, `NodeKey::world_origin`, an edit).
+pub fn offset(block: [i32; 3], anchor: Anchor) -> Vec3 {
+    offset_i64(block.map(i64::from), anchor)
+}
+
 /// [`offset`] kept as integers, for a block the CPU still has to build
-/// geometry around (the cracks) before it becomes floats.
+/// geometry around (the cracks) before it becomes floats. The difference
+/// is small (the block is one the player can reach), so the narrowing back
+/// to `i32` is exact.
 pub fn block_offset(block: [i32; 3], anchor: Anchor) -> [i32; 3] {
     let d = |a: i32, b: i32| (a as i64 - b as i64) as i32;
     [
@@ -128,11 +148,11 @@ pub fn anchor_f32(anchor: Anchor) -> [f32; 4] {
 ///
 /// This is how both arenas (`ChunkArena`, `TreeArena`) store a box, so the
 /// CPU frustum test runs in the same anchor-relative space as `view_proj`
-/// (decision 5) through one piece of arithmetic. `local` is derived from the
-/// absolute `f32` AABB the mesher produced by subtracting the origin, which
-/// is exact for coordinates below 2^24 blocks (both are integers there) and
-/// off by at most the `f32` step of the coordinate beyond it -- a block, at
-/// 16 million blocks out, on a box that is already conservative.
+/// (decision 5) through one piece of arithmetic. The local box is what the
+/// mesher produces (`cubara_voxel::build_mesh_bounded`,
+/// `cubara_world::mesh::NodeGeometry::local_aabb`): no absolute `f32`
+/// position is ever formed and subtracted again, so the box is as exact
+/// 2^30 blocks out as at the origin.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeBox {
     origin: [i32; 3],
@@ -140,13 +160,10 @@ pub struct NodeBox {
 }
 
 impl NodeBox {
-    /// From a node's integer origin and its absolute (world-space) bounds.
-    pub fn new(origin: [i32; 3], aabb: Aabb) -> Self {
-        let o = Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32);
-        Self {
-            origin,
-            local: Aabb::new(aabb.min - o, aabb.max - o),
-        }
+    /// From a node's integer origin and its bounds **relative to that
+    /// origin**.
+    pub fn new(origin: [i32; 3], local: Aabb) -> Self {
+        Self { origin, local }
     }
 
     /// The node's integer origin, in world blocks.
@@ -154,11 +171,15 @@ impl NodeBox {
         self.origin
     }
 
+    /// The bounds relative to the node's own origin, as given.
+    pub fn local(&self) -> Aabb {
+        self.local
+    }
+
     /// The bounds relative to `anchor`: the integer `origin - anchor`
     /// (exact) added to the local box.
     pub fn relative_to(&self, anchor: Anchor) -> Aabb {
-        let o = offset(self.origin, anchor);
-        Aabb::new(self.local.min + o, self.local.max + o)
+        self.local.translated(offset(self.origin, anchor))
     }
 
     /// The bounds in world space, for framing a camera around everything
@@ -213,9 +234,14 @@ mod tests {
         // The issue's test offset: 256 grid steps.
         let far = DVec3::new(1_048_576.0 + 8.0, 120.0, 1_048_576.0 + 8.0);
         assert_eq!(anchor_for(far), [1_048_576, 0, 1_048_576]);
-        // The world's edge: saturates, never wraps.
+        // The world's edge: saturates to the last grid line, never wraps,
+        // and stays a grid multiple (`i32::MAX` is not one).
         let edge = anchor_for(DVec3::splat(1e12));
-        assert!(edge.iter().all(|&a| a > 0), "{edge:?} wrapped negative");
+        assert_eq!(edge, [MAX_ANCHOR; 3]);
+        assert_eq!(edge[0] % ANCHOR_GRID, 0, "{edge:?} is not on the grid");
+        assert!(edge[0] > i32::MAX - ANCHOR_GRID, "{edge:?} stopped short");
+        assert_eq!(anchor_for(DVec3::splat(-1e12)), [-MAX_ANCHOR; 3]);
+        assert_eq!(anchor_for(DVec3::splat(f64::NAN)), ORIGIN);
     }
 
     #[test]
@@ -292,35 +318,41 @@ mod tests {
         // difference is computed in i64 and only then narrowed.
         let far = offset([i32::MAX, 0, 0], [i32::MIN + 1, 0, 0]);
         assert!(far.x > 4.0e9, "{far}");
+        // The far terrain's `i64` origins go through the same subtraction.
+        assert_eq!(
+            offset_i64([1_048_576 + 64, 0, -1_048_576 - 128], anchor),
+            Vec3::new(64.0, 0.0, -128.0)
+        );
     }
 
     #[test]
     fn a_node_box_re_expressed_against_the_shifted_anchor_is_the_same_box() {
+        // The mesher's box is local to the node, so the same box serves the
+        // node at the origin and the node 2^20 -- or 2^30 -- blocks out.
+        let local = Aabb::new(Vec3::new(0.0, 1.0, 0.0), Vec3::new(16.0, 9.0, 16.0));
+        let at_origin = NodeBox::new([16, 32, -64], local);
         let shift = 1_048_576;
-        let at_origin = NodeBox::new(
-            [16, 32, -64],
-            Aabb::new(Vec3::new(16.0, 33.0, -64.0), Vec3::new(32.0, 41.0, -48.0)),
-        );
-        let shifted = NodeBox::new(
-            [16 + shift, 32, -64 + shift],
-            Aabb::new(
-                Vec3::new((16 + shift) as f32, 33.0, (-64 + shift) as f32),
-                Vec3::new((32 + shift) as f32, 41.0, (-48 + shift) as f32),
-            ),
-        );
+        let shifted = NodeBox::new([16 + shift, 32, -64 + shift], local);
         let a = at_origin.relative_to(ORIGIN);
         let b = shifted.relative_to([shift, 0, shift]);
         assert_eq!((a.min, a.max), (b.min, b.max));
+        assert_eq!(a.min, Vec3::new(16.0, 33.0, -64.0));
         let abs = shifted.absolute();
         assert_eq!(
             abs.min,
             Vec3::new((16 + shift) as f32, 33.0, (-64 + shift) as f32)
         );
+        // Beyond 2^24, where an absolute f32 box would have been rounded
+        // to even blocks before it could be subtracted from.
+        let far = 1 << 30;
+        let c = NodeBox::new([16 + far, 32, -64 + far], local).relative_to([far, 0, far]);
+        assert_eq!((c.min, c.max), (a.min, a.max));
     }
 
     #[test]
     fn the_anchor_vec4_is_exact() {
-        let a = anchor_f32([1_048_576, -ANCHOR_GRID, 2_147_479_552]);
+        let a = anchor_f32([1_048_576, -ANCHOR_GRID, MAX_ANCHOR]);
         assert_eq!(a, [1_048_576.0, -4096.0, 2_147_479_552.0, 0.0]);
+        assert_eq!(a[2] as i64, MAX_ANCHOR as i64);
     }
 }

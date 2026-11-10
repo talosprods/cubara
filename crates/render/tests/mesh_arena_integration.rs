@@ -126,7 +126,7 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
                     geometry.origin,
                     geometry.scale,
                     &geometry.mesh,
-                    geometry.aabb,
+                    geometry.local_aabb,
                 );
             }
         }
@@ -195,7 +195,7 @@ fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
                 geometry.origin,
                 geometry.scale,
                 &geometry.mesh,
-                geometry.aabb,
+                geometry.local_aabb,
             );
         }
     }

@@ -584,6 +584,22 @@ enum Target {
     },
 }
 
+/// What one render-anchor rebase (issue #379 decision 2) cost the frame it
+/// happened on: the anchor moved to, how much was resident to rewrite, and
+/// the wall time of [`crate::anchor::rebase_if_needed`] -- the CPU work plus
+/// the `write_buffer` calls it issues, not the GPU copy they become. The
+/// decision bounds this at 1 ms; [`Renderer::last_rebase`] is how a
+/// measurement reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct RebaseReport {
+    pub anchor: Anchor,
+    /// Resident nodes, each one `vec4` rewritten.
+    pub nodes: usize,
+    /// Resident far patches; the whole capacity's records are rewritten.
+    pub far_patches: usize,
+    pub took: std::time::Duration,
+}
+
 /// All GPU + window state. Created once the event loop has `resumed`.
 ///
 /// Owns no `World`, no streaming policy, no mesh-generation pool -- what to
@@ -604,8 +620,10 @@ pub struct Renderer {
     /// `arena`, `far` and `trees` hold, and the frame uniform, is relative
     /// to it. Moved by [`update`](Self::update) when the eye strays far
     /// enough; the same value is held by each of the three, which this is
-    /// the one source of.
+    /// the one source of (and `SceneRenderer::encode_scene` checks).
     anchor: Anchor,
+    /// What the last rebase cost, for [`last_rebase`](Self::last_rebase).
+    last_rebase: Option<RebaseReport>,
 
     /// The GPU this window renders on, by name -- what a benchmarked setting is
     /// recorded against, so a different GPU is noticed.
@@ -832,6 +850,7 @@ impl Renderer {
             scene,
             frustum,
             anchor,
+            last_rebase: None,
             adapter_name,
             arena,
             far,
@@ -878,6 +897,15 @@ impl Renderer {
     /// ([`crate::anchor`]).
     pub fn anchor(&self) -> Anchor {
         self.anchor
+    }
+
+    /// What the most recent anchor rebase cost, or `None` if this renderer
+    /// has never rebased. How issue #379 decision 2's bound ("the rebase
+    /// frame's own work is <= 1 ms") is measured: `tests/offscreen.rs`'s
+    /// ignored `rebase_cost_report` fills the arena and the far terrain,
+    /// teleports across a grid line and prints this.
+    pub fn last_rebase(&self) -> Option<RebaseReport> {
+        self.last_rebase
     }
 
     /// Upload a far-terrain patch; `None` when every slot is taken.
@@ -1016,63 +1044,6 @@ impl Renderer {
     /// below.
     fn drain_uploads(&mut self, last_frame: std::time::Duration) {
         puffin::profile_function!();
-
-        /// [`Uploads::drain`]'s [`Sink`] over this crate's real GPU arena --
-        /// one value borrowing `arena`/`trees`/`queue` together, rather than
-        /// two closures each wanting their own exclusive borrow of the same
-        /// fields at once.
-        struct ArenaSink<'a> {
-            arena: &'a mut ChunkArena,
-            trees: &'a mut crate::trees::TreeArena,
-            queue: &'a wgpu::Queue,
-        }
-
-        impl Sink<MeshedNode> for ArenaSink<'_> {
-            fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
-                // Free any prior slot first -- and the trees that pointed
-                // at it, together, as `remove` below does. A tree instance
-                // carries its node's slot in `node_origins`
-                // (`TreeInstance::node_index`); if the insert below fails
-                // and another node takes the freed slot before this one is
-                // retried, instances left behind here would be drawn at
-                // that node's origin (#379 review finding S1).
-                self.remove(id);
-                // Cloned, not moved: `node` (the whole `MeshedNode`) is
-                // still needed whole if this insert fails and has to be
-                // requeued. Cheap either way -- a node's own tree list
-                // is at most a handful of positions.
-                let (trees, tree_model) = (node.trees.clone(), node.tree_model);
-                let placed = self.arena.insert(
-                    self.queue,
-                    id,
-                    node.origin,
-                    node.scale,
-                    &node.mesh,
-                    node.aabb,
-                );
-                if placed {
-                    // Just placed, so the slot exists; the instances are
-                    // stored relative to the node's origin and carry this
-                    // slot (`TreeInstance`).
-                    let node_index = self.arena.node_index(id).expect("just placed");
-                    self.trees
-                        .insert(id, node_index, node.origin, tree_model, trees, node.aabb);
-                    Ok(())
-                } else {
-                    // Arena full: this node is not done. `Uploads::drain`
-                    // requeues it and keeps draining whatever else can land
-                    // this frame (the arena warns once per episode of being
-                    // full).
-                    Err(node)
-                }
-            }
-
-            fn remove(&mut self, id: NodeId) {
-                self.arena.remove(id);
-                self.trees.remove(id);
-            }
-        }
-
         let started = Instant::now();
         let budget = crate::uploads::upload_budget(last_frame);
         let mut sink = ArenaSink {
@@ -1187,6 +1158,7 @@ impl Renderer {
                 SceneFrame {
                     arena: &self.arena,
                     draw_count,
+                    anchor: self.anchor,
                     selected_block,
                     cracking,
                     players,
@@ -1194,6 +1166,7 @@ impl Renderer {
                     trees: Some(crate::scene::TreeDraw {
                         oak: self.trees.oak_instances(),
                         boxed: self.trees.box_instances(),
+                        anchor: self.trees.anchor(),
                     }),
                     overlay: overlay.as_deref(),
                     hotbar,
@@ -1294,24 +1267,34 @@ impl Renderer {
         // The render anchor follows the eye (issue #379 decision 2): rarely
         // -- once per 4,096 blocks of travel, or on a jump -- and before
         // this frame's uploads, so a node arriving now is placed against
-        // the anchor the frame draws with. Timed and logged because
-        // decision 2 bounds this frame's own work at 1 ms; `--bench flight`
-        // across a grid line is how that is measured.
-        let rebasing = Instant::now();
-        if let Some(moved) = anchor::rebase_if_needed(
-            &mut self.anchor,
-            camera.eye,
-            &self.queue,
-            &mut self.arena,
-            &mut self.trees,
-            Some(&mut self.far),
-        ) {
+        // the anchor the frame draws with. Timed and kept because decision
+        // 2 bounds this frame's own work at 1 ms ([`Self::last_rebase`]);
+        // the per-frame cost of the check itself is three subtractions, and
+        // the clock is only read on the frame that rebases.
+        if anchor::needs_rebase(self.anchor, camera.eye) {
+            let rebasing = Instant::now();
+            let moved = anchor::rebase_if_needed(
+                &mut self.anchor,
+                camera.eye,
+                &self.queue,
+                &mut self.arena,
+                &mut self.trees,
+                Some(&mut self.far),
+            )
+            .expect("needs_rebase and rebase_if_needed agree on when to move");
+            let report = RebaseReport {
+                anchor: moved,
+                nodes: self.arena.len(),
+                far_patches: self.far.len(),
+                took: rebasing.elapsed(),
+            };
             log::info!(
                 "render anchor moved to {moved:?} ({} nodes, {} far patches) in {:.3} ms",
-                self.arena.len(),
-                self.far.len(),
-                rebasing.elapsed().as_secs_f64() * 1000.0
+                report.nodes,
+                report.far_patches,
+                report.took.as_secs_f64() * 1000.0
             );
+            self.last_rebase = Some(report);
         }
         self.drain_uploads(std::time::Duration::from_secs_f32(dt));
 
@@ -1969,9 +1952,154 @@ pub fn build_outline_pipeline(
     })
 }
 
+/// [`Uploads::drain`]'s [`Sink`] over this crate's real GPU arena --
+/// one value borrowing `arena`/`trees`/`queue` together, rather than
+/// two closures each wanting their own exclusive borrow of the same
+/// fields at once.
+struct ArenaSink<'a> {
+    arena: &'a mut ChunkArena,
+    trees: &'a mut crate::trees::TreeArena,
+    queue: &'a wgpu::Queue,
+}
+
+impl Sink<MeshedNode> for ArenaSink<'_> {
+    fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
+        // Free any prior slot first -- and the trees that pointed
+        // at it, together, as `remove` below does. A tree instance
+        // carries its node's slot in `node_origins`
+        // (`TreeInstance::node_index`); if the insert below fails
+        // and another node takes the freed slot before this one is
+        // retried, instances left behind here would be drawn at
+        // that node's origin (#379 review finding S1).
+        self.remove(id);
+        // Cloned, not moved: `node` (the whole `MeshedNode`) is
+        // still needed whole if this insert fails and has to be
+        // requeued. Cheap either way -- a node's own tree list
+        // is at most a handful of positions.
+        let (trees, tree_model) = (node.trees.clone(), node.tree_model);
+        let placed = self.arena.insert(
+            self.queue,
+            id,
+            node.origin,
+            node.scale,
+            &node.mesh,
+            node.local_aabb,
+        );
+        if placed {
+            // Just placed, so the slot exists; the instances are
+            // stored relative to the node's origin and carry this
+            // slot (`TreeInstance`).
+            let node_index = self.arena.node_index(id).expect("just placed");
+            self.trees.insert(
+                id,
+                node_index,
+                node.origin,
+                tree_model,
+                trees,
+                node.local_aabb,
+            );
+            Ok(())
+        } else {
+            // Arena full: this node is not done. `Uploads::drain`
+            // requeues it and keeps draining whatever else can land
+            // this frame (the arena warns once per episode of being
+            // full).
+            Err(node)
+        }
+    }
+
+    fn remove(&mut self, id: NodeId) {
+        self.arena.remove(id);
+        self.trees.remove(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding S1 (#379): a tree instance carries its node's slot in
+    /// `node_origins`, so when a re-insert frees the slot and then fails
+    /// (the arena is full on the frame an edit's re-mesh arrives), the trees
+    /// must go with the slot -- or the next node to take it draws them at
+    /// its own origin until the retry lands. GPU-backed because `ArenaSink`
+    /// is the real sink over the real arena; without an adapter it skips.
+    #[test]
+    fn a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot() {
+        let pose = CameraPose {
+            eye: glam::DVec3::new(8.0, 80.0, 8.0),
+            look_dir: glam::Vec3::NEG_Z,
+        };
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose) else {
+            crate::headless::skip_or_require_gpu(
+                "a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot",
+            );
+            return;
+        };
+        let id = NodeId {
+            level: 1,
+            pos: [0, 0, 0],
+        };
+        let quad = |vertices: usize| {
+            let v =
+                cubara_voxel::Vertex::new(0, 0, 0, 0, cubara_voxel::Face::DRAW_ORDER[0], 0, 0, 0);
+            cubara_voxel::Mesh {
+                vertices: vec![v; vertices],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ..Default::default()
+            }
+        };
+        let node = |id: NodeId, mesh: cubara_voxel::Mesh, trees: Vec<[i32; 3]>| MeshedNode {
+            id,
+            origin: [0, 0, 0],
+            scale: 1.0,
+            mesh,
+            local_aabb: crate::culling::Aabb::new(glam::Vec3::ZERO, glam::Vec3::splat(32.0)),
+            trees,
+            tree_model: crate::trees::TreeModel::Oak,
+        };
+        let mut sink = ArenaSink {
+            arena: &mut r.arena,
+            trees: &mut r.trees,
+            queue: &r.queue,
+        };
+        assert!(sink
+            .try_insert(id, node(id, quad(4), vec![[5, 7, 9]]))
+            .is_ok());
+        assert_eq!(sink.trees.node_count(), 1);
+        let slot = sink.arena.node_index(id).expect("just placed");
+
+        // The same node again, re-meshed too big for the arena -- the
+        // insert fails, after the old slot was freed for it.
+        let too_big = quad(crate::arena::VERTEX_CAPACITY as usize + 1);
+        assert!(sink
+            .try_insert(id, node(id, too_big, vec![[5, 7, 9]]))
+            .is_err());
+        assert!(
+            !sink.arena.contains(id),
+            "the failed insert left the old slot"
+        );
+        assert_eq!(
+            sink.trees.node_count(),
+            0,
+            "the node's trees survived its slot {slot} being freed, and still index it"
+        );
+
+        // Whoever takes that slot next must not inherit them either.
+        let other = NodeId {
+            level: 1,
+            pos: [1, 0, 0],
+        };
+        assert!(sink
+            .try_insert(other, node(other, quad(4), Vec::new()))
+            .is_ok());
+        assert_eq!(
+            sink.arena.node_index(other),
+            Some(slot),
+            "the freed slot is reused"
+        );
+        assert_eq!(sink.trees.node_count(), 0);
+    }
 
     #[test]
     fn vertex_layout_matches_vertex() {

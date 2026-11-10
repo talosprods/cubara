@@ -20,7 +20,9 @@ struct Frame {
     fog: vec4<f32>,
     haze: vec4<f32>,
     // The render anchor (issue #379): every position in this shader, `eye`
-    // included, is relative to it; only the height haze wants it back.
+    // included, is relative to it. The heights buffer is the exception --
+    // absolute, so `vs_main` subtracts `anchor.y` -- and the height haze
+    // wants it back.
     anchor: vec4<f32>,
 };
 
@@ -85,7 +87,11 @@ fn vs_main(
     let i = clamp(i32(gx) - 1, 0, QUADS);
     let j = clamp(i32(gz) - 1, 0, QUADS);
     let skirt = gx == 0u || gx == GRID - 1u || gz == 0u || gz == GRID - 1u;
-    var y = height(base, i, j);
+    // The heights are absolute world heights (a rebase leaves the heights
+    // buffer alone); every other position here is relative to the render
+    // anchor, so the anchor's y comes off here -- the eye, the hole and the
+    // voxels are all measured from it (issue #379, review finding B1).
+    var y = height(base, i, j) - frame.anchor.y;
     if skirt {
         y = y - tile.skirt;
     }
