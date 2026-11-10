@@ -475,14 +475,14 @@ impl ChunkArena {
             let o = anchor::offset(slot.place.origin(), anchor);
             self.origins[slot.node_index as usize] = [o.x, o.y, o.z, slot.scale];
         }
+        // Every slot ever handed out, in one write; an empty arena writes
+        // zero bytes, which wgpu ignores.
         let used = self.nodes.next as usize;
-        if used > 0 {
-            queue.write_buffer(
-                &self.origins_buffer,
-                0,
-                bytemuck::cast_slice(&self.origins[..used]),
-            );
-        }
+        queue.write_buffer(
+            &self.origins_buffer,
+            0,
+            bytemuck::cast_slice(&self.origins[..used]),
+        );
     }
 
     /// Mesh `chunk` (placed at `origin`, one lattice cell = `scale` world

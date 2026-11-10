@@ -2286,9 +2286,10 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     assert!(nodes.len() > 50, "only {} nodes", nodes.len());
 
     // Three trees on the surface, each given to the node whose chunk holds
-    // its base block.
+    // its base block -- all three down the look direction, in the frame
+    // (`instances_are_in_the_frame` below checks that they really draw).
     let mut planted = 0;
-    for (x, z) in [(20, 20), (-24, 8), (4, -30)] {
+    for (x, z) in [(-22, -18), (-16, -34), (-40, -46)] {
         let base = world.surface_height(x, z) + 1;
         let chunk = ChunkCoord::from_block(x, base, z);
         if let Some(node) = nodes
@@ -2302,13 +2303,17 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     }
     assert_eq!(planted, 3, "a tree's chunk is not in the region");
 
+    // Looking toward -x/-z, away from the direction the scene is shifted
+    // in: a culling box left absolute by a rebase that did not happen then
+    // sits *behind* the camera (inside the 10,000 km far plane it would
+    // still be in front), so a missed rebase culls what it owns and shows.
     let h0 = world.surface_height(8, 8);
     let eye = glam::DVec3::new(8.5, h0 as f64 + 24.0, 8.5);
-    let look = glam::vec3(0.55, -0.5, 0.7);
+    let look = glam::vec3(-0.55, -0.5, -0.7);
 
-    // One far tile beyond the region's +x/+z corner, a gentle slope a little
+    // One far tile beyond the region's -x/-z corner, a gentle slope a little
     // under the surface here, 128 blocks a side.
-    let far_origin = [64i64, 64i64];
+    let far_origin = [-192i64, -192i64];
     let far_quad = 4.0f32;
     let far_heights: Vec<f32> = (0..cubara_render::FAR_VERTS * cubara_render::FAR_VERTS)
         .map(|k| {
@@ -2324,9 +2329,9 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
 
     // Thirty-odd blocks down the look direction, where each is a dozen
     // pixels: enough that leaving any of them out shows.
-    let outline_block = [30, world.surface_height(30, 36), 36];
-    let crack_block = [24, world.surface_height(24, 30), 30];
-    let player_eye = [36.0, world.surface_height(36, 40) as f64 + 2.62, 40.0];
+    let outline_block = [-30, world.surface_height(-30, -36), -36];
+    let crack_block = [-24, world.surface_height(-24, -30), -30];
+    let player_eye = [-36.0, world.surface_height(-36, -40) as f64 + 2.62, -40.0];
 
     // Apply the shift to everything that is a position.
     let s32 = shift.map(|v| v as i32);
@@ -2386,8 +2391,13 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     }
 }
 
-/// Render an [`AnchoredScene`], or `None` without a GPU.
-fn render_anchored(scene: AnchoredScene, anchor: Option<cubara_render::Anchor>) -> Option<Frame> {
+/// Render an [`AnchoredScene`], or `None` without a GPU. With
+/// `without_trees`, its nodes carry no instances.
+fn render_anchored(
+    scene: AnchoredScene,
+    anchor: Option<cubara_render::Anchor>,
+    without_trees: bool,
+) -> Option<Frame> {
     use cubara_render::far::{FarParams, FarPatch};
     let patch = FarPatch {
         origin: scene.far_origin,
@@ -2403,8 +2413,14 @@ fn render_anchored(scene: AnchoredScene, anchor: Option<cubara_render::Anchor>) 
         anchor,
         ..scene.shot
     };
+    let mut nodes = scene.nodes;
+    if without_trees {
+        for node in &mut nodes {
+            node.trees.clear();
+        }
+    }
     let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
-    headless::render_with_far(scene.nodes, &[patch], Some(params), shot)
+    headless::render_with_far(nodes, &[patch], Some(params), shot)
 }
 
 /// How much of `frame` is not the sky: the share of pixels that differ from
@@ -2444,7 +2460,7 @@ fn drawn_fraction(frame: &Frame, shot: &Shot) -> f64 {
 fn a_scene_moved_by_a_grid_multiple_renders_byte_identically() {
     let here = anchored_scene([0; 3]);
     let shot = here.shot.clone();
-    let Some(a) = render_anchored(here, None) else {
+    let Some(a) = render_anchored(here, None, false) else {
         headless::skip_or_require_gpu("a_scene_moved_by_a_grid_multiple_renders_byte_identically");
         return;
     };
@@ -2454,7 +2470,18 @@ fn a_scene_moved_by_a_grid_multiple_renders_byte_identically() {
         "the scene covers only {:.1}% of the frame",
         drawn * 100.0
     );
-    let b = render_anchored(anchored_scene([FAR_SHIFT, 0, FAR_SHIFT]), None)
+    // The instances are in the frame, so a tree arena that was not rebased
+    // with its nodes (its boxes left absolute, its instances culled) shows
+    // -- `check-tests-can-fail.sh` found `TreeArena::rebase`'s no-op guard
+    // survive while the instances stood behind the camera.
+    let bare = render_anchored(anchored_scene([0; 3]), None, true)
+        .expect("adapter was available a moment ago");
+    let instances_are_in_the_frame = differing_pixels(&a, &bare).len();
+    assert!(
+        instances_are_in_the_frame > 500,
+        "the tree instances change only {instances_are_in_the_frame} pixels -- not in view"
+    );
+    let b = render_anchored(anchored_scene([FAR_SHIFT, 0, FAR_SHIFT]), None, false)
         .expect("adapter was available a moment ago");
 
     let differing = differing_pixels(&a, &b);
@@ -2480,7 +2507,7 @@ fn a_scene_moved_by_a_grid_multiple_renders_byte_identically() {
 /// well outside it at the same offset.
 #[test]
 fn a_scene_moved_off_the_grid_renders_within_the_golden_tolerance() {
-    let Some(a) = render_anchored(anchored_scene([0; 3]), None) else {
+    let Some(a) = render_anchored(anchored_scene([0; 3]), None, false) else {
         headless::skip_or_require_gpu(
             "a_scene_moved_off_the_grid_renders_within_the_golden_tolerance",
         );
@@ -2488,8 +2515,12 @@ fn a_scene_moved_off_the_grid_renders_within_the_golden_tolerance() {
     };
     // 1,152 and -896 are multiples of 16 (the nodes stay on their grid) and
     // not of 4,096 (the anchor stays at 2^20, so the eye is off-centre).
-    let c = render_anchored(anchored_scene([FAR_SHIFT + 1152, 0, FAR_SHIFT - 896]), None)
-        .expect("adapter was available a moment ago");
+    let c = render_anchored(
+        anchored_scene([FAR_SHIFT + 1152, 0, FAR_SHIFT - 896]),
+        None,
+        false,
+    )
+    .expect("adapter was available a moment ago");
     let diff = headless::compare(&a.pixels, &c.pixels, TOLERANCE);
     eprintln!(
         "a_scene_moved_off_the_grid_renders_within_the_golden_tolerance: {:.4}% differ \
@@ -2516,13 +2547,14 @@ fn a_scene_moved_off_the_grid_renders_within_the_golden_tolerance() {
 /// that always returns the origin passes everything else in this file).
 #[test]
 fn without_the_anchor_the_shifted_scene_falls_apart() {
-    let Some(a) = render_anchored(anchored_scene([0; 3]), None) else {
+    let Some(a) = render_anchored(anchored_scene([0; 3]), None, false) else {
         headless::skip_or_require_gpu("without_the_anchor_the_shifted_scene_falls_apart");
         return;
     };
     let broken = render_anchored(
         anchored_scene([FAR_SHIFT, 0, FAR_SHIFT]),
         Some(cubara_render::anchor::ORIGIN),
+        false,
     )
     .expect("adapter was available a moment ago");
     let diff = headless::compare(&a.pixels, &broken.pixels, TOLERANCE);
