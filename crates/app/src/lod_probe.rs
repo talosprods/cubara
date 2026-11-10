@@ -193,14 +193,17 @@ pub fn count_drawn(
         let Some(g) = b.geometry.as_ref() else {
             continue;
         };
-        if !visible.contains(&b.node) || !frustum.intersects_aabb(&g.aabb) {
+        // The probe's frusta are absolute (no render anchor here), so the
+        // node's bounds are taken in world space.
+        let aabb = g.world_aabb();
+        if !visible.contains(&b.node) || !frustum.intersects_aabb(&aabb) {
             continue;
         }
         let level = (b.node.level as usize).min(LEVELS - 1);
         let tris = if g.mesh.is_grouped_by_face() {
             // `face_indices` is in `Face::DRAW_ORDER` (#313); `faces_facing`
             // answers in `Face` order.
-            let facing = faces_facing(&g.aabb, eye);
+            let facing = faces_facing(&aabb, eye);
             g.mesh
                 .face_indices
                 .iter()
@@ -2958,7 +2961,11 @@ mod tests {
             node: NodeKey::new(level, pos),
             geometry: Some(NodeGeometry {
                 mesh,
-                aabb: Aabb::new(lo.into(), hi.into()),
+                // Local to the node, whose origin is `lo`.
+                local_aabb: Aabb::new(
+                    glam::Vec3::ZERO,
+                    glam::Vec3::from(hi) - glam::Vec3::from(lo),
+                ),
                 origin: lo.map(|v| v as i32),
                 scale: 1.0,
             }),

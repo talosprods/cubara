@@ -56,7 +56,7 @@ fn only_nodes_in_the_frustum_contribute_instances() {
     };
     let frustum = forward_frustum();
 
-    let mut arena = TreeArena::new(no_reach());
+    let mut arena = TreeArena::new(no_reach(), cubara_render::anchor::ORIGIN);
     let ahead = NodeId {
         level: 1,
         pos: [0, 0, 0],
@@ -107,7 +107,7 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
         );
         return;
     };
-    let mut arena = TreeArena::new(no_reach());
+    let mut arena = TreeArena::new(no_reach(), cubara_render::anchor::ORIGIN);
     let node = NodeId {
         level: 1,
         pos: [0, 0, 0],
@@ -174,7 +174,7 @@ fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does
     let local_bounds = (glam::vec3(-3.0, 0.0, -3.0), glam::vec3(3.0, 200.0, 3.0));
     let tree_position = [100, -100, 0];
 
-    let mut arena = TreeArena::new(local_bounds);
+    let mut arena = TreeArena::new(local_bounds, cubara_render::anchor::ORIGIN);
     let node = NodeId {
         level: 1,
         pos: [0, 0, 0],

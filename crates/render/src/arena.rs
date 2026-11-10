@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 
 use cubara_voxel::{build_mesh_bounded, Chunk, Mesh, MeshContext, Vertex};
 
+use crate::anchor::{self, Anchor, NodeBox};
 use crate::culling::{Aabb, Frustum};
 
 /// An opaque, orderable, hashable key for one resident node's arena slot.
@@ -196,8 +197,8 @@ struct DrawIndexedIndirect {
     first_instance: u32,
 }
 
-/// Where one node's geometry lives inside the shared arenas, plus its world-space
-/// bounds for culling. This is the per-node metadata the GPU compute cull (#28)
+/// Where one node's geometry lives inside the shared arenas, plus its bounds
+/// for culling. This is the per-node metadata the GPU compute cull (#28)
 /// will read straight from a storage buffer.
 #[derive(Clone, Copy)]
 struct NodeSlot {
@@ -207,6 +208,15 @@ struct NodeSlot {
     /// First index of this node in the index arena.
     first_index: u32,
     index_count: u32,
+    /// Where the node stands: its integer origin and local bounds, from
+    /// which `aabb` and the GPU origin are re-derived on a rebase
+    /// (issue #379).
+    place: NodeBox,
+    /// The node's lattice scale (`node_origins.w`), kept to rewrite the
+    /// origin entry on a rebase.
+    scale: f32,
+    /// The culling box, **relative to the arena's anchor** -- the space
+    /// `view_proj` and the `Frustum` are in (issue #379 decision 5).
     aabb: Aabb,
     /// This node's slot in the node-origins storage buffer. Baked into every
     /// vertex of this node's mesh at insert time ([`Vertex::with_node_index`]),
@@ -359,12 +369,20 @@ pub struct ChunkArena {
     index_buffer: wgpu::Buffer,
     /// One `DrawIndexedIndirect` per visible node, rewritten each frame.
     indirect_buffer: wgpu::Buffer,
-    /// One world-space origin (plus scale in `.w`) per resident node, indexed
-    /// by the `node_index` baked into each vertex -- what `mesh.wgsl` adds
-    /// (and multiplies) into a packed vertex's node-local position (see
-    /// [`build_node_mesh`]).
+    /// One **anchor-relative** origin (plus scale in `.w`) per resident
+    /// node, indexed by the `node_index` baked into each vertex -- what
+    /// `mesh.wgsl` adds (and multiplies) into a packed vertex's node-local
+    /// position (see [`build_node_mesh`]), and what `trees.wgsl` adds to a
+    /// node-relative tree instance.
     origins_buffer: wgpu::Buffer,
     origins_bind_group: wgpu::BindGroup,
+    /// The CPU copy of `origins_buffer`, every slot: a rebase (issue #379)
+    /// rewrites the resident entries here and uploads the used prefix in
+    /// one `write_buffer`, rather than one write per node.
+    origins: Vec<[f32; 4]>,
+    /// The render anchor (`crate::anchor`) every origin and `aabb` above is
+    /// relative to.
+    anchor: Anchor,
 
     vertices: SlabAllocator,
     indices: SlabAllocator,
@@ -396,8 +414,9 @@ pub struct ChunkArena {
 impl ChunkArena {
     /// Create the arena and its GPU buffers. `multi_draw` selects the fast indirect
     /// path; when false, drawing falls back to a per-chunk `draw_indexed` loop over
-    /// the same shared buffers.
-    pub fn new(device: &wgpu::Device, multi_draw: bool) -> Self {
+    /// the same shared buffers. `anchor` is the render anchor the first
+    /// nodes are placed against ([`rebase`](Self::rebase) moves it later).
+    pub fn new(device: &wgpu::Device, multi_draw: bool, anchor: Anchor) -> Self {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-arena-vertices"),
             size: VERTEX_CAPACITY as u64 * std::mem::size_of::<Vertex>() as u64,
@@ -441,6 +460,8 @@ impl ChunkArena {
             indirect_buffer,
             origins_buffer,
             origins_bind_group,
+            origins: vec![[0.0; 4]; MAX_NODES as usize],
+            anchor,
             vertices: SlabAllocator::new(VERTEX_CAPACITY),
             indices: SlabAllocator::new(INDEX_CAPACITY),
             nodes: NodeIndexAllocator::new(),
@@ -461,6 +482,45 @@ impl ChunkArena {
         &self.origins_bind_group
     }
 
+    /// The render anchor every origin and culling box here is relative to.
+    pub fn anchor(&self) -> Anchor {
+        self.anchor
+    }
+
+    /// Re-express every resident node against `anchor` (issue #379
+    /// decision 2): one `vec4` per node in the CPU copy of the origins, one
+    /// `write_buffer` of the used prefix, and the culling boxes. Nothing
+    /// per vertex, nothing per tree instance. A no-op for the anchor the
+    /// arena already has.
+    ///
+    /// **`origins` is the truth for `origins_buffer`.** This rewrites every
+    /// resident entry from `NodeSlot`, so anything that later modifies a
+    /// node's origin per frame -- #380's R6 cross-fade lifts
+    /// `node_origins[i].y` by up to a cell -- must live in `NodeSlot` and be
+    /// applied here *and* in [`insert`](Self::insert) through an arena
+    /// method (say `set_origin_lift(id, dy)` writing `origins[i]` and the
+    /// buffer); a `write_buffer` into `origins_buffer` from outside would
+    /// be silently undone by the next rebase and leave the mirror stale.
+    pub fn rebase(&mut self, queue: &wgpu::Queue, anchor: Anchor) {
+        if anchor == self.anchor {
+            return;
+        }
+        self.anchor = anchor;
+        for slot in self.slots.values_mut() {
+            slot.aabb = slot.place.relative_to(anchor);
+            let o = anchor::offset(slot.place.origin(), anchor);
+            self.origins[slot.node_index as usize] = [o.x, o.y, o.z, slot.scale];
+        }
+        // Every slot ever handed out, in one write; an empty arena writes
+        // zero bytes, which wgpu ignores.
+        let used = self.nodes.next as usize;
+        queue.write_buffer(
+            &self.origins_buffer,
+            0,
+            bytemuck::cast_slice(&self.origins[..used]),
+        );
+    }
+
     /// Mesh `chunk` (placed at `origin`, one lattice cell = `scale` world
     /// units) and upload it — the synchronous path used by the headless
     /// bench/screenshot/golden tests and by [`render_chunks`](crate::headless::render_chunks)'s
@@ -477,22 +537,22 @@ impl ChunkArena {
         chunk: &Chunk,
         ctx: &MeshContext,
     ) -> bool {
-        let origin_f32 = [origin[0] as f32, origin[1] as f32, origin[2] as f32];
-        match build_mesh_bounded(chunk, ctx, origin_f32, scale) {
-            Some((mesh, aabb)) => self.insert(queue, id, origin, scale, &mesh, aabb),
+        match build_mesh_bounded(chunk, ctx, scale) {
+            Some((mesh, local_aabb)) => self.insert(queue, id, origin, scale, &mesh, local_aabb),
             None => false,
         }
     }
 
-    /// Sub-allocate an already-built node-local `mesh` (with precomputed
-    /// world-space `aabb`) into the shared arenas and upload it, plus a
-    /// node-origins slot recording `origin`/`scale` for the vertex shader to
-    /// add/multiply back (§5.2 -- vertices themselves stay node-local). The
-    /// origin is a block position, an integer: it is what the trees
-    /// (`TreeArena::insert`) and the render anchor (issue #379) subtract
-    /// from, and an integer subtraction is exact where a float one is not.
-    /// No-op if `id` is already resident. Returns whether the geometry was
-    /// added.
+    /// Sub-allocate an already-built node-local `mesh` (with its precomputed
+    /// bounds `local_aabb`, **relative to `origin`**) into the shared arenas
+    /// and upload it, plus a node-origins slot recording `origin`/`scale`
+    /// for the vertex shader to add/multiply back (§5.2 -- vertices
+    /// themselves stay node-local). The origin is a block position, an
+    /// integer: it is what the trees (`TreeArena::insert`) and the render
+    /// anchor (issue #379) subtract from, and an integer subtraction is
+    /// exact where a float one is not; the bounds being local is what keeps
+    /// an absolute `f32` position out of this crate altogether. No-op if
+    /// `id` is already resident. Returns whether the geometry was added.
     /// This is the GPU-side step, kept separate from meshing so the latter
     /// can run on a worker thread or in a different crate entirely
     /// (`cubara_world::mesh`, since #110) -- `pub`, not `pub(crate)`, because
@@ -504,7 +564,7 @@ impl ChunkArena {
         origin: [i32; 3],
         scale: f32,
         mesh: &Mesh,
-        aabb: Aabb,
+        local_aabb: Aabb,
     ) -> bool {
         if self.slots.contains_key(&id) {
             return false;
@@ -570,12 +630,16 @@ impl ChunkArena {
         // `.w` carries the node's scale (world units per lattice step, §5.2/
         // §5.3): 1.0 at level 0, exactly matching every chunk's implicit
         // scale before nodes existed; `mesh.wgsl` multiplies it into the
-        // local position before adding the origin.
-        let [ox, oy, oz] = origin;
+        // local position before adding the origin. `.xyz` is the origin
+        // relative to the render anchor (issue #379): an exact integer
+        // subtraction, then a small number the GPU's `f32` holds exactly.
+        let place = NodeBox::new(origin, local_aabb);
+        let o = anchor::offset(origin, self.anchor);
+        self.origins[node_index as usize] = [o.x, o.y, o.z, scale];
         queue.write_buffer(
             &self.origins_buffer,
             node_index as u64 * 16,
-            bytemuck::bytes_of(&[ox as f32, oy as f32, oz as f32, scale]),
+            bytemuck::bytes_of(&self.origins[node_index as usize]),
         );
 
         // The arena took a node, so whatever episode of exhaustion the latch
@@ -588,7 +652,9 @@ impl ChunkArena {
                 vertex_len,
                 first_index,
                 index_count,
-                aabb,
+                aabb: place.relative_to(self.anchor),
+                place,
+                scale,
                 node_index,
                 face_indices: mesh.is_grouped_by_face().then_some(mesh.face_indices),
             },
@@ -596,8 +662,11 @@ impl ChunkArena {
         true
     }
 
-    /// Free a node's slots back to the arenas, returning the world-space
-    /// bounds it was drawn with. `None`, and a no-op, if not resident.
+    /// Free a node's slots back to the arenas, returning the bounds it was
+    /// drawn with -- **relative to the arena's anchor**, the space
+    /// `view_proj` is in (issue #379), so a caller projecting them uses the
+    /// renderer's anchor (`--bench flight`'s pops). `None`, and a no-op, if
+    /// not resident.
     pub fn remove(&mut self, id: NodeId) -> Option<Aabb> {
         let slot = self.slots.remove(&id)?;
         self.vertices.free(slot.base_vertex, slot.vertex_len);
@@ -666,7 +735,8 @@ impl ChunkArena {
         }
     }
 
-    /// World-space bounds over all resident nodes, for framing a camera.
+    /// World-space (absolute, not anchor-relative) bounds over all resident
+    /// nodes, for framing a camera.
     pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         if self.slots.is_empty() {
             return None;
@@ -674,8 +744,9 @@ impl ChunkArena {
         let mut min = glam::Vec3::splat(f32::MAX);
         let mut max = glam::Vec3::splat(f32::MIN);
         for slot in self.slots.values() {
-            min = min.min(slot.aabb.min);
-            max = max.max(slot.aabb.max);
+            let aabb = slot.place.absolute();
+            min = min.min(aabb.min);
+            max = max.max(aabb.max);
         }
         Some((min.to_array(), max.to_array()))
     }
@@ -684,7 +755,10 @@ impl ChunkArena {
     /// draw args: for each node in view, one draw per run of face directions
     /// that can face the camera ([`faces_facing`]). Returns the number of draws.
     /// Call once per frame, before beginning the render pass; then
-    /// [`encode`](Self::encode).
+    /// [`encode`](Self::encode). `frustum` must be built from the same
+    /// anchor-relative `view_proj` the frame draws with (issue #379 decision
+    /// 5): the boxes it is tested against are relative to this arena's
+    /// anchor, and so is the eye it recovers.
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum) -> u32 {
         puffin::profile_function!();
         self.visible.clear();
@@ -795,9 +869,10 @@ impl ChunkArena {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         multi_draw: bool,
+        anchor: Anchor,
         meshed: impl IntoIterator<Item = MeshedNode>,
     ) -> Self {
-        let mut arena = Self::new(device, multi_draw);
+        let mut arena = Self::new(device, multi_draw, anchor);
         let mut total_tris = 0u32;
         for node in meshed {
             if arena.insert(
@@ -806,7 +881,7 @@ impl ChunkArena {
                 node.origin,
                 node.scale,
                 &node.mesh,
-                node.aabb,
+                node.local_aabb,
             ) {
                 if let Some(slot) = arena.slots.get(&node.id) {
                     total_tris += slot.index_count / 3;
@@ -857,7 +932,11 @@ pub struct MeshedNode {
     pub origin: [i32; 3],
     pub scale: f32,
     pub mesh: Mesh,
-    pub aabb: Aabb,
+    /// The mesh's bounds **relative to `origin`** (what the mesher
+    /// produces, `cubara_voxel::build_mesh_bounded`): the renderer places
+    /// them against its anchor with one exact integer subtraction, so no
+    /// absolute `f32` position ever enters this crate (issue #379).
+    pub local_aabb: Aabb,
     /// The blocks the trees this node's footprint grows stand on (the
     /// trunk's base block, in world blocks; issue #332, R2 decision 2) --
     /// empty for a node with none, which is every level-0 node (its trees

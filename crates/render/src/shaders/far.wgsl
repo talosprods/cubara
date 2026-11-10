@@ -19,10 +19,15 @@ struct Frame {
     fog_color: vec4<f32>,
     fog: vec4<f32>,
     haze: vec4<f32>,
+    // The render anchor (issue #379): every position in this shader, `eye`
+    // included, is relative to it. The heights buffer is the exception --
+    // absolute, so `vs_main` subtracts `anchor.y` -- and the height haze
+    // wants it back.
+    anchor: vec4<f32>,
 };
 
-// One patch: its lowest corner, the width of one quad, and how far its skirt
-// drops, all in blocks.
+// One patch: its lowest corner (relative to the render anchor, issue #379),
+// the width of one quad, and how far its skirt drops, all in blocks.
 struct Patch {
     origin: vec2<f32>,
     quad: f32,
@@ -30,7 +35,8 @@ struct Patch {
 };
 
 struct Params {
-    // The box the voxel rings draw themselves: nothing here is drawn inside it.
+    // The box the voxel rings draw themselves: nothing here is drawn inside
+    // it. Relative to the render anchor, like every position here.
     hole_min: vec4<f32>,
     hole_max: vec4<f32>,
     // What the ground is made of, in linear light (`aggregate::Materials`):
@@ -81,7 +87,11 @@ fn vs_main(
     let i = clamp(i32(gx) - 1, 0, QUADS);
     let j = clamp(i32(gz) - 1, 0, QUADS);
     let skirt = gx == 0u || gx == GRID - 1u || gz == 0u || gz == GRID - 1u;
-    var y = height(base, i, j);
+    // The heights are absolute world heights (a rebase leaves the heights
+    // buffer alone); every other position here is relative to the render
+    // anchor, so the anchor's y comes off here -- the eye, the hole and the
+    // voxels are all measured from it (issue #379, review finding B1).
+    var y = height(base, i, j) - frame.anchor.y;
     if skirt {
         y = y - tile.skirt;
     }
@@ -222,7 +232,7 @@ fn shade(p: vec3<f32>, g: vec2<f32>) -> vec3<f32> {
 
     let dist = distance(p, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
-    let fog_amount = max(edge, haze_amount(frame.eye.xyz, p, frame.haze));
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, p, frame.haze, frame.anchor.y));
     return mix(lit, frame.fog_color.rgb, fog_amount);
 }
 

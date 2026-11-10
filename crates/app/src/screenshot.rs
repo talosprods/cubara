@@ -88,7 +88,7 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 width: v.size.0,
                 height: v.size.1,
                 region_radius: v.radius,
-                camera: Some((glam::Vec3::from(v.eye), glam::Vec3::from(v.look))),
+                camera: Some((glam::Vec3::from(v.eye).as_dvec3(), glam::Vec3::from(v.look))),
                 ..Shot::default()
             };
             let (min, max) =
