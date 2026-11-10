@@ -57,6 +57,32 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # Test-quality audit #4 (2026-11-09, `handover/2026-11-09-windows`): every
+    # GPU/golden test printed SKIP and returned `Ok` when `wgpu::Instance::
+    # request_adapter` found no adapter, so a runner that silently lost its
+    # adapter -- or never had one -- would go green having rendered zero
+    # frames, and nothing would say so. Checked directly against this
+    # workflow's own recent runs (`gh run view --job <id> --log`, the
+    # "Golden image deltas" step only, which runs with `--nocapture`) before
+    # setting this: all three matrix members print real `golden <name>: N%
+    # differ` lines there, with no "SKIPPED"/"no GPU adapter" among them --
+    # ubuntu-latest via the `mesa-vulkan-drivers` (lavapipe) install below,
+    # macos-latest and windows-latest via whatever software/virtual adapter
+    # their own OS exposes to wgpu, with no extra driver install needed. The
+    # plain "Test" step below proves nothing either way about SKIP lines:
+    # `cargo test` only shows captured output (including `eprintln!` SKIPs)
+    # for a *failing* test, so a passing-but-silently-skipped test's SKIP
+    # line is invisible there regardless of whether an adapter exists --
+    # only the `--nocapture` step, or this `CUBARA_REQUIRE_GPU` switch
+    # itself, can actually prove a test rendered something. All three
+    # runners already have a real adapter today, so all three get the
+    # switch; if a runner ever genuinely loses its adapter, this job should
+    # go red instead of silently testing nothing (same reasoning as the
+    # comment below on why these runners are not the perf-gate's
+    # representative GPU -- that is about *performance* representativeness,
+    # not adapter presence).
+    env:
+      CUBARA_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
       # winit needs the X11/Wayland client libraries to link its windowing
@@ -96,8 +122,15 @@ jobs:
       # silently, once there -- doubling both its cost (the slowest single test
       # in CI, ~79s on the macOS runner) and its exposure to a timing flake, for
       # no extra coverage. See issue #138.
+      #
+      # `--no-fail-fast`: `cargo test` otherwise stops at the first *binary*
+      # that fails, so one broken test crate (e.g. `cubara-app`'s unit tests)
+      # hides every later one (`cubara-render`'s golden tests among them) --
+      # exactly what happened investigating audit #4/#5: the macOS job's
+      # `bench.rs` panic meant the golden-image regressions on the same run
+      # never even got a chance to show up in this job's log.
       - name: Test
-        run: cargo test --all -- --skip radius_64_world_load_settles_within_budget
+        run: cargo test --all --no-fail-fast -- --skip radius_64_world_load_settles_within_budget
       # Re-run just the golden tests with output shown. `cargo test` captures
       # stderr for *passing* tests, so without this the measured image deltas are
       # invisible until something already fails. The reference is generated on one

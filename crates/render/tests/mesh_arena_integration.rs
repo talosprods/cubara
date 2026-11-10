@@ -76,9 +76,8 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
     // arrival orders of the *same* batch and asserts sort_batch makes all of
     // them land on the identical layout.
     let Some((device, queue)) = test_device() else {
-        eprintln!(
-            "SKIP sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order: \
-             no GPU adapter"
+        cubara_render::headless::skip_or_require_gpu(
+            "sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order",
         );
         return;
     };
@@ -164,8 +163,8 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
 #[test]
 fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
     let Some((device, queue)) = test_device() else {
-        eprintln!(
-            "SKIP prepare_emits_at_most_two_draws_per_visible_node_from_outside: no GPU adapter"
+        cubara_render::headless::skip_or_require_gpu(
+            "prepare_emits_at_most_two_draws_per_visible_node_from_outside",
         );
         return;
     };

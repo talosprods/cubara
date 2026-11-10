@@ -1457,31 +1457,51 @@ mod tests {
         }
     }
 
-    /// A real device (or `None` on a CI runner with no GPU adapter, or one
-    /// whose driver lacks `TIMESTAMP_QUERY`) -- the same
-    /// skip-loudly convention `mesh_arena_integration.rs` uses.
-    fn test_gpu_timer_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    /// Why [`test_gpu_timer_device`] couldn't produce a device -- kept
+    /// distinct from a real device rather than collapsed to `None` (audit
+    /// #5, PR #376): "no adapter at all" and "adapter present but missing
+    /// `TIMESTAMP_QUERY`" are different runner conditions with different
+    /// skip behaviour under `CUBARA_REQUIRE_GPU` (see
+    /// `cubara_render::headless::skip_or_require_gpu` vs
+    /// `skip_missing_feature`'s doc comments), and a `None` that meant
+    /// either is exactly what made `CUBARA_REQUIRE_GPU=1` panic on the
+    /// macOS runner, which has a Metal adapter without `TIMESTAMP_QUERY`.
+    enum GpuTimerDevice {
+        Device(wgpu::Device, wgpu::Queue),
+        NoAdapter,
+        MissingFeature(&'static str),
+    }
+
+    /// A real device, or the reason it couldn't be made -- see
+    /// [`GpuTimerDevice`]. The same skip-loudly convention
+    /// `mesh_arena_integration.rs` uses, split by reason.
+    fn test_gpu_timer_device() -> GpuTimerDevice {
         let instance = cubara_render::new_instance();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .ok()?;
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))
+        else {
+            return GpuTimerDevice::NoAdapter;
+        };
         let (features, _) = gpu_driven_features(&adapter);
         if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-            return None;
+            return GpuTimerDevice::MissingFeature("TIMESTAMP_QUERY");
         }
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cubara-test-gpu-timer-device"),
             required_features: features,
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
-        }))
-        .ok()
+        })) {
+            Ok((device, queue)) => GpuTimerDevice::Device(device, queue),
+            Err(_) => GpuTimerDevice::NoAdapter,
+        }
     }
 
     /// Pins `GpuTimer::take_ms`'s `take_ready` guard (the other half of the
@@ -1491,12 +1511,18 @@ mod tests {
     /// -- reading either would be reading a buffer that isn't mapped.
     #[test]
     fn take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping() {
-        let Some((device, queue)) = test_gpu_timer_device() else {
-            eprintln!(
-                "SKIP take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping: \
-                 no GPU adapter, or no TIMESTAMP_QUERY"
-            );
-            return;
+        const TEST_NAME: &str =
+            "take_ms_only_returns_a_value_once_the_slot_has_actually_finished_mapping";
+        let (device, queue) = match test_gpu_timer_device() {
+            GpuTimerDevice::Device(device, queue) => (device, queue),
+            GpuTimerDevice::NoAdapter => {
+                cubara_render::headless::skip_or_require_gpu(TEST_NAME);
+                return;
+            }
+            GpuTimerDevice::MissingFeature(feature) => {
+                cubara_render::headless::skip_missing_feature(TEST_NAME, feature);
+                return;
+            }
         };
         let timer = GpuTimer::new(&device, &queue);
         let slot = timer

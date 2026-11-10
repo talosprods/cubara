@@ -49,7 +49,9 @@ fn no_reach() -> (glam::Vec3, glam::Vec3) {
 #[test]
 fn only_nodes_in_the_frustum_contribute_instances() {
     let Some((device, queue)) = test_device() else {
-        eprintln!("SKIP only_nodes_in_the_frustum_contribute_instances: no GPU adapter");
+        cubara_render::headless::skip_or_require_gpu(
+            "only_nodes_in_the_frustum_contribute_instances",
+        );
         return;
     };
     let frustum = forward_frustum();
@@ -96,8 +98,8 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
     // is a per-frame re-test against the frustum, not a one-time filter
     // baked in at `insert` time.
     let Some((device, queue)) = test_device() else {
-        eprintln!(
-            "SKIP a_node_leaving_the_frustum_stops_contributing_without_being_removed: no GPU adapter"
+        cubara_render::headless::skip_or_require_gpu(
+            "a_node_leaving_the_frustum_stops_contributing_without_being_removed",
         );
         return;
     };
@@ -142,9 +144,8 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
 #[test]
 fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does_not() {
     let Some((device, queue)) = test_device() else {
-        eprintln!(
-            "SKIP a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does_not: \
-             no GPU adapter"
+        cubara_render::headless::skip_or_require_gpu(
+            "a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does_not",
         );
         return;
     };

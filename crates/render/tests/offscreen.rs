@@ -45,7 +45,9 @@ fn an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped() {
         look_dir: glam::Vec3::new(0.05, -1.0, 0.03),
     };
     let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera) else {
-        eprintln!("SKIP an_offscreen_renderer_draws_what_it_is_handed: no GPU adapter");
+        cubara_render::headless::skip_or_require_gpu(
+            "an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped",
+        );
         return;
     };
     assert_eq!(renderer.size(), (64, 48));

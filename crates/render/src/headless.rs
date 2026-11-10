@@ -158,6 +158,84 @@ impl Default for Shot {
 
 pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// Is `CUBARA_REQUIRE_GPU` set (to anything but empty or `0`)?
+///
+/// Test-quality audit #4 (2026-11-09, `handover/2026-11-09-windows`): every
+/// GPU/golden test `eprintln!("SKIP...")`s and returns `Ok` when no adapter is
+/// available, so a CI runner that silently lost its adapter -- or never had
+/// one -- goes green having rendered nothing, and nothing makes that loud. A
+/// runner known to have a real adapter sets this (wired into
+/// `.github/workflows/ci.yml` only for the runners confirmed to actually run
+/// the goldens; see the PR), and [`skip_or_require_gpu`] turns every one of
+/// those skip points into a hard failure instead.
+pub fn gpu_is_required() -> bool {
+    env_requires_gpu(std::env::var("CUBARA_REQUIRE_GPU").ok())
+}
+
+/// [`gpu_is_required`]'s parsing rule, on an already-read value -- split out
+/// so it is a pure function a unit test can drive directly, rather than one
+/// that has to mutate the real process environment (racy: other tests in
+/// this process read it too, and `cargo test` runs them concurrently).
+fn env_requires_gpu(v: Option<String>) -> bool {
+    match v {
+        Some(v) => !v.is_empty() && v != "0",
+        None => false,
+    }
+}
+
+/// Call this at every "no GPU adapter, so skip" point instead of a bare
+/// `eprintln!` -- one implementation of the decision (`ARCHITECTURE.md` Rule
+/// 5: two pieces of code answering the same question is a bug), so wiring
+/// [`gpu_is_required`] into CI covers every GPU/golden test at once rather
+/// than needing each one updated separately, and a future test that skips on
+/// no adapter gets the hard-failure behaviour for free instead of a copy of
+/// this `if`.
+///
+/// Behaves exactly as the old bare `eprintln!` did when GPU is not required
+/// (quiet skip, loudly logged); panics instead when it is, so a runner that
+/// has lost its adapter -- or a config mistake that points CI at one with no
+/// adapter at all -- turns the build red instead of silently testing zero
+/// frames.
+pub fn skip_or_require_gpu(test_name: &str) {
+    skip_or_require_gpu_decided(test_name, gpu_is_required());
+}
+
+/// [`skip_or_require_gpu`]'s decision, taking the already-resolved flag
+/// instead of reading the real environment -- a unit test can drive both
+/// branches directly this way (see [`env_requires_gpu`]'s doc comment for
+/// why the real env is off limits to a test).
+fn skip_or_require_gpu_decided(test_name: &str, required: bool) {
+    if required {
+        panic!(
+            "{test_name}: no GPU adapter available, and CUBARA_REQUIRE_GPU is set -- \
+             this runner is expected to have one"
+        );
+    }
+    eprintln!("SKIPPED {test_name}: no GPU adapter available on this machine");
+}
+
+/// Call this at every "adapter exists, but lacks a feature this test needs"
+/// skip point -- distinct from [`skip_or_require_gpu`]'s "no adapter at
+/// all".
+///
+/// Test-quality audit #5 (2026-11-10, PR #376): `bench.rs`'s
+/// `test_gpu_timer_device` and `gpu_timestamps.rs`'s `test_device` used to
+/// return `None` for *either* "no adapter" *or* "adapter has no
+/// `TIMESTAMP_QUERY`" and route both through [`skip_or_require_gpu`]. That
+/// made `CUBARA_REQUIRE_GPU=1` panic on the macOS runner, which has a real
+/// Metal adapter but whose driver does not report `TIMESTAMP_QUERY` --
+/// `CUBARA_REQUIRE_GPU` only promises a runner *has an adapter*; it says
+/// nothing about which optional features that adapter's driver implements.
+/// So this one, unlike [`skip_or_require_gpu`], never panics: a missing
+/// optional feature is a legitimate skip on any runner, required-GPU or not.
+///
+/// One implementation (`ARCHITECTURE.md` Rule 5) so every test with this
+/// "adapter present, feature missing" shape gets the same loud, named
+/// `SKIPPED` line instead of a hand-rolled `eprintln!`.
+pub fn skip_missing_feature(test_name: &str, feature: &str) {
+    eprintln!("SKIPPED {test_name}: adapter has no {feature} feature on this machine");
+}
+
 /// Render an already-meshed scene offscreen and read the pixels back.
 ///
 /// This crate never touches a `World` (`ARCHITECTURE.md` §1): a caller that
@@ -541,5 +619,69 @@ pub fn compare(actual: &[u8], expected: &[u8], tolerance: u8) -> Diff {
     Diff {
         differing_fraction: differing as f64 / total,
         max_channel_delta: max_delta,
+    }
+}
+
+#[cfg(test)]
+mod gpu_required_tests {
+    use super::*;
+
+    #[test]
+    fn env_requires_gpu_treats_unset_and_zero_as_off() {
+        assert!(!env_requires_gpu(None));
+        assert!(!env_requires_gpu(Some(String::new())));
+        assert!(!env_requires_gpu(Some("0".to_string())));
+    }
+
+    #[test]
+    fn env_requires_gpu_treats_any_other_value_as_on() {
+        assert!(env_requires_gpu(Some("1".to_string())));
+        assert!(env_requires_gpu(Some("true".to_string())));
+        // Not just "1": a `0` elsewhere in the string (e.g. a typo'd "10")
+        // must still count as on, not silently parse as a number.
+        assert!(env_requires_gpu(Some("10".to_string())));
+    }
+
+    /// The behaviour every existing call site relied on before this existed:
+    /// silent (well, loudly-logged) skip when the switch is off.
+    #[test]
+    fn decided_false_does_not_panic() {
+        skip_or_require_gpu_decided("some_test", false);
+    }
+
+    /// The whole point of the audit fix (#4): with the switch on, "no GPU
+    /// adapter" must turn the build red, not print SKIP and pass.
+    #[test]
+    fn decided_true_panics_and_names_the_test() {
+        let result = std::panic::catch_unwind(|| {
+            skip_or_require_gpu_decided("some_test_name", true);
+        });
+        let err = result.expect_err("must panic when required and no adapter");
+        let message = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .expect("panic payload is a string");
+        assert!(
+            message.contains("some_test_name"),
+            "panic message {message:?} does not name the test"
+        );
+    }
+
+    /// Audit #5's fix: "adapter present, optional feature missing" is a
+    /// legitimate skip on *any* runner -- unlike [`skip_or_require_gpu`], it
+    /// must never panic, not even when `CUBARA_REQUIRE_GPU` is set. (It
+    /// takes no `required` flag at all; this test is what pins that it
+    /// can't quietly grow one that panics, the way `skip_or_require_gpu`
+    /// does for the other skip reason.)
+    #[test]
+    fn skip_missing_feature_never_panics() {
+        let result = std::panic::catch_unwind(|| {
+            skip_missing_feature("some_test_name", "TIMESTAMP_QUERY");
+        });
+        assert!(
+            result.is_ok(),
+            "a missing optional feature must never panic, regardless of CUBARA_REQUIRE_GPU"
+        );
     }
 }

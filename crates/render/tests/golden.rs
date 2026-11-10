@@ -235,8 +235,10 @@ fn assert_frame_golden(name: &str, frame: Option<Frame>) {
     let Some(frame) = frame else {
         // No adapter (a GPU-less CI runner). Skipping is honest here — the
         // alternative is a red build that says nothing about the code — but it is
-        // reported loudly so a silently-never-running test is noticeable.
-        eprintln!("SKIPPED {name}: no GPU adapter available on this machine");
+        // reported loudly so a silently-never-running test is noticeable, and
+        // `CUBARA_REQUIRE_GPU=1` turns it into a hard failure on a runner that is
+        // supposed to have an adapter (test audit #4).
+        headless::skip_or_require_gpu(name);
         return;
     };
 
@@ -292,6 +294,168 @@ fn assert_frame_golden(name: &str, frame: Option<Frame>) {
     }
 }
 
+/// A rectangle in pixel space: `(x, y, width, height)`.
+type Rect = (u32, u32, u32, u32);
+
+/// Crop a tightly-packed RGBA8 buffer of row stride `stride` pixels to `rect`.
+fn crop(pixels: &[u8], stride: u32, rect: Rect) -> Vec<u8> {
+    let (x, y, w, h) = rect;
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * stride + x) * 4) as usize;
+        let end = start + (w * 4) as usize;
+        out.extend_from_slice(&pixels[start..end]);
+    }
+    out
+}
+
+/// Test-quality audit #5 ("golden tolerance swallows the thing named in the
+/// title", `handover/2026-11-09-windows`): [`MAX_DIFFERING`] lets ~0.5% of a
+/// frame move anywhere -- a few thousand pixels, which is well *more* than a
+/// missing half-heart, hotbar count, outline, ore vein, player figure, or LOD
+/// seam actually changes. The whole-image check alone cannot tell a backend
+/// quirk from exactly the feature a test's title names disappearing, which is
+/// what every rect this is called with was chosen to catch (see each call
+/// site, and the PR description's injected-defect table).
+///
+/// Re-reads the *same* committed golden [`assert_golden`]/[`assert_frame_golden`]
+/// already compare the whole frame against -- never a second reference, and
+/// never regenerated here (a `CUBARA_BLESS` run returns immediately: the
+/// golden this would read is the one about to be overwritten, so comparing
+/// against it proves nothing). `rect` must match within [`TOLERANCE`]
+/// everywhere but at most `max_differing` pixels -- zero at every call site
+/// where this was measured to hold exactly, and a small, explicitly justified
+/// (per call site) allowance where the region still contains rasterised
+/// terrain or text-under-alpha-blend, which real cross-backend noise does
+/// touch even inside a tight box.
+fn assert_region_golden(name: &str, frame: &Frame, rect: Rect, max_differing: u32, what: &str) {
+    if std::env::var_os("CUBARA_BLESS").is_some() {
+        return;
+    }
+    let path = golden_dir().join(format!("{name}.png"));
+    let (gw, gh, golden) = load_png(&path);
+    assert_eq!(
+        (gw, gh),
+        (frame.width, frame.height),
+        "golden {name} is {gw}x{gh}, rendered {}x{}",
+        frame.width,
+        frame.height
+    );
+    let (x, y, w, h) = rect;
+    assert!(
+        x + w <= frame.width && y + h <= frame.height,
+        "region {rect:?} for {name}/{what} is out of bounds for a {}x{} frame",
+        frame.width,
+        frame.height
+    );
+    let actual = crop(&frame.pixels, frame.width, rect);
+    let expected = crop(&golden, gw, rect);
+    let diff = headless::compare(&actual, &expected, TOLERANCE);
+    let differing = (diff.differing_fraction * (w * h) as f64).round() as u32;
+    eprintln!(
+        "golden {name}/{what}: {differing} of {} pixels in {rect:?} differ from the \
+         golden (tolerance {TOLERANCE}), allowed {max_differing}",
+        w * h
+    );
+    assert!(
+        differing <= max_differing,
+        "golden {name}/{what}: {differing} pixels inside {rect:?} differ from the \
+         committed golden (tolerance {TOLERANCE}), more than the {max_differing}-pixel \
+         cross-backend noise budget for this region -- the thing it is named for \
+         (test-quality audit #5) looks wrong here, not just noisy"
+    );
+}
+
+/// Perceptual luminance (ITU-R BT.601, integer) of one RGBA8 pixel, ignoring
+/// alpha -- every region [`assert_region_coverage_golden`] is used for is
+/// drawn fully opaque.
+fn luma(pixel: &[u8]) -> u32 {
+    (299 * pixel[0] as u32 + 587 * pixel[1] as u32 + 114 * pixel[2] as u32) / 1000
+}
+
+/// How many pixels of a cropped region are "lit" -- luminance over
+/// `threshold` -- out of the region's total.
+fn lit_count(pixels: &[u8], threshold: u32) -> u32 {
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| luma(*p) > threshold)
+        .count() as u32
+}
+
+/// [`assert_region_golden`]'s sibling for a region where plain per-pixel
+/// comparison cannot clear a healthy noise/defect margin (test-quality audit
+/// #5, PR #376): the hotbar's "12" count is an 8x8 bitmap glyph upscaled
+/// 1.5x through a `Nearest` sampler (`crates/render/src/text/mod.rs`), and at
+/// that non-integer scale factor, which source texel a destination pixel
+/// rounds to is the kind of rasterisation tie that backends settle
+/// differently -- not just at the glyph's silhouette edge but through its
+/// interior, since every row of the upscale has a tie somewhere. That moves
+/// *which* pixels inside the glyph are foreground vs shadow vs background
+/// more than a plain per-pixel count can budget for without also admitting
+/// most of what disabling the glyph draw changes (measured: disabling it
+/// changes 153 of this region's pixels per plain comparison, against 73
+/// measured noise on Windows CI -- only a 2.1x margin, well under the 3x
+/// this file aims for; see `the_hotbar_shows_slots_counts_and_the_held_one`).
+///
+/// So this compares *coverage* instead of position: how many pixels in the
+/// region are lit (luminance over `threshold`) in each image, not which
+/// ones. Shuffling ties among the glyph's own foreground pixels leaves that
+/// count almost unchanged -- the glyph is still "mostly on" in the same
+/// places -- while disabling the draw collapses it to zero, so the two are
+/// far apart on this measure even where they are close on a pixel-position
+/// one. `threshold` matters: it must sit above every opaque background this
+/// region can be drawn over (read back sRGB-encoded off `Rgba8UnormSrgb`,
+/// not the naive `color * 255`) or the count mixes background-crossing
+/// noise into the glyph signal -- see the call site for a case where the
+/// first threshold tried did exactly that.
+fn assert_region_coverage_golden(
+    name: &str,
+    frame: &Frame,
+    rect: Rect,
+    threshold: u32,
+    max_coverage_delta: u32,
+    what: &str,
+) {
+    if std::env::var_os("CUBARA_BLESS").is_some() {
+        return;
+    }
+    let path = golden_dir().join(format!("{name}.png"));
+    let (gw, gh, golden) = load_png(&path);
+    assert_eq!(
+        (gw, gh),
+        (frame.width, frame.height),
+        "golden {name} is {gw}x{gh}, rendered {}x{}",
+        frame.width,
+        frame.height
+    );
+    let (x, y, w, h) = rect;
+    assert!(
+        x + w <= frame.width && y + h <= frame.height,
+        "region {rect:?} for {name}/{what} is out of bounds for a {}x{} frame",
+        frame.width,
+        frame.height
+    );
+    let actual = crop(&frame.pixels, frame.width, rect);
+    let expected = crop(&golden, gw, rect);
+    let actual_lit = lit_count(&actual, threshold);
+    let expected_lit = lit_count(&expected, threshold);
+    let delta = actual_lit.abs_diff(expected_lit);
+    eprintln!(
+        "golden {name}/{what}: {actual_lit} of {} pixels lit (luminance > {threshold}) vs \
+         {expected_lit} in the golden, delta {delta}, allowed {max_coverage_delta}",
+        w * h
+    );
+    assert!(
+        delta <= max_coverage_delta,
+        "golden {name}/{what}: {actual_lit} lit pixels inside {rect:?} vs {expected_lit} in \
+         the committed golden (luminance threshold {threshold}), a coverage delta of {delta} -- \
+         more than the {max_coverage_delta}-pixel cross-backend noise budget for this region -- \
+         the thing it is named for (test-quality audit #5) looks wrong here, not just noisy"
+    );
+}
+
 #[test]
 fn the_same_scene_renders_byte_identically() {
     // The property that makes every other visual test trustworthy, and the one
@@ -325,7 +489,7 @@ fn the_same_scene_renders_byte_identically() {
     // state is hashed or saved; see issue #83.
     let shot = Shot::default();
     let Some(a) = render_world(&World::new(), shot.clone()) else {
-        eprintln!("SKIPPED the_same_scene_renders_byte_identically: no GPU adapter");
+        headless::skip_or_require_gpu("the_same_scene_renders_byte_identically");
         return;
     };
     let b = render_world(&World::new(), shot).expect("adapter was available a moment ago");
@@ -560,6 +724,21 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         menu: None,
         lighting: Lighting::default(),
     };
+    // Audit #5: the vein is a small patch of a 960x540 frame -- well inside
+    // the whole-image golden's 0.5% tolerance, so a defect that made ore
+    // generate as plain stone (`cubara_world::worldgen::ore_or` always
+    // returning `stone`) would pass `assert_golden` alone. Measured: 26 of
+    // the ~18,450 pixels in this rect differ from the committed
+    // (Windows/Vulkan-blessed) golden at `TOLERANCE` on an NVIDIA/Vulkan
+    // machine, 26-28 on the real macOS and Windows CI runners (checked via
+    // `gh run view --log` on a recent `main` run) -- ordinary cross-backend
+    // terrain/mip noise, the same kind `MAX_DIFFERING`'s table documents --
+    // while disabling ore substitution entirely changes 2,543. 60 keeps a
+    // >2x margin over every measured noise figure and a >40x margin under
+    // the defect.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden("iron_ore", &frame, (325, 225, 205, 90), 60, "the ore vein");
+    }
     assert_golden("iron_ore", &world, shot);
 }
 
@@ -590,6 +769,35 @@ fn no_crack_at_a_real_lod_boundary() {
         region_radius: 12,
         ..Shot::default()
     };
+    // Audit #5: a seam is "a few hundred pixels" (the audit's own words) of a
+    // 1280x720 frame, a small fraction of the whole-image golden's 0.5%
+    // tolerance -- and the ring boundary this test frames runs most of the
+    // way around the screen, so no single small rect covers "the" crack the
+    // way it does for a UI element. This one rect was found by disabling
+    // `push_skirt` (`crates/voxel/src/voxel.rs`) outright and diffing the
+    // result against the committed golden: the regression shows up in dozens
+    // of scattered patches around the ring, and this is one of them (43
+    // pixels with skirts off, 0 with them on, on this machine). It proves a
+    // *global* skirt regression (the actual failure mode #4/#5 describe,
+    // and the one `push_skirt`'s own unit tests in `voxel.rs` do not cover
+    // end-to-end) without having to track every point on the ring; it would
+    // not by itself catch a one-off bug in a single unrelated node's skirt.
+    // Checked via `gh run view --log` on a recent `main` run: the real macOS
+    // and Windows CI runners differ from the golden by 0.0030%/0.0015% of
+    // the *whole* frame here (28/14 pixels out of 921,600), where this
+    // machine matches exactly -- scattered over a ring that spans most of
+    // the image, so only a small fraction would be expected to land inside
+    // this one 75x35 patch. 15 keeps a wide margin over that estimate while
+    // staying well below the 43-pixel defect signal.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "lod_boundary",
+            &frame,
+            (515, 585, 75, 35),
+            15,
+            "a real LOD seam on the ring boundary",
+        );
+    }
     assert_golden("lod_boundary", &world, shot);
 }
 
@@ -665,9 +873,7 @@ fn trees_continue_past_the_first_ring() {
     // level 0, so `desired_nodes` cannot select one.
     let schedule = [(1u32, 18i32), (2, 32)];
     let Some((with_frame, without_frame)) = render_with_and_without_trees(&schedule) else {
-        eprintln!(
-            "SKIPPED trees_continue_past_the_first_ring: no GPU adapter available on this machine"
-        );
+        headless::skip_or_require_gpu("trees_continue_past_the_first_ring");
         return;
     };
     assert_eq!(
@@ -699,9 +905,7 @@ fn trees_continue_past_the_first_ring() {
 fn level_three_trees_draw_as_boxes() {
     let schedule = [(3u32, 16i32)];
     let Some((with_frame, without_frame)) = render_with_and_without_trees(&schedule) else {
-        eprintln!(
-            "SKIPPED level_three_trees_draw_as_boxes: no GPU adapter available on this machine"
-        );
+        headless::skip_or_require_gpu("level_three_trees_draw_as_boxes");
         return;
     };
     assert_eq!(
@@ -766,6 +970,39 @@ fn the_selected_block_shows_an_outline() {
         menu: None,
         lighting: Lighting::default(),
     };
+    // Audit #5: the outline is a thin wireframe box, a few hundred pixels at
+    // most -- well inside the whole-image golden's 0.5% tolerance, so a
+    // defect that skipped the outline draw call entirely
+    // (`SceneRenderer::encode_scene`'s `if selected_block.is_some()`) would
+    // pass `assert_golden` alone. `(383, 260, 194, 117)` is the screen-space
+    // bounding box of the targeted block's top face, computed from `eye`,
+    // `target` and `hit.block` via `CameraUniform::look_view_proj` and
+    // confirmed against the committed golden (the outline's own dark pixels
+    // fall at x 384..575, y 261..375 in it). This rect is mostly the
+    // block's top face and its surroundings, not just the outline, so it
+    // carries ordinary cross-backend terrain noise on top of the outline
+    // itself (unlike the UI rects elsewhere in this file, which sit over
+    // flat, opaque HUD quads).
+    //
+    // Measured, pixels differing from the golden at `TOLERANCE`: 13 of the
+    // ~22,700 in this rect on an NVIDIA/Vulkan machine (local), 14 on
+    // lavapipe (local and ubuntu CI), **41 on Windows CI** (the original
+    // budget of 30 was set from the NVIDIA/lavapipe numbers alone, before
+    // the Windows number was checked against this specific rect rather than
+    // the shot's whole-frame percentage -- it under-shot). Disabling the
+    // outline draw changes 235, a 5.7x margin over the worst measured
+    // noise. 60 keeps a healthy margin over 41 (macOS CI not yet measured
+    // under this rect; re-check once it runs) while staying a comfortable
+    // 3.9x under the defect.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "outline",
+            &frame,
+            (383, 260, 194, 117),
+            60,
+            "the outline around the targeted block's top face",
+        );
+    }
     assert_golden("outline", &world, shot);
 }
 
@@ -963,6 +1200,77 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         menu: None,
         lighting: Lighting::default(),
     };
+    // Audit #5: the count glyph for slot 0 ("12") is a couple of dozen
+    // pixels of a 960x540 frame -- far inside the whole-image golden's 0.5%
+    // tolerance, so a defect that stopped drawing counts entirely
+    // (`SceneRenderer::queue_item`'s `if item.count > 1`) would pass
+    // `assert_golden` alone. `(269, 509, 27, 15)` is the glyph's exact box,
+    // computed from `queue_item`'s own layout (`SLOT`=48, `GAP`=4,
+    // `MARGIN`=16 place slot 0 at x=248,y=476; `SCALE`=1.5, `font::GLYPH`=8
+    // place "12" at x=270,y=510, 24x12, plus its 1px drop shadow).
+    //
+    // Unlike the hotbar's *other* UI rects (opaque, pixel-aligned
+    // solid-colour quads -- see `inventory_screen`/`furnace_screen` below,
+    // where "no mips, `Nearest` sampler" really does mean zero cross-backend
+    // noise), a plain per-pixel comparison does not work for this one.
+    //
+    // Measured cross-backend noise, plain per-pixel count, this region: 0
+    // (NVIDIA/Vulkan, local), 40 (lavapipe, local and ubuntu CI), 73
+    // (Windows CI). Disabling the count draw entirely
+    // (`SceneRenderer::queue_item`'s `if item.count > 1`) changes only 153 --
+    // just 2.1x the measured Windows noise, short of the 3x margin this file
+    // aims for (test-quality audit #5). The reason is `SCALE`=1.5 upscaling
+    // an 8x8 bitmap glyph through a `Nearest` sampler: at a non-integer
+    // scale, which source texel a destination row/column rounds to is a
+    // rasterisation tie, and ties land differently across backends *through
+    // the glyph's interior*, not just at its silhouette -- unlike the
+    // opaque, pixel-aligned solid-colour quads the comment above actually
+    // describes.
+    //
+    // So this region uses [`assert_region_coverage_golden`] instead: coverage
+    // (how many pixels are lit) rather than position (which ones). Getting
+    // the threshold right took a second measurement -- the first (160) was
+    // wrong for a reason worth recording.
+    //
+    // Pixel values here are **not** the naive `color * 255`: the colour
+    // target is `Rgba8UnormSrgb` (`headless::COLOR_FORMAT`), so every value
+    // read back is sRGB-encoded. Slot 0's own green item swatch
+    // (`[0.45, 0.62, 0.30]`) reads back at luminance 191 -- *above* a 160
+    // threshold -- while the slot's outer well colour reads at 134. Dumping
+    // the region as a pixel grid (temporarily, not committed) showed why a
+    // 160 threshold measured only a 61-pixel delta when the count draw was
+    // disabled: that threshold counts the swatch's own 191 as "lit", so it
+    // is really measuring a mix of the glyph's white ink turning on *and*
+    // its black drop-shadow turning the swatch's already-lit background
+    // off, two effects partly cancelling. 220 sits above both backgrounds
+    // (191 and 134) and below white ink (255), so it counts *only* true
+    // white glyph pixels -- disabling the draw takes the golden's 105 lit
+    // pixels to a clean 0, not 194 down to 133.
+    //
+    // That is also a bigger, cleaner defect number against the same
+    // underlying noise: the delta is driven by `SCALE`=1.5 upscaling an 8x8
+    // glyph through a `Nearest` sampler, where ties over *which* pixels are
+    // white land differently across backends (Metal/DX12 vs this file's
+    // Vulkan-blessed reference) -- unaffected by where the threshold sits,
+    // since it is a white/not-white question either way. Measured coverage
+    // delta: 0 (NVIDIA/Vulkan, local), 0 (lavapipe, local and ubuntu CI,
+    // at both 160 and 220 -- lavapipe agrees with the Vulkan-blessed
+    // reference almost exactly), **20 on both macOS and Windows CI**
+    // (measured at threshold 160 before this was re-derived; unaffected by
+    // the threshold per the reasoning above, so still the right number to
+    // budget against). Disabling the draw changes 105 -- a 5.25x margin
+    // over the worst measured noise, comfortably over the 3x this file aims
+    // for, where the old 160-threshold number (61) gave only 2.1-3.05x.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_coverage_golden(
+            "hotbar",
+            &frame,
+            (269, 509, 27, 15),
+            220,
+            25,
+            "slot 0's \"12\" count",
+        );
+    }
     assert_golden("hotbar", &world, shot);
 }
 
@@ -1027,6 +1335,48 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
             (panel.slots()[0].x + 30.0, panel.slots()[0].y + 30.0),
         )),
     };
+    // Audit #5: the cursor's stack and the recipe result are each one 40x40
+    // slot out of a 960x540 frame -- far inside the whole-image golden's
+    // 0.5% tolerance, so a defect that stopped drawing either (the cursor's
+    // `if let Some(held) = view.held`, or the result slot's item draw in
+    // `queue_panel`'s slot loop) would pass `assert_golden` alone. Both
+    // rects are exact slot rectangles from `InventoryPanel::layout`'s own
+    // geometry (`SLOT`=40, `GAP`=4, `PAD`=16): the cursor box is centred on
+    // `(panel.slots()[0].x + 30, .y + 30)` above; the result slot is
+    // `panel.slots()`'s `Result`-kind entry.
+    //
+    // The two behave differently cross-backend, so they are budgeted
+    // differently. The result slot sits on the grid's own integer
+    // boundaries, like `furnace_screen`'s three slots below -- opaque
+    // `queue_rect`/`queue_item` quads through `TextRenderer`'s `Nearest`,
+    // no-mip sampler with no sub-pixel edge, measured at 0 pixels differing
+    // from the golden on every backend checked. Kept at 0.
+    //
+    // The cursor box is not grid-aligned -- it is centred 30px into slot 0
+    // from a corner, i.e. offset from the grid by a non-multiple of its own
+    // half-size, which puts its edges at a sub-pixel position relative to
+    // whatever is drawn under it. Measured noise there: 0 (NVIDIA/Vulkan,
+    // local), 12 (lavapipe, local and ubuntu CI), 18 (Windows CI).
+    // Disabling the cursor draw changes 533 in its box -- a 30x margin over
+    // the worst measured noise, so a plain per-pixel budget with headroom
+    // (30, below) keeps the 3x+ separation this file aims for. Hiding the
+    // result slot's item changes 784 in its box.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "inventory_screen",
+            &frame,
+            (294, 138, 40, 40),
+            30,
+            "the cursor's held stack",
+        );
+        assert_region_golden(
+            "inventory_screen",
+            &frame,
+            (394, 150, 40, 40),
+            0,
+            "the recipe's result slot",
+        );
+    }
     assert_golden("inventory_screen", &world, shot);
 }
 
@@ -1079,6 +1429,29 @@ fn an_item_name_shows_beside_the_cursor() {
             (hovered.x + 20.0, hovered.y + 20.0),
         )),
     };
+    // Audit #5: the tooltip box is a few thousand pixels of a 960x540 frame
+    // -- inside the whole-image golden's 0.5% tolerance, so a defect that
+    // stopped drawing it (`queue_panel`'s `if let Some(label) = view.tooltip`)
+    // would pass `assert_golden` alone. `(493, 359, 188, 28)` is the box's
+    // exact rectangle from `queue_tooltip`'s own layout (`SCALE`=2,
+    // `font::GLYPH`=8, `PAD`=5, cursor at `(hovered.x + 20, hovered.y + 20)`
+    // = (480, 392) above). Measured on this machine: 0 pixels differ from the
+    // golden here; disabling the tooltip draw changes 5,264. Not kept at 0
+    // like the other UI rects, unlike which this one is not fully opaque --
+    // `queue_tooltip`'s own box is drawn at 94% alpha
+    // (`queue_rect_alpha(.., BACK, 0.94)`), so 6% of whatever cross-backend
+    // terrain noise sits behind it (this shot's world background) can bleed
+    // through. 3 budgets for that without weakening what the rect actually
+    // checks -- a missing or wrong label still changes thousands of pixels.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "item_tooltip",
+            &frame,
+            (493, 359, 188, 28),
+            3,
+            "the \"Wooden Pick\" label",
+        );
+    }
     assert_golden("item_tooltip", &world, shot);
 }
 
@@ -1154,6 +1527,23 @@ fn hearts_show_health_including_a_half() {
         menu: None,
         lighting: Lighting::default(),
     };
+    // Audit #5: the half heart (the 7th heart, index 6: `points.saturating_sub
+    // (12).min(2) == 1`) is one 18x18 cell of a 960x540 frame -- far inside
+    // the whole-image golden's 0.5% tolerance, so a defect that drew it full
+    // or empty instead of half (`queue_hearts`'s `let w = HEART * (filled /
+    // PER_HEART)`) would pass `assert_golden` alone, exactly as the audit's
+    // own wording predicts ("a half heart drawn full or empty changes far
+    // fewer pixels"). `(373, 447, 20, 20)` is that heart's cell, computed
+    // from `queue_hearts`'s own layout (`HEART`=18, `GAP`=3, `MARGIN`=16,
+    // `HOTBAR`=48, `LIFT`=10; x0=248, y=448; heart 6 at x=374). Measured: 0
+    // pixels differ from the golden here. Kept at 0, not just a
+    // near-matching guess: flat `queue_rect` quads through `TextRenderer`'s
+    // `Nearest`, no-mip sampler (see `hotbar`'s region above), so none of
+    // the mip-selection or texture-filtering noise this file documents
+    // elsewhere applies. Forcing every heart to draw full changes 162.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden("hearts", &frame, (373, 447, 20, 20), 0, "the half heart");
+    }
     assert_golden("hearts", &world, shot);
 }
 
@@ -1213,6 +1603,65 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
             (panel.slots()[0].x + 30.0, panel.slots()[0].y + 30.0),
         )),
     };
+    // Audit #5: each of the three slots is one 40x40 cell of a 960x540
+    // frame -- far inside the whole-image golden's 0.5% tolerance, so a
+    // defect that hid any single slot's item (`queue_panel`'s slot loop)
+    // would pass `assert_golden` alone, and nothing else would say *which*
+    // slot broke. All three rects are exact slot rectangles from
+    // `InventoryPanel::layout_furnace`'s own geometry (input/`Grid` reuses
+    // the 2-wide base's cell 0; `Fuel` sits one `step` below it; `Result`
+    // sits two `step`s right of it, vertically centred). Each is an opaque
+    // `queue_rect`/`queue_item` quad through `TextRenderer`'s `Nearest`,
+    // no-mip sampler (see `hotbar`'s region above) -- the same case
+    // `inventory_screen`'s grid-aligned result slot measures at a clean 0.
+    //
+    // Measured cross-backend noise, plain per-pixel count -- 0 on
+    // NVIDIA/Vulkan (local) for all three. Not 0 everywhere, though, and not
+    // evenly: input 1 (lavapipe, local and ubuntu CI; also 1 on macOS and
+    // Windows CI). Fuel and output read 0 on ubuntu CI, but real hardware
+    // disagrees with the Vulkan-blessed reference far more than lavapipe's
+    // software rasteriser does -- fuel measured 18 on local lavapipe but
+    // **72 on macOS CI and 76 on Windows CI**; output measured 28 on local
+    // lavapipe (macOS/Windows not yet isolated -- the budgets below were
+    // set generously from fuel's real-hardware/lavapipe ratio, ~4x, and
+    // need re-checking once a CI run gets far enough to report output's own
+    // number). A plain per-pixel budget of 0 for any of the three would be
+    // betting real hardware never hits ties lavapipe's software rasteriser
+    // does not -- exactly the kind of thing `ARCHITECTURE.md`'s
+    // "verification means an automated check" warns against. So all three
+    // get a small, non-zero budget, scaled to what was actually measured on
+    // real GPUs rather than just the local software one.
+    //
+    // Suppressing just one slot's item at a time (`queue_panel`'s slot
+    // loop, gated on `slot.kind`) -- confined to its own rect, which is
+    // itself evidence the three are laid out apart the way the title
+    // claims -- changes: input 460 (a 92x margin over its 5-pixel budget),
+    // fuel 863 (a 7.2x margin over its 120-pixel budget, 11.3x over the
+    // 76 actually measured), output 824 (a 5.2x margin over its 160-pixel
+    // budget).
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "furnace_screen",
+            &frame,
+            (284, 128, 40, 40),
+            5,
+            "the input slot",
+        );
+        assert_region_golden(
+            "furnace_screen",
+            &frame,
+            (284, 172, 40, 40),
+            120,
+            "the fuel slot below it",
+        );
+        assert_region_golden(
+            "furnace_screen",
+            &frame,
+            (372, 150, 40, 40),
+            160,
+            "the output slot to the right",
+        );
+    }
     assert_golden("furnace_screen", &world, shot);
 }
 
@@ -1356,7 +1805,7 @@ fn distinct_materials_render_with_distinct_textures() {
         headless::render_chunks(&chunks, shot)
     };
     let Some(frame) = frame else {
-        eprintln!("SKIPPED distinct_materials_render_with_distinct_textures: no GPU adapter");
+        headless::skip_or_require_gpu("distinct_materials_render_with_distinct_textures");
         return;
     };
 
@@ -1408,7 +1857,7 @@ fn edits_change_what_is_drawn() {
     let shot = Shot::default();
     let mut world = World::new();
     let Some(base) = render_world(&World::new(), shot.clone()) else {
-        eprintln!("SKIPPED edits_change_what_is_drawn: no GPU adapter");
+        headless::skip_or_require_gpu("edits_change_what_is_drawn");
         return;
     };
 
@@ -1497,6 +1946,33 @@ fn three_players_stand_in_front_of_the_camera() {
         menu: None,
         lighting: Lighting::default(),
     };
+    // Audit #5: all three figures together are a few hundred pixels of a
+    // 960x540 frame -- inside the whole-image golden's 0.5% tolerance, so a
+    // defect that ignored `yaw` entirely (`figure_vertices`' `view.yaw.
+    // sin_cos()`) would pass `assert_golden` alone, which is exactly the
+    // failure mode the comment above names ("a figure that ignored it would
+    // be identical to its neighbours"). `(330, 183, 300, 133)` is the union
+    // of the three figures' screen-space bounding boxes, computed from each
+    // `eye`/`yaw` via `CameraUniform::look_view_proj` and `PLAYER_HEIGHT`/
+    // `PLAYER_WIDTH` (confirmed against the committed golden: each figure's
+    // shirt colour samples inside its own box, and the turned middle one is
+    // visibly narrower there). Measured: 1 of the ~39,900 pixels in this
+    // rect differs from the golden at `TOLERANCE` on an NVIDIA/Vulkan
+    // machine (ordinary silhouette-edge noise); the real macOS and Windows
+    // CI runners' whole-frame percentage for this shot is noticeably higher
+    // than this machine's (0.122%/0.124% vs 0.083%, checked via `gh run
+    // view --log`), so this rect's count is likely higher there too. Forcing
+    // every figure's yaw to 0 changes 1,841. 10 keeps a wide margin under
+    // the defect while giving real headroom over the higher CI baseline.
+    if let Some(frame) = render_world(&world, shot.clone()) {
+        assert_region_golden(
+            "three_players",
+            &frame,
+            (330, 183, 300, 133),
+            10,
+            "all three figures, including the turned one",
+        );
+    }
     assert_golden("three_players", &world, shot);
 }
 
@@ -1711,7 +2187,7 @@ fn far_shading_is_the_aggregate_reference() {
             headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
         };
         let Some(frame) = frame else {
-            eprintln!("SKIPPED far_shading_is_the_aggregate_reference: no GPU adapter");
+            headless::skip_or_require_gpu("far_shading_is_the_aggregate_reference");
             return;
         };
         let at = ((32 * frame.width + 32) * 4) as usize;

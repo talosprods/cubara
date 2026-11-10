@@ -18,42 +18,63 @@ use cubara_render::{
     gpu_driven_features, ChunkArena, GpuTimestamps, SceneFrame, SceneRenderer, TimestampRing,
 };
 
-/// A device with the timestamp-query features this test needs, or `None` on
-/// a CI runner with no GPU adapter, or one whose driver lacks
-/// `TIMESTAMP_QUERY` -- the same skip-loudly convention
-/// `mesh_arena_integration.rs`'s `test_device()` uses.
-fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+/// Why [`test_device`] couldn't produce a device -- kept distinct from a
+/// plain `None` (audit #5, PR #376): "no adapter at all" and "adapter
+/// present but missing `TIMESTAMP_QUERY`" take different skip paths under
+/// `CUBARA_REQUIRE_GPU` (see `cubara_render::headless::skip_or_require_gpu`
+/// vs `skip_missing_feature`'s doc comments). Collapsing both to `None` is
+/// exactly what made `CUBARA_REQUIRE_GPU=1` panic on the macOS runner, which
+/// has a Metal adapter without `TIMESTAMP_QUERY`.
+enum TestDevice {
+    Device(wgpu::Device, wgpu::Queue),
+    NoAdapter,
+    MissingFeature(&'static str),
+}
+
+/// A device with the timestamp-query features this test needs, or the
+/// reason it couldn't be made -- see [`TestDevice`]. The same skip-loudly
+/// convention `mesh_arena_integration.rs`'s `test_device()` uses, split by
+/// reason.
+fn test_device() -> TestDevice {
     let instance = cubara_render::new_instance();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
         apply_limit_buckets: false,
-    }))
-    .ok()?;
+    })) else {
+        return TestDevice::NoAdapter;
+    };
     let (features, _) = gpu_driven_features(&adapter);
     if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-        return None;
+        return TestDevice::MissingFeature("TIMESTAMP_QUERY");
     }
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cubara-test-gpu-timestamps-device"),
         required_features: features,
         required_limits: wgpu::Limits::default(),
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
-    }))
-    .ok()
+    })) {
+        Ok((device, queue)) => TestDevice::Device(device, queue),
+        Err(_) => TestDevice::NoAdapter,
+    }
 }
 
 #[test]
 fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
-    let Some((device, queue)) = test_device() else {
-        eprintln!(
-            "SKIP gpu_timestamps_through_encode_scene_produce_a_real_reading: \
-             no GPU adapter, or no TIMESTAMP_QUERY"
-        );
-        return;
+    const TEST_NAME: &str = "gpu_timestamps_through_encode_scene_produce_a_real_reading";
+    let (device, queue) = match test_device() {
+        TestDevice::Device(device, queue) => (device, queue),
+        TestDevice::NoAdapter => {
+            cubara_render::headless::skip_or_require_gpu(TEST_NAME);
+            return;
+        }
+        TestDevice::MissingFeature(feature) => {
+            cubara_render::headless::skip_missing_feature(TEST_NAME, feature);
+            return;
+        }
     };
 
     let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
