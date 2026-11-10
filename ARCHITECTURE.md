@@ -176,3 +176,27 @@ them. If one of these genuinely obstructs something necessary:
 
 What is not acceptable is an exception that lives only in someone's head, or a
 check disabled to make a build pass.
+
+**Granted exceptions:**
+
+- **Rule 1 — the walk/free-fly direction is `f32`.** `crates/sim/src/physics.rs`'s
+  walk step and `crates/sim/src/player.rs`'s free-fly (`Player::fly`) each take an
+  input direction, `.normalize()` it, and scale it by a speed constant in `f32`
+  before converting the result into `Fixed` (one `as i64`/`FixedVec3::from_f32`
+  truncation). `normalize()` is a `sqrt` plus divides — exactly the
+  least-portable kind of float operation Rule 1 exists to keep out of the sim.
+
+  **Why it is accepted:** IEEE 754 `+ − × /` and `sqrt` are bit-exact across the
+  three target platforms (the physics module's own comment: "a difference in
+  `wish` can perturb one tick's velocity by a sub-unit and no more -- it cannot
+  compound, because the position it feeds is exact"), and the result is pinned
+  by the cross-platform determinism fixture
+  (`crates/sim/tests/determinism.rs`), which hashes world state after a scripted
+  input replay on every CI run. Rewriting this onto `cubara_voxel::Angle`'s
+  integer unit vectors, which already exist for exactly this purpose, would
+  change the player's movement feel and every existing replay hash, so it is
+  not done as a side effect of a Rule 1 cleanup.
+
+  **What would revoke it:** a fixture-hash divergence between runners (macOS,
+  Windows, Linux) traced to this `normalize()` -- at that point the fixed-point
+  rewrite becomes its own issue, not a cleanup to fold into something else.

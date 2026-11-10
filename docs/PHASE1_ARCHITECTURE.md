@@ -291,14 +291,21 @@ Phase 1 format — three `u32`, **12 bytes**, positions local to the node:
 ```
 word 0:  x:10  y:10  z:10  ao:2          // node-local lattice coords
 word 1:  tex_layer:12  face:3  u_len:8  v_len:8  (1 spare)
-word 2:  node_index:16  (16 spare)
+word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  (12 spare)
 ```
 
 `face` is 3 bits because greedy-meshed voxel faces are always one of six axis
 directions — the normal is a lookup, not data. `u_len`/`v_len` carry the greedy
 quad's extent so the texture tiles across a merged face. `node_index` (word 2)
 is explained in §5.3 — it was not part of the original two-word design; it is
-the outcome of that section's own investigation.
+the outcome of that section's own investigation. `corner_u`/`corner_v` (one bit
+each) say which of the quad's four corners this vertex is, so `u_len`/`v_len`
+can stay the whole quad's extent while each corner still samples its own
+integer tile coordinate. `ao_width_log2` (two bits) scales a vertex's baked AO
+gradient to its face's cell width — up to log2 3, a level-3 node's 8-block
+horizontal cell (issue #327, decision 5; `docs/PROPOSAL_LOD_TRANSITIONS.md` §3
+R1). `crates/voxel/src/mesh.rs`'s `Vertex` doc comment is the one source for
+this layout — read it there if the two ever disagree.
 
 ### 5.3 How the shader knows which node it is drawing
 
@@ -398,14 +405,35 @@ approach cannot reach radius 64 no matter how far it is pushed.
 Level 0 is a single chunk. Level 3 covers 8×8×8 = 512 chunks in one draw. That is
 where the 25× draw-count reduction comes from.
 
-### 6.2 Uniform node cost
+### 6.2 Node cost per level
 
-Every node, at every level, is sampled on a **fixed 16³ lattice**. A level-0 node
-samples every block; a level-3 node samples every 8th block across a 128³ volume.
+Every node is sampled on a **16-wide horizontal lattice**, but since block 3.0b
+(R1b+R1c, issue #327) the vertical lattice count is not uniform: levels 0-2 keep
+one-block-tall cells, and level 3 widens to 4-block-tall cells
+(`NodeKey::cell_height_blocks`), so the cell *count* per node is no longer the
+same at every level (`NodeKey::lattice_dims`, `crates/world/src/node.rs`):
 
-The consequence is that generating and meshing any node costs the same, so total
-cost is O(node count) and node count is bounded by the ring schedule — rather than
-far nodes being quietly the most expensive things in the frame.
+| level | horizontal cell | vertical cell (`v`) | lattice (`16 × ny × 16`) | cells  |
+|-------|-----------------|----------------------|--------------------------|--------|
+| 0     | 1 block         | 1 block              | 16 × 16 × 16             | 4,096  |
+| 1     | 2 blocks        | 1 block              | 16 × 32 × 16             | 8,192  |
+| 2     | 4 blocks        | 1 block              | 16 × 64 × 16             | 16,384 |
+| 3     | 8 blocks        | 4 blocks             | 16 × 32 × 16             | 8,192  |
+
+So generating and meshing a node costs O(16 · ny · 16), not a constant: the
+ratio across levels 0-3 is **1 : 2 : 4 : 2**, not the flat 1:1:1:1 a truly
+uniform lattice would give. Total cost is still bounded by the ring schedule
+(node count × this per-node cost), rather than far nodes being quietly the
+most expensive things in the frame — that property survives R1b; only the
+per-node constant stopped being level-independent.
+
+In practice the measured cost grows less than the cell-count ratio predicts:
+`BENCHMARKS.md`⁸⁴ measured level 2 (the worst case, 4× the cells of level 0)
+taking 1.5–1.65× as long to generate and mesh, not 4×, because the
+surface-band optimisation (R1b/R1c) skips cells away from the terrain surface
+rather than sampling the node's full volume. The cell-count table above is the
+*upper* bound this check holds nodes to; the surface band is why real nodes
+usually cost less.
 
 ### 6.3 The ring schedule
 
