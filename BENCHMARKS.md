@@ -1273,6 +1273,10 @@ the whole frame in the game's own loop (`--bench walk`) in ⁸³.
 | 2026-11-09 | **Linux**, the same three⁷⁷ | low, 2 runs | **0.44% / 0.37%** | **5.8% / 5.6%** | **14% / 10%** | 3.1 / 3.6 ms | `5b29370` |
 | 2026-11-09 | **Linux**, before⁷⁷ | down, 2 runs | 22.80% / 21.81% | 97.9% / 97.9% | 42% / 37% | 3.4 / 3.3 ms | `bench/flight-before` |
 | 2026-11-09 | **Linux**, the same three⁷⁷ | down, 2 runs | **0.79% / 0.79%** | **24.0% / 24.0%** | **5% / 5%** | 3.6 / 4.3 ms | `5b29370` |
+| 2026-11-10 | **Linux**, swap lag measured (no behaviour change, #378)⁸⁷ | low, 2 runs | 0.18% / 0.20% | 1.67% / 2.73% | 8% / 8% | 2.1 / 2.1 ms | `8699d1d` |
+| 2026-11-10 | the same⁸⁷ | high | 0.21% | 7.34% | 2% | 2.8 ms | `8699d1d` |
+| 2026-11-10 | the same⁸⁷ | down | 0.57% | 21.35% | 3% | 3.2 ms | `8699d1d` |
+| 2026-11-10 | the same⁸⁷ | toward a peak (`--toward-peak`), 30 s | 0.20% | 2.21% | 6% | 2.5 ms | `8699d1d` |
 
 ### Holes while flying — nothing drawn where land belongs (`--bench flight`)
 
@@ -2955,3 +2959,45 @@ of frames with a hole pixel is about twice `main`'s (238–276 → 496–548, wo
 0.001% of the screen). Most likely these are trees appearing at the frustum's
 edge; this is not confirmed. One golden changed, `lod_boundary` (0.41%):
 trees now stand on the far slopes where there was a tree line.
+
+⁸⁷ **The swap lag while flying -- does mesh-ahead pay (block 3.0a, #378),
+Linux, 2026-11-10.** What remained of the owner's holes after #319–#321
+(issue #318's progress note) was a silhouette changing at an LOD swap, not a
+missing pixel, and mesh-ahead (meshing the finer level before the ring edge
+arrives) only pays if that swap happens noticeably late. This measures
+first. `NodeStreaming::swap_lags()` times a node whose replacement had not
+landed: frames from the search that first found it stale to the frame it
+actually unloaded (design decision 1 -- only nodes something replaces, never
+one simply left behind or seen visible again first). No clock inside
+`NodeStreaming` (rule 2): it counts its own `update` calls, and `--bench
+flight` converts frames to ms and blocks at the frame rate the flight
+achieved (frames drawn over seconds flown) and its speed (24 blocks/s).
+Quiet machine (load average 2–4, nothing else compiling), 1280×720, High,
+binary `8699d1d`; every flight ran at 59.6–60.0 FPS, so its nominal
+conversion equals the achieved one. A third low run at the achieved-rate
+conversion is the last line:
+
+```
+              n       p50      p90      p99      max     (blocks: p50/p90/p99/max)
+low        16,197   133 ms   167 ms   183 ms   217 ms     3.20 / 4.00 / 4.40 / 5.20
+low        16,197   133 ms   200 ms   233 ms   250 ms     3.20 / 4.80 / 5.60 / 6.00
+high       21,822   133 ms   167 ms   233 ms   317 ms     3.20 / 4.00 / 5.60 / 7.60
+down       19,240   117 ms   183 ms   350 ms   417 ms     2.80 / 4.40 / 8.40 / 10.00
+to a peak  28,435   133 ms   167 ms   217 ms   233 ms     3.20 / 4.00 / 5.20 / 5.60
+low (3rd)  15,630   151 ms   218 ms   268 ms   302 ms     3.62 / 5.23 / 6.44 / 7.25
+```
+
+**Decision rule (#378 decision 4): no prefetch on Linux.** Every flight's
+p99 is at most 8.4 blocks, about half a chunk; the worst single swap in any
+flight came 10 blocks late, against ring edges 160 m to 1 km away. Most of
+a swap's lag is fixed: a search answer (tens of ms) plus meshing and the
+paced upload, about 8 frames. The frame terms of the same flights are in
+the rows above (work p99 2.1–3.2 ms). Windows and the M3 print the same
+`SWAP LAG` line; they are the machines where it could still come out late.
+
+A first measurement on this branch, taken while other sessions compiled
+(load 10–13) and while the mutation check was rewriting
+`streaming.rs`/`flight.rs` on disk, read low p99 18 blocks and high n = 0.
+Both were artefacts: the quiet runs above count 21,822 swaps in the high
+flight, and low's lag was its work time (p99 18.1 ms against 2.1 ms here)
+under contention. A measurement taken on a loaded machine is not one.

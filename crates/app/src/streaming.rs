@@ -81,6 +81,52 @@ fn worth_remembering(node: NodeKey, desired: &HashSet<NodeKey>) -> bool {
         || node.children().iter().any(|c| desired.contains(c))
 }
 
+/// Record that `node` has just left the visible set, if it is worth
+/// measuring as a swap at all (design decision 1, issue #378): something
+/// still replaces it. A node nothing replaces is not a swap and is never
+/// added -- it simply leaves. `or_insert` keeps the *first* frame `node` was
+/// found stale: a later search re-confirming the same staleness must not
+/// reset the clock, or a node held across several searches would only ever
+/// show the latest one's short remaining wait.
+fn mark_stale(
+    pending: &mut HashMap<NodeKey, u64>,
+    node: NodeKey,
+    visible: &HashSet<NodeKey>,
+    frame: u64,
+) {
+    if !replacements_of(node, visible).is_empty() {
+        pending.entry(node).or_insert(frame);
+    }
+}
+
+/// `node` has just unloaded -- its replacement landed, or (checked again,
+/// because the visible set can have moved on since it was marked) nothing
+/// replaces it any more. Returns the swap lag in frames, `now` minus the
+/// frame it was first found stale, when it was a genuine swap; `None` when
+/// it was not pending at all (never went stale, or was dropped by
+/// [`forget_visible_again`]) or nothing replaces it any more.
+fn resolve_swap(
+    pending: &mut HashMap<NodeKey, u64>,
+    node: NodeKey,
+    visible: &HashSet<NodeKey>,
+    now: u64,
+) -> Option<u64> {
+    let since = pending.remove(&node)?;
+    if replacements_of(node, visible).is_empty() {
+        None
+    } else {
+        Some(now - since)
+    }
+}
+
+/// A node seen visible again before its replacement ever landed was not a
+/// swap after all -- the camera came back (issue #378's done-when list).
+/// Dropped silently rather than recorded, and rather than left to linger:
+/// the next time this node goes stale it starts a fresh clock.
+fn forget_visible_again(pending: &mut HashMap<NodeKey, u64>, visible: &HashSet<NodeKey>) {
+    pending.retain(|node, _| !visible.contains(node));
+}
+
 /// Whether `node` can leave the arena this frame without leaving a hole.
 ///
 /// **This is the whole fix for #262.** A node used to be unloaded the moment
@@ -265,11 +311,35 @@ pub struct NodeStreaming {
     generation: u64,
     /// A search is running that has not answered yet.
     searching: bool,
+    /// This streamer's own [`update`](Self::update) calls, counted rather
+    /// than timed (rule 2: no clock inside `NodeStreaming`). The only frame
+    /// index [`swap_lags`](Self::swap_lags) knows about -- the bench
+    /// converts it to milliseconds with its own frame times, and to blocks
+    /// with the flight speed (issue #378).
+    frame: u64,
+    /// Nodes something still replaces, not yet landed: the frame
+    /// ([`frame`](Self::frame)) the search that first found each one stale
+    /// was started. Cleared without being counted if the node becomes
+    /// visible again ([`forget_visible_again`]) or the world is forgotten
+    /// ([`forget_world`](Self::forget_world)) -- the whole cost of this
+    /// measurement while it is not being read.
+    swap_pending: HashMap<NodeKey, u64>,
+    /// Every swap's lag so far, in frames: [`frame`](Self::frame) when it
+    /// unloaded minus when it was first found stale. Only genuine swaps
+    /// (issue #378 decision 1) -- a node simply left behind, or one that
+    /// became visible again first, never adds one.
+    swap_lags: Vec<u64>,
 }
 
 /// One search to run: the camera's chunk and a snapshot of what is known.
 struct SearchJob {
     generation: u64,
+    /// [`NodeStreaming::frame`] when this search was started -- carried
+    /// through to the answer so a node this search first finds stale
+    /// remembers the frame the *search* started on, not the (later) one its
+    /// answer is applied on. That gap is the search's own latency, which
+    /// issue #378 decision 1 counts as part of the swap lag.
+    frame: u64,
     center: ChunkCoord,
     links: Arc<HashMap<NodeKey, visibility::NodeLinks>>,
 }
@@ -278,6 +348,8 @@ struct SearchJob {
 /// can be seen.
 struct SearchDone {
     generation: u64,
+    /// The job's own [`SearchJob::frame`], echoed back.
+    frame: u64,
     center: ChunkCoord,
     desired: HashSet<NodeKey>,
     visible: HashSet<NodeKey>,
@@ -314,6 +386,7 @@ impl Searcher {
                         visibility::visible_nodes(job.center, &desired, |n| links.get(&n).copied());
                     let answer = SearchDone {
                         generation: job.generation,
+                        frame: job.frame,
                         center: job.center,
                         desired,
                         visible,
@@ -373,6 +446,9 @@ impl NodeStreaming {
             searcher: Searcher::new(),
             generation: 0,
             searching: false,
+            frame: 0,
+            swap_pending: HashMap::new(),
+            swap_lags: Vec::new(),
         }
     }
 
@@ -381,6 +457,9 @@ impl NodeStreaming {
     /// Cheap when nothing changed: `stream_around` only runs on a
     /// chunk-boundary crossing.
     pub fn update(&mut self, renderer: &mut Renderer, world: &Arc<World>, eye: [f32; 3]) {
+        // The frame index `swap_lags` is measured in (decision 2, #378): no
+        // clock in here, just this call's own count.
+        self.frame += 1;
         let center = ChunkCoord::from_world_pos(eye);
         self.frames_since_visibility += 1;
         if self.center != Some(center) {
@@ -442,6 +521,9 @@ impl NodeStreaming {
         // so draining `resident` unloads both.
         let unload = self.resident.drain().map(to_node_id).collect();
         self.held.clear();
+        // Pending swaps are for terrain that no longer exists either; none of
+        // them landed, so none is counted.
+        self.swap_pending.clear();
         let in_flight: Vec<NodeKey> = self.mesh_pool.in_flight().collect();
         for node in in_flight {
             self.mesh_pool.cancel(node);
@@ -468,6 +550,7 @@ impl NodeStreaming {
         self.frames_since_visibility = 0;
         let job = SearchJob {
             generation: self.generation,
+            frame: self.frame,
             center,
             links: Arc::clone(&self.links),
         };
@@ -503,16 +586,35 @@ impl NodeStreaming {
         for &node in &stale {
             self.mesh_pool.cancel(node);
         }
+        // A node seen visible again before it ever swapped was not a swap
+        // (issue #378's done-when list) -- drop any pending measurement of it
+        // before the loop below can start a fresh one for something else.
+        forget_visible_again(&mut self.swap_pending, &self.visible);
         // ...but what is already *drawn* only leaves once its replacement has
         // arrived (#262). `held` keeps drawing until then; it is re-checked
         // here and again as each mesh lands, so the swap happens on the frame
         // the replacement is ready rather than on the next search.
-        let (unload_now, held): (Vec<NodeKey>, Vec<NodeKey>) = stale
+        let resident_stale: Vec<NodeKey> = stale
             .into_iter()
             .filter(|n| self.resident.contains(n))
+            .collect();
+        // This search's answer is what first makes each of these nodes stale
+        // (if nothing already had); #378 decision 1 starts the clock here,
+        // on `done.frame`, not on `self.frame` when this call runs -- the gap
+        // between the two is the search's own latency, which is part of what
+        // the player waits for.
+        for &node in &resident_stale {
+            mark_stale(&mut self.swap_pending, node, &self.visible, done.frame);
+        }
+        let (unload_now, held): (Vec<NodeKey>, Vec<NodeKey>) = resident_stale
+            .into_iter()
             .partition(|&n| can_unload(n, &self.visible, &self.resident));
         for &node in &unload_now {
             self.resident.remove(&node);
+            if let Some(lag) = resolve_swap(&mut self.swap_pending, node, &self.visible, self.frame)
+            {
+                self.swap_lags.push(lag);
+            }
         }
         self.held = held.into_iter().collect();
         let to_unload: Vec<NodeId> = unload_now.into_iter().map(to_node_id).collect();
@@ -663,10 +765,27 @@ impl NodeStreaming {
             for node in &ready {
                 self.held.remove(node);
                 self.resident.remove(node);
+                if let Some(lag) =
+                    resolve_swap(&mut self.swap_pending, *node, &self.visible, self.frame)
+                {
+                    self.swap_lags.push(lag);
+                }
             }
             ready.into_iter().map(to_node_id).collect()
         };
         renderer.apply_node_updates(released, meshed);
+    }
+
+    /// Every swap's lag so far, in frames (issue #378): a node with a
+    /// replacement counted from the frame the search that first found it
+    /// stale was started to the frame it actually unloaded, because its
+    /// replacement had landed. A node nothing replaces, and one seen visible
+    /// again before it swapped, never adds one (design decision 1 and the
+    /// done-when list). No clock in here (rule 2) -- the caller converts
+    /// frames to milliseconds with its own frame times, and to blocks with
+    /// the flight speed.
+    pub fn swap_lags(&self) -> &[u64] {
+        &self.swap_lags
     }
 }
 
@@ -933,5 +1052,144 @@ mod tests {
                 assert_eq!(i == j, a == b, "{a:?} vs {b:?}");
             }
         }
+    }
+
+    // Issue #378's swap-lag measurement: `mark_stale`/`resolve_swap`/
+    // `forget_visible_again` are the pure bookkeeping `follow_visibility` and
+    // `drain_meshes` call, kept separate so they can be tested without a GPU
+    // or a `World` -- the same reason `can_unload` and `replacements_of`
+    // above are free functions rather than inlined.
+
+    /// Done-when #1: a node swapped on the frame its replacement lands has a
+    /// lag equal to that frame minus the one the search that found it stale
+    /// started on.
+    #[test]
+    fn swap_lag_is_the_frames_between_going_stale_and_landing() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let replacement: HashSet<NodeKey> = children_of(parent).into_iter().collect();
+        let mut pending = HashMap::new();
+
+        mark_stale(&mut pending, parent, &replacement, 10);
+        assert_eq!(
+            resolve_swap(&mut pending, parent, &replacement, 42),
+            Some(32),
+            "landed 32 frames after the search that first found it stale"
+        );
+        assert!(pending.is_empty(), "a resolved swap must not stay pending");
+    }
+
+    /// A later search re-confirming the same staleness must not push the
+    /// start of the clock later -- `mark_stale` keeps the first frame.
+    #[test]
+    fn mark_stale_keeps_the_first_frame_not_the_latest() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let replacement: HashSet<NodeKey> = children_of(parent).into_iter().collect();
+        let mut pending = HashMap::new();
+
+        mark_stale(&mut pending, parent, &replacement, 5);
+        mark_stale(&mut pending, parent, &replacement, 50);
+        assert_eq!(pending[&parent], 5);
+        assert_eq!(
+            resolve_swap(&mut pending, parent, &replacement, 60),
+            Some(55)
+        );
+    }
+
+    /// Done-when #2 (half): a node nothing replaces is never even marked --
+    /// it is not a swap, so there is nothing to time.
+    #[test]
+    fn mark_stale_ignores_a_node_nothing_replaces() {
+        let gone = NodeKey::new(1, [40, 0, 40]);
+        let elsewhere: HashSet<NodeKey> = HashSet::from([NodeKey::new(1, [-40, 0, -40])]);
+        let mut pending = HashMap::new();
+
+        mark_stale(&mut pending, gone, &elsewhere, 7);
+        assert!(pending.is_empty());
+    }
+
+    /// Done-when #2 (other half): a node marked stale while something
+    /// replaced it, which later stops being replaced (the camera moved on
+    /// again before it swapped), must not be counted as a swap when it
+    /// finally leaves.
+    #[test]
+    fn resolve_swap_forgets_a_node_nothing_replaces_any_more() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let replacement: HashSet<NodeKey> = children_of(parent).into_iter().collect();
+        let mut pending = HashMap::new();
+        mark_stale(&mut pending, parent, &replacement, 3);
+
+        let nothing_replaces_it_now = HashSet::new();
+        assert_eq!(
+            resolve_swap(&mut pending, parent, &nothing_replaces_it_now, 9),
+            None,
+            "left because nothing replaces it, not because a replacement landed"
+        );
+        assert!(
+            pending.is_empty(),
+            "left either way -- resolved, not retried"
+        );
+    }
+
+    /// Done-when #3: a node seen visible again before it ever swapped was
+    /// not a swap after all, and records nothing when it is later dropped.
+    #[test]
+    fn a_node_visible_again_before_swapping_records_nothing() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let replacement: HashSet<NodeKey> = children_of(parent).into_iter().collect();
+        let mut pending = HashMap::new();
+        mark_stale(&mut pending, parent, &replacement, 1);
+
+        let visible_again: HashSet<NodeKey> = HashSet::from([parent]);
+        forget_visible_again(&mut pending, &visible_again);
+        assert!(pending.is_empty());
+        assert_eq!(
+            resolve_swap(&mut pending, parent, &replacement, 100),
+            None,
+            "nothing was pending any more -- it must not silently restart"
+        );
+    }
+
+    /// `forget_visible_again` only drops nodes that actually came back; a
+    /// node still legitimately held keeps its stale-since frame.
+    #[test]
+    fn forget_visible_again_leaves_nodes_still_stale_alone() {
+        let parent = NodeKey::new(2, [3, 0, -4]);
+        let replacement: HashSet<NodeKey> = children_of(parent).into_iter().collect();
+        let mut pending = HashMap::new();
+        mark_stale(&mut pending, parent, &replacement, 4);
+
+        // `parent` is still not in the visible set -- only its replacement is.
+        forget_visible_again(&mut pending, &replacement);
+        assert_eq!(
+            pending[&parent], 4,
+            "still genuinely stale, not visible again"
+        );
+    }
+
+    /// Done-when #4: `reset` (`forget_world`) forgets pending swaps rather
+    /// than counting them as having landed -- the terrain they were waiting
+    /// on no longer exists either.
+    #[test]
+    fn forget_world_drops_pending_swaps_without_counting_them() {
+        let mut s = real_streaming();
+        s.swap_pending.insert(NodeKey::new(0, [9, 9, 9]), 1);
+        s.frame = 500;
+
+        s.forget_world();
+
+        assert!(
+            s.swap_pending.is_empty(),
+            "a reset world has nothing pending"
+        );
+        assert!(
+            s.swap_lags.is_empty(),
+            "an unresolved swap must not be counted as a landed one"
+        );
+    }
+
+    #[test]
+    fn swap_lags_starts_empty() {
+        let s = real_streaming();
+        assert!(s.swap_lags().is_empty());
     }
 }

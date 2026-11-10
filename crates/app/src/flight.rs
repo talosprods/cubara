@@ -236,6 +236,58 @@ pub fn hole_fraction(live: &Frame, settled: &Frame) -> f64 {
     holes as f64 / n.max(1) as f64
 }
 
+/// The swap-lag distribution for one flight (issue #378): how long a node
+/// that should have been swapped for a different level of detail kept being
+/// drawn. `NodeStreaming` only counts frames of its own `update` calls (rule
+/// 2: no clock inside it); this is where those become milliseconds, with
+/// the flight's own pacing, and blocks travelled, with its speed -- the two
+/// units decision 3 asks the report to carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SwapLagStats {
+    pub count: usize,
+    pub p50_ms: f64,
+    pub p90_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub p50_blocks: f64,
+    pub p90_blocks: f64,
+    pub p99_blocks: f64,
+    pub max_blocks: f64,
+}
+
+impl SwapLagStats {
+    /// `lags` is [`crate::streaming::NodeStreaming::swap_lags`]'s frame
+    /// counts; `frames_per_second` and `speed` (blocks/s) convert a frame
+    /// count to time and distance the way the flight itself paced and moved.
+    /// The rate is the one the flight *achieved*, frames drawn over seconds
+    /// flown -- not the one it asked for: a frame that runs late is not made
+    /// up (`fly`'s pacing), so under load a frame is longer than 1/`fps` and
+    /// the nominal rate would understate the lag.
+    pub fn of(lags: &[u64], frames_per_second: f64, speed: f32) -> Self {
+        if lags.is_empty() {
+            return Self::default();
+        }
+        let mut sorted = lags.to_vec();
+        sorted.sort_unstable();
+        let at = |per_mille: usize| sorted[(sorted.len() - 1) * per_mille / 1000] as f64;
+        let rate = frames_per_second.max(1e-3);
+        let ms_per_frame = 1000.0 / rate;
+        let blocks_per_frame = speed as f64 / rate;
+        let (p50, p90, p99, max) = (at(500), at(900), at(990), *sorted.last().unwrap() as f64);
+        Self {
+            count: sorted.len(),
+            p50_ms: p50 * ms_per_frame,
+            p90_ms: p90 * ms_per_frame,
+            p99_ms: p99 * ms_per_frame,
+            max_ms: max * ms_per_frame,
+            p50_blocks: p50 * blocks_per_frame,
+            p90_blocks: p90 * blocks_per_frame,
+            p99_blocks: p99 * blocks_per_frame,
+            max_blocks: max * blocks_per_frame,
+        }
+    }
+}
+
 /// What a flight found.
 #[derive(Debug)]
 pub struct FlightReport {
@@ -250,6 +302,10 @@ pub struct FlightReport {
     pub holes: Vec<u32>,
     /// Pixels in a frame.
     pub pixels: usize,
+    /// How long a node kept being drawn after it should have swapped for a
+    /// different level of detail (issue #378) -- the live pass only; the
+    /// settled pass jumps around and is not what a player experiences.
+    pub swap_lags: SwapLagStats,
 }
 
 impl FlightReport {
@@ -290,13 +346,16 @@ impl FlightReport {
         let (any, visible, worst_px) = self.hole_frames();
         let kept_holes = self.samples.iter().filter(|s| s.hole > 0.0).count();
         let kept_worst = self.samples.iter().map(|s| s.hole).fold(0.0, f64::max);
+        let s = &self.swap_lags;
         format!(
             "FLIGHT: loading mean {:.2}% worst {:.2}% (at {:.2} s, {:.0?}), \
              frames over 1%: {:.0}%, work p99 {:.1} ms p99.9 {:.1} ms max {:.1} ms, \
              over 16.7 ms {} over 33.3 ms {} ({} kept frames) | \
              HOLES: {any} of {} frames show a hole, {visible} over 0.1% of the screen, \
              worst {:.3}%; kept frames with nothing where the finished frame has land: \
-             {kept_holes}, worst {:.3}%",
+             {kept_holes}, worst {:.3}% | \
+             SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
+             ({:.2}/{:.2}/{:.2}/{:.2} blocks)",
             self.mean() * 100.0,
             worst.loading * 100.0,
             worst.t,
@@ -311,6 +370,15 @@ impl FlightReport {
             self.holes.len(),
             worst_px as f64 * 100.0 / self.pixels.max(1) as f64,
             kept_worst * 100.0,
+            s.count,
+            s.p50_ms,
+            s.p90_ms,
+            s.p99_ms,
+            s.max_ms,
+            s.p50_blocks,
+            s.p90_blocks,
+            s.p99_blocks,
+            s.max_blocks,
         )
     }
 
@@ -635,6 +703,11 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
             None => next_frame = now,
         }
     }
+    // The live pass only (#378): the settled pass below jumps the eye around
+    // to reconstruct each kept frame, which is not a swap a player ever
+    // waits on.
+    let achieved = work_times.len() as f64 / flight.seconds.max(1e-3) as f64;
+    let swap_lags = SwapLagStats::of(live.nodes.swap_lags(), achieved, flight.speed);
     drop(live);
 
     // The settled pass: the same eyes, each loaded completely.
@@ -689,6 +762,7 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         work_times,
         holes: holes.map_or_else(Vec::new, |h| h.per_frame),
         pixels,
+        swap_lags,
     })
 }
 
@@ -770,6 +844,7 @@ mod tests {
             work_times: vec![0.002; 10],
             holes: Vec::new(),
             pixels: 4,
+            swap_lags: SwapLagStats::default(),
         };
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
@@ -859,5 +934,34 @@ mod tests {
             keep_worst(&mut worst, loading, name);
         }
         assert_eq!(worst, Some((0.3, "b")), "kept a later or a lesser frame");
+    }
+
+    /// Issue #378: frames become milliseconds at the flight's own pace, and
+    /// blocks at its speed -- at 60 FPS and 24 blocks/s (`FLY_SPEED`), one
+    /// frame is 1000/60 ms and 24/60 of a block.
+    #[test]
+    fn swap_lag_stats_convert_frames_with_the_flights_own_pace_and_speed() {
+        let lags = [1u64, 2, 10, 100];
+        let s = SwapLagStats::of(&lags, 60.0, 24.0);
+        assert_eq!(s.count, 4);
+        assert!((s.max_ms - 100.0 * 1000.0 / 60.0).abs() < 1e-9);
+        assert!((s.max_blocks - 100.0 * 24.0 / 60.0).abs() < 1e-9);
+        // p99 of these 4 sorted values is index (4-1)*990/1000 = 2: `10`.
+        assert!((s.p99_ms - 10.0 * 1000.0 / 60.0).abs() < 1e-9);
+    }
+
+    /// A flight that only managed 30 frames a second under load: the same
+    /// 30-frame lag is a whole second and 24 blocks, not the half second the
+    /// 60 FPS it asked for would claim.
+    #[test]
+    fn a_slow_flight_converts_at_the_rate_it_achieved() {
+        let s = SwapLagStats::of(&[30], 30.0, 24.0);
+        assert!((s.max_ms - 1000.0).abs() < 1e-9);
+        assert!((s.max_blocks - 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn swap_lag_stats_of_nothing_is_the_default() {
+        assert_eq!(SwapLagStats::of(&[], 60.0, 24.0), SwapLagStats::default());
     }
 }
