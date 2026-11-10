@@ -40,6 +40,15 @@ They catch the violation *shapes* seen so far. They cannot catch a novel one, so
 the standing review question is still: **what fails when someone breaks this?**
 If a new rule has no answer, write a check rather than a paragraph.
 
+`scripts/check-architecture-selftest.sh` proves those two scripts still catch
+what they were written for: every rule block has a fixture under
+`scripts/selftest/<rule>/`, the smallest snippet that violates it, and the
+self-test asserts each one still makes its check fail before asserting the
+real tree passes. It runs in CI too (after the two checks above, in the same
+`architecture rules` job). **A PR that adds or changes a rule's regex adds or
+changes the fixture that trips it** — otherwise a regex that silently stops
+matching goes unnoticed forever instead of failing this self-test.
+
 ## Then read this: what we are building right now
 
 [`ROADMAP.md`](ROADMAP.md) says which of three phases is active, the ordered
@@ -223,9 +232,17 @@ pushing through it silently.
 Repo facts that make this work:
 - `main` is a **protected branch**: direct pushes are rejected. Everything
   lands via a PR.
-- A PR only merges once the **required status checks** are green: `clippy +
-  build + test (macos-latest)`, `clippy + build + test (windows-latest)`,
-  `rustfmt`, and `architecture rules`.
+- A PR only merges once all **five required status checks** are green:
+  `rustfmt`, `clippy + build + test (macos-latest)`, `clippy + build + test
+  (windows-latest)`, `clippy + build + test (ubuntu-latest)`, and
+  `architecture rules`.
+- **`strict` is on**: a PR's branch must be up to date with `main` before it
+  can merge. If `main` moved while a PR was open, rebase or merge `main` into
+  it and wait for CI to go green again on the result — two PRs that each
+  passed CI against an older `main` are not proof they pass together.
+- **Zero approving reviews are required**, on purpose: this is a solo-owner
+  repo, and the lead reviews every subagent PR before merging it. CI is the
+  gate, not a second pair of human eyes on every commit.
 - `gh` (GitHub CLI) is installed and authenticated as `talosprods` — use it for
   PR creation/merging (`gh pr create`, `gh pr checks`, `gh pr merge`) instead
   of asking the user to click through the GitHub web UI.

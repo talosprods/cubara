@@ -49,6 +49,11 @@ jobs:
         run: ./scripts/check-single-render-path.sh
       - name: One performance history (BENCHMARKS.md)
         run: ./scripts/check-benchmark-history.sh
+      # Proves the two checks above still catch what they exist to catch --
+      # a regex edit that silently stops matching would otherwise leave this
+      # job green forever (CLAUDE.md "GitHub workflow — Repo facts").
+      - name: Architecture rules self-test (every grep still trips)
+        run: ./scripts/check-architecture-selftest.sh
 
   check:
     name: clippy + build + test (${{ matrix.os }})

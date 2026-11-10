@@ -6,8 +6,12 @@
 # defect in judgement.
 #
 # Runs in CI as a required check.
+#
+# `CUBARA_CHECK_ROOT` overrides the tree this scans, defaulting to this
+# script's own repo as before -- what lets `check-architecture-selftest.sh`
+# point it at a synthetic fixture tree without copying the script anywhere.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "${CUBARA_CHECK_ROOT:-$(dirname "$0")/..}"
 
 # A pipeline's last stage runs in a subshell, so a `fail=1` set inside `report`
 # would be discarded. Record failures in a file instead.

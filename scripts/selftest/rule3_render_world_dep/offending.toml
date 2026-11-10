@@ -1,0 +1,4 @@
+# ARCHITECTURE.md Rule 3: cubara-render's inputs must stay meshes, origins
+# and a camera -- never cubara-world. Trips check-architecture.sh's awk scan
+# of crates/render/Cargo.toml's [dependencies] table.
+cubara-world = { path = "../world" }

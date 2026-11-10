@@ -1,0 +1,4 @@
+# ARCHITECTURE.md Rule 3/4: no GPU/windowing dependency in a data or
+# simulation crate. Trips check-architecture.sh's `^(wgpu|winit|pollster)`
+# grep over a crate's [dependencies] table.
+winit = "0"

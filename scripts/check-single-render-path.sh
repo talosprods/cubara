@@ -12,7 +12,9 @@
 #
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# `CUBARA_CHECK_ROOT` overrides the tree this scans, defaulting to this
+# script's own repo as before -- see `check-architecture.sh` for why.
+cd "${CUBARA_CHECK_ROOT:-$(dirname "$0")/..}"
 
 fail=0
 
