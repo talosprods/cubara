@@ -2155,7 +2155,7 @@ mod tests {
             geometry: Some(NodeGeometry {
                 mesh,
                 aabb: Aabb::new(lo.into(), hi.into()),
-                origin: lo,
+                origin: lo.map(|v| v as i32),
                 scale: 1.0,
             }),
             links: cubara_world::visibility::OPEN,

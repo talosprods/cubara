@@ -563,12 +563,12 @@ pub fn run(
         .collect();
     let tree_data: Vec<_> = visible_meshed
         .iter()
-        .map(|n| (n.id, n.tree_model, n.trees.clone(), n.aabb))
+        .map(cubara_render::headless::NodeTrees::of)
         .collect();
     let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, visible_meshed);
     let mut trees = TreeArena::new(cubara_render::tree_instance_bounds(&load_structures()));
-    for (id, model, positions, aabb) in tree_data {
-        trees.insert(id, model, positions, aabb);
+    for node in tree_data {
+        node.insert_into(&mut trees, &arena);
     }
     let total_nodes = arena.len();
     // The far terrain beyond the voxels, for the eye the game would draw it

@@ -339,11 +339,12 @@ impl SceneRenderer {
         let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
         let far_pipeline =
             build_far_pipeline(device, format, &camera_bgl, &far_bind_group_layout(device));
-        // Same texture bind group layout as the mesh pipeline -- the trees
-        // pipeline reads the same block texture array (decision 4: "from
-        // the same uniforms"), just at @group(1) instead of @group(2),
-        // since it has no origins bind group to put there.
-        let tree_pipeline = build_tree_pipeline(device, format, &camera_bgl, &textures_bgl);
+        // The mesh pipeline's three bind group layouts, in the same order:
+        // the trees pipeline reads the same block texture array (decision
+        // 4: "from the same uniforms") and, since issue #379 made its
+        // instances node-relative, the same node origins at @group(1).
+        let tree_pipeline =
+            build_tree_pipeline(device, format, &camera_bgl, &origins_bgl, &textures_bgl);
         let figure_capacity = crate::figure::VERTICES_PER_FIGURE * 8;
         let figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("figure-vertices"),
@@ -726,7 +727,10 @@ impl SceneRenderer {
             if let Some(trees) = trees.filter(|t| t.oak.is_some() || t.boxed.is_some()) {
                 pass.set_pipeline(&self.tree_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                // The arena's origins: an instance is relative to its node
+                // (issue #379 decision 2), and this is where the node is.
+                pass.set_bind_group(1, arena.origins_bind_group(), &[]);
+                pass.set_bind_group(2, &self.texture_bind_group, &[]);
                 if let (Some(oak), Some((instances, count))) = (&self.tree_models.oak, trees.oak) {
                     pass.set_vertex_buffer(0, oak.vertex_buffer.slice(..));
                     pass.set_vertex_buffer(1, instances.slice(..));

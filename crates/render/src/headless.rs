@@ -265,19 +265,11 @@ pub fn render_with_far(
     // the chunk one -- `trees`/`tree_model` are small enough to clone,
     // which keeps `MeshedNode` itself intact for `from_meshed` right after.
     let nodes: Vec<MeshedNode> = meshed.into_iter().collect();
-    let tree_data: Vec<(
-        NodeId,
-        crate::trees::TreeModel,
-        Vec<[f32; 3]>,
-        crate::culling::Aabb,
-    )> = nodes
-        .iter()
-        .map(|n| (n.id, n.tree_model, n.trees.clone(), n.aabb))
-        .collect();
+    let tree_data: Vec<NodeTrees> = nodes.iter().map(NodeTrees::of).collect();
     render_arena(
         shot,
         (far, far_params),
-        &tree_data,
+        tree_data,
         |device, queue, multi_draw, _ctx| ChunkArena::from_meshed(device, queue, multi_draw, nodes),
     )
 }
@@ -289,17 +281,63 @@ pub fn render_with_far(
 /// chunk is its own level-0 node (`scale` 1.0, one lattice cell = one world
 /// block), placed at its own `ChunkCoord::world_offset`.
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
-    render_arena(shot, (&[], None), &[], |device, queue, multi_draw, ctx| {
-        let mut arena = ChunkArena::new(device, multi_draw);
-        for (coord, chunk) in chunks {
-            let id = NodeId {
-                level: 0,
-                pos: [coord.x, coord.y, coord.z],
-            };
-            arena.upload_node(queue, id, coord.world_offset(), 1.0, chunk, ctx);
+    render_arena(
+        shot,
+        (&[], None),
+        Vec::new(),
+        |device, queue, multi_draw, ctx| {
+            let mut arena = ChunkArena::new(device, multi_draw);
+            for (coord, chunk) in chunks {
+                let id = NodeId {
+                    level: 0,
+                    pos: [coord.x, coord.y, coord.z],
+                };
+                arena.upload_node(queue, id, coord.world_block(), 1.0, chunk, ctx);
+            }
+            arena
+        },
+    )
+}
+
+/// One node's trees, as [`TreeArena::insert`] wants them, pulled out of a
+/// [`MeshedNode`] before `ChunkArena::from_meshed` consumes it. Used by every
+/// one-shot scene builder (here, `--bench`), so the "trees of a node the
+/// arena did not take draw nowhere" rule lives in one place.
+pub struct NodeTrees {
+    pub id: NodeId,
+    pub origin: [i32; 3],
+    pub model: crate::trees::TreeModel,
+    pub trees: Vec<[i32; 3]>,
+    pub aabb: crate::culling::Aabb,
+}
+
+impl NodeTrees {
+    pub fn of(node: &MeshedNode) -> Self {
+        Self {
+            id: node.id,
+            origin: node.origin,
+            model: node.tree_model,
+            trees: node.trees.clone(),
+            aabb: node.aabb,
         }
-        arena
-    })
+    }
+
+    /// Record these trees against `arena`, which must already hold the node
+    /// -- the instances carry its slot in the origins buffer. A node the
+    /// arena did not take (full) draws no trees either, same as the live
+    /// renderer's `drain_uploads`.
+    pub fn insert_into(self, trees: &mut TreeArena, arena: &ChunkArena) {
+        if let Some(node_index) = arena.node_index(self.id) {
+            trees.insert(
+                self.id,
+                node_index,
+                self.origin,
+                self.model,
+                self.trees,
+                self.aabb,
+            );
+        }
+    }
 }
 
 /// Shared device setup, camera framing and readback for [`render`] and
@@ -310,12 +348,7 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
 fn render_arena(
     shot: Shot,
     (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
-    tree_data: &[(
-        NodeId,
-        crate::trees::TreeModel,
-        Vec<[f32; 3]>,
-        crate::culling::Aabb,
-    )],
+    tree_data: Vec<NodeTrees>,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
     let instance = crate::new_instance();
@@ -377,8 +410,8 @@ fn render_arena(
     let bounds = arena.bounds();
 
     let mut trees = TreeArena::new(crate::trees::tree_instance_bounds(&load_structures()));
-    for (id, model, positions, aabb) in tree_data {
-        trees.insert(*id, *model, positions.clone(), *aabb);
+    for node in tree_data {
+        node.insert_into(&mut trees, &arena);
     }
 
     let (vp, eye) = match camera {

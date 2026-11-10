@@ -68,15 +68,19 @@ fn only_nodes_in_the_frustum_contribute_instances() {
     // Ahead of the camera, inside the frustum.
     arena.insert(
         ahead,
+        0,
+        [0; 3],
         TreeModel::Oak,
-        vec![[100.0, 0.0, 0.0]],
+        vec![[100, 0, 0]],
         Aabb::new(glam::vec3(90.0, -5.0, -5.0), glam::vec3(110.0, 5.0, 5.0)),
     );
     // Directly behind the camera -- resident, but nothing the camera can see.
     arena.insert(
         behind,
+        1,
+        [0; 3],
         TreeModel::Oak,
-        vec![[-100.0, 0.0, 0.0]],
+        vec![[-100, 0, 0]],
         Aabb::new(glam::vec3(-110.0, -5.0, -5.0), glam::vec3(-90.0, 5.0, 5.0)),
     );
 
@@ -110,8 +114,10 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
     };
     arena.insert(
         node,
+        0,
+        [0; 3],
         TreeModel::Box,
-        vec![[100.0, 0.0, 0.0]],
+        vec![[100, 0, 0]],
         Aabb::new(glam::vec3(90.0, -5.0, -5.0), glam::vec3(110.0, 5.0, 5.0)),
     );
 
@@ -166,14 +172,21 @@ fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does
     // y = -100 + 200 = 100 -- comfortably inside the frustum vertically,
     // against the same ~58 boundary.
     let local_bounds = (glam::vec3(-3.0, 0.0, -3.0), glam::vec3(3.0, 200.0, 3.0));
-    let tree_position = [100.0, -100.0, 0.0];
+    let tree_position = [100, -100, 0];
 
     let mut arena = TreeArena::new(local_bounds);
     let node = NodeId {
         level: 1,
         pos: [0, 0, 0],
     };
-    arena.insert(node, TreeModel::Oak, vec![tree_position], node_aabb);
+    arena.insert(
+        node,
+        0,
+        [0; 3],
+        TreeModel::Oak,
+        vec![tree_position],
+        node_aabb,
+    );
 
     arena.prepare(&device, &queue, &frustum);
     assert_eq!(

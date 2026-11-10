@@ -9,7 +9,7 @@
 //! build the two *models*, once, at startup -- not to decide where a tree
 //! stands. `cubara-app`'s streaming glue (`crates/app/src/streaming.rs`)
 //! is the only caller that knows about `WorldGen::node_trees`; it hands this
-//! module plain `[f32; 3]` positions.
+//! module plain block positions.
 
 use std::collections::BTreeMap;
 
@@ -47,12 +47,23 @@ pub struct TreeVertex {
     pub color: [f32; 3],
 }
 
-/// One instance: a world-space position for the model's local origin (the
-/// trunk's base block) to be added to.
+/// One instance: where the model's local origin (the trunk's base block)
+/// stands, **relative to its node's origin**, plus that node's slot in the
+/// `node_origins` storage buffer (`crate::arena`) -- `trees.wgsl` adds the
+/// two the way `mesh.wgsl` places a packed vertex.
+///
+/// Node-relative rather than absolute (issue #379 decision 2, after review
+/// finding F16): the render anchor moves every 2,048 blocks of travel, and
+/// when it does, every absolute position the GPU holds has to be rewritten.
+/// With the instances relative to their node, a rebase rewrites one `vec4`
+/// per resident node (`ChunkArena::rebase`) and nothing per instance; this
+/// buffer is only ever rewritten when the set of *contributing nodes*
+/// changes (`TreeArena::prepare`), exactly as before.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TreeInstance {
     pub position: [f32; 3],
+    pub node_index: u32,
 }
 
 /// A model's CPU-side triangle data, before it goes to the GPU.
@@ -354,9 +365,9 @@ impl InstanceBuffer {
         }
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, positions: &[[f32; 3]]) {
-        self.count = positions.len() as u32;
-        if positions.is_empty() {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, instances: &[TreeInstance]) {
+        self.count = instances.len() as u32;
+        if instances.is_empty() {
             return;
         }
         // Reuse the existing GPU buffer (just `queue.write_buffer` into it)
@@ -373,8 +384,8 @@ impl InstanceBuffer {
         // case exercises both the changed and -- implicitly, by not
         // panicking -- the unchanged path). This check only matters for the
         // remaining case: contributors changed, but the count still fits.
-        if self.buffer.is_none() || positions.len() > self.capacity {
-            self.capacity = positions.len().next_power_of_two();
+        if self.buffer.is_none() || instances.len() > self.capacity {
+            self.capacity = instances.len().next_power_of_two();
             self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tree-instances"),
                 size: (self.capacity * std::mem::size_of::<TreeInstance>()) as u64,
@@ -382,14 +393,10 @@ impl InstanceBuffer {
                 mapped_at_creation: false,
             }));
         }
-        let instances: Vec<TreeInstance> = positions
-            .iter()
-            .map(|&position| TreeInstance { position })
-            .collect();
         queue.write_buffer(
             self.buffer.as_ref().expect("just ensured"),
             0,
-            bytemuck::cast_slice(&instances),
+            bytemuck::cast_slice(instances),
         );
     }
 
@@ -423,7 +430,7 @@ impl InstanceBuffer {
 /// play) is never. See [`last_oak_contributors`](Self::last_oak_contributors)'s
 /// doc comment.
 pub struct TreeArena {
-    by_node: BTreeMap<NodeId, (TreeModel, Vec<[f32; 3]>, crate::culling::Aabb)>,
+    by_node: BTreeMap<NodeId, TreeNode>,
     /// How far a tree reaches from its own position, in each direction --
     /// `(min, max)` offsets added to a node's own AABB, over every tree it
     /// contributes, in [`insert`](Self::insert). Fixed for the arena's whole
@@ -460,35 +467,58 @@ impl TreeArena {
         }
     }
 
-    /// Record (or replace) `id`'s trees. `node_aabb` is the node's own
-    /// (terrain) bounds; the AABB actually stored is `node_aabb` grown by
-    /// [`local_bounds`](Self::local_bounds) around every position in
-    /// `positions`, so a tall canopy standing near a node's edge is never
-    /// culled while the node's own ground is still in view, or vice versa.
-    /// An empty `positions` is the same as having none -- removed outright,
-    /// so a node that grows no trees never occupies a slot
-    /// [`prepare`](Self::prepare) has to visit for nothing.
+    /// Record (or replace) `id`'s trees: `trees` are block positions (the
+    /// trunk's base block, in world blocks), stored relative to the node's
+    /// `origin` -- an exact integer subtraction -- alongside `node_index`,
+    /// the node's slot in the arena's `node_origins` buffer that
+    /// `trees.wgsl` adds back ([`TreeInstance`]). `node_aabb` is the node's
+    /// own (terrain) bounds; the AABB actually stored is `node_aabb` grown
+    /// by [`local_bounds`](Self::local_bounds) around every tree, so a tall
+    /// canopy standing near a node's edge is never culled while the node's
+    /// own ground is still in view, or vice versa. An empty `trees` is the
+    /// same as having none -- removed outright, so a node that grows no
+    /// trees never occupies a slot [`prepare`](Self::prepare) has to visit
+    /// for nothing.
     pub fn insert(
         &mut self,
         id: NodeId,
+        node_index: u32,
+        origin: [i32; 3],
         model: TreeModel,
-        positions: Vec<[f32; 3]>,
+        trees: Vec<[i32; 3]>,
         node_aabb: crate::culling::Aabb,
     ) {
-        if positions.is_empty() {
+        if trees.is_empty() {
             self.remove(id);
             return;
         }
         let (local_min, local_max) = self.local_bounds;
         let mut min = node_aabb.min;
         let mut max = node_aabb.max;
-        for &p in &positions {
-            let p = glam::Vec3::from(p);
-            min = min.min(p + local_min);
-            max = max.max(p + local_max);
-        }
-        self.by_node
-            .insert(id, (model, positions, crate::culling::Aabb::new(min, max)));
+        let instances = trees
+            .iter()
+            .map(|&t| {
+                let p = glam::Vec3::new(t[0] as f32, t[1] as f32, t[2] as f32);
+                min = min.min(p + local_min);
+                max = max.max(p + local_max);
+                TreeInstance {
+                    position: [
+                        (t[0] - origin[0]) as f32,
+                        (t[1] - origin[1]) as f32,
+                        (t[2] - origin[2]) as f32,
+                    ],
+                    node_index,
+                }
+            })
+            .collect();
+        self.by_node.insert(
+            id,
+            TreeNode {
+                model,
+                instances,
+                aabb: crate::culling::Aabb::new(min, max),
+            },
+        );
     }
 
     pub fn remove(&mut self, id: NodeId) {
@@ -528,23 +558,23 @@ impl TreeArena {
         // false negative from pure reordering.
         let mut oak_contributors = Vec::new();
         let mut box_contributors = Vec::new();
-        for (&id, (model, _, aabb)) in &self.by_node {
-            if !frustum.intersects_aabb(aabb) {
+        for (&id, node) in &self.by_node {
+            if !frustum.intersects_aabb(&node.aabb) {
                 continue;
             }
-            match model {
+            match node.model {
                 TreeModel::Oak => oak_contributors.push(id),
                 TreeModel::Box => box_contributors.push(id),
             }
         }
         if oak_contributors != self.last_oak_contributors {
-            let positions = flatten(&self.by_node, &oak_contributors);
-            self.oak.upload(device, queue, &positions);
+            let instances = flatten(&self.by_node, &oak_contributors);
+            self.oak.upload(device, queue, &instances);
             self.last_oak_contributors = oak_contributors;
         }
         if box_contributors != self.last_box_contributors {
-            let positions = flatten(&self.by_node, &box_contributors);
-            self.boxed.upload(device, queue, &positions);
+            let instances = flatten(&self.by_node, &box_contributors);
+            self.boxed.upload(device, queue, &instances);
             self.last_box_contributors = box_contributors;
         }
     }
@@ -573,20 +603,33 @@ impl TreeArena {
     /// real `Frustum`/device (that proof lives in `tests/tree_culling.rs`).
     #[cfg(test)]
     fn aabb_of(&self, id: NodeId) -> Option<crate::culling::Aabb> {
-        self.by_node.get(&id).map(|&(_, _, aabb)| aabb)
+        self.by_node.get(&id).map(|node| node.aabb)
+    }
+
+    /// The node-relative instances stored for `id` -- white-box, for the
+    /// unit test that pins the subtraction [`insert`](Self::insert) does.
+    #[cfg(test)]
+    fn instances_of(&self, id: NodeId) -> Option<&[TreeInstance]> {
+        self.by_node.get(&id).map(|node| node.instances.as_slice())
     }
 }
 
-/// The positions every node in `ids` contributed, in order -- what
+/// What one resident node contributed: its model, its instances (already
+/// node-relative, [`TreeInstance`]) and the culling box enclosing both the
+/// node's terrain and every one of its trees.
+struct TreeNode {
+    model: TreeModel,
+    instances: Vec<TreeInstance>,
+    aabb: crate::culling::Aabb,
+}
+
+/// The instances every node in `ids` contributed, in order -- what
 /// [`TreeArena::prepare`] uploads for one model once it has decided the set
 /// of contributors actually changed.
-fn flatten(
-    by_node: &BTreeMap<NodeId, (TreeModel, Vec<[f32; 3]>, crate::culling::Aabb)>,
-    ids: &[NodeId],
-) -> Vec<[f32; 3]> {
+fn flatten(by_node: &BTreeMap<NodeId, TreeNode>, ids: &[NodeId]) -> Vec<TreeInstance> {
     let mut out = Vec::new();
     for id in ids {
-        out.extend_from_slice(&by_node[id].1);
+        out.extend_from_slice(&by_node[id].instances);
     }
     out
 }
@@ -689,7 +732,7 @@ mod tests {
             level: 1,
             pos: [0, 0, 0],
         };
-        arena.insert(id, TreeModel::Oak, Vec::new(), unit_aabb());
+        arena.insert(id, 0, [0; 3], TreeModel::Oak, Vec::new(), unit_aabb());
         assert_eq!(arena.node_count(), 0, "an empty insert recorded a node");
     }
 
@@ -702,7 +745,7 @@ mod tests {
         };
         arena.remove(id);
         assert_eq!(arena.node_count(), 0, "nothing was there to remove");
-        arena.insert(id, TreeModel::Box, vec![[1.0, 2.0, 3.0]], unit_aabb());
+        arena.insert(id, 0, [0; 3], TreeModel::Box, vec![[1, 2, 3]], unit_aabb());
         assert_eq!(arena.node_count(), 1);
         arena.remove(id);
         assert_eq!(
@@ -729,10 +772,10 @@ mod tests {
             crate::culling::Aabb::new(glam::vec3(0.0, 0.0, 0.0), glam::vec3(16.0, 4.0, 16.0));
         // A tree standing right at the node's edge, tall enough that its
         // canopy reaches well above the node's own (short) AABB.
-        let tree = [15.0, 4.0, 2.0];
-        arena.insert(id, TreeModel::Oak, vec![tree], node_aabb);
+        let tree = [15, 4, 2];
+        arena.insert(id, 0, [0; 3], TreeModel::Oak, vec![tree], node_aabb);
         let stored = arena.aabb_of(id).expect("just inserted");
-        let tree = glam::Vec3::from(tree);
+        let tree = glam::vec3(15.0, 4.0, 2.0);
         assert_eq!(
             stored.min,
             node_aabb.min.min(tree + local_bounds.0),
@@ -821,6 +864,54 @@ mod tests {
                 expect_max[2] as f32 + 1.0,
             ),
             "the max corner is one past the highest solid block's index on every axis"
+        );
+    }
+
+    /// Issue #379 decision 2: an instance is stored relative to its node's
+    /// origin, with the node's slot in `node_origins`, so `trees.wgsl` adds
+    /// the origin back from the same buffer `mesh.wgsl` reads -- and a
+    /// rebase of that buffer moves the trees with their node, touching no
+    /// instance. The culling box, by contrast, stays in world blocks: it is
+    /// what the frustum tests, and that box is in the same space as the
+    /// node's own AABB.
+    #[test]
+    fn instances_are_relative_to_their_node_and_carry_its_slot() {
+        let mut arena = no_local_bounds();
+        let id = NodeId {
+            level: 2,
+            pos: [3, 0, -1],
+        };
+        let origin = [192, 0, -64];
+        let node_aabb =
+            crate::culling::Aabb::new(glam::vec3(192.0, 0.0, -64.0), glam::vec3(256.0, 20.0, 0.0));
+        arena.insert(
+            id,
+            17,
+            origin,
+            TreeModel::Oak,
+            vec![[200, 12, -60], [255, 9, -1]],
+            node_aabb,
+        );
+        assert_eq!(
+            arena.instances_of(id),
+            Some(
+                &[
+                    TreeInstance {
+                        position: [8.0, 12.0, 4.0],
+                        node_index: 17,
+                    },
+                    TreeInstance {
+                        position: [63.0, 9.0, 63.0],
+                        node_index: 17,
+                    },
+                ][..]
+            )
+        );
+        let stored = arena.aabb_of(id).expect("just inserted");
+        assert_eq!(
+            (stored.min, stored.max),
+            (node_aabb.min, node_aabb.max),
+            "with no local reach, trees inside the node leave its box as it is"
         );
     }
 }

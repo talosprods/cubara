@@ -79,11 +79,7 @@ fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
         scale: geometry.scale,
         mesh: geometry.mesh,
         aabb: geometry.aabb,
-        trees: built
-            .trees
-            .iter()
-            .map(|t| [t.x as f32, t.base as f32, t.z as f32])
-            .collect(),
+        trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
         tree_model,
     })
 }

@@ -997,7 +997,12 @@ impl Renderer {
                         self.uploads.requeue(ArenaOp::Insert(id, node));
                         break;
                     }
-                    self.trees.insert(id, tree_model, trees, node.aabb);
+                    // Just placed, so the slot exists; the instances are
+                    // stored relative to the node's origin and carry this
+                    // slot (`TreeInstance`).
+                    let node_index = self.arena.node_index(id).expect("just placed");
+                    self.trees
+                        .insert(id, node_index, node.origin, tree_model, trees, node.aabb);
                     uploaded += 1;
                     if uploaded >= MIN_UPLOADS_PER_FRAME && started.elapsed() >= budget {
                         break;
@@ -1607,10 +1612,14 @@ pub const fn tree_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Float32x3];
+const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+    5 => Float32x3, // position, relative to the node's origin
+    6 => Uint32,    // node_index into `node_origins`
+];
 
-/// One tree instance (`crate::trees::TreeInstance`): a world-space position
-/// added to the model's local one.
+/// One tree instance (`crate::trees::TreeInstance`): a node-relative
+/// position added to the model's local one, and the node's slot in the
+/// origins buffer the shader adds back.
 pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<crate::trees::TreeInstance>() as wgpu::BufferAddress,
@@ -1621,9 +1630,11 @@ pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
 
 /// The instanced pipeline trees beyond the first ring draw with (issue #332,
 /// R2 decision 2): one model buffer (`tree_vertex_layout`) plus one instance
-/// buffer (`tree_instance_layout`), `camera_bgl`/`textures_bgl` shared with
-/// the mesh pipeline -- the same uniform, the same block texture array, no
-/// new bind group layout to keep in step with either.
+/// buffer (`tree_instance_layout`), and `camera_bgl`/`origins_bgl`/
+/// `textures_bgl` shared with the mesh pipeline, in the same group order --
+/// the same uniform, the same node origins (an instance is node-relative,
+/// `crate::trees::TreeInstance`), the same block texture array, no new bind
+/// group layout to keep in step with any of them.
 ///
 /// Depth-tested and back-face culled exactly like the terrain and the
 /// figures (decision 5: no discard, no alpha, so hidden-surface removal
@@ -1632,6 +1643,7 @@ pub fn build_tree_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
+    origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1641,7 +1653,7 @@ pub fn build_tree_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("tree-layout"),
-        bind_group_layouts: &[Some(camera_bgl), Some(textures_bgl)],
+        bind_group_layouts: &[Some(camera_bgl), Some(origins_bgl), Some(textures_bgl)],
         immediate_size: 0,
     });
 

@@ -36,7 +36,10 @@ use crate::{TerrainBlocks, World};
 pub struct NodeGeometry {
     pub mesh: Mesh,
     pub aabb: Aabb,
-    pub origin: [f32; 3],
+    /// The node's minimum-corner block ([`NodeKey::world_origin`]): kept as
+    /// the integer it is, so the renderer's render anchor (issue #379) is
+    /// subtracted from it exactly.
+    pub origin: [i32; 3],
     pub scale: f32,
 }
 
@@ -149,6 +152,7 @@ fn mesh_chunk(
         world_origin[2] as f32,
     ];
     let scale = 1.0f32;
+    let origin_blocks = world_origin;
     let surfaces = std::cell::RefCell::new(HashMap::new());
     let covered =
         |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
@@ -159,7 +163,7 @@ fn mesh_chunk(
     Some(NodeGeometry {
         mesh,
         aabb,
-        origin,
+        origin: origin_blocks,
         scale,
     })
 }

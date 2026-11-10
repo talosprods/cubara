@@ -445,12 +445,13 @@ impl ChunkArena {
         &mut self,
         queue: &wgpu::Queue,
         id: NodeId,
-        origin: [f32; 3],
+        origin: [i32; 3],
         scale: f32,
         chunk: &Chunk,
         ctx: &MeshContext,
     ) -> bool {
-        match build_mesh_bounded(chunk, ctx, origin, scale) {
+        let origin_f32 = [origin[0] as f32, origin[1] as f32, origin[2] as f32];
+        match build_mesh_bounded(chunk, ctx, origin_f32, scale) {
             Some((mesh, aabb)) => self.insert(queue, id, origin, scale, &mesh, aabb),
             None => false,
         }
@@ -459,8 +460,12 @@ impl ChunkArena {
     /// Sub-allocate an already-built node-local `mesh` (with precomputed
     /// world-space `aabb`) into the shared arenas and upload it, plus a
     /// node-origins slot recording `origin`/`scale` for the vertex shader to
-    /// add/multiply back (§5.2 -- vertices themselves stay node-local). No-op
-    /// if `id` is already resident. Returns whether the geometry was added.
+    /// add/multiply back (§5.2 -- vertices themselves stay node-local). The
+    /// origin is a block position, an integer: it is what the trees
+    /// (`TreeArena::insert`) and the render anchor (issue #379) subtract
+    /// from, and an integer subtraction is exact where a float one is not.
+    /// No-op if `id` is already resident. Returns whether the geometry was
+    /// added.
     /// This is the GPU-side step, kept separate from meshing so the latter
     /// can run on a worker thread or in a different crate entirely
     /// (`cubara_world::mesh`, since #110) -- `pub`, not `pub(crate)`, because
@@ -469,7 +474,7 @@ impl ChunkArena {
         &mut self,
         queue: &wgpu::Queue,
         id: NodeId,
-        origin: [f32; 3],
+        origin: [i32; 3],
         scale: f32,
         mesh: &Mesh,
         aabb: Aabb,
@@ -543,7 +548,7 @@ impl ChunkArena {
         queue.write_buffer(
             &self.origins_buffer,
             node_index as u64 * 16,
-            bytemuck::bytes_of(&[ox, oy, oz, scale]),
+            bytemuck::bytes_of(&[ox as f32, oy as f32, oz as f32, scale]),
         );
 
         // The arena took a node, so whatever episode of exhaustion the latch
@@ -583,6 +588,13 @@ impl ChunkArena {
 
     pub fn contains(&self, id: NodeId) -> bool {
         self.slots.contains_key(&id)
+    }
+
+    /// `id`'s slot in the node-origins buffer, if resident -- what a
+    /// node-relative tree instance carries (`TreeArena::insert`) so
+    /// `trees.wgsl` can add the same origin `mesh.wgsl` does.
+    pub fn node_index(&self, id: NodeId) -> Option<u32> {
+        self.slots.get(&id).map(|slot| slot.node_index)
     }
 
     pub fn len(&self) -> usize {
@@ -806,15 +818,19 @@ impl ChunkArena {
 /// ones.
 pub struct MeshedNode {
     pub id: NodeId,
-    pub origin: [f32; 3],
+    /// The node's minimum-corner block, in world blocks: an integer, so
+    /// what is subtracted from it (the trees below, the render anchor of
+    /// issue #379) is subtracted exactly.
+    pub origin: [i32; 3],
     pub scale: f32,
     pub mesh: Mesh,
     pub aabb: Aabb,
-    /// World-space positions of the trees this node's footprint grows
-    /// (issue #332, R2 decision 2) -- empty for a node with none, which is
-    /// every level-0 node (its trees are already in `mesh`) and any coarse
-    /// node whose footprint happens to grow none.
-    pub trees: Vec<[f32; 3]>,
+    /// The blocks the trees this node's footprint grows stand on (the
+    /// trunk's base block, in world blocks; issue #332, R2 decision 2) --
+    /// empty for a node with none, which is every level-0 node (its trees
+    /// are already in `mesh`) and any coarse node whose footprint happens to
+    /// grow none.
+    pub trees: Vec<[i32; 3]>,
     /// Which static model `trees` draws with: the real oak at levels 1-2,
     /// boxes at level 3 (decision 3). Meaningless when `trees` is empty.
     pub tree_model: crate::trees::TreeModel,
