@@ -208,18 +208,18 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | `main` before the warm-up change: gate eye ground + far terrain (High), 200 warm-up frames⁷⁷ | 1,940 | 819,928 voxel + far | ~1,590 | 0.309 ms | 0.948 ms | `b8a8550` |
 | 2026-11-09 | `main` before: gate eye hill + far terrain (High)⁷⁷ | 869 | 436,690 voxel + far | ~1,798 | 0.230 ms | 0.917 ms | `b8a8550` |
 | 2026-11-09 | `main` before: gate eye flight + far terrain (High)⁷⁷ | 0 | far only | ~2,395 | 0.174 ms | 0.732 ms | `b8a8550` |
-| 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁷ | 1,940 | 819,928 voxel + far | ~1,618 (+1.7%) | **0.167 ms** (−46%) | 0.539 ms | `5b29370` |
-| 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁷ | 869 | 436,690 voxel + far | ~1,793 (−0.3%) | **0.147 ms** (−36%) | 0.548 ms | `5b29370` |
-| 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
-| 2026-11-09 | **Face groups in `Face::DRAW_ORDER`** (D1) — gate eye ground (High): 1,055 draws for 592 nodes, was 1,325⁷⁸ | 1,940 | 819,928 voxel + far | ~1,622 (+0.1%) | 0.169 ms (within noise) | 0.762 ms | *(this PR)* |
-| 2026-11-09 | Face groups in `DRAW_ORDER` (D1) — gate eye hill (High): 530 draws for 277 nodes, was 644⁷⁸ | 869 | 436,690 voxel + far | ~1,798 (+0.7%) | 0.159 ms (within noise) | 0.509 ms | *(this PR)* |
-| 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | `79ceb55` |
-| 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | `79ceb55` |
-| 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ | 0 | far only | ~2,417 (−0.7%) | -- | -- | `79ceb55` |
-| 2026-11-10 | **Circular rings for the split** (R3a, #327) — gate eye ground (High): 836 draws and 213,381 voxel triangles, were 1,046 and 259,850⁸⁵ | 1,940 | 819,928 voxel + far | ~1,504 (+5.0%) | **0.172 ms** (−4.2%) | -- | `ae87b22` |
-| 2026-11-10 | R3a — gate eye hill (High): 446 draws, 160,291 triangles, were 530 and 196,619⁸⁵ | 869 | 436,690 voxel + far | ~1,624 (+4.8%) | **0.162 ms** (−4.4%) | -- | `ae87b22` |
-| 2026-11-10 | **Trees beyond the first ring** (R2, #332) — gate eye ground (High), best runs⁸⁶ | 1,940 | 213,381 voxel + trees | ~1,444 | 0.209 ms (+0.039) | -- | *(this PR)* |
-| 2026-11-10 | R2 — gate eye hill (High)⁸⁶ | 869 | 160,291 voxel + trees | ~1,560 (−4.4%) | 0.198 ms (+0.038) | -- | *(this PR)* |
+| 2026-11-09 | **The warm-up waits for steady clocks** (at least 200 frames and 1 s) — gate eye ground (High)⁷⁷ — M3: unmeasured | 1,940 | 819,928 voxel + far | ~1,618 (+1.7%) | **0.167 ms** (−46%) | 0.539 ms | `5b29370` |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye hill (High)⁷⁷ — M3: unmeasured | 869 | 436,690 voxel + far | ~1,793 (−0.3%) | **0.147 ms** (−36%) | 0.548 ms | `5b29370` |
+| 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ — M3: unmeasured | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
+| 2026-11-09 | **Face groups in `Face::DRAW_ORDER`** (D1) — gate eye ground (High): 1,055 draws for 592 nodes, was 1,325⁷⁸ — M3: unmeasured, Win: unmeasured | 1,940 | 819,928 voxel + far | ~1,622 (+0.1%) | 0.169 ms (within noise) | 0.762 ms | *(this PR)* |
+| 2026-11-09 | Face groups in `DRAW_ORDER` (D1) — gate eye hill (High): 530 draws for 277 nodes, was 644⁷⁸ — M3: unmeasured, Win: unmeasured | 869 | 436,690 voxel + far | ~1,798 (+0.7%) | 0.159 ms (within noise) | 0.509 ms | *(this PR)* |
+| 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ — M3: unmeasured, Win: unmeasured | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | `79ceb55` |
+| 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ — M3: unmeasured, Win: unmeasured | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | `79ceb55` |
+| 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ — M3: unmeasured, Win: unmeasured | 0 | far only | ~2,417 (−0.7%) | -- | -- | `79ceb55` |
+| 2026-11-10 | **Circular rings for the split** (R3a, #327) — gate eye ground (High): 836 draws and 213,381 voxel triangles, were 1,046 and 259,850⁸⁵ — M3: unmeasured, Win: unmeasured | 1,940 | 819,928 voxel + far | ~1,504 (+5.0%) | **0.172 ms** (−4.2%) | -- | `ae87b22` |
+| 2026-11-10 | R3a — gate eye hill (High): 446 draws, 160,291 triangles, were 530 and 196,619⁸⁵ — M3: unmeasured, Win: unmeasured | 869 | 436,690 voxel + far | ~1,624 (+4.8%) | **0.162 ms** (−4.4%) | -- | `ae87b22` |
+| 2026-11-10 | **Trees beyond the first ring** (R2, #332) — gate eye ground (High), best runs⁸⁶ — M3: unmeasured, Win: unmeasured | 1,940 | 213,381 voxel + trees | ~1,444 | 0.209 ms (+0.039) | -- | *(this PR)* |
+| 2026-11-10 | R2 — gate eye hill (High)⁸⁶ — M3: unmeasured, Win: unmeasured | 869 | 160,291 voxel + trees | ~1,560 (−4.4%) | 0.198 ms (+0.038) | -- | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
