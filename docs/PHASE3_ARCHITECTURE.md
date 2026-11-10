@@ -135,5 +135,71 @@ worldgen exactly as it does to rendering.
 
 ## Later blocks (filled in as each lands)
 
-Nothing below this line yet — block 3.1 (water) is next. Each block's PR adds
-its own `## §N <block>` section here, as phases 1 and 2 did.
+Each block's PR adds its own `## §N <block>` section here, as phases 1 and 2
+did. Block 3.1 (water) is the next world block; 3.0c below is the engine
+carry-over that lands before it.
+
+## §7 3.0c — Camera-relative rendering
+
+**Nothing absolute reaches the GPU.** Every position the renderer uploads is
+relative to a *render anchor* (`crates/render/src/anchor.rs`), an integer
+block `[i32; 3]` snapped to a 4,096-block grid, so what is drawn does not
+depend on how far the eye is from the world origin. Decided in
+[#379](../../issues/379); the test is the frame itself: a synthetic scene
+rendered at the origin and again shifted by (2^20, 0, 2^20) is byte-identical
+(`golden.rs`, `a_scene_moved_by_a_grid_multiple_renders_byte_identically`),
+and with the anchor forced to the origin — `origin/main`'s arithmetic — 23%
+of its pixels move.
+
+Why this had to come before the continents (`ROADMAP.md` 3.0 (c),
+`PROPOSAL_FAR_VIEW.md`): the simulation is exact (`FixedVec3`, `i64` in
+1/65536 of a block) but an `f32` at 50,000 blocks steps in 1/256 of a block,
+and phase 3 puts coasts an hour's walk away. Standing there, a block one
+block from the eye jittered by several pixels.
+
+The decisions, as built:
+
+- **Integers subtract exactly.** Node origins (`NodeKey::world_origin`,
+  carried as `[i32; 3]` through `NodeGeometry` → `MeshedNode` →
+  `ChunkArena::insert`), far tile origins (`PatchKey::origin`, `[i64; 2]`)
+  and the voxels' hole are integers; `origin - anchor` is an `i64`
+  subtraction and then a small `f32`. The eye is `f64` (`CameraPose::eye:
+  DVec3`, from `FixedVec3::to_f64`, which is exact); `eye - anchor` is under
+  2,048 + 256 blocks, so its `f32` error is at most 1/4,096 of a block.
+  `view_proj` is built from that difference. Streaming keeps its `[f32; 3]`
+  eye: it is chunk-granular.
+- **One space for drawing and culling** (Rule 5). Both arenas and the far
+  terrain store a `NodeBox` — integer origin plus bounds local to it — and
+  the CPU frustum, built from the same anchor-relative `view_proj`, tests
+  the box re-expressed through the one function `NodeBox::relative_to`.
+  `Frustum::eye` is therefore the relative eye, and `faces_facing`'s 0.05
+  margin is meaningful again at any distance.
+- **Rebase rarely, and cheaply** (decision 2, amended after review finding
+  F16). The anchor moves only when the eye is more than 2,304 blocks from
+  it on some axis — `anchor::next_anchor`, a pure function with its own
+  tests: a boundary wobble never rebases, a `/tp` rebases on its first
+  frame. A rebase rewrites one `vec4` per resident node from a CPU mirror
+  of the origins buffer in a single `write_buffer`, the far tiles' 16-byte
+  records in one bounded 64 KiB write (not spread over frames: a tile drawn
+  against the old anchor while the eye is measured from the new one would
+  be 4,096 blocks off — the very thing the anchor prevents; and not
+  deferred to each tile's next upload, which for the horizon may be
+  minutes away), the culling boxes, and the frame uniform. **Tree instances
+  are node-relative** (`TreeInstance` carries a position relative to its
+  node plus the node's slot in `node_origins`; `trees.wgsl` adds the origin
+  from the same storage buffer `mesh.wgsl` reads), so a rebase touches no
+  instance. Between rebases the cost per frame is zero.
+  `anchor::rebase_if_needed` is the one place a rebase touches everything;
+  the window and `--bench` both call it. Measured with a forced rebase in
+  `--bench flight` (the PR has the number).
+- **Absolute height where a shader needs it** (decision 4). The frame
+  uniform carries the anchor; `haze.wgsl` adds its `y` back to the relative
+  eye for the extinction's absolute height. Fog distance is relative
+  already.
+- **Goldens unchanged** (decision 6). Near the origin the anchor is
+  `(0, 0, 0)` and every subtraction is the identity; the 18 reference
+  images rendered byte-identically before and after on the same machine.
+
+Out of scope, as the issue says: far terrain *generation* at huge
+coordinates (worldgen noise precision) is its own question if it shows;
+physics and the network were already fixed-point.
