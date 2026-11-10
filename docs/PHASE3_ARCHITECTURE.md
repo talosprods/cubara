@@ -268,3 +268,51 @@ The decisions, as built:
 Out of scope, as the issue says: far terrain *generation* at huge
 coordinates (worldgen noise precision) is its own question if it shows;
 physics and the network were already fixed-point.
+
+did. Block 3.1 (water) is next.
+
+## §8 The world snapshot a mesh job holds (block 3.0c, [#387](../../issues/387))
+
+An engine carry-over from the critical review of 2026-11-10 (F4), landed
+before [#346](../../issues/346) because the flood step there would have paid
+for it on every tick.
+
+**What was wrong.** `World` was `derive(Clone)` and owned every edit; a mesh
+job held an `Arc<World>`; `Server::tick_sim_all` and the client's `predict`
+call `Arc::make_mut(&mut world)` every tick. While a job was in flight the
+`Arc` was shared, so the tick copied every edit ever made. Measured
+(`--bench edits`, 10,000 edits, a job requested every tick, as streaming
+does while the player moves): 60 clones/s, 8.4 MB/s, the tick 7–8× the
+empty world's.
+
+**The design, binding on what follows.**
+
+1. A mesh job holds a **`WorldSnapshot`** (`World::snapshot()`): the seed and
+   the edit overlay by reference. Not block entities, not chunk states, not
+   the `FluidQueue` #346 adds -- nothing that meshes reads them. One
+   snapshot per request batch (`NodeStreaming::follow_visibility`,
+   `invalidate`), shared by its jobs.
+2. **Edits are filed by region behind `Arc`s** (`EditMap`: save/load's
+   32-chunk region as the key, each region's `BTreeMap` behind its own
+   `Arc`). `set_block` does `Arc::make_mut` on the outer map and on the one
+   region it lands in. So an edit while a snapshot is held copies one entry
+   per edited region plus that one region's edits, never the whole set; with
+   no snapshot held it copies nothing.
+3. `World` **derefs to** `WorldSnapshot`: every read of terrain and edits is
+   the snapshot's, once (Rule 5). `World` adds what only the simulation owns.
+4. **Nothing holds an `Arc<World>` across a tick.** `World::clone_generation`
+   counts the clones; `--bench flight`, `--bench walk` and `--bench edits`
+   print them, and `crates/server/tests/mesh_snapshot.rs` asserts the tick
+   leaves every region map's pointer where it was.
+
+**For #346.** The `FluidQueue` lives on `World` beside the edits (its decision
+1 is unchanged) but is not part of `WorldSnapshot`, so a held mesh snapshot
+never copies it; a flood step edits through `set_block` and so touches only
+its own regions' maps. #346's PR keeps `a_held_mesh_snapshot_does_not_make_the_tick_clone_the_edits`
+green and adds its own variant with the queue populated.
+
+Iteration order over the edits is still total and fixed by the contents
+(Rule 1) -- regions ascending, positions within each -- but no longer plain
+position order; nothing depended on that (`dirty_chunks` sorts, the hash
+reads chunks, a client applies a snapshot's edits in any order), and the
+cross-platform fixture hashes are unchanged.
