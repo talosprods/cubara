@@ -179,6 +179,16 @@ does not:
   with the power state in the row itself and the thermal state said plainly
   even when the platform does not report one. Never the better of two.
 
+**The Linux laptop's power state needs no fresh ask either.** On 2026-11-10,
+in the Linux session, he installed `/etc/sudoers.d/claude-power` himself
+(passwordless `rtcwake`, `systemctl suspend` and `systemctl poweroff` for his
+user) so that a session there may turn the display off, suspend the laptop
+with a timed wake (e.g. overnight while another machine takes over), or power
+it off -- *"Ik wil dat jij volle permissie hebt"*. A session checks the rule is
+still there (`sudo -n -l`) rather than taking this paragraph's word for it.
+It covers those three commands and nothing else: every other `sudo`, and any
+install, still goes to him.
+
 He also allowed closing his other applications for a clean measurement, on the
 same day, on the same terms: it is for a measurement, and the session says
 afterwards what it closed.
