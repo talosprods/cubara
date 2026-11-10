@@ -398,20 +398,95 @@ fn two_clients_see_each_other_move() {
     let watcher_id = id_of(&mut watcher);
     assert_ne!(walker_id, watcher_id, "both clients got the same player");
 
-    // One of them walks, for long enough that the distance is unmistakable.
-    // Sent as numbered input, the way a real client does since block 2.13.
+    // One of them walks. Sent as numbered input, the way a real client does
+    // since block 2.13, and paced at the tick (`cubara_sim::TICK_DT`, 60/s):
+    // the server applies one input per client per tick and keeps at most
+    // `MAX_QUEUED_INPUTS = 8` queued, discarding the oldest past that
+    // (`headless.rs:606-620`). Sending faster than the tick turns this into a
+    // timing test -- whether a burst outruns the queue depends on how many
+    // ticks a loaded scheduler gives the server in a given wall-clock window.
+    // At the tick rate nothing is ever queued deep enough to be discarded: a
+    // stalled server thread only delays application, it never drops an input,
+    // so the deadlines below are what absorb a loaded runner.
+    // `jump: true` every tick, not just the one that clears a ledge: the
+    // deterministic seed-0 test world has incidental terrain (a tree, a
+    // one-block rise) within a few blocks of spawn in every direction, found
+    // by trying all four and the diagonal and measuring where the walker
+    // actually stopped. `step()` only reads `jump` while `on_ground`, so this
+    // is a continuous hop rather than a held key doing nothing after the
+    // first press, and it does not change the arithmetic below: horizontal
+    // velocity is set from `move_axes` every tick regardless of whether the
+    // player is airborne (`physics.rs` sets `velocity.x`/`velocity.z` before
+    // touching Y), so a hop costs no forward distance, only the chance to
+    // clear what would otherwise block it.
     let forward = InputFrame {
         move_axes: [0.0, 0.0, 1.0],
+        jump: true,
         ..InputFrame::default()
     };
+    let tick = Duration::from_secs_f64(f64::from(cubara_sim::TICK_DT));
+    // Scheduled against the burst's own start time rather than accumulated
+    // from one `sleep(tick)` per iteration: a sleep that overshoots by a
+    // fraction of a millisecond is unremarkable on its own, but 120 of them
+    // compound into whole extra ticks of drift, which is exactly the kind of
+    // timing dependence this test is being rewritten to remove.
+    let burst_start = Instant::now();
     for seq in 0..120 {
         walker.send(ClientMessage::Input {
             seq,
             frame: forward,
         });
-        std::thread::sleep(Duration::from_millis(4));
+        let target = burst_start + tick * (seq as u32 + 1);
+        let now = Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
+        }
     }
 
+    // Before measuring distance: wait for the server's own word that it
+    // applied every input. `Effect::SelfState.seq` is the last input id the
+    // server had applied when that state was produced
+    // (`headless.rs:656-658`), and it is sent to the walker every tick
+    // regardless of whether a new input arrived that tick. If it never
+    // reaches 119, the real defect is inputs lost on the way to the server --
+    // name that instead of reporting a short distance, which would look like
+    // the same failure for a different reason.
+    let mut last_acked_seq: Option<u64> = None;
+    let ack_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < ack_deadline && last_acked_seq != Some(119) {
+        for msg in walker.poll() {
+            if let ServerMessage::Effects(effects) = msg {
+                for e in effects {
+                    if let Effect::SelfState { seq, .. } = e {
+                        last_acked_seq = Some(last_acked_seq.map_or(seq, |s| s.max(seq)));
+                    }
+                }
+            }
+        }
+        if last_acked_seq == Some(119) {
+            break;
+        }
+        assert!(
+            !walker.is_closed(),
+            "the server closed the walker's connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        last_acked_seq,
+        Some(119),
+        "the server never acked all 120 inputs (last acked seq: {last_acked_seq:?}) -- \
+         inputs were lost, which is a different bug than the watcher not being told"
+    );
+
+    // The distance follows from the inputs the server just told us it applied,
+    // not from a margin that happens to clear whatever a burst lets through:
+    // 120 ticks at WALK_SPEED = 5 blocks/s and 60 ticks/s is 120 / 60 * 5 = 10
+    // blocks. `moved >= 8.0` leaves slack only for the watcher's first
+    // `PlayerMoved` sighting arriving a few ticks into the walk, not for
+    // scheduler timing -- a result between 2 and 8 is a bug (inputs applied
+    // but the movement not relayed in full), not a pass.
+    //
     // The watcher assembles what it was told, exactly as a real client does --
     // through `OtherPlayers`, not by reading the messages by hand, so this
     // covers the client-side half as well as the wire.
@@ -444,10 +519,10 @@ fn two_clients_see_each_other_move() {
                 }
             }
         }
-        // Enough movement to be sure it is movement and not a first sighting.
+        // Enough movement to be sure it is the full walk, not a first sighting.
         if let (Some(start), Some((_, now))) = (first, others.drawn(1.0).first().copied()) {
             let moved = (now.pos[0] - start[0]).abs() + (now.pos[2] - start[2]).abs();
-            if moved > 2.0 {
+            if moved >= 8.0 {
                 let _ = std::fs::remove_dir_all(&world);
                 return;
             }
@@ -458,7 +533,8 @@ fn two_clients_see_each_other_move() {
     let seen = others.drawn(1.0);
     let _ = std::fs::remove_dir_all(&world);
     panic!(
-        "the watcher never saw the walker move more than two blocks. \
+        "the watcher never saw the walker move the full ~10 blocks (all 120 inputs \
+         were acked, so this is a movement-relay defect, not a lost input). \
          Players it knows about: {}, first seen at {first:?}, now {:?}",
         seen.len(),
         seen.first().map(|(_, p)| p.pos)
