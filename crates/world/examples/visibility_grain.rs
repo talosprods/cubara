@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use cubara_voxel::{
-    BlockId, BlockRegistry, Chunk, ChunkCoord, Face, OreRegistry, StructureRegistry,
+    BlockId, BlockRegistry, Chunk, ChunkCoord, Face, NodeChunk, OreRegistry, StructureRegistry,
 };
 use cubara_world::mesh::build_node;
 use cubara_world::node::{desired_nodes_3d, schedule_for_radius, NodeKey};
@@ -42,25 +42,30 @@ fn opposite(f: Face) -> Face {
 }
 
 /// 6x6 joined matrix as bits: bit (a*6+b).
-fn sub_links(chunk: Option<&Chunk>, registry: &BlockRegistry, grain: usize) -> Vec<u64> {
-    let s = Chunk::SIZE / grain;
+///
+/// Takes [`NodeChunk`] (R1b), not a plain `Chunk`: a coarse node's lattice
+/// has its own vertical cell count now, so each axis's own sub-region size
+/// (`s`) is `dims[axis] / grain`, not one shared cubic size.
+fn sub_links(chunk: Option<&NodeChunk>, registry: &BlockRegistry, grain: usize) -> Vec<u64> {
     let mut out = vec![0u64; grain * grain * grain];
     let Some(chunk) = chunk else {
         return vec![u64::MAX; grain * grain * grain];
     };
+    let dims = chunk.dims();
+    let s = [dims[0] / grain, dims[1] / grain, dims[2] / grain];
     for gz in 0..grain {
         for gy in 0..grain {
             for gx in 0..grain {
-                let base = [gx * s, gy * s, gz * s];
-                let idx = |x: usize, y: usize, z: usize| (z * s + y) * s + x;
+                let base = [gx * s[0], gy * s[1], gz * s[2]];
+                let idx = |x: usize, y: usize, z: usize| (z * s[1] + y) * s[0] + x;
                 let open = |x: usize, y: usize, z: usize| {
                     !registry.is_solid(chunk.get(base[0] + x, base[1] + y, base[2] + z))
                 };
-                let mut seen = vec![false; s * s * s];
+                let mut seen = vec![false; s[0] * s[1] * s[2]];
                 let mut links = 0u64;
-                for z in 0..s {
-                    for y in 0..s {
-                        for x in 0..s {
+                for z in 0..s[2] {
+                    for y in 0..s[1] {
+                        for x in 0..s[0] {
                             if seen[idx(x, y, z)] || !open(x, y, z) {
                                 continue;
                             }
@@ -68,30 +73,30 @@ fn sub_links(chunk: Option<&Chunk>, registry: &BlockRegistry, grain: usize) -> V
                             let mut stack = vec![(x, y, z)];
                             let mut touched = 0u8;
                             while let Some((x, y, z)) = stack.pop() {
-                                let e = s - 1;
-                                touched |= (x == e) as u8
+                                let (ex, ey, ez) = (s[0] - 1, s[1] - 1, s[2] - 1);
+                                touched |= (x == ex) as u8
                                     | ((x == 0) as u8) << 1
-                                    | ((y == e) as u8) << 2
+                                    | ((y == ey) as u8) << 2
                                     | ((y == 0) as u8) << 3
-                                    | ((z == e) as u8) << 4
+                                    | ((z == ez) as u8) << 4
                                     | ((z == 0) as u8) << 5;
                                 let mut n = Vec::with_capacity(6);
                                 if x > 0 {
                                     n.push((x - 1, y, z));
                                 }
-                                if x < e {
+                                if x < ex {
                                     n.push((x + 1, y, z));
                                 }
                                 if y > 0 {
                                     n.push((x, y - 1, z));
                                 }
-                                if y < e {
+                                if y < ey {
                                     n.push((x, y + 1, z));
                                 }
                                 if z > 0 {
                                     n.push((x, y, z - 1));
                                 }
-                                if z < e {
+                                if z < ez {
                                     n.push((x, y, z + 1));
                                 }
                                 for (a, b, c) in n {
@@ -139,13 +144,13 @@ fn main() {
     let layer_of = |_: &str| 0;
 
     let t = Instant::now();
-    let mut chunks: HashMap<NodeKey, Option<Chunk>> = HashMap::new();
+    let mut chunks: HashMap<NodeKey, Option<NodeChunk>> = HashMap::new();
     // Quad centres in world blocks, per node.
     let mut quads: HashMap<NodeKey, Vec<[i32; 3]>> = HashMap::new();
     for &n in &nodes {
         let built = build_node(&world, &registry, &layer_of, n, blocks);
         if let Some(g) = built.geometry {
-            let (o, cell) = (n.world_origin(), n.extent_chunks());
+            let o = n.world_origin();
             let centres = g
                 .mesh
                 .vertices
@@ -159,8 +164,11 @@ fn main() {
                     };
                     let nrm = q[0].face().normal();
                     // Nudge into the solid side so a face on a sub-block
-                    // boundary belongs to the block drawing it.
-                    [0, 1, 2].map(|k| o[k] + avg(k) * cell - (nrm[k] > 0.0) as i32 * (cell.min(1)))
+                    // boundary belongs to the block drawing it. Positions
+                    // are already final node-local block coordinates (R1b,
+                    // decision 3), so this is an origin add, not a
+                    // per-axis scale multiply.
+                    [0, 1, 2].map(|k| o[k] + avg(k) - (nrm[k] > 0.0) as i32)
                 })
                 .collect();
             quads.insert(n, centres);
@@ -276,12 +284,19 @@ fn main() {
             .map(|l| NodeKey::containing(c, l))
             .find(|n| set.contains(n))?;
         let (o, cell) = (n.world_origin(), n.extent_chunks());
+        // The node's world footprint is a true cube (`16 * cell` on every
+        // axis, R1b or not), so one grain-4 sub-block's world size is the
+        // same on every axis even though the lattice's own cell size isn't
+        // -- `size` stays uniform, but the lattice *index* (`ci`) must use
+        // each axis's own cell size (`cell` horizontally, `cell_v`
+        // vertically) to land on the right cell.
+        let cell_v = n.cell_height_blocks();
         let size = sub_blocks * cell;
         let i = |k: usize| ((p[k] - o[k]) / size) as usize;
-        let ci = |k: usize| ((p[k] - o[k]) / cell) as usize;
+        let ci = |k: usize, c: i32| ((p[k] - o[k]) / c) as usize;
         let solid = chunks[&n]
             .as_ref()
-            .is_some_and(|ch| ch.get(ci(0), ci(1), ci(2)) != BlockId::AIR);
+            .is_some_and(|ch| ch.get(ci(0, cell), ci(1, cell_v), ci(2, cell)) != BlockId::AIR);
         Some((n, (i(2) * grain + i(1)) * grain + i(0), solid))
     };
     let t = Instant::now();

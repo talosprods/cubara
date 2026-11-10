@@ -6,6 +6,7 @@
 //! the renderer can share these types without depending on each other.
 
 pub mod angle;
+pub mod aniso;
 pub mod block;
 pub mod bounds;
 pub mod connectivity;
@@ -23,8 +24,11 @@ pub mod structure;
 pub mod voxel;
 
 pub use angle::Angle;
+pub use aniso::{AnisoChunk, NodeChunk};
 pub use block::BlockId;
-pub use bounds::{build_mesh_bounded, build_mesh_bounded_occluded, Aabb};
+pub use bounds::{
+    build_mesh_bounded, build_mesh_bounded_occluded, build_mesh_bounded_occluded_node, Aabb,
+};
 pub use connectivity::FaceLinks;
 pub use coord::ChunkCoord;
 pub use fixed::{Fixed, FixedVec3, FRAC_BITS};
@@ -40,4 +44,4 @@ pub use registry::{
 pub use smelt::{SmeltBook, SmeltError, SmeltRecipe, SmeltRecipeDef};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
-pub use voxel::{Chunk, MeshContext};
+pub use voxel::{face_ao, Chunk, MeshContext};

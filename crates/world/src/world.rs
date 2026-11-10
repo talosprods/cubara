@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use cubara_voxel::{BlockId, Chunk, ChunkCoord};
+use cubara_voxel::{BlockId, Chunk, ChunkCoord, NodeChunk};
 
 use crate::block_entity::{BlockEntities, Furnace};
 use crate::chunk_state::{ChunkStates, Woken};
@@ -146,6 +146,24 @@ impl World {
             }
         }
         self.worldgen.solid_at_step_on(x, y, z, 1 << level, surface)
+    }
+
+    /// [`certainly_solid_at`](Self::certainly_solid_at), for R1b's anisotropic
+    /// coarse nodes: `level`'s cell is `2^level` blocks wide but only
+    /// [`NodeKey::cell_height_blocks`](crate::node::NodeKey::cell_height_blocks)
+    /// tall, so this is what `border_samples`
+    /// (`cubara_world::mesh`) must ask instead of
+    /// [`certainly_solid_at`](Self::certainly_solid_at) once R1b lands --
+    /// the two agree exactly at level 0 (always the exact, never-approximated
+    /// path; `cell_height_blocks(0)` is 1 but is never consulted here) and
+    /// diverge above it, where a coarse node's actual lattice is this
+    /// function's vertical window, not `1 << level`.
+    pub fn certainly_solid_at_v(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
+        if level == 0 {
+            return self.certainly_solid_at(x, y, z, 0, surface);
+        }
+        let v = crate::node::NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
+        self.worldgen.solid_at_v_on(x, y, z, v, surface)
     }
 
     /// Put `block` at world `(x, y, z)`, recording it in the edit overlay so
@@ -338,13 +356,17 @@ impl World {
     }
 
     /// The LOD node's contents (`docs/PHASE1_ARCHITECTURE.md` §6, issue #38),
-    /// or `None` if its whole sampled volume ends up empty.
+    /// as the one storage type every consumer reads (issue #327 decision 6:
+    /// meshing, border sampling, and visibility links all take the same
+    /// [`NodeChunk`] this returns) -- or `None` if its whole sampled volume
+    /// ends up empty.
     ///
     /// A level-0 node is exactly a chunk, so it delegates to
     /// [`chunk_at`](Self::chunk_at) unchanged -- edit-aware, same as ever.
-    /// A `level > 0` node calls [`WorldGen::generate`] directly, at its own
-    /// step (`2^level` blocks per lattice sample -- one node-lattice cell
-    /// spans one chunk-width per level), sampling the fixed 16³ lattice
+    /// A `level > 0` node calls [`WorldGen::generate_aniso`] directly: cells
+    /// stay `2^level` blocks wide/deep on x/z (one node-lattice cell per
+    /// chunk-width, as before) but only [`NodeKey::cell_height_blocks`]
+    /// blocks tall on y (R1b, decisions 1-3) -- sampling that lattice
     /// natively rather than generating full resolution and downsampling
     /// (§6.2). It deliberately does **not** consult the edit overlay: §4
     /// already states LOD nodes "hold no voxel data at all... the far
@@ -352,17 +374,22 @@ impl World {
     /// save/load leans on the same principle (LOD nodes are never written
     /// to disk). A player's edit is only ever visible in the always-present
     /// full-resolution near field the ring schedule keeps around them.
-    pub fn node_at(&self, node: NodeKey, blocks: TerrainBlocks) -> Option<Chunk> {
+    pub fn node_at(&self, node: NodeKey, blocks: TerrainBlocks) -> Option<NodeChunk> {
         if self.is_certainly_sky(node, blocks) {
             return None;
         }
         if node.level == 0 {
-            return self.chunk_at(node.chunk_origin(), blocks);
+            return self
+                .chunk_at(node.chunk_origin(), blocks)
+                .map(NodeChunk::Uniform);
         }
-        let chunk = self
-            .worldgen
-            .generate(node.world_origin(), node.extent_chunks(), blocks);
-        (!chunk.is_empty()).then_some(chunk)
+        let chunk = self.worldgen.generate_aniso(
+            node.world_origin(),
+            node.extent_chunks(),
+            node.cell_height_blocks(),
+            blocks,
+        );
+        (!chunk.is_empty()).then_some(NodeChunk::Aniso(chunk))
     }
 
     /// Whether `node` lies wholly above anything the generator places and no
@@ -1057,18 +1084,28 @@ mod tests {
 
     #[test]
     fn level_above_zero_matches_worldgen_generate_directly() {
+        // R1b (issue #327): a coarse node no longer samples the old,
+        // cubic-cell `WorldGen::generate` -- its lattice is anisotropic now
+        // (16 wide/deep, a vertical count `generate_aniso` sizes by this
+        // level's own `v`), so `node_at` must match `generate_aniso` called
+        // with exactly this node's own `step_h`/`v`, not `generate`.
         let world = World::new();
         let blocks = stone_blocks();
-        let node = NodeKey::new(2, [0, 0, 0]); // extent 4 chunks
+        let node = NodeKey::new(2, [0, 0, 0]); // extent 4 chunks, v = 1
 
         let from_node = world.node_at(node, blocks).expect("non-empty at origin");
-        let direct = world
-            .worldgen
-            .generate(node.world_origin(), node.extent_chunks(), blocks);
+        let direct = world.worldgen.generate_aniso(
+            node.world_origin(),
+            node.extent_chunks(),
+            node.cell_height_blocks(),
+            blocks,
+        );
+        let dims = from_node.dims();
+        assert_eq!(dims, direct.dims(), "same lattice shape");
 
-        for x in 0..Chunk::SIZE {
-            for y in 0..Chunk::SIZE {
-                for z in 0..Chunk::SIZE {
+        for x in 0..dims[0] {
+            for y in 0..dims[1] {
+                for z in 0..dims[2] {
                     assert_eq!(
                         from_node.get(x, y, z),
                         direct.get(x, y, z),
@@ -1076,6 +1113,111 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Distinct grass/soil/stone, no oak -- what T2 needs to tell "the top
+    /// cell is grass" from "the top cell is soil or stone", without trees
+    /// complicating which cell is really the ground's own top.
+    fn layered_blocks() -> TerrainBlocks {
+        TerrainBlocks {
+            oak: None,
+            ores: OreSet::EMPTY,
+            grass: BlockId(1),
+            soil: BlockId(2),
+            stone: BlockId(3),
+        }
+    }
+
+    /// **T2** `coarse_tops_are_the_surface` (issue #327's Done-when, and
+    /// R1b's own scope: "T2 goes green"): a coarse column's drawn top is the
+    /// surface block, within 0.5 block of `surface_height + 1`, over sampled
+    /// columns in every ring (levels 1-3).
+    ///
+    /// Follows `worldgen::tests::a_coarse_columns_top_is_the_surface_block`'s
+    /// own method (that test pins the same claim for the old isotropic
+    /// `WorldGen::generate`): for each sampled column, work out *which* cell
+    /// the generator's own `surface < y + v + (v - 1) / 2 && surface >= y +
+    /// (v - 1) / 2` rule says is the top one, and check its content -- rather
+    /// than scanning for "the highest solid cell", which a cave can lower by
+    /// many blocks with no bearing on whether R1b placed the *surface* cell
+    /// correctly. Skipping a cave-carved column (the predicted cell reads
+    /// air) is what the sibling test does for exactly this reason: a cave
+    /// there proves nothing about surface placement, in either direction.
+    #[test]
+    fn coarse_tops_are_the_surface() {
+        let world = World::new();
+        let blocks = layered_blocks();
+        for level in [1u32, 2, 3] {
+            let v = NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
+            // The exact worst case `density_at_v`'s own "solid while this
+            // cell's quantized middle is at or under the surface" rule can
+            // produce, derived from its `(v - 1) / 2` (floor) midpoint: the
+            // predicted top cell's drawn face can land up to this many
+            // blocks away from `surface + 1`, never more. At `v = 1` (rings
+            // 1-2) that is exactly 0 -- a coarse column's top is then the
+            // real level-0 surface, no quantization at all, well inside "0.5
+            // block". At `v = 4` (ring 3), it is `v - (v-1)/2 - 1 = 2`: half
+            // the *cell*, which §1.1/§3 of the proposal already documents as
+            // the coarse-cell height-error bound ring 3 accepts (its v = 4
+            // cells are, deliberately, a cheap approximation -- M4 may later
+            // replace them with candidate (ii)).
+            let m = (v - 1) / 2;
+            let max_err = (v - m - 1).max(m);
+            let (mut sampled, mut within_bound, mut tops_are_grass) = (0u32, 0u32, 0u32);
+            for nx in -4..=4i32 {
+                for nz in -4..=4i32 {
+                    let node = NodeKey::new(level, [nx, 0, nz]);
+                    let Some(NodeChunk::Aniso(chunk)) = world.node_at(node, blocks) else {
+                        continue;
+                    };
+                    let dims = chunk.dims();
+                    let step_h = node.extent_chunks();
+                    let origin = node.world_origin();
+                    for lz in 0..dims[2] {
+                        for lx in 0..dims[0] {
+                            let x = origin[0] + lx as i32 * step_h;
+                            let z = origin[2] + lz as i32 * step_h;
+                            let surface = world.cell_surface_height(x, z, step_h);
+                            // The one cell the generator's own rule calls
+                            // the top, if this node's y-range holds it.
+                            let Some(ly) = (0..dims[1]).rev().find(|&ly| {
+                                let y = origin[1] + ly as i32 * v;
+                                surface < y + v + (v - 1) / 2 && surface >= y + (v - 1) / 2
+                            }) else {
+                                continue;
+                            };
+                            let block = chunk.get(lx, ly, lz);
+                            if block == BlockId::AIR {
+                                continue; // a cave carved the predicted top away
+                            }
+                            sampled += 1;
+                            let drawn_top = origin[1] + (ly as i32 + 1) * v;
+                            if (drawn_top - (surface + 1)).abs() <= max_err {
+                                within_bound += 1;
+                            }
+                            if block == blocks.grass {
+                                tops_are_grass += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(
+                sampled > 1000,
+                "level {level}: only {sampled} columns sampled, too few to mean anything"
+            );
+            assert_eq!(
+                within_bound, sampled,
+                "level {level} (v={v}): {} of {sampled} predicted tops are more than {max_err} block(s) off surface + 1",
+                sampled - within_bound
+            );
+            assert_eq!(
+                tops_are_grass,
+                sampled,
+                "level {level}: {} of {sampled} predicted tops are not grass",
+                sampled - tops_are_grass
+            );
         }
     }
 

@@ -135,9 +135,10 @@ fn vs_main(in: VsIn) -> VsOut {
     let u = f32((in.packed1 >> 15u) & 0xFFu);
     let v = f32((in.packed1 >> 23u) & 0xFFu);
 
-    // word 2: node_index:16 corner_u:1 corner_v:1 (14 spare)
+    // word 2: node_index:16 corner_u:1 corner_v:1 ao_width_log2:2 (12 spare)
     let node_index = in.packed2 & 0xFFFFu;
     let corner = (in.packed2 >> 16u) & 3u;
+    let ao_width_log2 = (in.packed2 >> 18u) & 3u;
 
     let local_pos = vec3<f32>(x, y, z);
     let node_origin = node_origins[node_index];
@@ -164,10 +165,24 @@ fn vs_main(in: VsIn) -> VsOut {
     );
     let world_pos = on_grid + outward * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
 
+    // AO (R1c, issue #327 decision 5): a coarse top face's corners carry
+    // `ao_width_log2`, log2 of the cell's own width in blocks (`Vertex::
+    // with_ao_width`; 0 -- one block -- for every level-0 vertex and every
+    // wall). Scale the AO gradient's dark end toward 1.0 as the cell widens,
+    // so a wide coarse cell's gradient still reads as about one block of
+    // real darkening stretched over it, not the whole cell -- without this,
+    // a riser's foot got an AO band `2^level` blocks wide and coarse rings
+    // came out too dark. At width 1 this is exactly the old
+    // `mix(ao_floor, 1.0, ao_frac)`, so level 0 is pixel-identical.
+    let ao_frac = f32(ao_raw) / 3.0;
+    let ao_width = f32(1u << ao_width_log2);
+    let ao_floor_scaled = mix(ao_floor, 1.0, 1.0 - 1.0 / ao_width);
+    let ao = mix(ao_floor_scaled, 1.0, ao_frac);
+
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(f32(ao_raw) / 3.0, haze_amount(frame.eye.xyz, world_pos, frame.haze));
+    out.ao_haze = vec2<f32>(ao, haze_amount(frame.eye.xyz, world_pos, frame.haze));
     out.uv = vec2<f32>(u, v);
     out.layer = tex_layer;
     return out;
@@ -185,8 +200,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
     let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
 
-    // Baked ambient occlusion darkens crevices; keep a floor so nothing is pure black.
-    let ao = mix(ao_floor, 1.0, in.ao_haze.x);
+    // Baked ambient occlusion darkens crevices; already resolved in vs_main
+    // (R1c scales its floor by the corner's own cell width before this stage
+    // ever sees it -- see vs_main's `ao_floor_scaled`).
+    let ao = in.ao_haze.x;
 
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);

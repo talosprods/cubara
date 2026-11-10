@@ -10,6 +10,7 @@
 //! to decide where faces go, so what this says can be seen through is exactly
 //! what is drawn as open.
 
+use crate::aniso::NodeChunk;
 use crate::block::BlockId;
 use crate::mesh::Face;
 use crate::registry::BlockRegistry;
@@ -71,30 +72,62 @@ impl FaceLinks {
 
     /// The same, for the cube of cells `size` wide starting at `min` -- its
     /// faces are that cube's faces, not the chunk's.
-    ///
-    /// Flood-fills each separate pocket of air once and records every face
-    /// that pocket touches; any two of those are joined. Linear in the number
-    /// of cells.
     pub fn of_region(
         chunk: &Chunk,
         registry: &BlockRegistry,
         min: [usize; 3],
         size: usize,
     ) -> Self {
-        let n = size;
-        let open = |x: usize, y: usize, z: usize| {
-            let id: BlockId = chunk.get(min[0] + x, min[1] + y, min[2] + z);
-            !registry.is_solid(id)
-        };
-        let index = |x: usize, y: usize, z: usize| (z * n + y) * n + x;
+        Self::of_region_dyn(
+            |x, y, z| chunk.get(min[0] + x, min[1] + y, min[2] + z),
+            registry,
+            [size; 3],
+        )
+    }
 
-        let mut seen = vec![false; n * n * n];
+    /// [`of_region`], for a [`NodeChunk`] (R1b, decision 6) -- `min`/`size`
+    /// per axis, since a coarse node's region may not be a cube (its vertical
+    /// cell count differs from its horizontal one). What
+    /// `cubara_world::visibility::node_links` calls for each of a node's
+    /// `GRAIN`³ sub-blocks, so cave-culling links are worked out from the
+    /// exact same lattice meshing and border sampling read (decision 6, one
+    /// storage type).
+    pub fn of_region_node(
+        chunk: &NodeChunk,
+        registry: &BlockRegistry,
+        min: [usize; 3],
+        size: [usize; 3],
+    ) -> Self {
+        Self::of_region_dyn(
+            |x, y, z| chunk.get(min[0] + x, min[1] + y, min[2] + z),
+            registry,
+            size,
+        )
+    }
+
+    /// Flood-fills each separate pocket of air once, over a region of
+    /// `size` cells per axis sampled through `block_at` (already offset to
+    /// the region's own `min`), and records every face that pocket touches;
+    /// any two of those are joined. Linear in the number of cells. The one
+    /// implementation [`of_region`] and [`of_region_node`] both reduce to
+    /// (`ARCHITECTURE.md` Rule 5) -- a cubic chunk region or an anisotropic
+    /// node region are the same flood fill over a different-shaped box.
+    fn of_region_dyn(
+        block_at: impl Fn(usize, usize, usize) -> BlockId,
+        registry: &BlockRegistry,
+        size: [usize; 3],
+    ) -> Self {
+        let [nx, ny, nz] = size;
+        let open = |x: usize, y: usize, z: usize| !registry.is_solid(block_at(x, y, z));
+        let index = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+
+        let mut seen = vec![false; nx * ny * nz];
         let mut stack: Vec<(usize, usize, usize)> = Vec::new();
         let mut links = 0u16;
 
-        for z in 0..n {
-            for y in 0..n {
-                for x in 0..n {
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
                     if seen[index(x, y, z)] || !open(x, y, z) {
                         continue;
                     }
@@ -102,12 +135,12 @@ impl FaceLinks {
                     stack.push((x, y, z));
                     let mut touched = 0u8;
                     while let Some((x, y, z)) = stack.pop() {
-                        let edge = n - 1;
-                        touched |= (x == edge) as u8
+                        let (ex, ey, ez) = (nx - 1, ny - 1, nz - 1);
+                        touched |= (x == ex) as u8
                             | ((x == 0) as u8) << 1
-                            | ((y == edge) as u8) << 2
+                            | ((y == ey) as u8) << 2
                             | ((y == 0) as u8) << 3
-                            | ((z == edge) as u8) << 4
+                            | ((z == ez) as u8) << 4
                             | ((z == 0) as u8) << 5;
                         let mut visit = |x: usize, y: usize, z: usize| {
                             let i = index(x, y, z);
@@ -119,19 +152,19 @@ impl FaceLinks {
                         if x > 0 {
                             visit(x - 1, y, z);
                         }
-                        if x < edge {
+                        if x < ex {
                             visit(x + 1, y, z);
                         }
                         if y > 0 {
                             visit(x, y - 1, z);
                         }
-                        if y < edge {
+                        if y < ey {
                             visit(x, y + 1, z);
                         }
                         if z > 0 {
                             visit(x, y, z - 1);
                         }
-                        if z < edge {
+                        if z < ez {
                             visit(x, y, z + 1);
                         }
                     }

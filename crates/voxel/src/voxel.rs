@@ -348,7 +348,7 @@ impl Chunk {
 ///
 /// `occluded` is [`Chunk::build_mesh_occluded`]'s: whether a border face of an
 /// inside solid cell may be dropped because the outside cell covers it.
-fn greedy_mesh(
+pub(crate) fn greedy_mesh(
     dims: [i32; 3],
     scale: [i32; 3],
     block_at: impl Fn(i32, i32, i32) -> BlockId,
@@ -510,8 +510,15 @@ fn greedy_mesh(
 /// The four corners' AO for the face cell at (`uu`,`vv`) whose empty side is the
 /// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
 /// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
+///
+/// `pub` (not just crate-internal): `cubara-render`'s T3
+/// (`a_coarse_node_averages_like_its_blocks`, issue #327 decision 5/R1c)
+/// computes a coarse cell's AO-lit colour against real level-0 blocks over
+/// the same footprint off the GPU, and must read the *same* AO this mesher
+/// bakes into a quad's corners (`ARCHITECTURE.md` Rule 5) rather than a
+/// second copy of this logic.
 #[allow(clippy::too_many_arguments)]
-fn face_ao(
+pub fn face_ao(
     block_at: &impl Fn(i32, i32, i32) -> BlockId,
     registry: &BlockRegistry,
     d: usize,
@@ -629,6 +636,26 @@ fn push_quad(
         )
     };
 
+    // AO on a top/bottom face spans one of its own cells -- `scale[u]`/
+    // `scale[v]` blocks wide, equal on both for a `d == 1` sweep (`u`/`v` are
+    // x and z, R1b's horizontal cells). Without scaling it, a coarse node's
+    // AO gradient still darkens over one block regardless of how wide its
+    // cell actually is, so a riser's foot gets a band 2^level blocks wide and
+    // reads darker than the same riser's own blocks would
+    // (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1, issue #327 decision 5).
+    // Walls keep an unscaled gradient -- the proposal measures this problem
+    // only at top faces, and every wall's own material is already per-block
+    // (decision 3's UVs). `scale` is always a power of two (1 at level 0,
+    // 2^level for a coarse node's horizontal cells), so `trailing_zeros` is
+    // exactly log2.
+    let ao_width_log2 = if d == 1 {
+        (scale[u].max(scale[v]).max(1) as u32)
+            .trailing_zeros()
+            .min(crate::mesh::MAX_AO_WIDTH_LOG2)
+    } else {
+        0
+    };
+
     let start = mesh.vertices.len() as u32;
     for (((c, (cu, cv)), a), (u_max, v_max)) in verts.iter().zip(uvs).zip(vao).zip(sides) {
         mesh.vertices.push(
@@ -642,7 +669,8 @@ fn push_quad(
                 cu as u32,
                 cv as u32,
             )
-            .with_corner(u_max, v_max),
+            .with_corner(u_max, v_max)
+            .with_ao_width(ao_width_log2),
         );
     }
 
@@ -1005,6 +1033,51 @@ mod tests {
                 Face::PosX | Face::NegX => assert_eq!((sx, sy, sz), (0, 1, 2), "{face:?}"),
                 Face::PosY | Face::NegY => assert_eq!((sx, sy, sz), (2, 0, 2), "{face:?}"),
                 Face::PosZ | Face::NegZ => assert_eq!((sx, sy, sz), (2, 1, 0), "{face:?}"),
+            }
+        }
+    }
+
+    /// R1c (decision 5): a top/bottom face's vertices carry log2 of the
+    /// *horizontal* cell width (`scale[u].max(scale[v])` for a `d == 1`
+    /// sweep) in `ao_width_log2` -- a wall's vertices carry 0, unscaled,
+    /// since the proposal only asks for top-face scaling. This is the one
+    /// place that proves the mesher actually *writes* the bit T3
+    /// (`cubara-render`'s `a_coarse_node_averages_like_its_blocks`) assumes
+    /// is there -- T3 itself computes its own expected width from the
+    /// node's `step_h` directly and never reads a real vertex's packed
+    /// bits, so a `push_quad` that computed the right AO levels but forgot
+    /// to call `with_ao_width` (or called it with the wrong axis) would
+    /// pass T3 and still ship broken bits to the shader. This test is what
+    /// closes that gap.
+    #[test]
+    fn push_quad_writes_ao_width_log2_for_top_faces_only() {
+        let registry = registry();
+        let c = ctx(&registry);
+        let dims = [4, 8, 4];
+        let scale = [4, 1, 4]; // horizontal width 4 => log2 = 2
+        let mesh = greedy_mesh(
+            dims,
+            scale,
+            |x, y, z| {
+                if (x, y, z) == (1, 3, 1) {
+                    BlockId::STONE
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| true,
+            &c,
+        );
+        assert_eq!(mesh.triangle_count(), 12, "6 unmerged faces, no skirts");
+        for quad in mesh.vertices.as_chunks::<4>().0 {
+            let face = quad[0].face();
+            let expect = match face {
+                Face::PosY | Face::NegY => 2,
+                _ => 0,
+            };
+            for v in quad {
+                assert_eq!(v.ao_width_log2(), expect, "{face:?}");
             }
         }
     }

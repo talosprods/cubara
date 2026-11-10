@@ -99,6 +99,22 @@ const NODE_INDEX_MASK: u32 = (1 << NODE_INDEX_BITS) - 1;
 /// ([`Vertex::with_corner`]): one bit each, above the node index.
 const CORNER_U_BIT: u32 = 1 << NODE_INDEX_BITS;
 const CORNER_V_BIT: u32 = 1 << (NODE_INDEX_BITS + 1);
+/// log2 of this face's cell width, for scaling its AO gradient
+/// ([`Vertex::with_ao_width`]) -- `docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1's
+/// "required alongside it" (issue #327, decision 5). Two bits: a level-3
+/// node's horizontal cell is 8 blocks wide (log2 = 3), the widest this ever
+/// needs to carry. 0 (the default every vertex starts at) means "AO already
+/// spans one block" -- level 0, and every vertex nobody has called
+/// `with_ao_width` on, read back unscaled.
+const AO_WIDTH_BITS: u32 = 2;
+const AO_WIDTH_SHIFT: u32 = NODE_INDEX_BITS + 2;
+const AO_WIDTH_MASK: u32 = (1 << AO_WIDTH_BITS) - 1;
+/// The widest cell [`Vertex::with_ao_width`] can record: 2 bits, so log2 up
+/// to 3 (an 8-block cell, a level-3 node's horizontal width -- the widest R1b
+/// ever asks for). A caller computing a wider log2 itself (e.g. `voxel.rs`'s
+/// old isotropic `Chunk::build_mesh_lod`, whose downsample factor can reach
+/// 16) clamps to this rather than overflowing the field.
+pub const MAX_AO_WIDTH_LOG2: u32 = AO_WIDTH_MASK;
 
 /// A single mesh vertex, packed into 12 bytes: node-local lattice position,
 /// baked ambient occlusion, texture-array layer, face direction, this
@@ -108,7 +124,7 @@ const CORNER_V_BIT: u32 = 1 << (NODE_INDEX_BITS + 1);
 /// ```text
 /// word 0:  x:10  y:10  z:10  ao:2
 /// word 1:  tex_layer:12  face:3  u:8  v:8  (1 spare)
-/// word 2:  node_index:16  (16 spare)
+/// word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  (12 spare)
 /// ```
 ///
 /// `u`/`v` are *this vertex's* coordinate -- 0 or the greedy quad's extent,
@@ -197,6 +213,29 @@ impl Vertex {
             self.packed2 & CORNER_U_BIT != 0,
             self.packed2 & CORNER_V_BIT != 0,
         )
+    }
+
+    /// Returns a copy of this vertex carrying `log2_width` (the log2 of this
+    /// face's cell width in blocks) in word 2's spare bits 18-19, for
+    /// `mesh.wgsl` to scale its AO gradient by -- without this, a coarse
+    /// riser's AO band stays one block wide regardless of how many blocks
+    /// its cell actually spans, so coarse rings read darker than their own
+    /// blocks would (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1, issue #327
+    /// decision 5). Independent of [`with_corner`]/[`with_node_index`]:
+    /// setting any of the three keeps the other two.
+    pub fn with_ao_width(self, log2_width: u32) -> Self {
+        debug_assert!(log2_width <= AO_WIDTH_MASK, "ao width log2 out of range");
+        Self {
+            packed2: (self.packed2 & !(AO_WIDTH_MASK << AO_WIDTH_SHIFT))
+                | (log2_width << AO_WIDTH_SHIFT),
+            ..self
+        }
+    }
+
+    /// The log2 cell width [`with_ao_width`](Self::with_ao_width) set; 0 (one
+    /// block) for a vertex nobody has called it on.
+    pub fn ao_width_log2(self) -> u32 {
+        (self.packed2 >> AO_WIDTH_SHIFT) & AO_WIDTH_MASK
     }
 
     pub fn node_index(self) -> u32 {
@@ -349,6 +388,34 @@ mod tests {
         assert_eq!((b.corner(), b.node_index()), ((false, true), 12345));
         assert_eq!(b.with_corner(true, true).corner(), (true, true));
         assert_eq!(v.corner(), (false, false));
+    }
+
+    /// `ao_width_log2` sits above the corner bits, above the node index:
+    /// setting any one of the three keeps the other two, in every order --
+    /// what R1c's AO-width scaling depends on not disturbing the crack-seal
+    /// corner bits (#321) or the node index a mesh gets stamped with on
+    /// arena insertion.
+    #[test]
+    fn ao_width_corner_and_node_index_all_keep_each_other() {
+        let v = Vertex::new(1, 2, 3, 1, Face::PosZ, 7, 4, 5);
+        let a = v
+            .with_ao_width(3)
+            .with_corner(true, false)
+            .with_node_index(NODE_INDEX_MASK);
+        assert_eq!(
+            (a.ao_width_log2(), a.corner(), a.node_index()),
+            (3, (true, false), NODE_INDEX_MASK)
+        );
+        let b = v
+            .with_node_index(12345)
+            .with_corner(false, true)
+            .with_ao_width(2);
+        assert_eq!(
+            (b.ao_width_log2(), b.corner(), b.node_index()),
+            (2, (false, true), 12345)
+        );
+        assert_eq!(v.ao_width_log2(), 0, "default is 0 (one block)");
+        assert_eq!(b.with_ao_width(0).ao_width_log2(), 0);
     }
 
     #[test]

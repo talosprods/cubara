@@ -8,7 +8,7 @@
 //! unedited chunk be regenerated instead of saved (§7.4) and a far LOD node
 //! sample its own volume with no neighbours to ask (§6).
 
-use cubara_voxel::{BlockId, BlockRegistry, Chunk, OreRegistry, StructureRegistry};
+use cubara_voxel::{AnisoChunk, BlockId, BlockRegistry, Chunk, OreRegistry, StructureRegistry};
 
 use crate::noise::{fbm2, fbm3, ridged2};
 
@@ -549,6 +549,67 @@ impl WorldGen {
         terrain - carved
     }
 
+    /// [`density_at`], for R1b's anisotropic coarse-node path: the vertical
+    /// window is `v` blocks (the node's own cell height, decision 1) rather
+    /// than the horizontal cell width -- so a node whose cells are `2^level`
+    /// blocks wide but only `v` tall samples its solid/air split, and its
+    /// caves, over exactly `v` blocks of height, not `2^level`.
+    ///
+    /// **Not the same function as `density_at` with `step = v`.** That
+    /// function's `step <= 1` branch means "always sample caves, regardless
+    /// of depth" -- correct for a genuine single-block query (`density`,
+    /// `is_solid`, raycasting), which must never approximate a cell it has
+    /// no business treating as one. Reusing it here would make it true of
+    /// every `v = 1` cell too (levels 1-2's rings), which defeats the
+    /// "generation costs about 2x today's, not 2^level x" requirement
+    /// (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1): a `v = 1` coarse column
+    /// would sample cave noise at every one of its 32 (level 1) or 64 (level
+    /// 2) rows, not just the ones near the surface. This keeps the same
+    /// depth-gated skip the old isotropic coarse path had (`shallow`,
+    /// `DISTANT_CAVE_DEPTH`) regardless of how small `v` is.
+    fn density_at_v(&self, x: i32, y: i32, z: i32, surface: i32, v: i32) -> f32 {
+        let terrain = (surface - (y + (v - 1) / 2) + 1) as f32;
+        if terrain <= 0.0 {
+            return terrain;
+        }
+        let shallow = y + v > surface - DISTANT_CAVE_DEPTH;
+        let carved = if shallow && self.cave_at(x, y, z, v) {
+            CAVE_CARVE_AMOUNT
+        } else {
+            0.0
+        };
+        terrain - carved
+    }
+
+    /// [`block_at_on_surface`], using [`density_at_v`] and probing material at
+    /// the vertical window `v` implies, exactly as [`block_at_on_surface`]
+    /// does for `step` -- see [`density_at_v`] for why this is a separate
+    /// function rather than a call with `step = v`.
+    fn block_at_on_surface_v(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        surface: i32,
+        blocks: TerrainBlocks,
+        v: i32,
+    ) -> Option<BlockId> {
+        let top_cell = v > 1 && surface < y + v + (v - 1) / 2;
+        let probe = if top_cell { surface } else { y + v - 1 };
+        (self.density_at_v(x, y, z, surface, v) > 0.0)
+            .then(|| self.material_at(x, probe, z, surface, blocks))
+    }
+
+    /// Whether the `v`-tall cell at `(x, y, z)` (R1b's anisotropic path) is
+    /// certainly solid, given the column's `surface` -- [`solid_at_step_on`]'s
+    /// counterpart for a vertical window that isn't the same as the node's
+    /// horizontal cell width. Used only for `level >= 1`; level 0's single
+    /// blocks go through the exact, never-approximated [`density`] instead
+    /// (see [`crate::World::certainly_solid_at_v`]).
+    pub fn solid_at_v_on(&self, x: i32, y: i32, z: i32, v: i32, surface: i32) -> bool {
+        self.density_at_v(x, y, z, surface, v) > 0.0
+    }
+
     /// Whether the cell of `step` blocks at `(x, y, z)` is cave.
     ///
     /// A block is cave where the cave noise crosses the threshold. A larger
@@ -1002,6 +1063,49 @@ impl WorldGen {
             let y = origin[1] + ly as i32 * step;
             let z = origin[2] + lz as i32 * step;
             self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks, step)
+                .unwrap_or(BlockId::AIR)
+        })
+    }
+
+    /// [`generate`](Self::generate), for a coarse (level > 0) node's
+    /// anisotropic lattice (R1b, issue #327 decisions 1/2): cells stay 16
+    /// wide/deep at `step_h` (`2^level`) blocks each, but the 16 tall rows
+    /// become `16 * step_h / v` rows of `v` blocks each. The column's surface
+    /// is `cell_surface_height(x, z, step_h)`, exactly as `generate` judges
+    /// it -- the horizontal footprint doesn't change. Vertically, every row
+    /// goes through [`block_at_on_surface_v`](Self::block_at_on_surface_v),
+    /// which applies at a `v`-block window rather than `generate`'s
+    /// `step`-block one: a `v = 1` row is exact at that `(x, z)` the way a
+    /// real level-0 block is (same material banding, same per-block cave
+    /// resolution), just sampled every `step_h` blocks horizontally instead
+    /// of every block -- and like `density_at_v`, it stays cheap deep below
+    /// the surface regardless of how small `v` is (no `step_h`-wide cave
+    /// noise column, no `2^level`x cost).
+    ///
+    /// No trees, for the same reason [`generate`](Self::generate) has none.
+    pub fn generate_aniso(
+        &self,
+        origin: [i32; 3],
+        step_h: i32,
+        v: i32,
+        blocks: TerrainBlocks,
+    ) -> AnisoChunk {
+        let nx = Chunk::SIZE;
+        let nz = Chunk::SIZE;
+        let ny = ((Chunk::SIZE as i32 * step_h) / v).max(1) as usize;
+        let mut surfaces = [[0i32; Chunk::SIZE]; Chunk::SIZE];
+        for (lz, row) in surfaces.iter_mut().enumerate() {
+            let z = origin[2] + lz as i32 * step_h;
+            for (lx, cell) in row.iter_mut().enumerate() {
+                let x = origin[0] + lx as i32 * step_h;
+                *cell = self.cell_surface_height(x, z, step_h);
+            }
+        }
+        AnisoChunk::from_fn([nx, ny, nz], [step_h, v, step_h], |lx, ly, lz| {
+            let x = origin[0] + lx as i32 * step_h;
+            let y = origin[1] + ly as i32 * v;
+            let z = origin[2] + lz as i32 * step_h;
+            self.block_at_on_surface_v(x, y, z, surfaces[lz][lx], blocks, v)
                 .unwrap_or(BlockId::AIR)
         })
     }

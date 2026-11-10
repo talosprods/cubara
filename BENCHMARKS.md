@@ -213,6 +213,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | The warm-up waits for steady clocks — gate eye flight (High)⁷⁷ | 0 | far only | ~2,439 (+1.8%) | **0.077 ms** (−56%) | 0.155 ms | `5b29370` |
 | 2026-11-09 | **Face groups in `Face::DRAW_ORDER`** (D1) — gate eye ground (High): 1,055 draws for 592 nodes, was 1,325⁷⁸ | 1,940 | 819,928 voxel + far | ~1,622 (+0.1%) | 0.169 ms (within noise) | 0.762 ms | *(this PR)* |
 | 2026-11-09 | Face groups in `DRAW_ORDER` (D1) — gate eye hill (High): 530 draws for 277 nodes, was 644⁷⁸ | 869 | 436,690 voxel + far | ~1,798 (+0.7%) | 0.159 ms (within noise) | 0.509 ms | *(this PR)* |
+| 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | *(this PR)* |
+| 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | *(this PR)* |
+| 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ | 0 | far only | ~2,417 (−0.7%) | -- | -- | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2854,3 +2857,41 @@ after 26 blocks, so it measures the tick more than the streaming; the flight
 measures the streaming. Not measured here: the display's pacing (a window's
 present mode), the start-up `--bench tune` child, and the other machines.
 The owner's stutters, if they persist, are most likely in one of those.
+
+⁸⁴ **Coarse cells one block tall (block 3.0b, R1b+R1c, #327), Linux,
+2026-11-10.** Levels 1 and 2 of the voxel rings now have cells 2^L blocks wide
+and 1 block tall, and level 3 has 4-block-tall cells, so a terrain step no
+longer doubles at the 160 m and 288 m edges. AO on a coarse top face is scaled
+to its cell's width. `--bench gate`: `main` at `244d9a1` against this branch,
+separate binaries, alternating, 2 runs each. The CPU was at 52–92 °C with the
+lid closed. CPU/frame was recorded for the ground eye only, which is why the
+other rows show `--`.
+
+```
+            FPS             GPU/frame         voxel triangles drawn
+ground   1,578 -> 1,429   0.563 -> 0.626 ms   165,711 -> 259,850 (+94,139)
+hill     1,753 -> 1,548   0.513 -> 0.593 ms    99,170 -> 196,619 (+97,449)
+flight   2,435 -> 2,417        (far terrain only, unchanged)
+```
+
+The ground eye's growth is under the issue's bound: M2 allowed at most +129k
+(`docs/PROPOSAL_LOD_TRANSITIONS.md` §5.1), and +94k was measured. CPU/frame at
+ground goes from 0.174 to 0.180 ms: no draws were added, and the cost lands on
+the GPU. Generating and meshing a level-2 node takes 1.5–1.65× as long, with
+2.5× its triangles. `--bench flight`, one run each (`main` → this branch):
+
+```
+           loading         frames with a hole pixel   work p99.9
+low        0.29% -> 0.21%   334 -> 245                 6.6 -> 3.7 ms
+high       0.18% -> 0.30%     4 ->   3                 5.3 -> 4.9 ms
+down       0.69% -> 0.69%     6 ->  22                 5.6 -> 5.5 ms
+to a peak  0.17% -> 0.18%     0 ->   0                 5.5 -> 4.2 ms
+```
+
+No frame has a hole over 0.1% of the screen in either. The low flight's
+silhouette changes at LOD swaps (⁸¹) drop by about a quarter, as the
+proposal expected. **On the M3** the extra GPU time measured here (11–16%)
+would cost more than its 0.083 ms of headroom at Low on the ground (proposal
+§2). Before this holds there, R3a (circular rings, about −35k triangles at
+ground) and the ring-3 decision have to pay part of it back, and the Mac has
+to measure it.

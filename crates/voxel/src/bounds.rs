@@ -8,6 +8,7 @@
 
 use glam::Vec3;
 
+use crate::aniso::NodeChunk;
 use crate::mesh::Mesh;
 use crate::voxel::{Chunk, MeshContext};
 
@@ -83,6 +84,43 @@ pub fn build_mesh_bounded_occluded(
     if mesh.indices.is_empty() {
         return None;
     }
+    let aabb = mesh_aabb(&mesh, origin, Vec3::splat(scale));
+    Some((mesh, aabb))
+}
+
+/// [`build_mesh_bounded_occluded`], for a [`NodeChunk`] (R1b, decision 6) --
+/// the anisotropic coarse-node path alongside the plain-`Chunk` one above.
+///
+/// There is no `scale` parameter: a `NodeChunk::Aniso` already bakes its own
+/// per-axis scale into every vertex position it emits (decision 3 --
+/// positions in blocks, so `node_origins.w` is 1.0 for these), and a
+/// `NodeChunk::Uniform` is exactly a level-0 `Chunk`, whose positions are
+/// already node-local block coordinates too (its own scale is 1 on every
+/// axis). So the world-space bounds here are the mesh's own positions plus
+/// `origin`, unscaled -- the same place [`mesh_aabb`] 's `scale` argument
+/// would be `[1.0; 3]` if this took one.
+pub fn build_mesh_bounded_occluded_node(
+    chunk: &NodeChunk,
+    ctx: &MeshContext,
+    origin: [f32; 3],
+    occluded: impl Fn(i32, i32, i32) -> bool,
+    may_be_solid: impl Fn(i32, i32, i32) -> bool,
+) -> Option<(Mesh, Aabb)> {
+    let mesh = chunk.build_mesh_with_neighbours(ctx, occluded, may_be_solid);
+    if mesh.indices.is_empty() {
+        return None;
+    }
+    let aabb = mesh_aabb(&mesh, origin, Vec3::ONE);
+    Some((mesh, aabb))
+}
+
+/// The world-space bounds of `mesh`'s vertex positions, placed at `origin`
+/// and scaled per axis by `scale` -- the one "mesh + origin + scale -> AABB"
+/// computation [`build_mesh_bounded_occluded`] and
+/// [`build_mesh_bounded_occluded_node`] both reduce to (`ARCHITECTURE.md`
+/// Rule 5), so a future third caller has one place to share rather than a
+/// second copy of the loop.
+fn mesh_aabb(mesh: &Mesh, origin: [f32; 3], scale: Vec3) -> Aabb {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
     for v in &mesh.vertices {
@@ -91,7 +129,7 @@ pub fn build_mesh_bounded_occluded(
         max = max.max(p);
     }
     let offset = Vec3::from(origin);
-    Some((mesh, Aabb::new(min * scale + offset, max * scale + offset)))
+    Aabb::new(min * scale + offset, max * scale + offset)
 }
 
 #[cfg(test)]

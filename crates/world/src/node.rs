@@ -67,6 +67,38 @@ impl NodeKey {
         1 << self.level
     }
 
+    /// This level's vertical cell height in blocks (R1b, issue #327 decision
+    /// 1): `v = 1` at levels 1-2, `v = 4` at level 3 and beyond (ring 3's
+    /// candidate (i) -- M4 decides whether that holds past it). Level 0's
+    /// cells are always 1 block on every axis regardless of this (it stays a
+    /// plain [`Chunk`](cubara_voxel::Chunk), decision 6), so this is only
+    /// meaningful for `level >= 1`.
+    ///
+    /// A node's **horizontal** cell width is `2^level` blocks, unchanged --
+    /// that's [`extent_chunks`](Self::extent_chunks) itself, numerically.
+    pub fn cell_height_blocks(self) -> i32 {
+        if self.level <= 2 {
+            1
+        } else {
+            4
+        }
+    }
+
+    /// This node's own lattice cell counts `[nx, ny, nz]` (R1b): 16 on x/z,
+    /// always, and `16 * extent_chunks() / cell_height_blocks()` on y -- the
+    /// same formula [`crate::worldgen::WorldGen::generate_aniso`] sizes its
+    /// lattice with, so a caller that needs to know a node's own vertical
+    /// cell count (`cubara_world::mesh::border_samples`,
+    /// `visibility::node_links`) doesn't need to generate it to find out.
+    /// `[16, 16, 16]` at level 0 -- never actually consulted there, since
+    /// level 0 is a plain [`Chunk`](cubara_voxel::Chunk), but correct by the
+    /// same formula regardless (`extent_chunks`/`cell_height_blocks` are
+    /// both 1).
+    pub fn lattice_dims(self) -> [i32; 3] {
+        let ny = (16 * self.extent_chunks()) / self.cell_height_blocks();
+        [16, ny, 16]
+    }
+
     /// The node's minimum-corner chunk.
     pub fn chunk_origin(self) -> ChunkCoord {
         let extent = self.extent_chunks();
@@ -422,6 +454,23 @@ mod tests {
         assert_eq!(NodeKey::new(0, [0, 0, 0]).extent_chunks(), 1);
         assert_eq!(NodeKey::new(1, [0, 0, 0]).extent_chunks(), 2);
         assert_eq!(NodeKey::new(3, [0, 0, 0]).extent_chunks(), 8);
+    }
+
+    /// R1b's decision 1, pinned directly: `v = 1` at levels 0-2, `v = 4` at
+    /// level 3. Nothing else in this crate's test suite fails if level 3's
+    /// `4` regresses to `1` -- `coarse_tops_are_the_surface` (world.rs)
+    /// derives its own tolerance from this same function, so a bug here
+    /// moves its expectation along with its answer; `a_coarse_node_averages_
+    /// like_its_blocks` (`cubara-render`) only asserts rings 1-2 strictly,
+    /// and ring 3's golden scenes don't happen to put a riser where the
+    /// difference crosses tolerance. This is the one test standing between
+    /// "level 3's v matches the issue" and nothing noticing.
+    #[test]
+    fn cell_height_blocks_is_one_except_level_three() {
+        assert_eq!(NodeKey::new(0, [0, 0, 0]).cell_height_blocks(), 1);
+        assert_eq!(NodeKey::new(1, [0, 0, 0]).cell_height_blocks(), 1);
+        assert_eq!(NodeKey::new(2, [0, 0, 0]).cell_height_blocks(), 1);
+        assert_eq!(NodeKey::new(3, [0, 0, 0]).cell_height_blocks(), 4);
     }
 
     #[test]

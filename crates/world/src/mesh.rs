@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cubara_voxel::{
-    build_mesh_bounded_occluded, Aabb, BlockRegistry, Chunk, ChunkCoord, Mesh, MeshContext,
+    build_mesh_bounded_occluded_node, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext, NodeChunk,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -100,13 +100,22 @@ pub fn mesh_node(
 }
 
 /// Mesh `node` from its already generated blocks.
+///
+/// `scale` is always 1.0 now (R1b, issue #327 decision 3): a level-0
+/// `Chunk`'s positions were already node-local blocks (its own cell is 1
+/// block), and a coarse node's mesh now bakes its own per-axis `[2^level, v,
+/// 2^level]` scale straight into its vertex positions
+/// ([`cubara_voxel::AnisoChunk::build_mesh_with_neighbours`]) instead of
+/// leaving a single scalar for the GPU's `node_origins.w` to multiply by --
+/// which a single scalar couldn't represent anyway, once the vertical cell
+/// stopped matching the horizontal one.
 fn mesh_chunk(
     world: &World,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     node: NodeKey,
     blocks: TerrainBlocks,
-    chunk: &Chunk,
+    chunk: &NodeChunk,
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
     let world_origin = node.world_origin();
@@ -115,14 +124,14 @@ fn mesh_chunk(
         world_origin[1] as f32,
         world_origin[2] as f32,
     ];
-    let scale = node.extent_chunks() as f32;
+    let scale = 1.0f32;
     let surfaces = std::cell::RefCell::new(HashMap::new());
     let covered =
         |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
     let may_be_solid =
         |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::Any);
     let (mesh, aabb) =
-        build_mesh_bounded_occluded(chunk, &ctx, origin, scale, covered, may_be_solid)?;
+        build_mesh_bounded_occluded_node(chunk, &ctx, origin, covered, may_be_solid)?;
     Some(NodeGeometry {
         mesh,
         aabb,
@@ -199,12 +208,23 @@ fn border_samples(
     want: Want,
 ) -> bool {
     let level = node.level;
-    let step = node.extent_chunks();
+    // This node's own per-axis cell size in blocks (R1b): `[2^level, v,
+    // 2^level]`, not a single scalar `step` any more -- the node's lattice
+    // is no longer a cube of cells, even though its world footprint still
+    // is. `g` is a grid coordinate in *this* lattice (exactly one axis at
+    // `-1` or that axis's own cell count, from `lattice_dims`), so each axis
+    // converts to world blocks by its own cell size, not a shared one.
+    let step = [
+        node.extent_chunks(),
+        node.cell_height_blocks(),
+        node.extent_chunks(),
+    ];
+    let dims = node.lattice_dims();
     let origin = node.world_origin();
     let p = [
-        origin[0] + g[0] * step,
-        origin[1] + g[1] * step,
-        origin[2] + g[2] * step,
+        origin[0] + g[0] * step[0],
+        origin[1] + g[1] * step[1],
+        origin[2] + g[2] * step[2],
     ];
     // Surface heights are the expensive part of a sample, and one node's
     // border touches few columns, so each is computed once per node.
@@ -214,12 +234,12 @@ fn border_samples(
             // the border needs, where for covering it can only keep a face.
             return world.is_solid_at(q[0], q[1], q[2], blocks);
         }
-        let step = 1 << at;
+        let step_h = 1 << at;
         let surface = *surfaces
             .borrow_mut()
-            .entry((q[0], q[2], step))
-            .or_insert_with(|| world.cell_surface_height(q[0], q[2], step));
-        world.certainly_solid_at(q[0], q[1], q[2], at, surface)
+            .entry((q[0], q[2], step_h))
+            .or_insert_with(|| world.cell_surface_height(q[0], q[2], step_h));
+        world.certainly_solid_at_v(q[0], q[1], q[2], at, surface)
     };
     // `All` stops at the first air, `Any` at the first solid.
     let decided = |is_solid: bool| match want {
@@ -231,29 +251,45 @@ fn border_samples(
     if decided(solid(p, level)) {
         return answer_if_decided;
     }
-    let coarse = 2 * step;
-    let q = [
-        p[0].div_euclid(coarse) * coarse,
-        p[1].div_euclid(coarse) * coarse,
-        p[2].div_euclid(coarse) * coarse,
+    // The coarser neighbour's own cell size, per axis -- not simply `2 *
+    // step` any more, since the coarser level's `v` isn't necessarily double
+    // this one's (decision 1's v sequence is 1, 1, 1, 4: level 3's cell is
+    // 4x its level-2 neighbour's, not 2x).
+    let coarser = NodeKey::new(level + 1, [0, 0, 0]);
+    let coarser_step = [
+        coarser.extent_chunks(),
+        coarser.cell_height_blocks(),
+        coarser.extent_chunks(),
     ];
+    let q = [0, 1, 2].map(|k| p[k].div_euclid(coarser_step[k]) * coarser_step[k]);
     if decided(solid(q, level + 1)) {
         return answer_if_decided;
     }
     if level > 0 {
-        // The finer layer that touches this face: the near half of the outside
-        // cell along the face's axis, and both halves across it.
-        let half = step / 2;
+        // The finer layer that touches this face: the near sub-cell of the
+        // outside cell along the face's axis, and every finer sub-cell
+        // across it -- `this_step[k] / finer_step[k]` of them per cross
+        // axis, which is 1 (no subdivision: level 1/0 and 2/1 share the same
+        // `v`), 2 (the usual isotropic halving, including every horizontal
+        // axis always) or 4 (level 3's `v = 4` down to level 2's `v = 1`),
+        // never assumed to be 2 the way a single scalar `half` would.
+        let finer = NodeKey::new(level - 1, [0, 0, 0]);
+        let finer_step = [
+            finer.extent_chunks(),
+            finer.cell_height_blocks(),
+            finer.extent_chunks(),
+        ];
         let axis = (0..3)
-            .find(|&k| g[k] == -1 || g[k] == 16)
+            .find(|&k| g[k] == -1 || g[k] == dims[k])
             .expect("a border cell");
         let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
         let mut f = p;
         if g[axis] == -1 {
-            f[axis] += half;
+            f[axis] += step[axis] - finer_step[axis];
         }
-        for da in [0, half] {
-            for db in [0, half] {
+        let steps = |k: usize| (0..step[k]).step_by(finer_step[k].max(1) as usize);
+        for da in steps(a) {
+            for db in steps(b) {
                 let mut r = f;
                 r[a] += da;
                 r[b] += db;
@@ -512,30 +548,36 @@ mod tests {
     fn drawn_solid(
         world: &World,
         blocks: TerrainBlocks,
-        chunks: &mut HashMap<NodeKey, Option<cubara_voxel::Chunk>>,
+        chunks: &mut HashMap<NodeKey, Option<NodeChunk>>,
         node: NodeKey,
         p: [i32; 3],
     ) -> bool {
         let chunk = chunks
             .entry(node)
             .or_insert_with(|| world.node_at(node, blocks));
-        let (o, s) = (node.world_origin(), node.extent_chunks());
-        let i = |k: usize| ((p[k] - o[k]) / s) as usize;
+        let o = node.world_origin();
+        let (sy, sh) = (node.cell_height_blocks(), node.extent_chunks());
+        let i = |k: usize, step: i32| ((p[k] - o[k]) / step) as usize;
         chunk
             .as_ref()
-            .is_some_and(|c| c.get(i(0), i(1), i(2)) != cubara_voxel::BlockId::AIR)
+            .is_some_and(|c| c.get(i(0, sh), i(1, sy), i(2, sh)) != cubara_voxel::BlockId::AIR)
     }
 
     /// Whether `node`'s mesh has a face on the plane `axis = at`, pointing
     /// `sign` along it, covering the unit square with min corner `p`.
     fn has_face(mesh: &Mesh, node: NodeKey, axis: usize, at: i32, sign: i8, p: [i32; 3]) -> bool {
-        let (o, s) = (node.world_origin(), node.extent_chunks());
+        // R1b, decision 3: every node's mesh positions are already final
+        // node-local *block* coordinates (a level-0 `Chunk`'s always were,
+        // since its own cell is 1 block; a coarse node's now bakes its own
+        // per-axis scale in) -- so placing a vertex in world space is just
+        // adding the origin, never multiplying by `extent_chunks` again.
+        let o = node.world_origin();
         let face = cubara_voxel::Face::from_axis_sign(axis, sign);
         let world = |v: cubara_voxel::Vertex| {
             [
-                o[0] + v.x() as i32 * s,
-                o[1] + v.y() as i32 * s,
-                o[2] + v.z() as i32 * s,
+                o[0] + v.x() as i32,
+                o[1] + v.y() as i32,
+                o[2] + v.z() as i32,
             ]
         };
         let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);

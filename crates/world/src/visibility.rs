@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord, Face, FaceLinks};
+use cubara_voxel::{BlockRegistry, Chunk, ChunkCoord, Face, FaceLinks, NodeChunk};
 
 use crate::node::NodeKey;
 
@@ -55,14 +55,25 @@ pub const OPEN: NodeLinks = [FaceLinks::ALL; GRAIN * GRAIN * GRAIN];
 
 /// The sub-block links of a generated node; `None` (nothing generated, it is
 /// empty) is [`OPEN`].
-pub fn node_links(chunk: Option<&Chunk>, registry: &BlockRegistry) -> NodeLinks {
+///
+/// Takes [`NodeChunk`] (R1b, issue #327 decision 6), not a plain [`Chunk`]:
+/// a coarse node's lattice has its own vertical cell count now, different
+/// from its horizontal one, so each of the `GRAIN`³ sub-blocks' own region
+/// size is per-axis -- `chunk.dims()[axis] / GRAIN` -- rather than one shared
+/// `Chunk::SIZE / GRAIN`. `GRAIN` divides every axis's cell count evenly for
+/// every level/`v` combination R1b produces (checked by
+/// `node_links_region_size_divides_every_level_evenly` below), so this never
+/// rounds.
+pub fn node_links(chunk: Option<&NodeChunk>, registry: &BlockRegistry) -> NodeLinks {
     let Some(chunk) = chunk else {
         return OPEN;
     };
-    let size = Chunk::SIZE / GRAIN;
+    let dims = chunk.dims();
+    let size = [dims[0] / GRAIN, dims[1] / GRAIN, dims[2] / GRAIN];
     std::array::from_fn(|i| {
         let (x, y, z) = (i % GRAIN, i / GRAIN % GRAIN, i / GRAIN / GRAIN);
-        FaceLinks::of_region(chunk, registry, [x * size, y * size, z * size], size)
+        let min = [x * size[0], y * size[1], z * size[2]];
+        FaceLinks::of_region_node(chunk, registry, min, size)
     })
 }
 
@@ -395,6 +406,25 @@ mod tests {
     use crate::{TerrainBlocks, World};
     use cubara_voxel::{BlockId, BlockRegistry, Chunk, DropRule, Faces, Interact, Material, Shape};
 
+    /// `node_links` divides each axis's own cell count by `GRAIN` (2); this
+    /// must never round, at any level/`v` combination R1b produces, or
+    /// `node_links` silently drops cells off the edge of its sub-block
+    /// regions. Level 0's `[16, 16, 16]` divides trivially; levels 1-3 are
+    /// R1b's real anisotropic shapes.
+    #[test]
+    fn node_links_region_size_divides_every_level_evenly() {
+        for level in 0u32..=3 {
+            let dims = NodeKey::new(level, [0, 0, 0]).lattice_dims();
+            for (axis, &n) in dims.iter().enumerate() {
+                assert_eq!(
+                    n % GRAIN as i32,
+                    0,
+                    "level {level} axis {axis}: {n} cells does not divide evenly by GRAIN={GRAIN}"
+                );
+            }
+        }
+    }
+
     fn registry() -> BlockRegistry {
         let material = |name: &str| {
             (
@@ -422,7 +452,7 @@ mod tests {
     /// A small world region and what every node in it draws.
     struct Scene {
         nodes: HashSet<NodeKey>,
-        chunks: HashMap<NodeKey, Option<Chunk>>,
+        chunks: HashMap<NodeKey, Option<NodeChunk>>,
         links: HashMap<NodeKey, NodeLinks>,
     }
 
@@ -452,11 +482,12 @@ mod tests {
             let node = (0..=2)
                 .map(|l| NodeKey::containing(chunk, l))
                 .find(|n| self.nodes.contains(n))?;
-            let (o, s) = (node.world_origin(), node.extent_chunks());
-            let i = |k: usize| ((b[k] - o[k]) / s) as usize;
+            let o = node.world_origin();
+            let (sy, sh) = (node.cell_height_blocks(), node.extent_chunks());
+            let i = |k: usize, step: i32| ((b[k] - o[k]) / step) as usize;
             let solid = self.chunks[&node]
                 .as_ref()
-                .is_some_and(|c| c.get(i(0), i(1), i(2)) != BlockId::AIR);
+                .is_some_and(|c| c.get(i(0, sh), i(1, sy), i(2, sh)) != BlockId::AIR);
             Some((node, solid))
         }
     }

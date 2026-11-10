@@ -101,13 +101,18 @@ fn main() {
             };
             chunk.build_mesh(&ctx)
         };
-        // Blocks per lattice cell of this node's mesh.
-        let cell = node.extent_chunks();
+        // Blocks per lattice cell of this node's mesh, per axis (R1b: the
+        // vertical one, `cell_v`, no longer matches the horizontal one,
+        // `cell_h`, above level 0).
+        let cell_h = node.extent_chunks();
+        let cell_v = node.cell_height_blocks();
         let origin = node.world_origin();
         let tally = &mut per_level[node.level as usize];
 
         for quad in mesh.vertices.chunks(4) {
-            // The quad's centre, in world blocks.
+            // The quad's centre, in world blocks. Positions are already
+            // final node-local block coordinates (R1b, decision 3), so this
+            // is an origin add, never a per-axis scale multiply.
             let mut c = [0f64; 3];
             for v in quad {
                 c[0] += v.x() as f64 / 4.0;
@@ -115,20 +120,24 @@ fn main() {
                 c[2] += v.z() as f64 / 4.0;
             }
             let world_c = [
-                origin[0] as f64 + c[0] * cell as f64,
-                origin[1] as f64 + c[1] * cell as f64,
-                origin[2] as f64 + c[2] * cell as f64,
+                origin[0] as f64 + c[0],
+                origin[1] as f64 + c[1],
+                origin[2] as f64 + c[2],
             ];
             let n = quad[0].face().normal();
             // Half a cell outside the face: the centre of the neighbouring
             // cell at this node's own resolution. At level 0 that is exactly
             // the neighbouring block; above, it samples the middle of the
             // coarse cell, which is what the downsample keys on.
-            let half = cell as f64 * 0.5;
+            let half = [
+                cell_h as f64 * 0.5,
+                cell_v as f64 * 0.5,
+                cell_h as f64 * 0.5,
+            ];
             let out = [
-                (world_c[0] + n[0] as f64 * half).floor() as i32,
-                (world_c[1] + n[1] as f64 * half).floor() as i32,
-                (world_c[2] + n[2] as f64 * half).floor() as i32,
+                (world_c[0] + n[0] as f64 * half[0]).floor() as i32,
+                (world_c[1] + n[1] as f64 * half[1]).floor() as i32,
+                (world_c[2] + n[2] as f64 * half[2]).floor() as i32,
             ];
             let tris = 2u64;
             if registry.is_solid(world.block_at(out[0], out[1], out[2], blocks)) {
