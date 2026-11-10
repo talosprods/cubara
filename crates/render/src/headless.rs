@@ -7,6 +7,7 @@
 
 use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
 
+use crate::anchor::{self, Anchor};
 use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::render::{
@@ -75,8 +76,17 @@ pub struct Shot {
     /// fixed elevation can't produce a grazing, near-ground viewpoint at any
     /// scale (shrinking the region shrinks the eye's height by the same factor
     /// as its distance, so the angle never changes) — which a shot that needs to
-    /// look *into* something at ground level, like a cave mouth, needs.
-    pub camera: Option<(glam::Vec3, glam::Vec3)>,
+    /// look *into* something at ground level, like a cave mouth, needs. The
+    /// eye is `f64`, as [`crate::CameraPose`]'s is (issue #379).
+    pub camera: Option<(glam::DVec3, glam::Vec3)>,
+    /// The render anchor to draw against (issue #379), or `None` for the
+    /// one the renderer itself would pick for this eye
+    /// ([`crate::anchor::anchor_for`]) -- which is every real shot. `Some`
+    /// exists for the tests that pin the anchor: forcing it to the origin
+    /// for a scene a million blocks away is how a test shows the frame
+    /// falling apart *without* the anchor, which is what proves the test
+    /// can fail.
+    pub anchor: Option<Anchor>,
     /// Other players to draw as figures, or empty for none (block 2.12b).
     ///
     /// Explicit rather than derived: a headless shot has no simulation to ask,
@@ -140,6 +150,7 @@ impl Default for Shot {
             region_radius: 6,
             orbit_t: 6.0,
             camera: None,
+            anchor: None,
             players: Vec::new(),
             highlighted_block: None,
             cracking: None,
@@ -270,7 +281,9 @@ pub fn render_with_far(
         shot,
         (far, far_params),
         tree_data,
-        |device, queue, multi_draw, _ctx| ChunkArena::from_meshed(device, queue, multi_draw, nodes),
+        |device, queue, multi_draw, anchor, _ctx| {
+            ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
+        },
     )
 }
 
@@ -285,8 +298,8 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
         shot,
         (&[], None),
         Vec::new(),
-        |device, queue, multi_draw, ctx| {
-            let mut arena = ChunkArena::new(device, multi_draw);
+        |device, queue, multi_draw, anchor, ctx| {
+            let mut arena = ChunkArena::new(device, multi_draw, anchor);
             for (coord, chunk) in chunks {
                 let id = NodeId {
                     level: 0,
@@ -349,7 +362,7 @@ fn render_arena(
     shot: Shot,
     (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
     tree_data: Vec<NodeTrees>,
-    build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
+    build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, Anchor, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
     let instance = crate::new_instance();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -377,6 +390,7 @@ fn render_arena(
         region_radius: _,
         orbit_t,
         camera,
+        anchor: forced_anchor,
         players,
         highlighted_block,
         cracking,
@@ -406,19 +420,24 @@ fn render_arena(
         registry: &mesh_assets.registry,
         layer_of: &layer_of,
     };
-    let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
+    // Built against the world origin, then rebased to the eye's anchor once
+    // the eye is known -- the orbit camera is framed from the arena's own
+    // bounds, which do not exist until it is built. Same code the window
+    // runs when the eye crosses a grid line (`ChunkArena::rebase`), and a
+    // no-op for every shot near the origin.
+    let mut arena = build_arena(&device, &queue, multi_draw, anchor::ORIGIN, &ctx);
     let bounds = arena.bounds();
 
-    let mut trees = TreeArena::new(crate::trees::tree_instance_bounds(&load_structures()));
+    let mut trees = TreeArena::new(
+        crate::trees::tree_instance_bounds(&load_structures()),
+        anchor::ORIGIN,
+    );
     for node in tree_data {
         node.insert_into(&mut trees, &arena);
     }
 
-    let (vp, eye) = match camera {
-        Some((eye, look_dir)) => (
-            CameraUniform::look_view_proj(width as f32 / height as f32, eye, look_dir),
-            eye,
-        ),
+    let (eye, look_dir) = match camera {
+        Some((eye, look_dir)) => (eye, look_dir),
         None => {
             // The orbit frames the voxels; with none there is nothing to frame.
             let (min, max) = bounds?;
@@ -428,28 +447,28 @@ fn render_arena(
                 (min[2] + max[2]) * 0.5,
             ];
             let view_radius = (max[0] - min[0]).max(max[2] - min[2]) * 0.75;
-            let vp = CameraUniform::view_proj_matrix(
-                width as f32 / height as f32,
-                orbit_t,
-                look_target,
-                view_radius,
-            );
             let eye = glam::Vec3::from(CameraUniform::orbit_eye(orbit_t, look_target, view_radius));
-            (vp, eye)
+            (eye.as_dvec3(), glam::Vec3::from(look_target) - eye)
         }
     };
+    let pose = crate::render::CameraPose { eye, look_dir };
+    let anchor = forced_anchor.unwrap_or_else(|| anchor::anchor_for(eye));
+    arena.rebase(&queue, anchor);
+    trees.rebase(anchor);
+    let eye_rel = pose.relative_eye(anchor);
+    let vp = pose.view_proj(width as f32 / height as f32, anchor);
     let frustum = Frustum::from_view_proj(vp);
     let draw_count = arena.prepare(&queue, &frustum);
     trees.prepare(&device, &queue, &frustum);
     let far_terrain = (!far.is_empty()).then(|| {
-        let mut terrain = crate::far::FarTerrain::new(&device, &queue, far.len() as u32);
+        let mut terrain = crate::far::FarTerrain::new(&device, &queue, far.len() as u32, anchor);
         for patch in far {
             terrain.insert(&queue, *patch);
         }
         if let Some(params) = far_params {
             terrain.set_params(&queue, params);
         }
-        terrain.prepare(&queue, &frustum, eye);
+        terrain.prepare(&queue, &frustum, eye_rel);
         terrain
     });
 
@@ -468,7 +487,7 @@ fn render_arena(
     // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
     // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
     // see it either).
-    scene.set_camera(&device, &queue, vp, eye, lighting);
+    scene.set_camera(&device, &queue, vp, eye_rel, anchor, lighting);
     // A one-shot capture (headless render/golden/`--screenshot`): the mesh
     // pipeline must match `lighting` in this exact frame, not a frame or two
     // later once a background rebuild lands.

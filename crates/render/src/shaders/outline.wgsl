@@ -11,8 +11,9 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 struct Outline {
-    // .xyz is the targeted voxel's world-space min corner; .w is unused,
-    // padding for WGSL's 16-byte uniform alignment on a vec3.
+    // .xyz is the targeted voxel's min corner relative to the render anchor
+    // (issue #379), like every position the GPU sees; .w is unused, padding
+    // for WGSL's 16-byte uniform alignment on a vec3.
     origin: vec4<f32>,
 };
 

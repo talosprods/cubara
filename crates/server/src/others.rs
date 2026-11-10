@@ -45,10 +45,13 @@ pub struct Pose {
 }
 
 /// The same, ready to draw: floats, because a sub-pixel disagreement about
-/// where somebody else's shoulder is cannot desynchronise anything.
+/// where somebody else's shoulder is cannot desynchronise anything. `f64`
+/// for the position (issue #379): the renderer places a figure relative to
+/// its anchor, and an `f32` a million blocks out has already dropped the
+/// fraction of a block that placement keeps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrawnPose {
-    pub pos: [f32; 3],
+    pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
     /// The colour they asked for, or `None` if they have not said yet.
@@ -152,8 +155,8 @@ impl OtherPlayers {
             .iter()
             .map(|(&who, t)| {
                 let lerp = |a: cubara_voxel::Fixed, b: cubara_voxel::Fixed| {
-                    let (a, b) = (a.to_f32(), b.to_f32());
-                    a + (b - a) * alpha
+                    let (a, b) = (a.to_f64(), b.to_f64());
+                    a + (b - a) * alpha as f64
                 };
                 (
                     who,

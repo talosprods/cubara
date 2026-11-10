@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cubara_render::{
-    gpu_driven_features, load_mesh_assets, load_structures, load_tree_models, CameraUniform,
-    ChunkArena, Frustum, GpuTimestamps, SceneFrame, SceneRenderer, TimestampRing, TreeArena,
-    TreeDraw,
+    gpu_driven_features, load_mesh_assets, load_structures, load_tree_models, CameraPose,
+    CameraUniform, ChunkArena, Frustum, GpuTimestamps, SceneFrame, SceneRenderer, TimestampRing,
+    TreeArena, TreeDraw,
 };
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::mesh_nodes;
@@ -565,8 +565,15 @@ pub fn run(
         .iter()
         .map(cubara_render::headless::NodeTrees::of)
         .collect();
-    let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, visible_meshed);
-    let mut trees = TreeArena::new(cubara_render::tree_instance_bounds(&load_structures()));
+    // The render anchor (issue #379) for the first eye; `submit_frame`
+    // moves it exactly as the window does if the camera strays far enough
+    // (an orbit around a region near a grid line can).
+    let mut anchor = cubara_render::anchor::anchor_for(glam::Vec3::from(eyes[0]).as_dvec3());
+    let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, anchor, visible_meshed);
+    let mut trees = TreeArena::new(
+        cubara_render::tree_instance_bounds(&load_structures()),
+        anchor,
+    );
     for node in tree_data {
         node.insert_into(&mut trees, &arena);
     }
@@ -597,8 +604,12 @@ pub fn run(
                 patches.len(),
                 building.elapsed().as_secs_f64()
             );
-            let mut terrain =
-                cubara_render::FarTerrain::new(&device, &queue, patches.len().max(1) as u32);
+            let mut terrain = cubara_render::FarTerrain::new(
+                &device,
+                &queue,
+                patches.len().max(1) as u32,
+                anchor,
+            );
             for p in &patches {
                 terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
             }
@@ -683,32 +694,47 @@ pub fn run(
     // after: both are real per-frame CPU cost (a `queue.write_buffer` plus six
     // plane extractions), and excluding them understated what "CPU/frame" claims
     // to measure.
-    let submit_frame = |arena: &mut ChunkArena,
-                        trees: &mut TreeArena,
-                        far: &mut Option<cubara_render::FarTerrain>,
-                        scene: &mut SceneRenderer,
-                        vt: f32,
-                        gpu_timer: Option<&GpuTimer>,
-                        frame_index: u64|
+    let mut submit_frame = |arena: &mut ChunkArena,
+                            trees: &mut TreeArena,
+                            far: &mut Option<cubara_render::FarTerrain>,
+                            scene: &mut SceneRenderer,
+                            vt: f32,
+                            gpu_timer: Option<&GpuTimer>,
+                            frame_index: u64|
      -> (f64, u32, usize) {
         puffin::profile_scope!("frame");
         let cpu_start = Instant::now();
-        let (vp, eye) = match view.eye {
+        let pose = match view.eye {
             Some(eye) => {
                 // A full turn every ~20 virtual seconds, pitched down a
                 // little: what a player looking around sees.
                 let yaw = vt * 0.3;
                 let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
-                (
-                    CameraUniform::look_view_proj(aspect, glam::Vec3::from(eye), dir),
-                    glam::Vec3::from(eye),
-                )
+                CameraPose {
+                    eye: glam::Vec3::from(eye).as_dvec3(),
+                    look_dir: dir,
+                }
             }
-            None => (
-                CameraUniform::view_proj_matrix(aspect, vt, look_target, view_radius),
-                glam::Vec3::from(CameraUniform::orbit_eye(vt, look_target, view_radius)),
-            ),
+            None => {
+                let eye = glam::Vec3::from(CameraUniform::orbit_eye(vt, look_target, view_radius));
+                CameraPose {
+                    eye: eye.as_dvec3(),
+                    look_dir: glam::Vec3::from(look_target) - eye,
+                }
+            }
         };
+        // The same rebase the window does (issue #379), through the same
+        // function, so the bench measures the frame the game draws.
+        cubara_render::anchor::rebase_if_needed(
+            &mut anchor,
+            pose.eye,
+            &queue,
+            arena,
+            trees,
+            far.as_mut(),
+        );
+        let eye = pose.relative_eye(anchor);
+        let vp = pose.view_proj(aspect, anchor);
         // Fog end tied to the region's own radius, so it moves with
         // `--bench <radius>` rather than a number picked for radius 64.
         // `--fog off` (via the `fog` parameter) gives a same-commit,
@@ -733,7 +759,7 @@ pub fn run(
         } else {
             cubara_render::Lighting::default()
         };
-        scene.set_camera(&device, &queue, vp, eye, lighting);
+        scene.set_camera(&device, &queue, vp, eye, anchor, lighting);
         // `lighting` is the same value every frame in one bench run, so
         // after the first frame's rebuild lands this is a free no-op; on
         // the first frame it keeps a cold pipeline-specialization compile

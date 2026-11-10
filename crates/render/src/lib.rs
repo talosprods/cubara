@@ -13,6 +13,7 @@
 //! block 1.6).
 
 pub mod aggregate;
+pub mod anchor;
 mod arena;
 pub mod crack;
 pub mod culling;
@@ -31,6 +32,7 @@ mod text;
 mod trees;
 mod uploads;
 
+pub use anchor::Anchor;
 pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};

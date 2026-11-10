@@ -35,8 +35,12 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerView {
     /// Eye position, which is what the simulation tracks — the figure is built
-    /// downward from it, so a player's head is where their camera is.
-    pub eye: [f32; 3],
+    /// downward from it, so a player's head is where their camera is. In
+    /// `f64`, like the camera's own eye (`crate::CameraPose`): the figure is
+    /// built relative to the render anchor (issue #379), and an `f32`
+    /// absolute position a million blocks out would already have lost the
+    /// fraction of a block the subtraction is there to keep.
+    pub eye: [f64; 3],
     /// Heading, radians. 0 looks toward −Z, matching `Angle`.
     pub yaw: f32,
     /// Shirt colour: torso and arms.
@@ -140,13 +144,19 @@ fn parts() -> [Part; 6] {
     ]
 }
 
-/// The triangles for one player, in world space.
+/// The triangles for one player, relative to the render anchor `anchor`
+/// (issue #379) -- world space when the anchor is the origin.
 ///
 /// Pure: same input, same vertices, on any machine. That is what lets the tests
 /// below assert where an arm is without an adapter.
-pub fn figure_vertices(view: PlayerView, out: &mut Vec<FigureVertex>) {
+pub fn figure_vertices(
+    view: PlayerView,
+    anchor: crate::anchor::Anchor,
+    out: &mut Vec<FigureVertex>,
+) {
     let (sin, cos) = view.yaw.sin_cos();
-    let crown = [view.eye[0], view.eye[1] + EYE_BELOW_CROWN, view.eye[2]];
+    let eye = crate::anchor::relative_eye(anchor, glam::DVec3::from_array(view.eye));
+    let crown = [eye.x, eye.y + EYE_BELOW_CROWN, eye.z];
 
     for part in parts() {
         let color = match part.color {
@@ -208,6 +218,8 @@ mod tests {
         }
     }
 
+    const ORIGIN: crate::anchor::Anchor = crate::anchor::ORIGIN;
+
     fn bounds(v: &[FigureVertex]) -> ([f32; 3], [f32; 3]) {
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
@@ -223,7 +235,7 @@ mod tests {
     #[test]
     fn a_figure_fits_the_body_the_simulation_collides_with() {
         let mut v = Vec::new();
-        figure_vertices(view(0.0), &mut v);
+        figure_vertices(view(0.0), ORIGIN, &mut v);
         assert_eq!(v.len(), VERTICES_PER_FIGURE);
 
         let (lo, hi) = bounds(&v);
@@ -259,11 +271,11 @@ mod tests {
     #[test]
     fn yaw_turns_the_figure_about_its_own_axis() {
         let mut facing = Vec::new();
-        figure_vertices(view(0.0), &mut facing);
+        figure_vertices(view(0.0), ORIGIN, &mut facing);
         let (flo, fhi) = bounds(&facing);
 
         let mut turned = Vec::new();
-        figure_vertices(view(std::f32::consts::FRAC_PI_2), &mut turned);
+        figure_vertices(view(std::f32::consts::FRAC_PI_2), ORIGIN, &mut turned);
         let (tlo, thi) = bounds(&turned);
 
         let wide = fhi[0] - flo[0];
@@ -293,6 +305,7 @@ mod tests {
                 yaw: 0.0,
                 shirt: [1.0, 0.0, 0.0],
             },
+            ORIGIN,
             &mut v,
         );
         let shirt = v.iter().filter(|x| x.color == [1.0, 0.0, 0.0]).count();
@@ -315,8 +328,8 @@ mod tests {
     fn the_same_player_builds_the_same_vertices() {
         let mut a = Vec::new();
         let mut b = Vec::new();
-        figure_vertices(view(1.2), &mut a);
-        figure_vertices(view(1.2), &mut b);
+        figure_vertices(view(1.2), ORIGIN, &mut a);
+        figure_vertices(view(1.2), ORIGIN, &mut b);
         assert_eq!(a, b);
 
         let mut green = Vec::new();
@@ -325,6 +338,7 @@ mod tests {
                 shirt: [0.0, 1.0, 0.0],
                 ..view(1.2)
             },
+            ORIGIN,
             &mut green,
         );
         assert_ne!(a, green, "two shirts produced identical geometry");
@@ -334,13 +348,14 @@ mod tests {
     #[test]
     fn a_figure_follows_its_player() {
         let mut here = Vec::new();
-        figure_vertices(view(0.0), &mut here);
+        figure_vertices(view(0.0), ORIGIN, &mut here);
         let mut there = Vec::new();
         figure_vertices(
             PlayerView {
                 eye: [100.0, 40.0, -25.0],
                 ..view(0.0)
             },
+            ORIGIN,
             &mut there,
         );
         let (hlo, _) = bounds(&here);
@@ -348,5 +363,33 @@ mod tests {
         assert!((tlo[0] - hlo[0] - 100.0).abs() < 1e-3);
         assert!((tlo[1] - hlo[1] - 40.0).abs() < 1e-3);
         assert!((tlo[2] - hlo[2] + 25.0).abs() < 1e-3);
+    }
+
+    /// Issue #379: a player a million blocks out, drawn against the anchor
+    /// there, is the same triangles as a player at the origin drawn against
+    /// the origin -- bit for bit, not within a tolerance. Built from an
+    /// `f32` eye this could not hold: 2^20 + 0.3 is not an `f32`.
+    #[test]
+    fn a_figure_far_from_the_origin_is_the_figure_at_the_origin() {
+        let shift = 1_048_576.0;
+        let mut here = Vec::new();
+        figure_vertices(
+            PlayerView {
+                eye: [0.3, 40.0, -0.7],
+                ..view(0.9)
+            },
+            ORIGIN,
+            &mut here,
+        );
+        let mut there = Vec::new();
+        figure_vertices(
+            PlayerView {
+                eye: [shift + 0.3, 40.0, -shift - 0.7],
+                ..view(0.9)
+            },
+            [1_048_576, 0, -1_048_576],
+            &mut there,
+        );
+        assert_eq!(here, there);
     }
 }

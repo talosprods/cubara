@@ -8,6 +8,7 @@
 //! [`FarPatch`] and leaves as a [`FarSlot`].
 
 use crate::aggregate::{MaskingTable, Materials, TABLE_SIZE};
+use crate::anchor::{self, Anchor};
 use crate::culling::{Aabb, Frustum};
 use crate::render::far_bind_group_layout;
 use glam::Vec3;
@@ -27,8 +28,10 @@ const GRID: u32 = FAR_VERTS as u32 + 2;
 /// heights row by row (`z` outer, `x` inner), [`FAR_VERTS`] a side.
 #[derive(Clone, Copy, Debug)]
 pub struct FarPatch<'a> {
-    /// The lowest `(x, z)` corner, in blocks.
-    pub origin: [f32; 2],
+    /// The lowest `(x, z)` corner, in blocks -- the integer it is
+    /// (`cubara_world::far::PatchKey::origin`), so the render anchor is
+    /// subtracted from it exactly (issue #379).
+    pub origin: [i64; 2],
     /// The width of one quad, in blocks.
     pub quad: f32,
     pub heights: &'a [f32],
@@ -44,9 +47,10 @@ pub struct FarSlot(u32);
 /// What `far.wgsl` reads besides the heights.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarParams {
-    /// The box the voxel rings draw themselves, `(min, max)` in blocks.
+    /// The box the voxel rings draw themselves, `(min, max)` in blocks --
+    /// integers (chunk edges), subtracted from exactly like a tile origin.
     /// Nothing of the far terrain is drawn inside it. `None`: no hole.
-    pub hole: Option<([f32; 3], [f32; 3])>,
+    pub hole: Option<([i32; 3], [i32; 3])>,
     /// What the ground is made of: the mean colours of its faces
     /// ([`crate::materials::mean_color`]) and the soil's depth, for the
     /// block-aggregate shading (`crate::aggregate`).
@@ -101,13 +105,18 @@ struct ParamsGpu {
 }
 
 impl ParamsGpu {
-    fn new(p: FarParams) -> Self {
+    /// `p` with its hole made relative to `anchor` -- the space `far.wgsl`'s
+    /// vertices are in.
+    fn new(p: FarParams, anchor: Anchor) -> Self {
         // No hole: an empty box, min above max, which nothing is inside.
-        let (min, max) = p.hole.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
+        let (min, max) = match p.hole {
+            Some((min, max)) => (anchor::offset(min, anchor), anchor::offset(max, anchor)),
+            None => (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        };
         let m = p.materials;
         Self {
-            hole_min: [min[0], min[1], min[2], 0.0],
-            hole_max: [max[0], max[1], max[2], 0.0],
+            hole_min: [min.x, min.y, min.z, 0.0],
+            hole_max: [max.x, max.y, max.z, 0.0],
             top_color: m.top.extend(1.0).to_array(),
             side_color: m.side.extend(m.soil_depth).to_array(),
             soil_color: m.soil.extend(1.0).to_array(),
@@ -182,17 +191,82 @@ pub struct FarTerrain {
     capacity: u32,
     /// Slots not holding a patch, handed out last-freed first.
     free: Vec<u32>,
-    /// The voxels' hole, from the last [`set_params`](Self::set_params).
+    /// The voxels' hole, from the last [`set_params`](Self::set_params),
+    /// relative to `anchor`.
     hole: Option<Aabb>,
-    /// Each occupied slot's box, for culling; `None` where the slot is free.
+    /// Each occupied slot's box relative to `anchor`, for culling; `None`
+    /// where the slot is free.
     boxes: Vec<Option<Aabb>>,
+    /// Each occupied slot's patch in world terms -- what `boxes` and the
+    /// GPU records are re-derived from on a [`rebase`](Self::rebase).
+    placed: Vec<Option<PlacedPatch>>,
+    /// The last [`set_params`](Self::set_params), in world terms, for the
+    /// same reason.
+    params_world: FarParams,
+    /// The render anchor (`crate::anchor`) the GPU records, `hole` and
+    /// `boxes` are relative to.
+    anchor: Anchor,
     /// How many slots [`prepare`](Self::prepare) found in view.
     drawn: u32,
 }
 
+/// A patch as it was inserted, minus its heights (which the anchor does not
+/// touch): enough to rewrite its `PatchGpu` record and its box.
+#[derive(Clone, Copy, Debug)]
+struct PlacedPatch {
+    origin: [i64; 2],
+    quad: f32,
+    skirt: f32,
+    /// Lowest and highest height.
+    lo: f32,
+    hi: f32,
+}
+
+impl PlacedPatch {
+    fn of(patch: &FarPatch<'_>) -> Self {
+        let (lo, hi) = min_max(patch.heights);
+        Self {
+            origin: patch.origin,
+            quad: patch.quad,
+            skirt: patch.skirt,
+            lo,
+            hi,
+        }
+    }
+
+    /// The `(x, z)` origin relative to `anchor`: an exact integer
+    /// subtraction, then a small `f32`.
+    fn origin_relative(&self, anchor: Anchor) -> [f32; 2] {
+        [
+            (self.origin[0] - anchor[0] as i64) as f32,
+            (self.origin[1] - anchor[2] as i64) as f32,
+        ]
+    }
+
+    fn gpu(&self, anchor: Anchor) -> PatchGpu {
+        PatchGpu {
+            origin: self.origin_relative(anchor),
+            quad: self.quad,
+            skirt: self.skirt,
+        }
+    }
+
+    /// The patch's box relative to `anchor`: its square of ground, from the
+    /// bottom of its skirt to its highest vertex.
+    fn aabb(&self, anchor: Anchor) -> Aabb {
+        let [ox, oz] = self.origin_relative(anchor);
+        let size = self.quad * FAR_QUADS as f32;
+        Aabb {
+            min: Vec3::new(ox, self.lo - self.skirt, oz),
+            max: Vec3::new(ox + size, self.hi, oz + size),
+        }
+    }
+}
+
 impl FarTerrain {
-    /// Room for `capacity` patches.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Self {
+    /// Room for `capacity` patches, placed against the render anchor
+    /// `anchor` until [`rebase`](Self::rebase) moves it.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32, anchor: Anchor) -> Self {
         let storage = |label, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -214,13 +288,14 @@ impl FarTerrain {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let params_world = FarParams {
+            hole: None,
+            materials: PLACEHOLDER_MATERIALS,
+        };
         queue.write_buffer(
             &params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(FarParams {
-                hole: None,
-                materials: PLACEHOLDER_MATERIALS,
-            })),
+            bytemuck::bytes_of(&ParamsGpu::new(params_world, anchor)),
         );
         let (masking, masking_sampler) = masking_texture(device, queue);
 
@@ -279,9 +354,54 @@ impl FarTerrain {
             capacity,
             free: (0..capacity).rev().collect(),
             boxes: vec![None; capacity as usize],
+            placed: vec![None; capacity as usize],
+            params_world,
+            anchor,
             drawn: 0,
             hole: None,
         }
+    }
+
+    /// The render anchor the records, hole and boxes are relative to.
+    pub fn anchor(&self) -> Anchor {
+        self.anchor
+    }
+
+    /// Re-express every patch, the hole and their boxes against `anchor`
+    /// (issue #379 decision 2). The heights are untouched; what is
+    /// rewritten is one 16-byte record per slot -- all of them, in **one**
+    /// `write_buffer` of `capacity * 16` bytes (64 KiB at the window's
+    /// `FAR_PATCH_CAPACITY`), which costs less than a frame's own indirect
+    /// upload. Not spread over frames: a patch drawn against the old anchor
+    /// while the eye is measured from the new one would be 4,096 blocks
+    /// off, the very thing the anchor exists to prevent; and not deferred to
+    /// each patch's next upload, because a patch at the horizon may not be
+    /// re-uploaded for minutes. The bounded single write is the cheapest
+    /// form that is also correct on the rebase frame itself. A no-op for
+    /// the anchor already in use.
+    pub fn rebase(&mut self, queue: &wgpu::Queue, anchor: Anchor) {
+        if anchor == self.anchor {
+            return;
+        }
+        self.anchor = anchor;
+        let records: Vec<PatchGpu> = self
+            .placed
+            .iter()
+            .map(|p| p.map_or(bytemuck::Zeroable::zeroed(), |p| p.gpu(anchor)))
+            .collect();
+        queue.write_buffer(&self.patches, 0, bytemuck::cast_slice(&records));
+        for (slot, placed) in self.placed.iter().enumerate() {
+            self.boxes[slot] = placed.map(|p| p.aabb(anchor));
+        }
+        self.hole = self
+            .params_world
+            .hole
+            .map(|(min, max)| hole_aabb(min, max, anchor));
+        queue.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&ParamsGpu::new(self.params_world, anchor)),
+        );
     }
 
     /// Upload a patch. `None` when every slot is taken -- the caller decides
@@ -299,16 +419,14 @@ impl FarTerrain {
             per_patch * slot as u64,
             bytemuck::cast_slice(patch.heights),
         );
+        let placed = PlacedPatch::of(&patch);
         queue.write_buffer(
             &self.patches,
             std::mem::size_of::<PatchGpu>() as u64 * slot as u64,
-            bytemuck::bytes_of(&PatchGpu {
-                origin: patch.origin,
-                quad: patch.quad,
-                skirt: patch.skirt,
-            }),
+            bytemuck::bytes_of(&placed.gpu(self.anchor)),
         );
-        self.boxes[slot as usize] = Some(patch_box(&patch));
+        self.boxes[slot as usize] = Some(placed.aabb(self.anchor));
+        self.placed[slot as usize] = Some(placed);
         Some(FarSlot(slot))
     }
 
@@ -316,22 +434,28 @@ impl FarTerrain {
     /// [`prepare`](Self::prepare).
     pub fn remove(&mut self, slot: FarSlot) {
         if self.boxes[slot.0 as usize].take().is_some() {
+            self.placed[slot.0 as usize] = None;
             self.free.push(slot.0);
         }
     }
 
     pub fn set_params(&mut self, queue: &wgpu::Queue, params: FarParams) {
-        self.hole = params.hole.map(|(min, max)| Aabb {
-            min: Vec3::from(min),
-            max: Vec3::from(max),
-        });
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&ParamsGpu::new(params)));
+        self.params_world = params;
+        self.hole = params
+            .hole
+            .map(|(min, max)| hole_aabb(min, max, self.anchor));
+        queue.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&ParamsGpu::new(params, self.anchor)),
+        );
     }
 
     /// Decide what is drawn this frame: every occupied slot whose box the
     /// frustum can see, nearest to `eye` first -- so near ground fills the
     /// depth buffer before the distant ground it hides is drawn. Returns how
-    /// many.
+    /// many. `frustum` and `eye` are anchor-relative, like the boxes
+    /// (issue #379 decision 5).
     /// Patches wholly inside the voxels' hole are not drawn at all.
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum, eye: Vec3) -> u32 {
         let visible = visible_slots(&self.boxes, frustum);
@@ -386,16 +510,19 @@ fn min_max(heights: &[f32]) -> (f32, f32) {
         })
 }
 
-/// A patch's box: its square of ground, from the bottom of its skirt to its
-/// highest vertex.
-fn patch_box(patch: &FarPatch<'_>) -> Aabb {
-    let size = patch.quad * FAR_QUADS as f32;
-    let (lo, hi) = min_max(patch.heights);
-    let lo = lo - patch.skirt;
+/// The voxels' hole as a culling box relative to `anchor`.
+fn hole_aabb(min: [i32; 3], max: [i32; 3], anchor: Anchor) -> Aabb {
     Aabb {
-        min: Vec3::new(patch.origin[0], lo, patch.origin[1]),
-        max: Vec3::new(patch.origin[0] + size, hi, patch.origin[1] + size),
+        min: anchor::offset(min, anchor),
+        max: anchor::offset(max, anchor),
     }
+}
+
+/// A patch's box: its square of ground, from the bottom of its skirt to its
+/// highest vertex -- against the world origin, i.e. in world blocks.
+#[cfg(test)]
+fn patch_box(patch: &FarPatch<'_>) -> Aabb {
+    PlacedPatch::of(patch).aabb(anchor::ORIGIN)
 }
 
 /// The occupied slots the frustum can see, in slot order.
@@ -491,13 +618,49 @@ mod tests {
             .map(|i| 10.0 + (i % 7) as f32)
             .collect();
         let b = patch_box(&FarPatch {
-            origin: [64.0, -128.0],
+            origin: [64, -128],
             quad: 4.0,
             heights: &heights,
             skirt: 8.0,
         });
         assert_eq!(b.min, Vec3::new(64.0, 2.0, -128.0));
         assert_eq!(b.max, Vec3::new(64.0 + 128.0, 16.0, 0.0));
+    }
+
+    /// Issue #379: a patch's record and box against a shifted anchor are the
+    /// record and box of the unshifted patch against the origin -- the exact
+    /// integer subtraction the anchor relies on, at an offset (2^20) where
+    /// an `f32` origin would already have no fractional bits to spare.
+    #[test]
+    fn a_patch_against_the_shifted_anchor_is_the_patch_at_the_origin() {
+        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
+            .map(|i| 10.0 + (i % 7) as f32)
+            .collect();
+        let shift = 1_048_576i64;
+        let here = PlacedPatch::of(&FarPatch {
+            origin: [64, -128],
+            quad: 4.0,
+            heights: &heights,
+            skirt: 8.0,
+        });
+        let there = PlacedPatch::of(&FarPatch {
+            origin: [64 + shift, -128 - shift],
+            quad: 4.0,
+            heights: &heights,
+            skirt: 8.0,
+        });
+        let anchor = [shift as i32, 0, -shift as i32];
+        assert_eq!(there.gpu(anchor).origin, here.gpu(anchor::ORIGIN).origin);
+        let (a, b) = (there.aabb(anchor), here.aabb(anchor::ORIGIN));
+        assert_eq!((a.min, a.max), (b.min, b.max));
+        // And the hole likewise.
+        let h = hole_aabb(
+            [-64 + shift as i32, 0, -64 - shift as i32],
+            [80 + shift as i32, 48, 80 - shift as i32],
+            anchor,
+        );
+        assert_eq!(h.min, Vec3::new(-64.0, 0.0, -64.0));
+        assert_eq!(h.max, Vec3::new(80.0, 48.0, 80.0));
     }
 
     /// Patches wholly inside the voxels' hole are not drawn; the rest are,

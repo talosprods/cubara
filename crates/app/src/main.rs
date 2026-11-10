@@ -775,7 +775,10 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let camera = self.game.camera_pose();
-                streaming.update(renderer, self.game.world(), camera.eye.to_array());
+                // Streaming is chunk-granular, so the `f32` eye is enough for
+                // it (issue #379 decision 3); only the renderer needs `f64`.
+                let eye = camera.eye.as_vec3().to_array();
+                streaming.update(renderer, self.game.world(), eye);
                 if let Some(far) = self.far.as_mut() {
                     // Whatever changed the world -- New World, a load, a join --
                     // changed its seed, and the far terrain follows the seed.
@@ -786,8 +789,8 @@ impl ApplicationHandler for App {
                             w.settle();
                         }
                     }
-                    let hole = streaming.far_hole(renderer, camera.eye.to_array());
-                    far.update(renderer, camera.eye.to_array(), hole);
+                    let hole = streaming.far_hole(renderer, eye);
+                    far.update(renderer, eye, hole);
                 }
                 // Spectating hides the play HUD (#305): no hotbar, hearts or
                 // crosshair. The outline and cracks go too, because the sim

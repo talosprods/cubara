@@ -616,7 +616,7 @@ fn distance_fog_fades_the_far_ring_into_the_sky() {
         height: 540,
         region_radius,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -627,6 +627,7 @@ fn distance_fog_fades_the_far_ring_into_the_sky() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting {
             fog_start,
@@ -664,7 +665,7 @@ fn a_cave_mouth_is_visible() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -675,6 +676,7 @@ fn a_cave_mouth_is_visible() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -706,7 +708,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -717,6 +719,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -952,7 +955,7 @@ fn the_selected_block_shows_an_outline() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: Some(hit.block),
         cracking: None,
@@ -963,6 +966,7 @@ fn the_selected_block_shows_an_outline() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1027,7 +1031,7 @@ fn a_block_being_dug_shows_cracks() {
         height: 540,
         region_radius: 3,
         orbit_t: 0.0,
-        camera: Some((eye, target - eye)),
+        camera: Some((eye.as_dvec3(), target - eye)),
         players: Vec::new(),
         highlighted_block: Some(hit.block),
         cracking: Some((hit.block, 0.75)),
@@ -1038,6 +1042,7 @@ fn a_block_being_dug_shows_cracks() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1105,6 +1110,7 @@ fn items_show_their_icons() {
         region_radius: 2,
         orbit_t: 0.0,
         camera: None,
+        anchor: None,
         players: Vec::new(),
         highlighted_block: None,
         cracking: None,
@@ -1193,6 +1199,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1320,6 +1327,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
         panel: Some((
@@ -1416,6 +1424,7 @@ fn an_item_name_shows_beside_the_cursor() {
         tooltip: Some("Wooden Pick".to_string()),
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
         panel: Some((
@@ -1473,6 +1482,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1520,6 +1530,7 @@ fn hearts_show_health_including_a_half() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1590,6 +1601,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
         panel: Some((
@@ -1702,6 +1714,7 @@ fn a_furnace_shows_its_flame_and_progress() {
         tooltip: None,
         gauges: Some((0.25, 0.75)),
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
         panel: Some((PanelLayout::Furnace, contents, None, (10.0, 10.0))),
@@ -1792,6 +1805,7 @@ fn distinct_materials_render_with_distinct_textures() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -1910,7 +1924,7 @@ fn three_players_stand_in_front_of_the_camera() {
         height: 540,
         region_radius: 2,
         orbit_t: 0.0,
-        camera: Some((eye, glam::vec3(0.0, -0.15, -1.0))),
+        camera: Some((eye.as_dvec3(), glam::vec3(0.0, -0.15, -1.0))),
         players: vec![
             cubara_render::PlayerView {
                 eye: [-1.8, 40.0, -1.0],
@@ -1939,6 +1953,7 @@ fn three_players_stand_in_front_of_the_camera() {
         tooltip: None,
         gauges: None,
         icons: Vec::new(),
+        anchor: None,
         menu: None,
         lighting: Lighting::default(),
     };
@@ -2030,19 +2045,16 @@ fn render_world_with_far(
     .filter_map(to_meshed_node);
     let patches: Vec<FarPatch> = far
         .iter()
-        .map(|p| {
-            let [ox, oz] = p.key.origin();
-            FarPatch {
-                origin: [ox as f32, oz as f32],
-                quad: p.key.quad() as f32,
-                heights: &p.heights,
-                skirt: p.skirt(),
-            }
+        .map(|p| FarPatch {
+            origin: p.key.origin(),
+            quad: p.key.quad() as f32,
+            heights: &p.heights,
+            skirt: p.skirt(),
         })
         .collect();
-    let edge = (shot.region_radius * 16) as f32;
+    let edge = shot.region_radius * 16;
     let params = FarParams {
-        hole: Some(([-edge, 0.0, -edge], [edge + 16.0, 48.0, edge + 16.0])),
+        hole: Some(([-edge, 0, -edge], [edge + 16, 48, edge + 16])),
         materials: far_materials(),
     };
     let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2059,7 +2071,7 @@ fn the_far_terrain_reaches_the_horizon() {
     let eye = glam::Vec3::new(8.0, 120.0, 8.0);
     let shot = Shot {
         region_radius: 4,
-        camera: Some((eye, glam::Vec3::new(1.0, -0.12, 0.35))),
+        camera: Some((eye.as_dvec3(), glam::Vec3::new(1.0, -0.12, 0.35))),
         ..Shot::default()
     };
     let far = far_terrain(&world, eye, shot.region_radius, &shot, 20_000.0);
@@ -2148,29 +2160,32 @@ fn far_shading_is_the_aggregate_reference() {
         let v = view(elevation, azimuth);
         let expected = aggregate_colour(&table, g, v, &lighting, &materials)
             .expect("every case faces the eye");
-        // One patch, a plane through the origin. `far.wgsl` shades per
-        // vertex, so the quads are made tiny: the four vertices around the
-        // centre pixel then see it from the same direction, and the pixel is
-        // the shading function itself rather than a blend of its neighbours.
+        // One patch, a plane with its corner on the origin (a patch origin
+        // is an integer block, like every real one), aimed at through its
+        // centre vertex. `far.wgsl` shades per vertex, so the quads are made
+        // tiny: the four vertices around the centre pixel then see it from
+        // the same direction, and the pixel is the shading function itself
+        // rather than a blend of its neighbours.
         let quad = 0.05;
-        let origin = [-16.0 * quad; 2];
         let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
             .map(|k| {
                 let (i, j) = ((k % FAR_VERTS) as f32, (k / FAR_VERTS) as f32);
-                g[0] * (origin[0] + i * quad) + g[1] * (origin[1] + j * quad)
+                g[0] * (i * quad) + g[1] * (j * quad)
             })
             .collect();
         let patch = FarPatch {
-            origin,
+            origin: [0, 0],
             quad,
             heights: &heights,
             skirt: 0.0,
         };
+        // The centre vertex (16, 16), where the look direction lands.
+        let centre = glam::vec3(16.0 * quad, (g[0] + g[1]) * 16.0 * quad, 16.0 * quad);
         let shot = Shot {
             // Odd, so the centre pixel's ray is the look direction itself.
             width: 65,
             height: 65,
-            camera: Some((v * 40.0, -v)),
+            camera: Some(((centre + v * 40.0).as_dvec3(), -v)),
             lighting,
             ..Shot::default()
         };

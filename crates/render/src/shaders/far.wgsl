@@ -19,10 +19,13 @@ struct Frame {
     fog_color: vec4<f32>,
     fog: vec4<f32>,
     haze: vec4<f32>,
+    // The render anchor (issue #379): every position in this shader, `eye`
+    // included, is relative to it; only the height haze wants it back.
+    anchor: vec4<f32>,
 };
 
-// One patch: its lowest corner, the width of one quad, and how far its skirt
-// drops, all in blocks.
+// One patch: its lowest corner (relative to the render anchor, issue #379),
+// the width of one quad, and how far its skirt drops, all in blocks.
 struct Patch {
     origin: vec2<f32>,
     quad: f32,
@@ -30,7 +33,8 @@ struct Patch {
 };
 
 struct Params {
-    // The box the voxel rings draw themselves: nothing here is drawn inside it.
+    // The box the voxel rings draw themselves: nothing here is drawn inside
+    // it. Relative to the render anchor, like every position here.
     hole_min: vec4<f32>,
     hole_max: vec4<f32>,
     // What the ground is made of, in linear light (`aggregate::Materials`):
@@ -222,7 +226,7 @@ fn shade(p: vec3<f32>, g: vec2<f32>) -> vec3<f32> {
 
     let dist = distance(p, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);
-    let fog_amount = max(edge, haze_amount(frame.eye.xyz, p, frame.haze));
+    let fog_amount = max(edge, haze_amount(frame.eye.xyz, p, frame.haze, frame.anchor.y));
     return mix(lit, frame.fog_color.rgb, fog_amount);
 }
 

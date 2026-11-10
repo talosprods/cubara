@@ -138,19 +138,23 @@ pub fn voxel_hole(eye: [f32; 3]) -> Hole {
 
 /// The renderer's form of a patch.
 pub fn to_far_patch(p: &PatchHeights) -> FarPatch<'_> {
-    let [ox, oz] = p.key.origin();
     FarPatch {
-        origin: [ox as f32, oz as f32],
+        // The integer it is: the renderer subtracts its anchor from it
+        // exactly (issue #379).
+        origin: p.key.origin(),
         quad: p.key.quad() as f32,
         heights: &p.heights,
         skirt: p.skirt(),
     }
 }
 
-/// The renderer's form of a hole.
+/// The renderer's form of a hole. A hole's edges are chunk edges
+/// (`hole_in_blocks`), so the `f64`s are integers and the conversion is
+/// exact; the renderer wants them integer to subtract its anchor exactly
+/// (issue #379).
 pub fn to_far_params(hole: Hole, materials: Materials) -> FarParams {
     FarParams {
-        hole: Some((hole.min.map(|v| v as f32), hole.max.map(|v| v as f32))),
+        hole: Some((hole.min.map(|v| v as i32), hole.max.map(|v| v as i32))),
         materials,
     }
 }

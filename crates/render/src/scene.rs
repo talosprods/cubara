@@ -13,6 +13,7 @@
 
 use glam::Mat4;
 
+use crate::anchor::{self, Anchor};
 use crate::arena::ChunkArena;
 use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
@@ -262,6 +263,11 @@ pub struct SceneRenderer {
     )>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    /// The render anchor the last [`set_camera`](Self::set_camera) was for
+    /// (issue #379): what the outline, the cracks and the figures are placed
+    /// against in [`encode_scene`](Self::encode_scene), so they land in the
+    /// same space as the `view_proj` uploaded with it.
+    anchor: Anchor,
     /// `@group(2)` in `mesh.wgsl`: the block texture array + sampler.
     texture_bind_group: wgpu::BindGroup,
     /// The selected-block wireframe (issue #52): a dedicated line-list
@@ -401,6 +407,7 @@ impl SceneRenderer {
             lighting_rebuild: None,
             camera_buffer,
             camera_bind_group,
+            anchor: anchor::ORIGIN,
             texture_bind_group,
             figure_pipeline,
             far_pipeline,
@@ -569,16 +576,25 @@ impl SceneRenderer {
     /// than derived from `view_proj` (which is possible but a needless round
     /// trip through a matrix inverse) since every caller already knows where
     /// its camera is.
+    ///
+    /// Both are relative to `anchor`, the render anchor (issue #379,
+    /// [`crate::anchor`]): `view_proj` built from `eye - anchor`
+    /// ([`crate::CameraPose::view_proj`]) and `eye` that same difference
+    /// ([`crate::anchor::relative_eye`]). The anchor is kept for
+    /// [`encode_scene`](Self::encode_scene) to place the outline, cracks and
+    /// figures against.
     pub fn set_camera(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         view_proj: Mat4,
         eye: glam::Vec3,
+        anchor: Anchor,
         lighting: Lighting,
     ) {
-        let uniform = FrameUniform::new(view_proj, eye, lighting);
+        let uniform = FrameUniform::new(view_proj, eye, anchor, lighting);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        self.anchor = anchor;
         self.set_lighting(device, lighting);
     }
 
@@ -616,16 +632,24 @@ impl SceneRenderer {
         } = frame;
 
         // Build this frame's figures and upload them. Done before the pass so
-        // the write is ordered against the draw that reads it.
+        // the write is ordered against the draw that reads it. Placed
+        // against the anchor `set_camera` gave (issue #379), like every
+        // other position this pass draws.
         let mut figure_vertices: Vec<crate::figure::FigureVertex> =
             Vec::with_capacity(players.len() * crate::figure::VERTICES_PER_FIGURE);
         for &view in players {
-            crate::figure::figure_vertices(view, &mut figure_vertices);
+            crate::figure::figure_vertices(view, self.anchor, &mut figure_vertices);
         }
         // Cracks share the figures' buffer and draw: both are coloured,
-        // depth-tested triangles built on the CPU.
+        // depth-tested triangles built on the CPU. The block is handed over
+        // already anchor-relative (an exact integer subtraction), so the
+        // crack builder stays a pure function of a block.
         if let Some((block, progress)) = cracking {
-            crate::crack::crack_vertices(block, progress, &mut figure_vertices);
+            crate::crack::crack_vertices(
+                anchor::block_offset(block, self.anchor),
+                progress,
+                &mut figure_vertices,
+            );
         }
         if figure_vertices.len() > self.figure_capacity {
             // More people came into view than the buffer holds. Grown rather
@@ -650,11 +674,10 @@ impl SceneRenderer {
         }
 
         if let Some(block) = selected_block {
-            let origin = [block[0] as f32, block[1] as f32, block[2] as f32];
             queue.write_buffer(
                 &self.outline_uniform_buffer,
                 0,
-                bytemuck::bytes_of(&OutlineUniform::new(origin)),
+                bytemuck::bytes_of(&OutlineUniform::new(block, self.anchor)),
             );
         }
         {

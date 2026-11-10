@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use cubara_voxel::{AnisoChunk, BlockId, BlockRegistry, MeshContext, StructureRegistry};
 
+use crate::anchor::{Anchor, NodeBox};
 use crate::arena::NodeId;
 
 /// Which static model a node's trees draw with (issue #332 decision 3):
@@ -438,6 +439,10 @@ pub struct TreeArena {
     /// 3), so this is set once at construction rather than looked up per
     /// insert.
     local_bounds: (glam::Vec3, glam::Vec3),
+    /// The render anchor every node's culling box is relative to -- the
+    /// same one the `ChunkArena` whose `node_origins` the instances index
+    /// has, since the two are rebased together (`crate::anchor`).
+    anchor: Anchor,
     oak: InstanceBuffer,
     boxed: InstanceBuffer,
     /// The node ids [`prepare`](Self::prepare) found contributing oak
@@ -456,10 +461,11 @@ pub struct TreeArena {
 }
 
 impl TreeArena {
-    pub fn new(local_bounds: (glam::Vec3, glam::Vec3)) -> Self {
+    pub fn new(local_bounds: (glam::Vec3, glam::Vec3), anchor: Anchor) -> Self {
         Self {
             by_node: BTreeMap::new(),
             local_bounds,
+            anchor,
             oak: InstanceBuffer::new(),
             boxed: InstanceBuffer::new(),
             last_oak_contributors: Vec::new(),
@@ -511,18 +517,34 @@ impl TreeArena {
                 }
             })
             .collect();
+        let place = NodeBox::new(origin, crate::culling::Aabb::new(min, max));
         self.by_node.insert(
             id,
             TreeNode {
                 model,
                 instances,
-                aabb: crate::culling::Aabb::new(min, max),
+                aabb: place.relative_to(self.anchor),
+                place,
             },
         );
     }
 
     pub fn remove(&mut self, id: NodeId) {
         self.by_node.remove(&id);
+    }
+
+    /// Re-express every node's culling box against `anchor` (issue #379
+    /// decision 2). The instances are node-relative and are not touched --
+    /// their node's origin moves in the `ChunkArena`'s buffer, which is
+    /// rebased alongside this.
+    pub fn rebase(&mut self, anchor: Anchor) {
+        if anchor == self.anchor {
+            return;
+        }
+        self.anchor = anchor;
+        for node in self.by_node.values_mut() {
+            node.aabb = node.place.relative_to(anchor);
+        }
     }
 
     /// Forget every node at once -- the streamed world was just replaced
@@ -616,10 +638,12 @@ impl TreeArena {
 
 /// What one resident node contributed: its model, its instances (already
 /// node-relative, [`TreeInstance`]) and the culling box enclosing both the
-/// node's terrain and every one of its trees.
+/// node's terrain and every one of its trees -- `place` in world terms, and
+/// `aabb` relative to the arena's anchor, which is what the frustum tests.
 struct TreeNode {
     model: TreeModel,
     instances: Vec<TreeInstance>,
+    place: NodeBox,
     aabb: crate::culling::Aabb,
 }
 
@@ -711,7 +735,7 @@ mod tests {
     /// No reach beyond the node's own AABB -- for tests that only care about
     /// `insert`/`remove` bookkeeping, not the AABB union itself.
     fn no_local_bounds() -> TreeArena {
-        TreeArena::new((glam::Vec3::ZERO, glam::Vec3::ZERO))
+        TreeArena::new((glam::Vec3::ZERO, glam::Vec3::ZERO), crate::anchor::ORIGIN)
     }
 
     #[test]
@@ -763,7 +787,7 @@ mod tests {
     #[test]
     fn insert_grows_the_aabb_to_cover_every_tree() {
         let local_bounds = (glam::vec3(-2.0, 0.0, -2.0), glam::vec3(3.0, 10.0, 3.0));
-        let mut arena = TreeArena::new(local_bounds);
+        let mut arena = TreeArena::new(local_bounds, crate::anchor::ORIGIN);
         let id = NodeId {
             level: 1,
             pos: [0, 0, 0],

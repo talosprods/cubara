@@ -101,7 +101,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
     // array to bind (`materials::bind_group_layout` expects `D2Array`, which
     // a plain render-target texture isn't) -- the same real
     // `assets/`-backed array every other entry point binds.
-    let arena = ChunkArena::new(&device, false);
+    let arena = ChunkArena::new(&device, false, cubara_render::anchor::ORIGIN);
     let (mesh_assets, tex_view, tex_sampler) = cubara_render::load_mesh_assets(&device, &queue);
     let tree_models = cubara_render::load_tree_models(&device, &queue, &mesh_assets);
     let color = device.create_texture(&wgpu::TextureDescriptor {

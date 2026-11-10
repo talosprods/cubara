@@ -18,6 +18,7 @@ use winit::window::{CursorGrabMode, Window};
 
 use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 
+use crate::anchor::{self, Anchor};
 use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
@@ -339,18 +340,24 @@ impl Lighting {
 
 /// The uniform actually bound at `@group(0) @binding(0)`: the camera plus
 /// [`Lighting`], std140-safe (every field a full `vec4`, so nothing needs
-/// manual padding to hit 16-byte alignment). `figure.wgsl` declares the
-/// matching `Frame` struct and reads through `fog`; `outline.wgsl` and
-/// `mesh.wgsl` both declare only the leading `view_proj` they actually use
-/// -- WGSL doesn't require a shader to describe a whole bound buffer, only
-/// the prefix it reads, so a smaller struct there stays correct as long as
+/// manual padding to hit 16-byte alignment). `figure.wgsl`, `far.wgsl`,
+/// `trees.wgsl` and `mesh.wgsl` declare the matching `Frame` struct;
+/// `outline.wgsl` declares only the leading `view_proj` it actually uses --
+/// WGSL doesn't require a shader to describe a whole bound buffer, only the
+/// prefix it reads, so a smaller struct there stays correct as long as
 /// `view_proj` stays first. `mesh.wgsl` gets its lighting and fog from
 /// pipeline `override` constants instead ([`mesh_pipeline_constants`]), not
 /// this uniform -- see that function's doc comment for why.
+///
+/// Every position in here is relative to the render anchor (issue #379,
+/// [`crate::anchor`]): `view_proj` is built from `eye - anchor`, `eye` *is*
+/// `eye - anchor`, and `anchor` is carried so the height haze can get the
+/// eye's absolute height back (decision 4).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FrameUniform {
     view_proj: [[f32; 4]; 4],
+    /// The eye relative to the anchor.
     eye: [f32; 4],
     sun_dir: [f32; 4],
     /// `.w` is [`Lighting::diffuse_weight`].
@@ -360,13 +367,16 @@ pub struct FrameUniform {
     fog_color: [f32; 4],
     /// `.x` [`Lighting::fog_start`], `.y` `fog_end`, `.z` `time_of_day`.
     fog: [f32; 4],
-    /// [`crate::haze::Haze::uniform`]. Appended last so every shader's
-    /// prefix struct stays valid.
+    /// [`crate::haze::Haze::uniform`].
     haze: [f32; 4],
+    /// [`crate::anchor::anchor_f32`]: the render anchor, `.w` unused.
+    /// Appended last so every shader's prefix struct stays valid.
+    anchor: [f32; 4],
 }
 
 impl FrameUniform {
-    pub fn new(view_proj: glam::Mat4, eye: glam::Vec3, lighting: Lighting) -> Self {
+    /// `eye` is already relative to `anchor` ([`crate::anchor::relative_eye`]).
+    pub fn new(view_proj: glam::Mat4, eye: glam::Vec3, anchor: Anchor, lighting: Lighting) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 0.0],
@@ -401,6 +411,7 @@ impl FrameUniform {
                 0.0,
             ],
             haze: lighting.haze.uniform(),
+            anchor: anchor::anchor_f32(anchor),
         }
     }
 }
@@ -412,23 +423,36 @@ impl FrameUniform {
 /// by interpolating the sim's previous and current tick
 /// (`docs/PHASE1_ARCHITECTURE.md` §9) and hands it in; headless callers
 /// (bench, screenshot, golden tests) build one directly.
+///
+/// The eye is `f64` (issue #379 decision 3): it comes from a `FixedVec3`,
+/// which `f64` holds exactly, and the renderer subtracts its anchor from it
+/// before anything becomes `f32` -- an `f32` eye a million blocks out would
+/// already have lost the fraction of a block that subtraction preserves.
+/// The look direction is a unit vector and stays `f32`.
 #[derive(Clone, Copy, Debug)]
 pub struct CameraPose {
-    pub eye: glam::Vec3,
+    pub eye: glam::DVec3,
     pub look_dir: glam::Vec3,
 }
 
 impl CameraPose {
-    pub fn view_proj(&self, aspect: f32) -> glam::Mat4 {
-        CameraUniform::look_view_proj(aspect, self.eye, self.look_dir)
+    /// The view-projection for this pose against the render anchor
+    /// `anchor`: built from `eye - anchor`, the only form the GPU ever sees.
+    pub fn view_proj(&self, aspect: f32, anchor: Anchor) -> glam::Mat4 {
+        CameraUniform::look_view_proj(aspect, self.relative_eye(anchor), self.look_dir)
+    }
+
+    /// `eye - anchor`, as the `f32` the frame draws with.
+    pub fn relative_eye(&self, anchor: Anchor) -> glam::Vec3 {
+        anchor::relative_eye(anchor, self.eye)
     }
 }
 
-/// Uniform block shared with `outline.wgsl`: the highlighted voxel's
-/// world-space min corner. `origin` is `[f32; 4]`, not `[f32; 3]` -- WGSL's
-/// uniform address space requires 16-byte alignment for a `vec3<f32>`
-/// member, so a plain `vec3` here would need hand-rolled padding to match;
-/// a `vec4` with `.w` unused sidesteps that entirely.
+/// Uniform block shared with `outline.wgsl`: the highlighted voxel's min
+/// corner relative to the render anchor (issue #379). `origin` is `[f32; 4]`,
+/// not `[f32; 3]` -- WGSL's uniform address space requires 16-byte alignment
+/// for a `vec3<f32>` member, so a plain `vec3` here would need hand-rolled
+/// padding to match; a `vec4` with `.w` unused sidesteps that entirely.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct OutlineUniform {
@@ -436,9 +460,12 @@ pub struct OutlineUniform {
 }
 
 impl OutlineUniform {
-    pub fn new(origin: [f32; 3]) -> Self {
+    /// For the block at `block`, against `anchor`: an exact integer
+    /// subtraction ([`crate::anchor::offset`]).
+    pub fn new(block: [i32; 3], anchor: Anchor) -> Self {
+        let o = anchor::offset(block, anchor);
         Self {
-            origin: [origin[0], origin[1], origin[2], 0.0],
+            origin: [o.x, o.y, o.z, 0.0],
         }
     }
 }
@@ -573,6 +600,12 @@ pub struct Renderer {
     /// The one scene-render path, shared with `--bench` and `--screenshot`.
     scene: SceneRenderer,
     frustum: Frustum,
+    /// The render anchor (issue #379, [`crate::anchor`]): every position
+    /// `arena`, `far` and `trees` hold, and the frame uniform, is relative
+    /// to it. Moved by [`update`](Self::update) when the eye strays far
+    /// enough; the same value is held by each of the three, which this is
+    /// the one source of.
+    anchor: Anchor,
 
     /// The GPU this window renders on, by name -- what a benchmarked setting is
     /// recorded against, so a different GPU is noticed.
@@ -785,10 +818,12 @@ impl Renderer {
         );
 
         let aspect = width as f32 / height as f32;
-        let frustum = Frustum::from_view_proj(camera.view_proj(aspect));
+        // The anchor for the first eye; `update` moves it as the eye does.
+        let anchor = anchor::anchor_for(camera.eye);
+        let frustum = Frustum::from_view_proj(camera.view_proj(aspect, anchor));
 
-        let arena = ChunkArena::new(&device, multi_draw);
-        let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY);
+        let arena = ChunkArena::new(&device, multi_draw, anchor);
+        let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY, anchor);
 
         let renderer = Self {
             target,
@@ -796,10 +831,11 @@ impl Renderer {
             queue,
             scene,
             frustum,
+            anchor,
             adapter_name,
             arena,
             far,
-            trees: crate::trees::TreeArena::new(tree_local_bounds),
+            trees: crate::trees::TreeArena::new(tree_local_bounds, anchor),
             uploads: Uploads::new(),
             last_frame: Instant::now(),
             visible_chunks: 0,
@@ -836,6 +872,12 @@ impl Renderer {
     /// The GPU this window renders on.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// The render anchor the last [`render`](Self::render) drew against
+    /// ([`crate::anchor`]).
+    pub fn anchor(&self) -> Anchor {
+        self.anchor
     }
 
     /// Upload a far-terrain patch; `None` when every slot is taken.
@@ -1085,7 +1127,8 @@ impl Renderer {
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
-        self.far.prepare(&self.queue, &self.frustum, camera.eye);
+        self.far
+            .prepare(&self.queue, &self.frustum, camera.relative_eye(self.anchor));
         // Trees beyond the first ring (issue #332 decision 2): the same
         // frustum, re-filtering which resident node's trees actually draw
         // this frame -- cheap even every frame, since what it re-uploads is
@@ -1159,6 +1202,7 @@ impl Renderer {
     /// shadow) belongs to the shared scene path, so this only produces the string.
     fn debug_text(&self, camera: CameraPose) -> String {
         let p = camera.eye;
+        let a = self.anchor;
         let d = camera.look_dir;
         let facing = if d.x.abs() > d.z.abs() {
             if d.x > 0.0 {
@@ -1176,13 +1220,14 @@ impl Renderer {
         } else {
             0.0
         };
-        let c = ChunkCoord::from_world_pos(p.to_array());
+        let c = ChunkCoord::from_world_pos(p.as_vec3().to_array());
         let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
         format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
              chunk  {cx} {cy} {cz}\n\
+             anchor  {ax} {ay} {az}\n\
              facing  {facing}\n\
              nodes  {vis} drawn / {res} resident\n\
              fog  {fog_start:.0}-{fog_end:.0}",
@@ -1193,6 +1238,9 @@ impl Renderer {
             cx = c.x,
             cy = c.y,
             cz = c.z,
+            ax = a[0],
+            ay = a[1],
+            az = a[2],
             vis = self.visible_chunks,
             res = self.arena.len(),
         )
@@ -1214,9 +1262,31 @@ impl Renderer {
         } else {
             self.frame_ms * 0.9 + ms * 0.1
         };
+        // The render anchor follows the eye (issue #379 decision 2): rarely
+        // -- once per 4,096 blocks of travel, or on a jump -- and before
+        // this frame's uploads, so a node arriving now is placed against
+        // the anchor the frame draws with. Timed and logged because
+        // decision 2 bounds this frame's own work at 1 ms; `--bench flight`
+        // across a grid line is how that is measured.
+        let rebasing = Instant::now();
+        if let Some(moved) = anchor::rebase_if_needed(
+            &mut self.anchor,
+            camera.eye,
+            &self.queue,
+            &mut self.arena,
+            &mut self.trees,
+            Some(&mut self.far),
+        ) {
+            log::info!(
+                "render anchor moved to {moved:?} ({} nodes, {} far patches) in {:.3} ms",
+                self.arena.len(),
+                self.far.len(),
+                rebasing.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.drain_uploads(std::time::Duration::from_secs_f32(dt));
 
-        let vp = camera.view_proj(self.scene.aspect());
+        let vp = camera.view_proj(self.scene.aspect(), self.anchor);
         self.frustum = Frustum::from_view_proj(vp);
         // `self.render_radius_blocks` came in with this frame's `render()`
         // call -- `cubara-app`'s idea of how far streaming actually reaches
@@ -1226,7 +1296,8 @@ impl Renderer {
             &self.device,
             &self.queue,
             vp,
-            camera.eye,
+            camera.relative_eye(self.anchor),
+            self.anchor,
             Lighting {
                 fog_start,
                 fog_end,
@@ -1919,6 +1990,7 @@ mod tests {
         let f = FrameUniform::new(
             glam::Mat4::IDENTITY,
             glam::Vec3::new(1.0, 2.0, 3.0),
+            [4096, -8192, 1_048_576],
             Lighting::default(),
         );
         assert_eq!(f.eye, [1.0, 2.0, 3.0, 0.0]);
@@ -1927,6 +1999,37 @@ mod tests {
         assert_eq!(f.fog[0], 0.0, "fog_start");
         assert_eq!(f.fog[1], 0.0, "fog_end");
         assert_eq!(f.haze, Lighting::default().haze.uniform());
+        assert_eq!(f.anchor, [4096.0, -8192.0, 1_048_576.0, 0.0]);
+        // Eight vec4-sized fields after the matrix: what every shader's
+        // `Frame` struct declares, in this order.
+        assert_eq!(std::mem::size_of::<FrameUniform>(), 64 + 8 * 16);
+    }
+
+    /// Issue #379: the view-projection a pose yields against its anchor is
+    /// the one a pose at the origin yields against the origin, bit for bit
+    /// -- the eye's `f64` subtraction is exact and the matrix never sees the
+    /// large number.
+    #[test]
+    fn a_pose_a_million_blocks_out_gives_the_matrix_of_the_pose_at_the_origin() {
+        let look = glam::vec3(0.3, -0.2, 1.0);
+        let here = CameraPose {
+            eye: glam::DVec3::new(8.3, 120.0, 8.3),
+            look_dir: look,
+        };
+        let there = CameraPose {
+            eye: glam::DVec3::new(1_048_576.0 + 8.3, 120.0, -1_048_576.0 + 8.3),
+            look_dir: look,
+        };
+        let anchor = anchor::anchor_for(there.eye);
+        assert_eq!(anchor, [1_048_576, 0, -1_048_576]);
+        assert_eq!(
+            here.view_proj(16.0 / 9.0, anchor::ORIGIN),
+            there.view_proj(16.0 / 9.0, anchor)
+        );
+        assert_eq!(
+            here.relative_eye(anchor::ORIGIN),
+            there.relative_eye(anchor)
+        );
     }
 
     #[test]

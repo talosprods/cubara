@@ -45,8 +45,9 @@ impl Frustum {
             *p /= len;
         }
         // `m * eye = (0, 0, c, 0)` for a perspective camera, so the eye is
-        // `m⁻¹ * (0, 0, 1, 0)`, divided through. In f64: world coordinates run
-        // to thousands and the far plane is 20,000 near planes away.
+        // `m⁻¹ * (0, 0, 1, 0)`, divided through. In f64: coordinates run to
+        // thousands (anchor-relative since issue #379, so never to millions)
+        // and the far plane is 20,000 near planes away.
         let h = m.as_dmat4().inverse() * glam::DVec4::new(0.0, 0.0, 1.0, 0.0);
         let eye = (h.truncate() / h.w).as_vec3();
         Self { planes, eye }
