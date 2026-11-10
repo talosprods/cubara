@@ -452,7 +452,7 @@ impl NodeStreaming {
     /// moved), and apply whatever's finished meshing since the last call.
     /// Cheap when nothing changed: `stream_around` only runs on a
     /// chunk-boundary crossing.
-    pub fn update(&mut self, renderer: &mut Renderer, world: &Arc<World>, eye: [f32; 3]) {
+    pub fn update(&mut self, renderer: &mut Renderer, world: &World, eye: [f32; 3]) {
         // The frame index `swap_lags` is measured in (decision 2, #378): no
         // clock in here, just this call's own count.
         self.frame += 1;
@@ -486,11 +486,15 @@ impl NodeStreaming {
     /// schedule keeps around the player (`World::node_at`'s doc comment) --
     /// a coarser node can never be the one actually representing an
     /// editable chunk.
-    pub fn invalidate(&mut self, world: &Arc<World>, cc: ChunkCoord) {
+    ///
+    /// The job gets a [`World::snapshot`] taken now (issue #387): the edit is
+    /// in it, and the tick that follows does not copy the world for it.
+    pub fn invalidate(&mut self, world: &World, cc: ChunkCoord) {
         let node = NodeKey::containing(cc, 0);
         self.mesh_pool.cancel(node);
+        let snapshot = Arc::new(world.snapshot());
         self.mesh_pool
-            .request(world, &self.registry, &self.layer_of, node, self.blocks);
+            .request(&snapshot, &self.registry, &self.layer_of, node, self.blocks);
     }
 
     /// Drop everything streamed from the world that was just replaced -- the
@@ -563,7 +567,7 @@ impl NodeStreaming {
     /// node not yet generated counts as seen but is not searched through until
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
-    fn follow_visibility(&mut self, renderer: &mut Renderer, world: &Arc<World>, done: SearchDone) {
+    fn follow_visibility(&mut self, renderer: &mut Renderer, world: &World, done: SearchDone) {
         self.searched = Some(done.center);
         let desired = done.desired;
         Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
@@ -623,9 +627,12 @@ impl NodeStreaming {
             .copied()
             .collect();
         node::sort_nearest_first(&mut to_load, done.center);
+        // One snapshot for the whole batch (issue #387 decision 2): every job
+        // this search starts meshes the same world, and shares the one copy.
+        let snapshot = Arc::new(world.snapshot());
         for node in to_load {
             self.mesh_pool
-                .request(world, &self.registry, &self.layer_of, node, self.blocks);
+                .request(&snapshot, &self.registry, &self.layer_of, node, self.blocks);
         }
     }
 
@@ -834,7 +841,7 @@ mod tests {
     #[test]
     fn forgetting_the_world_leaves_nothing_of_it() {
         let mut s = real_streaming();
-        let world = Arc::new(World::new());
+        let world = Arc::new(World::new().snapshot());
         let (drawn, superseded, meshing) = (
             NodeKey::new(0, [0, 0, 0]),
             NodeKey::new(1, [1, 0, 0]),

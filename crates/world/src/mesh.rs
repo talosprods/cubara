@@ -27,7 +27,7 @@ use cubara_voxel::{
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
 use crate::worldgen::TreeSite;
-use crate::{TerrainBlocks, World};
+use crate::{TerrainBlocks, WorldSnapshot};
 
 /// A meshed node's geometry, ready to hand to a renderer: the triangle mesh
 /// (node-local, §5.2 -- placing it is a GPU-side per-node origin add), its
@@ -79,7 +79,7 @@ pub struct BuiltNode {
 /// Generate `node` once, and both mesh it and work out what it joins -- what a
 /// meshing job produces.
 pub fn build_node(
-    world: &World,
+    world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     node: NodeKey,
@@ -132,7 +132,7 @@ pub fn sort_batch(mut batch: Vec<BuiltNode>) -> Vec<BuiltNode> {
 /// `registry`/`layer_of` — the synchronous building block both the worker pool
 /// ([`MeshPool`]) and the whole-region helper ([`mesh_region`]) share.
 pub fn mesh_node(
-    world: &World,
+    world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     node: NodeKey,
@@ -153,7 +153,7 @@ pub fn mesh_node(
 /// which a single scalar couldn't represent anyway, once the vertical cell
 /// stopped matching the horizontal one.
 fn mesh_chunk(
-    world: &World,
+    world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     node: NodeKey,
@@ -237,7 +237,7 @@ enum Want {
 /// drawn, but it is solid ground. What used to be a grey cliff where the drawn
 /// world stopped is now the terrain simply ending -- which is what it is.
 fn border_samples(
-    world: &World,
+    world: &WorldSnapshot,
     node: NodeKey,
     blocks: TerrainBlocks,
     surfaces: &std::cell::RefCell<HashMap<(i32, i32, i32), i32>>,
@@ -345,7 +345,7 @@ fn border_samples(
 /// don't need a worker pool: the headless bench, screenshot, and golden-image
 /// test paths.
 pub fn mesh_region(
-    world: &World,
+    world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     center: ChunkCoord,
@@ -366,7 +366,7 @@ pub fn mesh_region(
 /// [`mesh_region`] does for its band, for a caller that chose the nodes some
 /// other way (a 3D selection).
 pub fn mesh_nodes(
-    world: &World,
+    world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
     mut nodes: Vec<NodeKey>,
@@ -384,14 +384,17 @@ pub fn mesh_nodes(
 /// against.
 ///
 /// The snapshot travels *with* the job rather than the workers reaching for
-/// shared state (`ARCHITECTURE.md` Rule 2). An edit publishes a new [`Arc`] via
-/// [`MeshPool::request`], so a job always meshes a consistent view and readers
-/// never block a writer. `layer_of` is a callback rather than a concrete type
-/// (mirroring `MeshContext`'s own convention) so this crate never has to name
-/// whatever GPU-side type actually owns the texture array — that stays the
-/// caller's business.
+/// shared state (`ARCHITECTURE.md` Rule 2), so a job always meshes a
+/// consistent view and readers never block a writer. It is a
+/// [`WorldSnapshot`] -- the terrain and the edit overlay, by reference -- and
+/// **not** an `Arc<World>` (issue #387 decision 2): holding the whole world
+/// made the tick's `Arc::make_mut` copy every edit ever made while a job was
+/// in flight. `layer_of` is a callback rather than a concrete type (mirroring
+/// `MeshContext`'s own convention) so this crate never has to name whatever
+/// GPU-side type actually owns the texture array — that stays the caller's
+/// business.
 type Job = (
-    Arc<World>,
+    Arc<WorldSnapshot>,
     Arc<BlockRegistry>,
     Arc<dyn Fn(&str) -> u32 + Send + Sync>,
     NodeKey,
@@ -478,10 +481,13 @@ impl MeshPool {
     /// `layer_of`, unless it's already in flight.
     ///
     /// The caller passes the world it wants meshed, so a job can never observe
-    /// an edit that lands after it was queued.
+    /// an edit that lands after it was queued. **One snapshot per batch**
+    /// (issue #387 decision 2): a caller requesting several nodes takes
+    /// `Arc::new(world.snapshot())` once and passes it to each -- the jobs
+    /// share it, and nothing in here copies it.
     pub fn request(
         &mut self,
-        world: &Arc<World>,
+        world: &Arc<WorldSnapshot>,
         registry: &Arc<BlockRegistry>,
         layer_of: &Arc<dyn Fn(&str) -> u32 + Send + Sync>,
         node: NodeKey,
@@ -543,6 +549,7 @@ impl Default for MeshPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::World;
     use cubara_voxel::{DropRule, Faces, Interact, Material, Shape};
     use std::collections::HashMap;
 
@@ -583,7 +590,7 @@ mod tests {
     /// Whether `node`'s cell containing world point `p` is solid, as the node
     /// itself draws it. `chunks` caches generated nodes across calls.
     fn drawn_solid(
-        world: &World,
+        world: &WorldSnapshot,
         blocks: TerrainBlocks,
         chunks: &mut HashMap<NodeKey, Option<NodeChunk>>,
         node: NodeKey,
@@ -800,7 +807,7 @@ mod tests {
         // Meshing on workers must produce exactly what the synchronous path does,
         // for every requested node (including empty ones, reported as None),
         // across a mix of levels.
-        let world = Arc::new(World::new());
+        let world = Arc::new(World::new().snapshot());
         let registry = test_registry();
         let layer_of = zero_layer();
         let nodes = [
@@ -846,7 +853,7 @@ mod tests {
 
     #[test]
     fn cancelled_nodes_are_dropped_by_poll() {
-        let world = Arc::new(World::new());
+        let world = Arc::new(World::new().snapshot());
         let registry = test_registry();
         let layer_of = zero_layer();
         let mut pool = MeshPool::with_workers(1);
@@ -881,15 +888,15 @@ mod tests {
         let blocks = TerrainBlocks::from_registry(&registry);
         let rock = [5, -40, 5];
         let node = NodeKey::containing(ChunkCoord::from_block(rock[0], rock[1], rock[2]), 0);
-        let old = Arc::new(World::new());
+        let old = Arc::new(World::new().snapshot());
         assert!(
             old.is_solid_at(rock[0], rock[1], rock[2], blocks),
             "not rock"
         );
         let mut dug = World::new();
         dug.set_block(rock[0], rock[1], rock[2], cubara_voxel::BlockId::AIR);
-        let new = Arc::new(dug);
-        let tris = |w: &World| {
+        let new = Arc::new(dug.snapshot());
+        let tris = |w: &WorldSnapshot| {
             mesh_node(w, &registry, &*layer_of, node, blocks).map(|g| g.mesh.triangle_count())
         };
         assert_ne!(
@@ -930,7 +937,7 @@ mod tests {
         // no "different level supersedes" case -- a different level is simply a
         // different key. Re-requesting the same key while it's in flight must
         // stay a no-op.
-        let world = Arc::new(World::new());
+        let world = Arc::new(World::new().snapshot());
         let registry = test_registry();
         let layer_of = zero_layer();
         let mut pool = MeshPool::with_workers(1);

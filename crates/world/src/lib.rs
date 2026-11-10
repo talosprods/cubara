@@ -31,7 +31,7 @@ mod worldgen;
 pub use block_entity::{BlockEntities, Furnace, FurnaceOutcome, SmeltCtx, TimedProcess};
 pub use chunk_state::{ChunkState, ChunkStates, Woken};
 pub use raycast::{raycast, RayHit};
-pub use world::{simulation_box, World};
+pub use world::{simulation_box, EditMap, RegionEdits, RegionKey, World, WorldSnapshot};
 pub use worldgen::{
     OreGen, OreSet, TerrainBlocks, TreeSite, WorldGen, MAX_ORES, SOIL_DEPTH, WORLDGEN_VERSION,
 };
