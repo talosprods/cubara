@@ -79,11 +79,7 @@ fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
         scale: geometry.scale,
         mesh: geometry.mesh,
         aabb: geometry.aabb,
-        trees: built
-            .trees
-            .iter()
-            .map(|t| [t.x as f32, t.base as f32, t.z as f32])
-            .collect(),
+        trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
         tree_model,
     })
 }
@@ -2142,19 +2138,16 @@ fn render_world_with_far(
     .filter_map(to_meshed_node);
     let patches: Vec<FarPatch> = far
         .iter()
-        .map(|p| {
-            let [ox, oz] = p.key.origin();
-            FarPatch {
-                origin: [ox as f32, oz as f32],
-                quad: p.key.quad() as f32,
-                heights: &p.heights,
-                skirt: p.skirt(),
-            }
+        .map(|p| FarPatch {
+            origin: p.key.origin(),
+            quad: p.key.quad() as f32,
+            heights: &p.heights,
+            skirt: p.skirt(),
         })
         .collect();
-    let edge = (shot.region_radius * 16) as f32;
+    let edge = shot.region_radius * 16;
     let params = FarParams {
-        hole: Some(([-edge, 0.0, -edge], [edge + 16.0, 48.0, edge + 16.0])),
+        hole: Some(([-edge, 0, -edge], [edge + 16, 48, edge + 16])),
         materials: far_materials(),
     };
     let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2260,29 +2253,32 @@ fn far_shading_is_the_aggregate_reference() {
         let v = view(elevation, azimuth);
         let expected = aggregate_colour(&table, g, v, &lighting, &materials)
             .expect("every case faces the eye");
-        // One patch, a plane through the origin. `far.wgsl` shades per
-        // vertex, so the quads are made tiny: the four vertices around the
-        // centre pixel then see it from the same direction, and the pixel is
-        // the shading function itself rather than a blend of its neighbours.
+        // One patch, a plane with its corner on the origin (a patch origin
+        // is an integer block, like every real one), aimed at through its
+        // centre vertex. `far.wgsl` shades per vertex, so the quads are made
+        // tiny: the four vertices around the centre pixel then see it from
+        // the same direction, and the pixel is the shading function itself
+        // rather than a blend of its neighbours.
         let quad = 0.05;
-        let origin = [-16.0 * quad; 2];
         let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
             .map(|k| {
                 let (i, j) = ((k % FAR_VERTS) as f32, (k / FAR_VERTS) as f32);
-                g[0] * (origin[0] + i * quad) + g[1] * (origin[1] + j * quad)
+                g[0] * (i * quad) + g[1] * (j * quad)
             })
             .collect();
         let patch = FarPatch {
-            origin,
+            origin: [0, 0],
             quad,
             heights: &heights,
             skirt: 0.0,
         };
+        // The centre vertex (16, 16), where the look direction lands.
+        let centre = glam::vec3(16.0 * quad, (g[0] + g[1]) * 16.0 * quad, 16.0 * quad);
         let shot = Shot {
             // Odd, so the centre pixel's ray is the look direction itself.
             width: 65,
             height: 65,
-            camera: Some((v * 40.0, -v)),
+            camera: Some((centre + v * 40.0, -v)),
             lighting,
             ..Shot::default()
         };

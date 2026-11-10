@@ -27,8 +27,11 @@ const GRID: u32 = FAR_VERTS as u32 + 2;
 /// heights row by row (`z` outer, `x` inner), [`FAR_VERTS`] a side.
 #[derive(Clone, Copy, Debug)]
 pub struct FarPatch<'a> {
-    /// The lowest `(x, z)` corner, in blocks.
-    pub origin: [f32; 2],
+    /// The lowest `(x, z)` corner, in blocks -- the integer it is
+    /// (`cubara_world::far::PatchKey::origin`), kept exact so what is
+    /// subtracted from it (the render anchor, issue #379) is subtracted
+    /// exactly; it becomes an `f32` only in the GPU record.
+    pub origin: [i64; 2],
     /// The width of one quad, in blocks.
     pub quad: f32,
     pub heights: &'a [f32],
@@ -44,9 +47,10 @@ pub struct FarSlot(u32);
 /// What `far.wgsl` reads besides the heights.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarParams {
-    /// The box the voxel rings draw themselves, `(min, max)` in blocks.
+    /// The box the voxel rings draw themselves, `(min, max)` in blocks --
+    /// integers (chunk edges), for the same reason a tile's origin is one.
     /// Nothing of the far terrain is drawn inside it. `None`: no hole.
-    pub hole: Option<([f32; 3], [f32; 3])>,
+    pub hole: Option<([i32; 3], [i32; 3])>,
     /// What the ground is made of: the mean colours of its faces
     /// ([`crate::materials::mean_color`]) and the soil's depth, for the
     /// block-aggregate shading (`crate::aggregate`).
@@ -103,7 +107,10 @@ struct ParamsGpu {
 impl ParamsGpu {
     fn new(p: FarParams) -> Self {
         // No hole: an empty box, min above max, which nothing is inside.
-        let (min, max) = p.hole.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
+        let (min, max) = match p.hole {
+            Some((min, max)) => (min.map(|v| v as f32), max.map(|v| v as f32)),
+            None => ([f32::MAX; 3], [f32::MIN; 3]),
+        };
         let m = p.materials;
         Self {
             hole_min: [min[0], min[1], min[2], 0.0],
@@ -303,7 +310,7 @@ impl FarTerrain {
             &self.patches,
             std::mem::size_of::<PatchGpu>() as u64 * slot as u64,
             bytemuck::bytes_of(&PatchGpu {
-                origin: patch.origin,
+                origin: [patch.origin[0] as f32, patch.origin[1] as f32],
                 quad: patch.quad,
                 skirt: patch.skirt,
             }),
@@ -322,8 +329,8 @@ impl FarTerrain {
 
     pub fn set_params(&mut self, queue: &wgpu::Queue, params: FarParams) {
         self.hole = params.hole.map(|(min, max)| Aabb {
-            min: Vec3::from(min),
-            max: Vec3::from(max),
+            min: Vec3::new(min[0] as f32, min[1] as f32, min[2] as f32),
+            max: Vec3::new(max[0] as f32, max[1] as f32, max[2] as f32),
         });
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&ParamsGpu::new(params)));
     }
@@ -392,9 +399,10 @@ fn patch_box(patch: &FarPatch<'_>) -> Aabb {
     let size = patch.quad * FAR_QUADS as f32;
     let (lo, hi) = min_max(patch.heights);
     let lo = lo - patch.skirt;
+    let [ox, oz] = [patch.origin[0] as f32, patch.origin[1] as f32];
     Aabb {
-        min: Vec3::new(patch.origin[0], lo, patch.origin[1]),
-        max: Vec3::new(patch.origin[0] + size, hi, patch.origin[1] + size),
+        min: Vec3::new(ox, lo, oz),
+        max: Vec3::new(ox + size, hi, oz + size),
     }
 }
 
@@ -491,7 +499,7 @@ mod tests {
             .map(|i| 10.0 + (i % 7) as f32)
             .collect();
         let b = patch_box(&FarPatch {
-            origin: [64.0, -128.0],
+            origin: [64, -128],
             quad: 4.0,
             heights: &heights,
             skirt: 8.0,

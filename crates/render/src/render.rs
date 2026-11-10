@@ -987,58 +987,6 @@ impl Renderer {
     /// below.
     fn drain_uploads(&mut self, last_frame: std::time::Duration) {
         puffin::profile_function!();
-
-        /// [`Uploads::drain`]'s [`Sink`] over this crate's real GPU arena --
-        /// one value borrowing `arena`/`trees`/`queue` together, rather than
-        /// two closures each wanting their own exclusive borrow of the same
-        /// fields at once.
-        struct ArenaSink<'a> {
-            arena: &'a mut ChunkArena,
-            trees: &'a mut crate::trees::TreeArena,
-            queue: &'a wgpu::Queue,
-            /// The bounds of every node this drain stopped drawing
-            /// ([`Renderer::swapped_out`]): a leaver is recorded when its
-            /// Remove actually applies -- after its batch's Inserts, by
-            /// [`Uploads::drain`]'s rules -- never when it is only queued.
-            swapped_out: &'a mut Vec<Aabb>,
-        }
-
-        impl Sink<MeshedNode> for ArenaSink<'_> {
-            fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
-                self.arena.remove(id); // free any prior slot first
-                                       // Cloned, not moved: `node` (the whole `MeshedNode`) is
-                                       // still needed whole if this insert fails and has to be
-                                       // requeued. Cheap either way -- a node's own tree list
-                                       // is at most a handful of positions.
-                let (trees, tree_model) = (node.trees.clone(), node.tree_model);
-                let placed = self.arena.insert(
-                    self.queue,
-                    id,
-                    node.origin,
-                    node.scale,
-                    &node.mesh,
-                    node.aabb,
-                );
-                if placed {
-                    self.trees.insert(id, tree_model, trees, node.aabb);
-                    Ok(())
-                } else {
-                    // Arena full: this node is not done. `Uploads::drain`
-                    // requeues it and keeps draining whatever else can land
-                    // this frame (the arena warns once per episode of being
-                    // full).
-                    Err(node)
-                }
-            }
-
-            fn remove(&mut self, id: NodeId) {
-                if let Some(aabb) = self.arena.remove(id) {
-                    self.swapped_out.push(aabb);
-                }
-                self.trees.remove(id);
-            }
-        }
-
         let started = Instant::now();
         let budget = crate::uploads::upload_budget(last_frame);
         self.swapped_out.clear();
@@ -1651,10 +1599,14 @@ pub const fn tree_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Float32x3];
+const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+    5 => Float32x3, // position, relative to the node's origin
+    6 => Uint32,    // node_index into `node_origins`
+];
 
-/// One tree instance (`crate::trees::TreeInstance`): a world-space position
-/// added to the model's local one.
+/// One tree instance (`crate::trees::TreeInstance`): a node-relative
+/// position added to the model's local one, and the node's slot in the
+/// origins buffer the shader adds back.
 pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<crate::trees::TreeInstance>() as wgpu::BufferAddress,
@@ -1665,9 +1617,11 @@ pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
 
 /// The instanced pipeline trees beyond the first ring draw with (issue #332,
 /// R2 decision 2): one model buffer (`tree_vertex_layout`) plus one instance
-/// buffer (`tree_instance_layout`), `camera_bgl`/`textures_bgl` shared with
-/// the mesh pipeline -- the same uniform, the same block texture array, no
-/// new bind group layout to keep in step with either.
+/// buffer (`tree_instance_layout`), and `camera_bgl`/`origins_bgl`/
+/// `textures_bgl` shared with the mesh pipeline, in the same group order --
+/// the same uniform, the same node origins (an instance is node-relative,
+/// `crate::trees::TreeInstance`), the same block texture array, no new bind
+/// group layout to keep in step with any of them.
 ///
 /// Depth-tested and back-face culled exactly like the terrain and the
 /// figures (decision 5: no discard, no alpha, so hidden-surface removal
@@ -1676,6 +1630,7 @@ pub fn build_tree_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     camera_bgl: &wgpu::BindGroupLayout,
+    origins_bgl: &wgpu::BindGroupLayout,
     textures_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1685,7 +1640,7 @@ pub fn build_tree_pipeline(
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("tree-layout"),
-        bind_group_layouts: &[Some(camera_bgl), Some(textures_bgl)],
+        bind_group_layouts: &[Some(camera_bgl), Some(origins_bgl), Some(textures_bgl)],
         immediate_size: 0,
     });
 
@@ -1901,9 +1856,163 @@ pub fn build_outline_pipeline(
     })
 }
 
+/// [`Uploads::drain`]'s [`Sink`] over this crate's real GPU arena --
+/// one value borrowing `arena`/`trees`/`queue` together, rather than
+/// two closures each wanting their own exclusive borrow of the same
+/// fields at once.
+struct ArenaSink<'a> {
+    arena: &'a mut ChunkArena,
+    trees: &'a mut crate::trees::TreeArena,
+    queue: &'a wgpu::Queue,
+    /// The bounds of every node this drain stopped drawing
+    /// ([`Renderer::swapped_out`]): a leaver is recorded when its
+    /// Remove actually applies -- after its batch's Inserts, by
+    /// [`Uploads::drain`]'s rules -- never when it is only queued.
+    swapped_out: &'a mut Vec<Aabb>,
+}
+
+impl Sink<MeshedNode> for ArenaSink<'_> {
+    fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
+        // Free any prior slot first -- and the trees that pointed
+        // at it, together. A tree instance carries its node's slot
+        // in `node_origins` (`TreeInstance::node_index`); if the
+        // insert below fails and another node takes the freed slot
+        // before this one is retried, instances left behind here
+        // would be drawn at that node's origin. Not through
+        // `remove`: an edit's replacement is not a swap-out
+        // (`swapped_out`).
+        self.arena.remove(id);
+        self.trees.remove(id);
+        // Cloned, not moved: `node` (the whole `MeshedNode`) is
+        // still needed whole if this insert fails and has to be
+        // requeued. Cheap either way -- a node's own tree list
+        // is at most a handful of positions.
+        let (trees, tree_model) = (node.trees.clone(), node.tree_model);
+        let placed = self.arena.insert(
+            self.queue,
+            id,
+            node.origin,
+            node.scale,
+            &node.mesh,
+            node.aabb,
+        );
+        if placed {
+            // Just placed, so the slot exists; the instances are
+            // stored relative to the node's origin and carry this
+            // slot (`TreeInstance`).
+            let node_index = self.arena.node_index(id).expect("just placed");
+            self.trees
+                .insert(id, node_index, node.origin, tree_model, trees, node.aabb);
+            Ok(())
+        } else {
+            // Arena full: this node is not done. `Uploads::drain`
+            // requeues it and keeps draining whatever else can land
+            // this frame (the arena warns once per episode of being
+            // full).
+            Err(node)
+        }
+    }
+
+    fn remove(&mut self, id: NodeId) {
+        if let Some(aabb) = self.arena.remove(id) {
+            self.swapped_out.push(aabb);
+        }
+        self.trees.remove(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tree instance carries its node's slot in `node_origins`, so when a
+    /// re-insert frees the slot and then fails (the arena is full on the
+    /// frame an edit's re-mesh arrives), the trees must go with the slot --
+    /// or the next node to take it draws them at its own origin until the
+    /// retry lands. GPU-backed because `ArenaSink` is the real sink over the
+    /// real arena; without an adapter it skips.
+    #[test]
+    fn a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot() {
+        let pose = CameraPose {
+            eye: glam::Vec3::new(8.0, 80.0, 8.0),
+            look_dir: glam::Vec3::NEG_Z,
+        };
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose) else {
+            crate::headless::skip_or_require_gpu(
+                "a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot",
+            );
+            return;
+        };
+        let id = NodeId {
+            level: 1,
+            pos: [0, 0, 0],
+        };
+        let quad = |vertices: usize| {
+            let v =
+                cubara_voxel::Vertex::new(0, 0, 0, 0, cubara_voxel::Face::DRAW_ORDER[0], 0, 0, 0);
+            cubara_voxel::Mesh {
+                vertices: vec![v; vertices],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ..Default::default()
+            }
+        };
+        let node = |id: NodeId, mesh: cubara_voxel::Mesh, trees: Vec<[i32; 3]>| MeshedNode {
+            id,
+            origin: [0, 0, 0],
+            scale: 1.0,
+            mesh,
+            aabb: crate::culling::Aabb::new(glam::Vec3::ZERO, glam::Vec3::splat(32.0)),
+            trees,
+            tree_model: crate::trees::TreeModel::Oak,
+        };
+        let mut swapped_out = Vec::new();
+        let mut sink = ArenaSink {
+            arena: &mut r.arena,
+            trees: &mut r.trees,
+            queue: &r.queue,
+            swapped_out: &mut swapped_out,
+        };
+        assert!(sink
+            .try_insert(id, node(id, quad(4), vec![[5, 7, 9]]))
+            .is_ok());
+        assert_eq!(sink.trees.node_count(), 1);
+        let slot = sink.arena.node_index(id).expect("just placed");
+
+        // The same node again, re-meshed too big for the arena -- the
+        // insert fails, after the old slot was freed for it.
+        let too_big = quad(crate::arena::VERTEX_CAPACITY as usize + 1);
+        assert!(sink
+            .try_insert(id, node(id, too_big, vec![[5, 7, 9]]))
+            .is_err());
+        assert!(
+            !sink.arena.contains(id),
+            "the failed insert left the old slot"
+        );
+        assert_eq!(
+            sink.trees.node_count(),
+            0,
+            "the node's trees survived its slot {slot} being freed, and still index it"
+        );
+        assert!(
+            sink.swapped_out.is_empty(),
+            "an edit's re-insert is not a swap-out"
+        );
+
+        // Whoever takes that slot next must not inherit them either.
+        let other = NodeId {
+            level: 1,
+            pos: [1, 0, 0],
+        };
+        assert!(sink
+            .try_insert(other, node(other, quad(4), Vec::new()))
+            .is_ok());
+        assert_eq!(
+            sink.arena.node_index(other),
+            Some(slot),
+            "the freed slot is reused"
+        );
+        assert_eq!(sink.trees.node_count(), 0);
+    }
 
     #[test]
     fn vertex_layout_matches_vertex() {

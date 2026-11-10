@@ -31,8 +31,15 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
-@group(1) @binding(0) var tree_textures: texture_2d_array<f32>;
-@group(1) @binding(1) var tree_sampler: sampler;
+// The same per-node origins `mesh.wgsl` reads (`crates/render/src/arena.rs`):
+// an instance stands relative to its node (issue #379 decision 2, so a
+// render-anchor rebase rewrites one vec4 per node and no instance), and this
+// is where the node stands. Only xyz: a tree position is in blocks already,
+// not in the node's lattice units, so `.w` (the lattice scale) is not applied.
+@group(1) @binding(0) var<storage, read> node_origins: array<vec4<f32>>;
+
+@group(2) @binding(0) var tree_textures: texture_2d_array<f32>;
+@group(2) @binding(1) var tree_sampler: sampler;
 
 struct VsIn {
     // Per-vertex, from the model (`trees.rs::TreeVertex`): local position
@@ -44,9 +51,11 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) layer: f32,
     @location(4) color: vec3<f32>,
-    // Per-instance (`trees.rs::TreeInstance`): the world-space position the
-    // model's local origin is added to.
+    // Per-instance (`trees.rs::TreeInstance`): where the model's local
+    // origin stands relative to its node's origin, and that node's slot in
+    // `node_origins`.
     @location(5) instance_pos: vec3<f32>,
+    @location(6) node_index: u32,
 };
 
 struct VsOut {
@@ -60,7 +69,7 @@ struct VsOut {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let world_pos = in.position + in.instance_pos;
+    let world_pos = node_origins[in.node_index].xyz + in.instance_pos + in.position;
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = in.normal;

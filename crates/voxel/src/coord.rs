@@ -26,6 +26,15 @@ impl ChunkCoord {
         Self { x, y, z }
     }
 
+    /// This chunk's origin corner as a world-block coordinate -- the exact
+    /// integer [`world_offset`](Self::world_offset) rounds to `f32`, for the
+    /// renderer's node origins (`cubara_render::ChunkArena::upload_node`),
+    /// which subtract the render anchor from it exactly (issue #379).
+    pub fn world_block(self) -> [i32; 3] {
+        let size = Chunk::SIZE as i32;
+        [self.x * size, self.y * size, self.z * size]
+    }
+
     /// World-space block offset of this chunk's origin corner.
     pub fn world_offset(self) -> [f32; 3] {
         let size = Chunk::SIZE as f32;
