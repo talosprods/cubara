@@ -328,6 +328,10 @@ if [ "$phase" = "3" ]; then
     # nothing where the finished frame has land inside land -- a coarse node
     # still drawn late -- and says how much of it lay under a swap whose lag
     # (#378) was open.
+    # T1 and T4 are both CPU-only (T4 on the M4 ray-marching harness, #381 as
+    # amended); T4's one GPU golden (`golden.rs`,
+    # `the_288_m_edge_matches_a_finer_ring_on_screen`) counts in the normal
+    # test run, not here.
     flight_gate "item 0: flight low" --eye 8,120,8 --look 1,-0.15,0.3 --seconds 20
     flight_gate "item 0: flight high" --eye 8,400,8 --look 1,-0.35,0.3 --seconds 20
     flight_gate "item 0: flight down" --eye 8,450,8 --look 0.4,-0.8,0.2 --seconds 15
@@ -336,7 +340,8 @@ if [ "$phase" = "3" ]; then
     walk_gate "item 0: scripted flight (F4)" --fly --seconds 30
     run_n "item 0: T1 no ring edge doubles a step on screen" 1 \
         cargo test --release -p cubara --bin cubara no_ring_edge_doubles_a_step_on_screen
-    not_yet "item 0: T4 ring edges match a finer ring" "3.0b" "381"
+    run_n "item 0: T4 ring edges match a finer ring" 1 \
+        cargo test --release -p cubara --bin cubara ring_edges_match_a_finer_ring
 
     # Item 1: unchanged mechanism from phases 1 and 2 -- the owner's three
     # fixed first-person eyes at the game's own view distance. The eyes

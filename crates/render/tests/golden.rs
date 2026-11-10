@@ -801,6 +801,114 @@ fn no_crack_at_a_real_lod_boundary() {
     assert_golden("lod_boundary", &world, shot);
 }
 
+/// Mesh exactly the nodes of `schedule` (levels 0-2, around the origin)
+/// that `shot`'s camera can see -- `PROPOSAL_LOD_TRANSITIONS.md` §6 T4's
+/// "meshing only the nodes in the frustum" -- and render them. The frustum
+/// is the renderer's own (`CameraUniform::look_view_proj` +
+/// `Frustum::from_view_proj`, what `ChunkArena::prepare` culls with), so
+/// nothing is meshed that the frame cannot show; at the hill eye looking 44
+/// degrees down that is a wedge of a few hundred nodes instead of the
+/// 1,300-plus level-0 chunks `render_world`'s whole region would be.
+fn render_frustum_nodes(world: &World, shot: Shot, schedule: &[(u32, i32)]) -> Option<Frame> {
+    use cubara_render::{Aabb, CameraUniform, Frustum};
+    let (eye, dir) = shot.camera.expect("a T4 shot has an explicit camera");
+    let frustum = Frustum::from_view_proj(CameraUniform::look_view_proj(
+        shot.width as f32 / shot.height as f32,
+        eye,
+        dir,
+    ));
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let center = ChunkCoord::from_world_pos(eye.to_array());
+    let nodes: Vec<_> = desired_nodes(center, 0..=2, schedule)
+        .into_iter()
+        .filter(|n| {
+            let o = n.world_origin();
+            let size = (16 * n.extent_chunks()) as f32;
+            let lo = glam::vec3(o[0] as f32, o[1] as f32, o[2] as f32);
+            frustum.intersects_aabb(&Aabb::new(lo, lo + glam::Vec3::splat(size)))
+        })
+        .collect();
+    assert!(
+        nodes.iter().any(|n| n.level == 1) && nodes.iter().any(|n| n.level == 2),
+        "the frustum holds both sides of the 288 m edge (levels 1 and 2), or this \
+         pins nothing: {} nodes",
+        nodes.len()
+    );
+    let meshed = mesh_nodes(world, &registry, &layer_of, nodes, real_blocks())
+        .into_iter()
+        .filter_map(to_meshed_node);
+    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    headless::render(meshed, shot)
+}
+
+/// **T4's visual pin** (issue #381 as amended, decision 5): the CPU test
+/// `cubara::lod_probe::tests::ring_edges_match_a_finer_ring` is where T4
+/// lives -- 3 edges x 3 eyes x 2 yaws on the M4 ray-marching harness, with
+/// its calibrated thresholds -- and this one GPU golden is the picture that
+/// the rendered scene agrees with that verdict at one of its cases: the
+/// 288 m edge from the hill eye `[8, 300, 8]`, yaw 0, the camera pitched
+/// to put the edge on the frame's middle row exactly as the CPU case does
+/// (its `pitch` column: `-0.976`, a look vector of `(1, -0.976, 0)`).
+///
+/// What the picture shows, read from the committed golden: the eye is 300
+/// blocks up looking 44 degrees down along +x; the ground fills the frame
+/// from about 90 m out (bottom) to the 512 m edge and the end of ring 2
+/// (top), with ring 1's 2-block cells below the middle row and ring 2's
+/// 4-block cells above it, both one block tall (R1b/R1c). The 288 m edge
+/// runs across the middle of the frame as a change in cell *width* only: no
+/// taller riser, no step in the surface -- which is the thing T4's metric
+/// scores and this golden pins by eye.
+///
+/// **Region-asserted** (#376): the middle 400 x 120 pixels, where the edge
+/// sits, must match the golden within a budget measured for this region
+/// (see the call site). Re-creating option A -- `NodeKey::cell_height_blocks`
+/// returning `2^level`, so ring 2's cells become 4 blocks tall -- changes
+/// that region far beyond the budget (the PR's mutation table has the
+/// count); a GPU-less runner skips, or fails under `CUBARA_REQUIRE_GPU`.
+#[test]
+fn the_288_m_edge_matches_a_finer_ring_on_screen() {
+    let world = World::new();
+    let eye = glam::Vec3::new(8.0, 300.0, 8.0);
+    let shot = Shot {
+        region_radius: 32,
+        camera: Some((eye, glam::Vec3::new(1.0, -0.976, 0.0))),
+        ..Shot::default()
+    };
+    // The real schedule out to ring 2's end (512 m): rings 0-2, so both sides
+    // of the 288 m edge are drawn at their own level.
+    let schedule = schedule_for_radius(shot.region_radius);
+    assert_eq!(schedule, vec![(0, 10), (1, 18), (2, 32)]);
+    let Some(frame) = render_frustum_nodes(&world, shot, &schedule) else {
+        headless::skip_or_require_gpu("the_288_m_edge_matches_a_finer_ring_on_screen");
+        return;
+    };
+    // Calibration for this region, blessed on NVIDIA/Vulkan (Linux,
+    // 2026-11-10), measured per plain pixel comparison at `TOLERANCE`:
+    //
+    // | Signal | Pixels of 48,000 |
+    // |---|---|
+    // | Same machine, same scene, twice | 0 |
+    // | lavapipe (Mesa's CPU Vulkan) against the NVIDIA golden | 23 (whole frame 0.0729%, max delta 98) |
+    // | Option A (`cell_height_blocks` = `2^level`), NVIDIA | **9,584** |
+    // | This budget | 120 |
+    //
+    // 5x the one other backend measured here -- the region is dense with
+    // riser silhouettes, which is where backends disagree, and the three
+    // CI runners (Metal, DX12, and their own Vulkan) were not available to
+    // measure when this was written; their counts are in the `Golden image
+    // deltas` CI step of the PR that landed this -- and 80x under option A.
+    assert_region_golden(
+        "ring_edge_288m",
+        &frame,
+        (440, 300, 400, 120),
+        120,
+        "the 288 m edge across the frame's middle",
+    );
+    assert_frame_golden("ring_edge_288m", Some(frame));
+}
+
 /// Mesh exactly `schedule`'s nodes around the origin (never level 0, which
 /// callers assert for themselves) with trees, and again with every node's
 /// `trees` cleared -- same terrain, same auto-framed camera either way, so
