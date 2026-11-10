@@ -81,7 +81,8 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
     // a plain render-target texture isn't) -- the same real
     // `assets/`-backed array every other entry point binds.
     let arena = ChunkArena::new(&device, false);
-    let (_mesh_assets, tex_view, tex_sampler) = cubara_render::load_mesh_assets(&device, &queue);
+    let (mesh_assets, tex_view, tex_sampler) = cubara_render::load_mesh_assets(&device, &queue);
+    let tree_models = cubara_render::load_tree_models(&device, &queue, &mesh_assets);
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test-color"),
         size: wgpu::Extent3d {
@@ -105,6 +106,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
         4,
         &tex_view,
         &tex_sampler,
+        tree_models,
     );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test-encoder"),
@@ -121,6 +123,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
             cracking: None,
             players: &[],
             far: None,
+            trees: None,
             overlay: None,
             hotbar: None,
             panel: None,

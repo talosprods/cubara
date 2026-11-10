@@ -24,6 +24,11 @@ pub(crate) const FIGURE_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
     include_str!("shaders/figure.wgsl")
 );
+/// `haze.wgsl` prepended to `trees.wgsl` (issue #332, R2).
+pub(crate) const TREES_WGSL: &str = concat!(
+    include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/trees.wgsl")
+);
 
 /// The atmosphere: how thick, and how fast it thins with height.
 #[derive(Clone, Copy, Debug, PartialEq)]

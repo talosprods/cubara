@@ -151,18 +151,40 @@ pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     }
 }
 
+/// Which static model (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R2, issue #332
+/// decision 3) a node at `level` would draw its trees with: the real oak at
+/// levels 1-2, two boxes from level 3 up. Level 0 never matters -- it has no
+/// trees to convert (`cubara_world::mesh::build_node` only populates
+/// `BuiltNode::trees` at `level >= 1`) -- so this is total rather than an
+/// `Option`, for the simplicity of always having an answer to plug into
+/// [`MeshedNode::tree_model`] even where `trees` ends up empty.
+pub(crate) fn tree_model_for(level: u32) -> cubara_render::TreeModel {
+    if level <= 2 {
+        cubara_render::TreeModel::Oak
+    } else {
+        cubara_render::TreeModel::Box
+    }
+}
+
 /// A finished `cubara_world::mesh` job, converted to what `cubara-render`
 /// understands -- `None` if the node was empty. Shared by the live
 /// (worker-pool) path here and the one-shot `--bench`/`--screenshot` paths,
 /// since both end up needing exactly this conversion.
 pub(crate) fn to_meshed_node(built: BuiltNode) -> Option<MeshedNode> {
     let geometry = built.geometry?;
+    let tree_model = tree_model_for(built.node.level);
     Some(MeshedNode {
         id: to_node_id(built.node),
         origin: geometry.origin,
         scale: geometry.scale,
         mesh: geometry.mesh,
         aabb: geometry.aabb,
+        trees: built
+            .trees
+            .iter()
+            .map(|t| [t.x as f32, t.base as f32, t.z as f32])
+            .collect(),
+        tree_model,
     })
 }
 
@@ -660,6 +682,17 @@ mod tests {
             &cubara_server::assets::load_ore_registry(),
             |_: &str| 0,
         )
+    }
+
+    /// Issue #332 decision 3: the real oak at levels 1-2, boxes from level 3
+    /// up -- the line `lod_probe.rs`'s M6 table's "instanced" column
+    /// describes in prose rather than asserting against directly.
+    #[test]
+    fn tree_model_for_splits_at_level_three() {
+        assert_eq!(tree_model_for(1), cubara_render::TreeModel::Oak);
+        assert_eq!(tree_model_for(2), cubara_render::TreeModel::Oak);
+        assert_eq!(tree_model_for(3), cubara_render::TreeModel::Box);
+        assert_eq!(tree_model_for(4), cubara_render::TreeModel::Box);
     }
 
     /// New World replaces every block: nothing streamed from the old world may

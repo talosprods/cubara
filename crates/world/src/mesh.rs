@@ -26,6 +26,7 @@ use cubara_voxel::{
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
+use crate::worldgen::TreeSite;
 use crate::{TerrainBlocks, World};
 
 /// A meshed node's geometry, in world space and ready to hand to a renderer:
@@ -49,6 +50,11 @@ pub struct BuiltNode {
     /// was, in the same job, so the two can never describe different contents.
     /// An empty node joins everything.
     pub links: crate::visibility::NodeLinks,
+    /// Trees `node`'s footprint grows (issue #332, R2 decision 1), standing
+    /// on their own drawn top -- empty at level 0 (real voxel trees already
+    /// mesh into `geometry`) and whenever `geometry` is `None` (nothing is
+    /// drawn here at all, so nothing stands on it either).
+    pub trees: Vec<TreeSite>,
 }
 
 /// Generate `node` once, and both mesh it and work out what it joins -- what a
@@ -61,10 +67,28 @@ pub fn build_node(
     blocks: TerrainBlocks,
 ) -> BuiltNode {
     let chunk = world.node_at(node, blocks);
+    let links = crate::visibility::node_links(chunk.as_ref(), registry);
+    let geometry = chunk
+        .as_ref()
+        .and_then(|c| mesh_chunk(world, registry, layer_of, node, blocks, c));
+    // Both halves of this guard are belt-and-braces, not load-bearing on
+    // their own, which is why neither has a dedicated test here (found by
+    // `check-tests-can-fail.sh`, recorded rather than chased): `node.level
+    // >= 1` is redundant with `World::node_trees`'s own `level == 0` check,
+    // and `geometry.is_some()` only skips wasted computation for a node
+    // nothing will draw -- `to_meshed_node` (cubara-app) discards `trees`
+    // right along with a `None` geometry anyway, so computing it here for a
+    // sky node would be silently thrown away, not wrong.
+    let trees = if node.level >= 1 && geometry.is_some() {
+        world.node_trees(node, blocks)
+    } else {
+        Vec::new()
+    };
     BuiltNode {
         node,
-        links: crate::visibility::node_links(chunk.as_ref(), registry),
-        geometry: chunk.and_then(|c| mesh_chunk(world, registry, layer_of, node, blocks, &c)),
+        links,
+        geometry,
+        trees,
     }
 }
 

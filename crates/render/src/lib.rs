@@ -28,6 +28,7 @@ pub mod profiling;
 mod render;
 mod scene;
 mod text;
+mod trees;
 mod uploads;
 
 pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
@@ -42,10 +43,13 @@ pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
     camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_mesh_assets, load_registry, CameraPose, CameraUniform, FrameUniform, Lighting, Renderer,
+    load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose, CameraUniform,
+    FrameUniform, Lighting, Renderer,
 };
 pub use scene::HealthView;
 pub use scene::{
-    FurnaceGauges, GpuTimestamps, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame, SceneRenderer,
+    FurnaceGauges, GpuTimestamps, HotbarSlot, HotbarView, Hud, PanelView, SceneFrame,
+    SceneRenderer, TreeDraw,
 };
 pub use text::TextRenderer;
+pub use trees::{tree_instance_bounds, TreeArena, TreeModel};

@@ -810,6 +810,14 @@ pub struct MeshedNode {
     pub scale: f32,
     pub mesh: Mesh,
     pub aabb: Aabb,
+    /// World-space positions of the trees this node's footprint grows
+    /// (issue #332, R2 decision 2) -- empty for a node with none, which is
+    /// every level-0 node (its trees are already in `mesh`) and any coarse
+    /// node whose footprint happens to grow none.
+    pub trees: Vec<[f32; 3]>,
+    /// Which static model `trees` draws with: the real oak at levels 1-2,
+    /// boxes at level 3 (decision 3). Meaningless when `trees` is empty.
+    pub tree_model: crate::trees::TreeModel,
 }
 
 #[cfg(test)]

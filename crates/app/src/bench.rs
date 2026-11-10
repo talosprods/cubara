@@ -29,8 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cubara_render::{
-    gpu_driven_features, load_mesh_assets, CameraUniform, ChunkArena, Frustum, GpuTimestamps,
-    SceneFrame, SceneRenderer, TimestampRing,
+    gpu_driven_features, load_mesh_assets, load_structures, load_tree_models, CameraUniform,
+    ChunkArena, Frustum, GpuTimestamps, SceneFrame, SceneRenderer, TimestampRing, TreeArena,
+    TreeDraw,
 };
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::mesh_nodes;
@@ -552,15 +553,23 @@ pub fn run(
         eyes.len(),
         searching.elapsed().as_secs_f64() * 1000.0
     );
-    let mut arena = ChunkArena::from_meshed(
-        &device,
-        &queue,
-        multi_draw,
-        meshed
-            .into_iter()
-            .filter(|b| visible.contains(&b.node))
-            .filter_map(to_meshed_node),
-    );
+    // Collected rather than piped straight into `from_meshed`: trees (issue
+    // #332, R2) go into a *second* GPU-side arena (`TreeArena`), built from
+    // the same visible nodes before they are moved into the chunk one.
+    let visible_meshed: Vec<_> = meshed
+        .into_iter()
+        .filter(|b| visible.contains(&b.node))
+        .filter_map(to_meshed_node)
+        .collect();
+    let tree_data: Vec<_> = visible_meshed
+        .iter()
+        .map(|n| (n.id, n.tree_model, n.trees.clone(), n.aabb))
+        .collect();
+    let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, visible_meshed);
+    let mut trees = TreeArena::new(cubara_render::tree_instance_bounds(&load_structures()));
+    for (id, model, positions, aabb) in tree_data {
+        trees.insert(id, model, positions, aabb);
+    }
     let total_nodes = arena.len();
     // The far terrain beyond the voxels, for the eye the game would draw it
     // for: every patch its selection settles on, built up front like the
@@ -630,6 +639,7 @@ pub fn run(
         }
     );
 
+    let tree_models = load_tree_models(&device, &queue, &mesh_assets);
     // The same scene renderer the window uses — ARCHITECTURE.md Rule 5.
     let mut scene = SceneRenderer::new(
         &device,
@@ -639,6 +649,7 @@ pub fn run(
         height,
         &tex_view,
         &tex_sampler,
+        tree_models,
     );
 
     // Offscreen colour target (the window's equivalent is the surface texture).
@@ -673,6 +684,7 @@ pub fn run(
     // plane extractions), and excluding them understated what "CPU/frame" claims
     // to measure.
     let submit_frame = |arena: &mut ChunkArena,
+                        trees: &mut TreeArena,
                         far: &mut Option<cubara_render::FarTerrain>,
                         scene: &mut SceneRenderer,
                         vt: f32,
@@ -733,6 +745,7 @@ pub fn run(
 
         // CPU cull + indirect-list upload — the per-frame work we're measuring.
         let draw_count = arena.prepare(&queue, &frustum);
+        trees.prepare(&device, &queue, &frustum);
         if let Some(f) = far.as_mut() {
             f.prepare(&queue, &frustum, eye);
         }
@@ -769,6 +782,10 @@ pub fn run(
                 cracking: None,
                 players: &[],
                 far: far.as_ref(),
+                trees: Some(TreeDraw {
+                    oak: trees.oak_instances(),
+                    boxed: trees.box_instances(),
+                }),
                 overlay: overlay_text.as_deref(),
                 health: None,
                 hotbar: None,
@@ -803,6 +820,7 @@ pub fn run(
     while !warmed_up(warmup_frames, warmup_start.elapsed()) {
         submit_frame(
             &mut arena,
+            &mut trees,
             &mut far_terrain,
             &mut scene,
             warmup_t0 + warmup_path_step(warmup_frames) as f32 * VIRTUAL_DT,
@@ -872,6 +890,7 @@ pub fn run(
         cubara_render::Profiler::new_frame();
         let (ms, draws, visible) = submit_frame(
             &mut arena,
+            &mut trees,
             &mut far_terrain,
             &mut scene,
             virtual_t,

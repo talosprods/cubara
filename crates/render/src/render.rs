@@ -154,6 +154,34 @@ pub fn load_mesh_assets(
     (MeshAssets { registry, layers }, view, sampler)
 }
 
+/// `assets/structures/*.ron`, loaded independently of `cubara-server`'s own
+/// copy (`cubara_server::assets::load_structure_registry`) -- this crate
+/// cannot depend on that one (`ARCHITECTURE.md` Rule 3), so it reads the
+/// same data file itself, the same way [`load_registry`] reads
+/// `assets/blocks` itself rather than sharing `cubara-world`'s copy.
+pub fn load_structures() -> cubara_voxel::StructureRegistry {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    cubara_voxel::StructureRegistry::load(&repo_root.join("assets/structures"))
+        .expect("assets/structures must load")
+}
+
+/// The two static tree models (issue #332, R2 decision 3), built from
+/// [`load_structures`] and the mesh assets [`load_mesh_assets`] already
+/// built -- everything [`SceneRenderer::new`] needs to bind them, uploaded
+/// once here alongside the block texture array rather than inside
+/// `SceneRenderer` itself, which has no filesystem access of its own (same
+/// reasoning as `tex_view`/`tex_sampler`: built by the caller, bound by
+/// `SceneRenderer`).
+pub fn load_tree_models(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    assets: &MeshAssets,
+) -> crate::trees::TreeModels {
+    let structures = load_structures();
+    let layer_of = |name: &str| assets.layers.layer_of(name);
+    crate::trees::build_tree_models(device, queue, &assets.registry, &structures, &layer_of)
+}
+
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32];
 
@@ -555,6 +583,10 @@ pub struct Renderer {
     /// patches are the caller's to choose ([`far_insert`](Self::far_insert),
     /// [`far_remove`](Self::far_remove)); this only culls and draws them.
     far: crate::far::FarTerrain,
+    /// Trees beyond the first ring (issue #332, R2): which resident node
+    /// contributed which instances, flattened into the two models' GPU
+    /// instance buffers only when that set actually changes.
+    trees: crate::trees::TreeArena,
     /// Streamed geometry waiting for its turn, drops included
     /// ([`crate::uploads`]): drained a share of each frame's time at a time
     /// ([`crate::uploads::upload_budget`]) to avoid upload spikes.
@@ -735,6 +767,12 @@ impl Renderer {
         camera: CameraPose,
     ) -> (Self, MeshAssets) {
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
+        let tree_models = load_tree_models(&device, &queue, &mesh_assets);
+        // Same `assets/structures` read `load_tree_models` already did
+        // internally (it has no way to hand the registry back out) -- cheap,
+        // and the one place issue #332's culling box needs to know how far a
+        // tree instance reaches from its own position.
+        let tree_local_bounds = crate::trees::tree_instance_bounds(&load_structures());
         let scene = SceneRenderer::new(
             &device,
             &queue,
@@ -743,6 +781,7 @@ impl Renderer {
             height,
             &tex_view,
             &tex_sampler,
+            tree_models,
         );
 
         let aspect = width as f32 / height as f32;
@@ -760,6 +799,7 @@ impl Renderer {
             adapter_name,
             arena,
             far,
+            trees: crate::trees::TreeArena::new(tree_local_bounds),
             uploads: Uploads::new(),
             last_frame: Instant::now(),
             visible_chunks: 0,
@@ -856,6 +896,7 @@ impl Renderer {
     pub fn clear_nodes(&mut self) {
         self.uploads.clear();
         self.arena.clear();
+        self.trees.clear();
     }
 
     /// The window this renders to. Only the game asks, and the game always
@@ -935,6 +976,11 @@ impl Renderer {
             match op {
                 ArenaOp::Insert(id, node) => {
                     self.arena.remove(id); // free any prior slot first
+                                           // Cloned, not moved: `node` (the whole `MeshedNode`) is
+                                           // still needed whole if this insert fails and has to be
+                                           // requeued below. Cheap either way -- a node's own tree
+                                           // list is at most a handful of positions.
+                    let (trees, tree_model) = (node.trees.clone(), node.tree_model);
                     let placed = self.arena.insert(
                         &self.queue,
                         id,
@@ -951,14 +997,23 @@ impl Renderer {
                         self.uploads.requeue(ArenaOp::Insert(id, node));
                         break;
                     }
+                    self.trees.insert(id, tree_model, trees, node.aabb);
                     uploaded += 1;
                     if uploaded >= MIN_UPLOADS_PER_FRAME && started.elapsed() >= budget {
                         break;
                     }
                 }
-                ArenaOp::Remove(id) => self.arena.remove(id),
+                ArenaOp::Remove(id) => {
+                    self.arena.remove(id);
+                    self.trees.remove(id);
+                }
             }
         }
+        // Not re-filtered by the frustum here -- `self.trees.prepare` does
+        // that once per frame, alongside `self.arena.prepare` (issue #332
+        // decision 2), since only *drawn* (frustum-visible) nodes may
+        // contribute, and residency alone (what this function tracks) says
+        // nothing about that.
     }
 
     /// `hud` is plain data the caller reduces its state to -- this crate never
@@ -1026,6 +1081,11 @@ impl Renderer {
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
         self.far.prepare(&self.queue, &self.frustum, camera.eye);
+        // Trees beyond the first ring (issue #332 decision 2): the same
+        // frustum, re-filtering which resident node's trees actually draw
+        // this frame -- cheap even every frame, since what it re-uploads is
+        // at most a few hundred `[f32; 3]`s.
+        self.trees.prepare(&self.device, &self.queue, &self.frustum);
 
         let mut encoder = self
             .device
@@ -1054,6 +1114,10 @@ impl Renderer {
                     cracking,
                     players,
                     far: Some(&self.far),
+                    trees: Some(crate::scene::TreeDraw {
+                        oak: self.trees.oak_instances(),
+                        boxed: self.trees.box_instances(),
+                    }),
                     overlay: overlay.as_deref(),
                     hotbar,
                     panel,
@@ -1514,6 +1578,101 @@ pub fn build_figure_pipeline(
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(true),
             // Reversed-Z, like the terrain: greater is nearer.
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+const TREE_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Float32x3, // position
+    1 => Float32x3, // normal
+    2 => Float32x2, // uv
+    3 => Float32,   // layer
+    4 => Float32x3, // color
+];
+
+/// One tree-model vertex (`crate::trees::TreeVertex`): local position,
+/// normal, this corner's own tile coordinate, texture layer (or negative for
+/// "use `color`"), and a flat colour.
+pub const fn tree_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::trees::TreeVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &TREE_VERTEX_ATTRS,
+    }
+}
+
+const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Float32x3];
+
+/// One tree instance (`crate::trees::TreeInstance`): a world-space position
+/// added to the model's local one.
+pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::trees::TreeInstance>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &TREE_INSTANCE_ATTRS,
+    }
+}
+
+/// The instanced pipeline trees beyond the first ring draw with (issue #332,
+/// R2 decision 2): one model buffer (`tree_vertex_layout`) plus one instance
+/// buffer (`tree_instance_layout`), `camera_bgl`/`textures_bgl` shared with
+/// the mesh pipeline -- the same uniform, the same block texture array, no
+/// new bind group layout to keep in step with either.
+///
+/// Depth-tested and back-face culled exactly like the terrain and the
+/// figures (decision 5: no discard, no alpha, so hidden-surface removal
+/// stays on), `REPLACE` blending (opaque).
+pub fn build_tree_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    textures_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("tree-shader"),
+        source: wgpu::ShaderSource::Wgsl(crate::haze::TREES_WGSL.into()),
+    });
+
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tree-layout"),
+        bind_group_layouts: &[Some(camera_bgl), Some(textures_bgl)],
+        immediate_size: 0,
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("tree-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(tree_vertex_layout()), Some(tree_instance_layout())],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),

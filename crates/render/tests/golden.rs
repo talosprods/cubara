@@ -24,11 +24,11 @@ use std::sync::Mutex;
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
 use cubara_render::{
-    HotbarSlot, InventoryPanel, Lighting, MeshedNode, NodeId, PanelLayout, PanelSlotKind,
+    HotbarSlot, InventoryPanel, Lighting, MeshedNode, NodeId, PanelLayout, PanelSlotKind, TreeModel,
 };
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
-use cubara_world::mesh::mesh_region;
-use cubara_world::node::schedule_for_radius;
+use cubara_world::mesh::{mesh_nodes, mesh_region};
+use cubara_world::node::{desired_nodes, schedule_for_radius};
 use cubara_world::{TerrainBlocks, World};
 
 /// The real `assets/blocks` registry -- the same one every entry point
@@ -50,6 +50,42 @@ fn real_blocks() -> TerrainBlocks {
 fn real_registry() -> BlockRegistry {
     let assets_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/blocks");
     BlockRegistry::load(&assets_dir).expect("assets/blocks must be valid")
+}
+
+/// Which static model a node at `level` draws its trees with (issue #332
+/// decision 3) -- mirrors `cubara_app::streaming::tree_model_for`, which
+/// this test cannot import (`cubara-render`'s own tests cannot depend on
+/// `cubara-app`; dependencies point one way, `ARCHITECTURE.md` Rule 3).
+fn tree_model_for(level: u32) -> TreeModel {
+    if level <= 2 {
+        TreeModel::Oak
+    } else {
+        TreeModel::Box
+    }
+}
+
+/// [`cubara_world::mesh::BuiltNode`] converted to [`MeshedNode`] -- mirrors
+/// `cubara_app::streaming::to_meshed_node` for the same reason
+/// [`tree_model_for`] does.
+fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
+    let geometry = built.geometry?;
+    let tree_model = tree_model_for(built.node.level);
+    Some(MeshedNode {
+        id: NodeId {
+            level: built.node.level,
+            pos: built.node.pos,
+        },
+        origin: geometry.origin,
+        scale: geometry.scale,
+        mesh: geometry.mesh,
+        aabb: geometry.aabb,
+        trees: built
+            .trees
+            .iter()
+            .map(|t| [t.x as f32, t.base as f32, t.z as f32])
+            .collect(),
+        tree_model,
+    })
 }
 
 /// Serialises every `wgpu::Instance`/adapter/device creation and teardown in
@@ -99,19 +135,7 @@ fn render_world(world: &World, shot: Shot) -> Option<Frame> {
         real_blocks(),
     )
     .into_iter()
-    .filter_map(|built| {
-        let geometry = built.geometry?;
-        Some(MeshedNode {
-            id: NodeId {
-                level: built.node.level,
-                pos: built.node.pos,
-            },
-            origin: geometry.origin,
-            scale: geometry.scale,
-            mesh: geometry.mesh,
-            aabb: geometry.aabb,
-        })
-    });
+    .filter_map(to_meshed_node);
     let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     headless::render(meshed, shot)
 }
@@ -567,6 +591,136 @@ fn no_crack_at_a_real_lod_boundary() {
         ..Shot::default()
     };
     assert_golden("lod_boundary", &world, shot);
+}
+
+/// Mesh exactly `schedule`'s nodes around the origin (never level 0, which
+/// callers assert for themselves) with trees, and again with every node's
+/// `trees` cleared -- same terrain, same auto-framed camera either way, so
+/// the only thing that can differ between the two renders is whether R2's
+/// instances were drawn. Shared by [`trees_continue_past_the_first_ring`]
+/// and [`level_three_trees_draw_as_boxes`], which differ only in which
+/// level they isolate.
+fn render_with_and_without_trees(schedule: &[(u32, i32)]) -> Option<(Frame, Frame)> {
+    let world = World::new();
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let blocks = real_blocks();
+
+    let center = ChunkCoord::new(0, 0, 0);
+    let nodes = desired_nodes(center, 0..=0, schedule);
+    assert!(
+        nodes.iter().all(|n| n.level >= 1),
+        "a level-0 node would carry real voxel trees of its own, which this \
+         test must rule out to isolate R2's instances"
+    );
+
+    let with_trees = mesh_nodes(&world, &registry, &layer_of, nodes.clone(), blocks);
+    assert!(
+        with_trees.iter().any(|b| !b.trees.is_empty()),
+        "no coarse node around the default-seed origin grows a tree at all \
+         -- this scene proves nothing until it does"
+    );
+    let mut without_trees = mesh_nodes(&world, &registry, &layer_of, nodes, blocks);
+    for b in &mut without_trees {
+        b.trees.clear();
+    }
+
+    let shot = Shot {
+        width: 960,
+        height: 540,
+        ..Shot::default()
+    };
+    let render = |built: Vec<cubara_world::mesh::BuiltNode>| {
+        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        headless::render(built.into_iter().filter_map(to_meshed_node), shot.clone())
+    };
+    let (with_frame, without_frame) = (render(with_trees), render(without_trees));
+    Some((with_frame?, without_frame?))
+}
+
+/// T7 (`docs/PROPOSAL_LOD_TRANSITIONS.md` §6, issue #332 R2):
+/// "trees_continue_past_the_first_ring" -- leaf-coloured pixels show up past
+/// the first ring now, where before this landed nothing did.
+///
+/// Meshed is *only* `desired_nodes`' levels 1-2 selection (160-512 m) --
+/// never level 0 -- so nothing in the geometry this renders can be a real
+/// voxel tree (those only ever grow at level 0,
+/// `WorldGen::generate`'s own doc comment). Whatever the camera sees
+/// standing above the coarse ground can only be R2's instances (the real
+/// oak model at these levels, decision 3).
+///
+/// Rendered twice from the *identical* mesh and camera
+/// ([`render_with_and_without_trees`]), with every node's `trees` cleared
+/// the second time. `headless::compare` (the goldens' own pixel diff)
+/// between the two is the assertion: if the scene doesn't visibly change,
+/// nothing drew. That is also this test's own proof that it can fail
+/// (CLAUDE.md "a test that has never been seen to fail is not yet
+/// evidence") -- `./scripts/check-tests-can-fail.sh`-style, stated
+/// directly: strip the renderer's own tree draw (not just this test's
+/// copy) and this goes red, recorded in the PR's defect-injection table.
+#[test]
+fn trees_continue_past_the_first_ring() {
+    // Levels 1 and 2 only: a schedule whose first entry is level 1, never
+    // level 0, so `desired_nodes` cannot select one.
+    let schedule = [(1u32, 18i32), (2, 32)];
+    let Some((with_frame, without_frame)) = render_with_and_without_trees(&schedule) else {
+        eprintln!(
+            "SKIPPED trees_continue_past_the_first_ring: no GPU adapter available on this machine"
+        );
+        return;
+    };
+    assert_eq!(
+        (with_frame.width, with_frame.height),
+        (without_frame.width, without_frame.height)
+    );
+    let diff = headless::compare(&with_frame.pixels, &without_frame.pixels, TOLERANCE);
+    eprintln!(
+        "trees_continue_past_the_first_ring: {:.4}% of pixels differ with trees on vs off \
+         (max channel delta {})",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta
+    );
+    assert!(
+        diff.differing_fraction > MAX_DIFFERING,
+        "turning trees on changed only {:.4}% of pixels (same threshold the \
+         goldens use for cross-backend noise) -- nothing R2 added is \
+         actually visible past the first ring",
+        diff.differing_fraction * 100.0
+    );
+}
+
+/// Decision 3's other half: level 3 draws two boxes, not the real oak --
+/// its own instanced draw, so "the real oak model landed but the boxes
+/// didn't" is a distinct failure T7 alone cannot see (T7 never reaches
+/// level 3). Same method as T7 (`render_with_and_without_trees`), isolated
+/// to a level-3-only schedule instead.
+#[test]
+fn level_three_trees_draw_as_boxes() {
+    let schedule = [(3u32, 16i32)];
+    let Some((with_frame, without_frame)) = render_with_and_without_trees(&schedule) else {
+        eprintln!(
+            "SKIPPED level_three_trees_draw_as_boxes: no GPU adapter available on this machine"
+        );
+        return;
+    };
+    assert_eq!(
+        (with_frame.width, with_frame.height),
+        (without_frame.width, without_frame.height)
+    );
+    let diff = headless::compare(&with_frame.pixels, &without_frame.pixels, TOLERANCE);
+    eprintln!(
+        "level_three_trees_draw_as_boxes: {:.4}% of pixels differ with trees on vs off \
+         (max channel delta {})",
+        diff.differing_fraction * 100.0,
+        diff.max_channel_delta
+    );
+    assert!(
+        diff.differing_fraction > MAX_DIFFERING,
+        "turning trees on at level 3 changed only {:.4}% of pixels -- the \
+         box model is not actually visible",
+        diff.differing_fraction * 100.0
+    );
 }
 
 #[test]
@@ -1401,19 +1555,7 @@ fn render_world_with_far(
         real_blocks(),
     )
     .into_iter()
-    .filter_map(|built| {
-        let geometry = built.geometry?;
-        Some(MeshedNode {
-            id: NodeId {
-                level: built.node.level,
-                pos: built.node.pos,
-            },
-            origin: geometry.origin,
-            scale: geometry.scale,
-            mesh: geometry.mesh,
-            aabb: geometry.aabb,
-        })
-    });
+    .filter_map(to_meshed_node);
     let patches: Vec<FarPatch> = far
         .iter()
         .map(|p| {

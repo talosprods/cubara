@@ -610,6 +610,70 @@ impl WorldGen {
         self.density_at_v(x, y, z, surface, v) > 0.0
     }
 
+    /// The `y` of the topmost block a coarse node whose vertical cells are
+    /// `v` blocks tall ([`crate::node::NodeKey::cell_height_blocks`])
+    /// actually draws at column `(x, z)` -- what issue #332 (R2) decision 1
+    /// calls "the column's drawn top": exactly [`surface_height`](Self::surface_height)
+    /// at `v = 1` (levels 0-2, since every row is already one block), and the
+    /// top of whichever `v`-tall row holds the surface otherwise (level 3,
+    /// `v = 4`) -- "within half a cell" of the exact surface, which is as
+    /// close as a node that coarse ever draws its own ground.
+    ///
+    /// A row starts solid while its own middle (`row*v + (v-1)/2`) is at or
+    /// under the surface -- the same boundary [`density_at_v`] tests, so this
+    /// can never disagree with what `generate_aniso` actually meshes. Rows
+    /// are at world `y` multiples of `v` with no node-specific offset: every
+    /// node's own [`chunk_origin`](crate::node::NodeKey::chunk_origin) scaled
+    /// to blocks is already a multiple of `v` (`16 * 2^level` is a multiple
+    /// of 4 from level 2 up), so the row grid a tree needs to stand on is the
+    /// same regardless of which node its column happens to belong to.
+    pub fn drawn_top(&self, x: i32, z: i32, v: i32) -> i32 {
+        let surface = self.surface_height(x, z);
+        if v <= 1 {
+            return surface;
+        }
+        let bound = surface + 1 - (v - 1) / 2;
+        let row = (bound - 1).div_euclid(v);
+        row * v + (v - 1)
+    }
+
+    /// Every tree whose trunk chunk column `node` covers, standing on
+    /// [`drawn_top`](Self::drawn_top) rather than the exact surface (issue
+    /// #332, R2 decision 1) -- the same sites [`tree_site`](Self::tree_site)
+    /// places at level 0, so a tree never pops in or out crossing a ring
+    /// edge. `None` at level 0: its real voxel trees are grown by
+    /// [`block_at`](Self::block_at)/[`is_solid_with_trees`](Self::is_solid_with_trees)
+    /// already (decision 1's "one source: no second placement rule" --
+    /// this is not a second one, it is the same `tree_site` evaluated over a
+    /// node's footprint instead of one chunk column at a time).
+    ///
+    /// Pure, like every other placement in this file (§8.1): `cubara-app`'s
+    /// streaming glue calls this once per resident coarse node and hands the
+    /// positions to `cubara-render`, which never calls into this crate
+    /// (`ARCHITECTURE.md` Rule 3).
+    pub fn node_trees(&self, node: crate::node::NodeKey, blocks: TerrainBlocks) -> Vec<TreeSite> {
+        if node.level == 0 {
+            return Vec::new();
+        }
+        let v = node.cell_height_blocks();
+        let origin = node.chunk_origin();
+        let extent = node.extent_chunks();
+        let mut out = Vec::new();
+        for cz in origin.z..origin.z + extent {
+            for cx in origin.x..origin.x + extent {
+                let Some(site) = self.tree_site(cx, cz, blocks) else {
+                    continue;
+                };
+                let top = self.drawn_top(site.x, site.z, v);
+                out.push(TreeSite {
+                    base: top + 1,
+                    ..site
+                });
+            }
+        }
+        out
+    }
+
     /// Whether the cell of `step` blocks at `(x, y, z)` is cave.
     ///
     /// A block is cave where the cave noise crosses the threshold. A larger
@@ -852,6 +916,12 @@ impl WorldGen {
     ///
     /// Trunk wins over canopy where they overlap, so the trunk reads as a
     /// continuous column rather than being swallowed by its own leaves.
+    ///
+    /// The single-tree shape test (trunk column, rounded canopy blob) is
+    /// [`cubara_voxel::tree_part_at`], not duplicated here (issue #332) --
+    /// this function's own job is only the part that needs trees' absolute
+    /// positions: which of several overlapping trees wins where they
+    /// disagree.
     pub(crate) fn tree_block_at(
         &self,
         trees: &TreeSet,
@@ -862,23 +932,11 @@ impl WorldGen {
     ) -> Option<BlockId> {
         let mut leaves = false;
         for t in trees.iter() {
-            let top = t.base + t.height - 1;
-            if t.x == x && t.z == z && y >= t.base && y <= top {
-                return Some(oak.log);
-            }
-            // A blob around the top of the trunk: within the canopy radius
-            // horizontally, and from just below the top to just above it.
-            let dx = (x - t.x).abs();
-            let dz = (z - t.z).abs();
-            let r = oak.canopy_radius;
-            if dx <= r && dz <= r && y >= top - r && y <= top + 1 {
-                // Trim the corners so the canopy reads as round rather than a
-                // cube, and drop the ring at the very top so it comes to a
-                // point.
-                let shrink = if y >= top { 1 } else { 0 };
-                if dx + dz <= r + 1 - shrink {
-                    leaves = true;
-                }
+            let (dx, dz, dy) = ((x - t.x).abs(), (z - t.z).abs(), y - t.base);
+            match cubara_voxel::tree_part_at(dx, dz, dy, t.height, oak.canopy_radius) {
+                Some(cubara_voxel::TreePart::Trunk) => return Some(oak.log),
+                Some(cubara_voxel::TreePart::Canopy) => leaves = true,
+                None => {}
             }
         }
         leaves.then_some(oak.leaves)
@@ -1479,6 +1537,163 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn drawn_top_is_the_surface_itself_at_v_one() {
+        // Levels 0-2 (issue #332, R2 decision 1): a tree there stands at
+        // exactly the real surface, same as a level-0 tree.
+        let gen = WorldGen::new(0x77EE_5EED);
+        for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
+            assert_eq!(gen.drawn_top(x, z, 1), gen.surface_height(x, z));
+        }
+    }
+
+    #[test]
+    fn drawn_top_is_within_half_a_cell_at_v_four() {
+        // Level 3 (R2 decision 1: "within half a cell at level 3's v = 4"),
+        // and always the top block of a 4-tall row -- never a value a level-3
+        // node's own mesh wouldn't actually draw as the top of a cell.
+        let gen = WorldGen::new(0x77EE_5EED);
+        for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12), (5, 5)] {
+            let surface = gen.surface_height(x, z);
+            let top = gen.drawn_top(x, z, 4);
+            assert!(
+                (top - surface).abs() <= 2,
+                "({x},{z}): drawn top {top} vs surface {surface}, more than half a 4-cell off"
+            );
+            assert_eq!(
+                top.rem_euclid(4),
+                3,
+                "({x},{z}): {top} is not the top block of a 4-tall row"
+            );
+        }
+    }
+
+    #[test]
+    fn node_trees_is_empty_at_level_zero() {
+        // Level 0 already grows real voxel trees (`block_at`); `node_trees`
+        // must not place a second, independent set on top of them.
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        let node = crate::node::NodeKey::new(0, [0, 0, 0]);
+        assert!(gen.node_trees(node, blocks).is_empty());
+    }
+
+    #[test]
+    fn node_trees_is_exactly_one_per_tree_bearing_column_in_the_footprint() {
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        let node = crate::node::NodeKey::new(2, [1, 0, -1]); // level 2, extent 4
+        let trees = gen.node_trees(node, blocks);
+
+        let origin = node.chunk_origin();
+        let extent = node.extent_chunks();
+        let mut expected = 0usize;
+        for cz in origin.z..origin.z + extent {
+            for cx in origin.x..origin.x + extent {
+                if gen.tree_site(cx, cz, blocks).is_some() {
+                    expected += 1;
+                }
+            }
+        }
+        assert_eq!(
+            trees.len(),
+            expected,
+            "wrong count of trees in the footprint"
+        );
+        // Every tree's (x, z) is genuinely inside the node's own chunk
+        // footprint, in blocks -- a tree outside it would be a column some
+        // *other* node is responsible for, drawn twice.
+        let size = Chunk::SIZE as i32;
+        for t in &trees {
+            assert!(
+                (origin.x * size..(origin.x + extent) * size).contains(&t.x),
+                "{t:?} outside the node's own x span"
+            );
+            assert!(
+                (origin.z * size..(origin.z + extent) * size).contains(&t.z),
+                "{t:?} outside the node's own z span"
+            );
+        }
+    }
+
+    #[test]
+    fn node_trees_stands_on_the_drawn_top_not_the_exact_surface_at_level_three() {
+        // `drawn_top` is tested directly above; this proves `node_trees`
+        // actually *calls* it for level 3 rather than handing back
+        // `tree_site`'s own exact-surface base unmodified -- a search wide
+        // enough to find at least one tree whose base differs from the
+        // exact surface, which a `node_trees` that skipped the adjustment
+        // would never produce.
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        let mut saw_adjustment = false;
+        'search: for nx in -4..4 {
+            for nz in -4..4 {
+                let node = crate::node::NodeKey::new(3, [nx, 0, nz]);
+                for t in gen.node_trees(node, blocks) {
+                    let exact = gen.surface_height(t.x, t.z) + 1;
+                    if t.base != exact {
+                        saw_adjustment = true;
+                        break 'search;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_adjustment,
+            "no level-3 tree ever differed from the exact surface -- \
+             drawn_top's v=4 snapping is not being exercised by node_trees"
+        );
+    }
+
+    /// **T332-edge**, the issue's own bar: a tree site exactly at the 160 m
+    /// edge is a tree on both sides of a level-0/level-1 swap. Level 0 draws
+    /// it as real voxel blocks (`tree_site`, the same rule `block_at` uses);
+    /// a level-1 node covering the same chunk column must grow the identical
+    /// tree (`node_trees`) -- same column, same height, same standing base
+    /// (`v = 1` at level 1, so `drawn_top` is exact) -- or crossing that ring
+    /// edge pops a tree in or out.
+    #[test]
+    fn a_tree_at_the_160m_edge_is_a_tree_on_both_sides_of_the_swap() {
+        use crate::node::NodeKey;
+        use cubara_voxel::ChunkCoord;
+
+        let gen = WorldGen::new(0x77EE_5EED);
+        let blocks = tree_blocks();
+        // `node::DEFAULT_RING_SCHEDULE`'s first ring ends at chunk-radius 10
+        // (160 m): level 0 up to there, level 1 picks up past it. Trees are
+        // sparse (one in `density` columns), so search outward from the edge
+        // chunk for one that actually has a tree.
+        let (cx, cz) = (9..16)
+            .flat_map(|cx| (-4..4).map(move |cz| (cx, cz)))
+            .find(|&(cx, cz)| gen.tree_site(cx, cz, blocks).is_some())
+            .expect("some chunk column at/near the 160m edge grows a tree");
+
+        // The level-0 side: exactly what `block_at`'s per-voxel trees place.
+        let level0 = gen.tree_site(cx, cz, blocks).expect("checked above");
+
+        // The level-1 side: the coarse node that would replace this chunk
+        // once it crosses the edge.
+        let node = NodeKey::containing(ChunkCoord::new(cx, 0, cz), 1);
+        let node_trees = gen.node_trees(node, blocks);
+        let same_tree = node_trees
+            .iter()
+            .find(|t| t.x == level0.x && t.z == level0.z)
+            .unwrap_or_else(|| {
+                panic!("level-1 node {node:?} grows no tree at ({}, {}), level 0 does -- a tree would vanish crossing the edge", level0.x, level0.z)
+            });
+
+        assert_eq!(
+            same_tree.base, level0.base,
+            "a tree changed standing height crossing the 160m edge"
+        );
+        assert_eq!(
+            same_tree.height, level0.height,
+            "a tree changed size crossing the edge"
+        );
+        assert_eq!(same_tree.canopy_radius, level0.canopy_radius);
     }
 
     #[test]

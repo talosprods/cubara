@@ -21,6 +21,7 @@ pub mod registry;
 pub mod smelt;
 pub mod storage;
 pub mod structure;
+pub mod tree_shape;
 pub mod voxel;
 
 pub use angle::Angle;
@@ -44,4 +45,5 @@ pub use registry::{
 pub use smelt::{SmeltBook, SmeltError, SmeltRecipe, SmeltRecipeDef};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
+pub use tree_shape::{tree_bounds, tree_part_at, TreePart};
 pub use voxel::{face_ao, Chunk, MeshContext};

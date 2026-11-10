@@ -18,12 +18,13 @@ use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
     build_far_pipeline, build_figure_pipeline, build_mesh_pipeline_from_module,
-    build_outline_pipeline, build_pipeline, camera_bind_group_layout, create_depth_view,
-    far_bind_group_layout, mesh_pipeline_constants, origins_bind_group_layout,
+    build_outline_pipeline, build_pipeline, build_tree_pipeline, camera_bind_group_layout,
+    create_depth_view, far_bind_group_layout, mesh_pipeline_constants, origins_bind_group_layout,
     outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;
+use crate::trees::TreeModels;
 
 /// The sky colour a frame clears to.
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -65,6 +66,11 @@ pub struct SceneFrame<'a> {
     /// already [`prepare`](crate::far::FarTerrain::prepare)d for this frame's
     /// camera, or `None` for none.
     pub far: Option<&'a crate::far::FarTerrain>,
+    /// Trees beyond the first ring (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3
+    /// R2, issue #332): the instance buffers to draw with the two static
+    /// models, or `None` to draw none (a headless shot with no trees at
+    /// all).
+    pub trees: Option<TreeDraw<'a>>,
     /// Health in **points**, or `None` to draw no hearts.
     ///
     /// Points, not hearts, and not a fraction: this crate is told the number
@@ -108,6 +114,16 @@ pub struct GpuTimestamps<'a> {
     pub begin: u32,
     /// Index written just after the main pass ends.
     pub end: u32,
+}
+
+/// The two tree-instance buffers to draw this frame -- `(buffer, instance
+/// count)` per model, or `None` where that model has nothing to draw
+/// (issue #332, R2 decision 2: "one draw per model", so an empty model
+/// draws zero times rather than once with zero instances).
+#[derive(Clone, Copy)]
+pub struct TreeDraw<'a> {
+    pub oak: Option<(&'a wgpu::Buffer, u32)>,
+    pub boxed: Option<(&'a wgpu::Buffer, u32)>,
 }
 
 /// Everything drawn over the world in screen space, as the window hands it to
@@ -255,6 +271,14 @@ pub struct SceneRenderer {
     figure_pipeline: wgpu::RenderPipeline,
     /// The far terrain's (`far.wgsl`), drawn after the voxels.
     far_pipeline: wgpu::RenderPipeline,
+    /// Trees beyond the first ring (`trees.wgsl`, issue #332 R2): one
+    /// instanced pipeline, shared by both static models.
+    tree_pipeline: wgpu::RenderPipeline,
+    /// The two static tree models' own GPU buffers, built once at startup
+    /// ([`crate::render::load_tree_models`]) and never rewritten -- only the
+    /// *instances* (where each one stands) change, which is
+    /// [`crate::trees::TreeArena`]'s job, not this struct's.
+    tree_models: TreeModels,
     /// Rebuilt every frame from the players in sight, and grown when it has to
     /// be. A figure is 216 vertices, so this stays small enough that reusing
     /// one buffer beats managing per-player ones.
@@ -277,7 +301,10 @@ pub struct SceneRenderer {
 impl SceneRenderer {
     /// `texture_view`/`texture_sampler` are the block texture array built by
     /// [`crate::render::load_mesh_assets`] — `SceneRenderer` only binds it,
-    /// it doesn't know about the registry that produced it.
+    /// it doesn't know about the registry that produced it. `tree_models`
+    /// is the same story (issue #332, R2): built by the caller
+    /// ([`crate::render::load_tree_models`]), bound here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -286,6 +313,7 @@ impl SceneRenderer {
         height: u32,
         texture_view: &wgpu::TextureView,
         texture_sampler: &wgpu::Sampler,
+        tree_models: TreeModels,
     ) -> Self {
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera-uniform"),
@@ -311,6 +339,11 @@ impl SceneRenderer {
         let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
         let far_pipeline =
             build_far_pipeline(device, format, &camera_bgl, &far_bind_group_layout(device));
+        // Same texture bind group layout as the mesh pipeline -- the trees
+        // pipeline reads the same block texture array (decision 4: "from
+        // the same uniforms"), just at @group(1) instead of @group(2),
+        // since it has no origins bind group to put there.
+        let tree_pipeline = build_tree_pipeline(device, format, &camera_bgl, &textures_bgl);
         let figure_capacity = crate::figure::VERTICES_PER_FIGURE * 8;
         let figure_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("figure-vertices"),
@@ -370,6 +403,8 @@ impl SceneRenderer {
             texture_bind_group,
             figure_pipeline,
             far_pipeline,
+            tree_pipeline,
+            tree_models,
             figure_vertex_buffer,
             figure_capacity,
             outline_pipeline,
@@ -570,6 +605,7 @@ impl SceneRenderer {
             cracking,
             players,
             far,
+            trees,
             overlay,
             hotbar,
             panel,
@@ -672,6 +708,39 @@ impl SceneRenderer {
             pass.set_bind_group(1, arena.origins_bind_group(), &[]);
             pass.set_bind_group(2, &self.texture_bind_group, &[]);
             arena.encode(&mut pass, draw_count);
+
+            // Trees beyond the first ring (issue #332, R2): the same
+            // camera/texture bind groups, one instanced draw per model with
+            // something to draw -- "one draw per model" (decision 2), so an
+            // empty model draws zero times rather than once with zero
+            // instances.
+            //
+            // The pipeline/bind-group *state changes* themselves are gated
+            // the same way: with nothing in frustum to draw (the common case
+            // away from any coarse node, e.g. the flight eye, which has no
+            // voxel nodes and so no trees), this must cost nothing beyond
+            // the `is_some()` checks below -- not a pipeline bind and two
+            // bind-group binds for zero draws. Measured: the state changes
+            // alone cost CPU/frame even with zero instances, which is
+            // exactly the fixed cost this skips.
+            if let Some(trees) = trees.filter(|t| t.oak.is_some() || t.boxed.is_some()) {
+                pass.set_pipeline(&self.tree_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                if let (Some(oak), Some((instances, count))) = (&self.tree_models.oak, trees.oak) {
+                    pass.set_vertex_buffer(0, oak.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, instances.slice(..));
+                    pass.set_index_buffer(oak.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..oak.index_count, 0, 0..count);
+                }
+                if let Some((instances, count)) = trees.boxed {
+                    let boxed = &self.tree_models.boxed;
+                    pass.set_vertex_buffer(0, boxed.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, instances.slice(..));
+                    pass.set_index_buffer(boxed.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..boxed.index_count, 0, 0..count);
+                }
+            }
 
             // The far terrain, after the voxels: where both could draw, the
             // depth test and the hole leave it to them.

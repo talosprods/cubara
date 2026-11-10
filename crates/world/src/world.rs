@@ -18,7 +18,7 @@ use cubara_voxel::{BlockId, Chunk, ChunkCoord, NodeChunk};
 use crate::block_entity::{BlockEntities, Furnace};
 use crate::chunk_state::{ChunkStates, Woken};
 use crate::node::NodeKey;
-use crate::worldgen::{TerrainBlocks, WorldGen};
+use crate::worldgen::{TerrainBlocks, TreeSite, WorldGen};
 
 /// The seed [`World::new`] uses -- a fixed constant, so callers that don't
 /// need a *specific* seed (most tests, the benches, and the live game, which
@@ -390,6 +390,16 @@ impl World {
             blocks,
         );
         (!chunk.is_empty()).then_some(NodeChunk::Aniso(chunk))
+    }
+
+    /// Every tree `node`'s footprint grows, standing on its own drawn top
+    /// (issue #332, R2 decision 1) -- empty at level 0, whose real voxel
+    /// trees are grown by [`block_at`](crate::WorldGen::block_at) already.
+    /// Delegates straight to [`WorldGen::node_trees`]: terrain never
+    /// consults the edit overlay for LOD nodes (see [`node_at`](Self::node_at)'s
+    /// doc comment), and neither does this.
+    pub fn node_trees(&self, node: NodeKey, blocks: TerrainBlocks) -> Vec<TreeSite> {
+        self.worldgen.node_trees(node, blocks)
     }
 
     /// Whether `node` lies wholly above anything the generator places and no

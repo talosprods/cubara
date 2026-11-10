@@ -447,22 +447,34 @@ pub fn tree_sites(
 }
 
 /// M6 as the table that goes in the PR.
+///
+/// Two columns answer two different questions, not one: "grown there"
+/// (real voxel blocks, `WorldGen::generate`/`generate_aniso` -- still only
+/// level 0) and "instanced" (issue #332, R2's static models, now levels
+/// 1-3). Before R2 the second column would have read "no" everywhere but
+/// level 0, which is exactly the tree line at 160 m this landed to remove.
 pub fn format_m6(name: &str, eye: [f32; 3], rows: &[TreeRow; LEVELS]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "M6 {name} eye {eye:?}");
     let _ = writeln!(
         s,
-        "| level | grown there today | trees | in view (avg) | on-screen height px mean (min-max) |"
+        "| level | grown there today | instanced (R2) | trees | in view (avg) | on-screen height px mean (min-max) |"
     );
-    let _ = writeln!(s, "|---|---|---|---|---|");
+    let _ = writeln!(s, "|---|---|---|---|---|---|");
     for (l, r) in rows.iter().enumerate() {
         if r.trees == 0 {
             continue;
         }
+        // No test asserts this table's exact text (`check-tests-can-fail.sh`
+        // found the "instanced" column's cell survive a mutation that always
+        // prints "no") -- it is PR-report prose, not program behaviour; the
+        // thing it reports (which model a level actually draws with) is
+        // `cubara_app::streaming::tree_model_for`, which does have one.
         let _ = writeln!(
             s,
-            "| {l} | {} | {} | {:.0} | {:.1} ({:.1}-{:.1}) |",
+            "| {l} | {} | {} | {} | {:.0} | {:.1} ({:.1}-{:.1}) |",
             if l == 0 { "yes" } else { "no" },
+            if l == 0 { "no" } else { "yes" },
             r.trees,
             r.in_view_avg,
             r.px_mean,
@@ -694,6 +706,7 @@ mod tests {
                 scale: 1.0,
             }),
             links: cubara_world::visibility::OPEN,
+            trees: Vec::new(),
         }
     }
 

@@ -216,8 +216,10 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-10 | **Coarse cells one block tall** (R1b+R1c, #327) — gate eye ground (High): 259,850 voxel triangles drawn, was 165,711⁸⁴ | 1,940 | 819,928 voxel + far | ~1,429 (−9.5%) | 0.180 ms (+0.006) | -- | `79ceb55` |
 | 2026-11-10 | R1b+R1c — gate eye hill (High): 196,619 drawn, was 99,170⁸⁴ | 869 | 436,690 voxel + far | ~1,548 (−11.7%) | -- | -- | `79ceb55` |
 | 2026-11-10 | R1b+R1c — gate eye flight (High)⁸⁴ | 0 | far only | ~2,417 (−0.7%) | -- | -- | `79ceb55` |
-| 2026-11-10 | **Circular rings for the split** (R3a, #327) — gate eye ground (High): 836 draws and 213,381 voxel triangles, were 1,046 and 259,850⁸⁵ | 1,940 | 819,928 voxel + far | ~1,504 (+5.0%) | **0.172 ms** (−4.2%) | -- | *(this PR)* |
-| 2026-11-10 | R3a — gate eye hill (High): 446 draws, 160,291 triangles, were 530 and 196,619⁸⁵ | 869 | 436,690 voxel + far | ~1,624 (+4.8%) | **0.162 ms** (−4.4%) | -- | *(this PR)* |
+| 2026-11-10 | **Circular rings for the split** (R3a, #327) — gate eye ground (High): 836 draws and 213,381 voxel triangles, were 1,046 and 259,850⁸⁵ | 1,940 | 819,928 voxel + far | ~1,504 (+5.0%) | **0.172 ms** (−4.2%) | -- | `ae87b22` |
+| 2026-11-10 | R3a — gate eye hill (High): 446 draws, 160,291 triangles, were 530 and 196,619⁸⁵ | 869 | 436,690 voxel + far | ~1,624 (+4.8%) | **0.162 ms** (−4.4%) | -- | `ae87b22` |
+| 2026-11-10 | **Trees beyond the first ring** (R2, #332) — gate eye ground (High), best runs⁸⁶ | 1,940 | 213,381 voxel + trees | ~1,444 | 0.209 ms (+0.039) | -- | *(this PR)* |
+| 2026-11-10 | R2 — gate eye hill (High)⁸⁶ | 869 | 160,291 voxel + trees | ~1,560 (−4.4%) | 0.198 ms (+0.038) | -- | *(this PR)* |
 
 ¹ FPS at this scene is submit-bound and noisy. 4 back-to-back runs on `7a249d2`
 climbed **monotonically 9,732 → 10,471 → 11,719 → 13,657 FPS** — not random
@@ -2926,3 +2928,30 @@ and work max 8.7 → 5.6 ms. One golden changed, `lod_boundary` (3.52%): the
 level-0/level-1 seam moves, and fewer trees stand in the diagonal corners,
 because trees grow at level 0 only (M6 at the ground eye: 40 → 31). R2 (trees
 beyond the first ring) answers that.
+
+⁸⁶ **Trees beyond the first ring (block 3.0b, R2, #332), Linux, 2026-11-10.**
+Levels 1–3 now draw the oaks that level 0 would grow, as instances on the
+coarse nodes' drawn tops: the real oak (188 triangles) at levels 1–2 and two
+boxes at level 3. Each model is one draw, culled per node with the node's box
+grown to its trees. `--bench gate`, `main` at `ae87b22` against this branch,
+separate binaries, alternating, 3 runs each. The machine was cooled to about
+50 °C first and then ran at 47–92 °C. The ground eye was noisy on both sides,
+so the best run of each is used. The hill eye was steady:
+
+```
+          GPU/frame (best / steady)      CPU/frame
+ground    0.587 -> 0.618 ms (+0.031)     0.170 -> 0.209 ms (+0.039)
+hill      0.552-0.556 -> 0.583 ms (+0.028)  0.160 -> 0.198 ms (+0.038)
+flight    0.358 -> 0.358 ms              0.074 -> 0.074 ms (no trees in view)
+```
+
+Over this and the subagent's two earlier rounds, the extra GPU time is
+consistently 0.023–0.031 ms, at the edge of #332's +0.03 ms. The CPU cost is
+the per-frame visibility pass over the resident tree-bearing nodes and the
+rebuilt instance list. The gate's camera turns every frame, so the list
+changes every frame; a still camera skips the upload. `--bench flight` toward
+a peak: no holes, work p99.9 2.6–3.4 ms on both. In the low flight, the count
+of frames with a hole pixel is about twice `main`'s (238–276 → 496–548, worst
+0.001% of the screen). Most likely these are trees appearing at the frustum's
+edge; this is not confirmed. One golden changed, `lod_boundary` (0.41%):
+trees now stand on the far slopes where there was a tree line.

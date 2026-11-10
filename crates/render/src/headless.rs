@@ -9,8 +9,11 @@ use cubara_voxel::{Chunk, ChunkCoord, MeshContext};
 
 use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
-use crate::render::{gpu_driven_features, load_mesh_assets, CameraUniform};
-use crate::scene::{SceneFrame, SceneRenderer};
+use crate::render::{
+    gpu_driven_features, load_mesh_assets, load_structures, load_tree_models, CameraUniform,
+};
+use crate::scene::{SceneFrame, SceneRenderer, TreeDraw};
+use crate::trees::TreeArena;
 
 /// A rendered frame: tightly-packed RGBA8, `width * height * 4` bytes.
 pub struct Frame {
@@ -178,12 +181,26 @@ pub fn render_with_far(
     far_params: Option<crate::far::FarParams>,
     shot: Shot,
 ) -> Option<Frame> {
+    // Collected rather than left as the iterator `ChunkArena::from_meshed`
+    // wants: trees (issue #332, R2) are a *second* GPU-side arena
+    // (`TreeArena`), built from the same nodes before they are moved into
+    // the chunk one -- `trees`/`tree_model` are small enough to clone,
+    // which keeps `MeshedNode` itself intact for `from_meshed` right after.
+    let nodes: Vec<MeshedNode> = meshed.into_iter().collect();
+    let tree_data: Vec<(
+        NodeId,
+        crate::trees::TreeModel,
+        Vec<[f32; 3]>,
+        crate::culling::Aabb,
+    )> = nodes
+        .iter()
+        .map(|n| (n.id, n.tree_model, n.trees.clone(), n.aabb))
+        .collect();
     render_arena(
         shot,
         (far, far_params),
-        |device, queue, multi_draw, _ctx| {
-            ChunkArena::from_meshed(device, queue, multi_draw, meshed)
-        },
+        &tree_data,
+        |device, queue, multi_draw, _ctx| ChunkArena::from_meshed(device, queue, multi_draw, nodes),
     )
 }
 
@@ -194,7 +211,7 @@ pub fn render_with_far(
 /// chunk is its own level-0 node (`scale` 1.0, one lattice cell = one world
 /// block), placed at its own `ChunkCoord::world_offset`.
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
-    render_arena(shot, (&[], None), |device, queue, multi_draw, ctx| {
+    render_arena(shot, (&[], None), &[], |device, queue, multi_draw, ctx| {
         let mut arena = ChunkArena::new(device, multi_draw);
         for (coord, chunk) in chunks {
             let id = NodeId {
@@ -208,10 +225,19 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
 }
 
 /// Shared device setup, camera framing and readback for [`render`] and
-/// [`render_chunks`]; `build_arena` is the one part that differs between them.
+/// [`render_chunks`]; `build_arena` is the one part that differs between
+/// them. `tree_data` is each node's already-resolved tree positions +
+/// model (issue #332, R2) -- empty for [`render_chunks`], which has no
+/// `cubara_world::mesh::BuiltNode`s to have carried any.
 fn render_arena(
     shot: Shot,
     (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
+    tree_data: &[(
+        NodeId,
+        crate::trees::TreeModel,
+        Vec<[f32; 3]>,
+        crate::culling::Aabb,
+    )],
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
     let instance = crate::new_instance();
@@ -263,6 +289,7 @@ fn render_arena(
     });
 
     let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
+    let tree_models = load_tree_models(&device, &queue, &mesh_assets);
     let layer_of = |name: &str| mesh_assets.layers.layer_of(name);
     let ctx = MeshContext {
         registry: &mesh_assets.registry,
@@ -270,6 +297,11 @@ fn render_arena(
     };
     let mut arena = build_arena(&device, &queue, multi_draw, &ctx);
     let bounds = arena.bounds();
+
+    let mut trees = TreeArena::new(crate::trees::tree_instance_bounds(&load_structures()));
+    for (id, model, positions, aabb) in tree_data {
+        trees.insert(*id, *model, positions.clone(), *aabb);
+    }
 
     let (vp, eye) = match camera {
         Some((eye, look_dir)) => (
@@ -297,6 +329,7 @@ fn render_arena(
     };
     let frustum = Frustum::from_view_proj(vp);
     let draw_count = arena.prepare(&queue, &frustum);
+    trees.prepare(&device, &queue, &frustum);
     let far_terrain = (!far.is_empty()).then(|| {
         let mut terrain = crate::far::FarTerrain::new(&device, &queue, far.len() as u32);
         for patch in far {
@@ -317,6 +350,7 @@ fn render_arena(
         height,
         &tex_view,
         &tex_sampler,
+        tree_models,
     );
     // Fog off: a golden test wants the same pixels every run, and this
     // crate's headless callers have no render-radius concept of their own
@@ -368,6 +402,10 @@ fn render_arena(
             cracking,
             players: &players,
             far: far_terrain.as_ref(),
+            trees: Some(TreeDraw {
+                oak: trees.oak_instances(),
+                boxed: trees.box_instances(),
+            }),
             overlay: menu.as_deref(),
             hotbar: hotbar.as_ref().map(|slots| crate::scene::HotbarView {
                 slots: slots.as_slice(),

@@ -60,6 +60,8 @@ fn an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped() {
         scale: geometry.scale,
         mesh: geometry.mesh,
         aabb: geometry.aabb,
+        trees: Vec::new(),
+        tree_model: cubara_render::TreeModel::Oak,
     };
 
     let sky = draw(&mut renderer, camera);
