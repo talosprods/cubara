@@ -22,7 +22,7 @@ use crate::arena::{ChunkArena, MeshedNode, NodeId};
 use crate::culling::Frustum;
 use crate::materials::{self, MeshAssets};
 use crate::scene::{SceneFrame, SceneRenderer};
-use crate::uploads::{ArenaOp, Uploads};
+use crate::uploads::{Sink, Uploads};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -967,48 +967,70 @@ impl Renderer {
     /// doesn't spike the frame time -- and drop the ones whose turn has come. Called every
     /// [`render`](Self::render); a node's old geometry (if any) stays drawn
     /// until its queued replacement's turn comes up.
+    ///
+    /// The ordering/dependency logic (what may apply when, and what happens
+    /// when the arena is full -- #390) lives in [`Uploads::drain`]; this is
+    /// just the GPU-touching half of it, through the local `ArenaSink`
+    /// below.
     fn drain_uploads(&mut self, last_frame: std::time::Duration) {
         puffin::profile_function!();
-        let started = Instant::now();
-        let budget = crate::uploads::upload_budget(last_frame);
-        let mut uploaded = 0;
-        while let Some(op) = self.uploads.pop() {
-            match op {
-                ArenaOp::Insert(id, node) => {
-                    self.arena.remove(id); // free any prior slot first
-                                           // Cloned, not moved: `node` (the whole `MeshedNode`) is
-                                           // still needed whole if this insert fails and has to be
-                                           // requeued below. Cheap either way -- a node's own tree
-                                           // list is at most a handful of positions.
-                    let (trees, tree_model) = (node.trees.clone(), node.tree_model);
-                    let placed = self.arena.insert(
-                        &self.queue,
-                        id,
-                        node.origin,
-                        node.scale,
-                        &node.mesh,
-                        node.aabb,
-                    );
-                    if !placed {
-                        // Arena full: this node is not done. Try it again
-                        // after the drops queued behind it have freed space,
-                        // and upload nothing more this frame. (The arena
-                        // warns once per episode of being full.)
-                        self.uploads.requeue(ArenaOp::Insert(id, node));
-                        break;
-                    }
+
+        /// [`Uploads::drain`]'s [`Sink`] over this crate's real GPU arena --
+        /// one value borrowing `arena`/`trees`/`queue` together, rather than
+        /// two closures each wanting their own exclusive borrow of the same
+        /// fields at once.
+        struct ArenaSink<'a> {
+            arena: &'a mut ChunkArena,
+            trees: &'a mut crate::trees::TreeArena,
+            queue: &'a wgpu::Queue,
+        }
+
+        impl Sink<MeshedNode> for ArenaSink<'_> {
+            fn try_insert(&mut self, id: NodeId, node: MeshedNode) -> Result<(), MeshedNode> {
+                self.arena.remove(id); // free any prior slot first
+                                       // Cloned, not moved: `node` (the whole `MeshedNode`) is
+                                       // still needed whole if this insert fails and has to be
+                                       // requeued. Cheap either way -- a node's own tree list
+                                       // is at most a handful of positions.
+                let (trees, tree_model) = (node.trees.clone(), node.tree_model);
+                let placed = self.arena.insert(
+                    self.queue,
+                    id,
+                    node.origin,
+                    node.scale,
+                    &node.mesh,
+                    node.aabb,
+                );
+                if placed {
                     self.trees.insert(id, tree_model, trees, node.aabb);
-                    uploaded += 1;
-                    if uploaded >= MIN_UPLOADS_PER_FRAME && started.elapsed() >= budget {
-                        break;
-                    }
-                }
-                ArenaOp::Remove(id) => {
-                    self.arena.remove(id);
-                    self.trees.remove(id);
+                    Ok(())
+                } else {
+                    // Arena full: this node is not done. `Uploads::drain`
+                    // requeues it and keeps draining whatever else can land
+                    // this frame (the arena warns once per episode of being
+                    // full).
+                    Err(node)
                 }
             }
+
+            fn remove(&mut self, id: NodeId) {
+                self.arena.remove(id);
+                self.trees.remove(id);
+            }
         }
+
+        let started = Instant::now();
+        let budget = crate::uploads::upload_budget(last_frame);
+        let mut sink = ArenaSink {
+            arena: &mut self.arena,
+            trees: &mut self.trees,
+            queue: &self.queue,
+        };
+        self.uploads.drain(
+            MIN_UPLOADS_PER_FRAME,
+            || started.elapsed() >= budget,
+            &mut sink,
+        );
         // Not re-filtered by the frustum here -- `self.trees.prepare` does
         // that once per frame, alongside `self.arena.prepare` (issue #332
         // decision 2), since only *drawn* (frustum-visible) nodes may
