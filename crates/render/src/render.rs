@@ -19,7 +19,7 @@ use winit::window::{CursorGrabMode, Window};
 use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 
 use crate::arena::{ChunkArena, MeshedNode, NodeId};
-use crate::culling::Frustum;
+use crate::culling::{Aabb, Frustum};
 use crate::materials::{self, MeshAssets};
 use crate::scene::{SceneFrame, SceneRenderer};
 use crate::uploads::{Sink, Uploads};
@@ -591,6 +591,10 @@ pub struct Renderer {
     /// ([`crate::uploads`]): drained a share of each frame's time at a time
     /// ([`crate::uploads::upload_budget`]) to avoid upload spikes.
     uploads: Uploads<MeshedNode>,
+    /// The bounds of the nodes the last [`drain_uploads`](Self::drain_uploads)
+    /// stopped drawing -- the swaps that frame applied. Read by a measurement
+    /// (`--bench flight`'s pops, issue #384); the renderer itself never looks.
+    swapped_out: Vec<Aabb>,
 
     last_frame: Instant,
     visible_chunks: usize,
@@ -801,6 +805,7 @@ impl Renderer {
             far,
             trees: crate::trees::TreeArena::new(tree_local_bounds),
             uploads: Uploads::new(),
+            swapped_out: Vec::new(),
             last_frame: Instant::now(),
             visible_chunks: 0,
             frames: 0,
@@ -862,6 +867,14 @@ impl Renderer {
     /// Meshes handed over and not yet uploaded: still to appear on screen.
     pub fn uploads_pending(&self) -> usize {
         self.uploads.len()
+    }
+
+    /// The world-space bounds of every node the last frame stopped drawing:
+    /// the swaps it applied, the point where the outgoing nodes leave
+    /// ([`crate::uploads`]). What `--bench flight` measures a pop against
+    /// (issue #384). Empty on a frame that dropped nothing.
+    pub fn swapped_out(&self) -> &[Aabb] {
+        &self.swapped_out
     }
 
     /// Far-terrain patches drawn in the last frame.
@@ -983,6 +996,11 @@ impl Renderer {
             arena: &'a mut ChunkArena,
             trees: &'a mut crate::trees::TreeArena,
             queue: &'a wgpu::Queue,
+            /// The bounds of every node this drain stopped drawing
+            /// ([`Renderer::swapped_out`]): a leaver is recorded when its
+            /// Remove actually applies -- after its batch's Inserts, by
+            /// [`Uploads::drain`]'s rules -- never when it is only queued.
+            swapped_out: &'a mut Vec<Aabb>,
         }
 
         impl Sink<MeshedNode> for ArenaSink<'_> {
@@ -1014,17 +1032,21 @@ impl Renderer {
             }
 
             fn remove(&mut self, id: NodeId) {
-                self.arena.remove(id);
+                if let Some(aabb) = self.arena.remove(id) {
+                    self.swapped_out.push(aabb);
+                }
                 self.trees.remove(id);
             }
         }
 
         let started = Instant::now();
         let budget = crate::uploads::upload_budget(last_frame);
+        self.swapped_out.clear();
         let mut sink = ArenaSink {
             arena: &mut self.arena,
             trees: &mut self.trees,
             queue: &self.queue,
+            swapped_out: &mut self.swapped_out,
         };
         self.uploads.drain(
             MIN_UPLOADS_PER_FRAME,

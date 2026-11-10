@@ -16,6 +16,7 @@ use crate::scene::{SceneFrame, SceneRenderer, TreeDraw};
 use crate::trees::TreeArena;
 
 /// A rendered frame: tightly-packed RGBA8, `width * height * 4` bytes.
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
