@@ -2773,6 +2773,595 @@ mod m4 {
     }
 }
 
+/// **R6, decision 8 (issue #380), amendment E.** Measurement only -- nothing
+/// here is drawn, and nothing the game does changes. Per fine cell inside a
+/// swap's coarse footprint, `d = fine − coarse`; `min(|d|, Δ)` is what the
+/// 250 ms slide covers, `max(|d| − Δ, 0)` is what still pops in one frame
+/// even with the fade. The table this prints (`print_r6_residual_pops`) is
+/// decision 8's: whether the fade's 4× is reachable on height alone, for
+/// 0↔1 and 1↔2, over the four gate flights -- before any render code is
+/// touched (PR 1 of #380's three-PR split, the issue's "Delivery" note and
+/// amendment E).
+mod r6 {
+    use super::*;
+    use crate::flight::{eye_at, toward_peak, Flight, FLY_SPEED};
+    use cubara_voxel::ChunkCoord;
+
+    /// A coarse node's drawn top FACE at `(x, z)`, generalized to any
+    /// `level` -- [`m4::coarse_top`] plus the `+ 1` that turns a top solid
+    /// row into a face, read from [`m4::production_cell_height`] rather
+    /// than copying `NodeKey::cell_height_blocks` (Rule 5, and the render
+    /// crate may not depend on `cubara-world` -- #380's own finding that
+    /// Δ comes from the caller).
+    pub fn top_face(gen: &WorldGen, level: u32, x: i32, z: i32) -> i32 {
+        m4::coarse_top(gen, x, z, 1 << level, m4::production_cell_height(level)) + 1
+    }
+
+    /// One swap's residual: a coarse node about to be split into its finer
+    /// children, or the reverse, with every fine cell inside its footprint
+    /// sampled against what the coarse node itself draws there.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SwapResidual {
+        /// The coarser of the two levels (the parent's).
+        pub coarse_level: u32,
+        /// Fine cells sampled (32 x 32 minus any outside the node's y range).
+        pub cells: u32,
+        pub max_abs: i32,
+        pub u_up: i64,
+        pub c_up: i64,
+        pub u_down: i64,
+        pub c_down: i64,
+        pub cells_within: u32,
+        pub skyline_abs: i32,
+        /// 3-D eye-to-footprint-centre distance, blocks (not horizontal --
+        /// the down flight looks from 450 m up, where horizontal distance
+        /// would under-read).
+        pub distance: f32,
+    }
+
+    /// Per cell of `d`, what the 250 ms slide covers and what still pops in
+    /// one frame at `delta` (amendment E): `min(|d|, Δ)` slides, `max(|d| −
+    /// Δ, 0)` pops -- `u_up`/`c_up` over `d > 0` (insert, fine higher),
+    /// `u_down`/`c_down` over `d < 0` (removal, fine lower). Pure, and the
+    /// only place this arithmetic is written (so a hand-made case pins it
+    /// without a `WorldGen`).
+    pub fn summarize(d: &[i32], delta: i32) -> (i32, i64, i64, i64, i64, u32) {
+        let mut max_abs = 0;
+        let (mut u_up, mut c_up, mut u_down, mut c_down) = (0i64, 0i64, 0i64, 0i64);
+        let mut cells_within = 0u32;
+        for &x in d {
+            let a = x.abs();
+            max_abs = max_abs.max(a);
+            if a <= delta {
+                cells_within += 1;
+            }
+            if x > 0 {
+                u_up += (x - delta).max(0) as i64;
+                c_up += x.min(delta) as i64;
+            } else if x < 0 {
+                u_down += (a - delta).max(0) as i64;
+                c_down += a.min(delta) as i64;
+            }
+        }
+        (max_abs, u_up, c_up, u_down, c_down, cells_within)
+    }
+
+    /// Amendment E's go/no-go, derived from decision 7's 4×: "the 4× must
+    /// be reachable on height alone" -- `max(U↑ + C↑/7.5, U↓ + C↓/7.5) ≤
+    /// T/4`, 7.5 = frames per half-fade at the flights' 60 Hz. Necessary,
+    /// not sufficient (texture, AO and trees come on top). Trivially true
+    /// with nothing to cover.
+    pub fn height_reachable(u_up: i64, c_up: i64, u_down: i64, c_down: i64) -> bool {
+        const HALF_FADE_FRAMES: f64 = 7.5;
+        let total = (u_up + c_up + u_down + c_down) as f64;
+        if total <= 0.0 {
+            return true;
+        }
+        let best = (u_up as f64 + c_up as f64 / HALF_FADE_FRAMES)
+            .max(u_down as f64 + c_down as f64 / HALF_FADE_FRAMES);
+        best <= total / 4.0
+    }
+
+    /// The coarse node of every swap between `before` and `after`: a node in
+    /// `before \ after` with **any** child in `after` (split), or a node in
+    /// `after \ before` with any child in `before` (merge). A node that
+    /// simply left (no replacement on the other side) is neither.
+    /// Deduplicated, sorted (`NodeKey`'s `Ord` is total, #380 plan §4.1).
+    pub fn swaps_between(before: &HashSet<NodeKey>, after: &HashSet<NodeKey>) -> Vec<NodeKey> {
+        let mut swaps: Vec<NodeKey> = before
+            .difference(after)
+            .filter(|n| n.children().iter().any(|c| after.contains(c)))
+            .chain(
+                after
+                    .difference(before)
+                    .filter(|n| n.children().iter().any(|c| before.contains(c))),
+            )
+            .copied()
+            .collect();
+        swaps.sort();
+        swaps.dedup();
+        swaps
+    }
+
+    /// Fine-cell samples per axis for a coarse footprint `extent_blocks`
+    /// wide at fine-cell `step`: `extent_blocks / step`, floored to 1 so a
+    /// degenerate (zero- or negative-width) footprint still samples its
+    /// own origin rather than nothing. 32 for every real node (`extent /
+    /// step` is always 32: the fine cell is half the coarse one and the
+    /// node is 16 coarse cells wide) -- pulled out of [`residual`] so the
+    /// floor is something a test can see.
+    fn samples_per_axis(extent_blocks: i32, step: i32) -> i32 {
+        (extent_blocks / step).max(1)
+    }
+
+    /// One swap's [`SwapResidual`]: every fine cell (step `1 << fine`) over
+    /// `coarse`'s own x/z footprint (32 x 32 of them, any level -- a node's
+    /// footprint is always 32 fine cells wide, since the fine cell is half
+    /// the coarse one and the node is 16 coarse cells wide). A sample whose
+    /// fine top face falls outside the coarse node's own y range belongs to
+    /// a different sibling of the split and is skipped. `None` if every
+    /// sample was (a node with no cell of its own inside the eye's reach).
+    pub fn residual(gen: &WorldGen, coarse: NodeKey, eye: [f32; 3]) -> Option<SwapResidual> {
+        let fine_level = coarse.level.checked_sub(1)?;
+        let delta = m4::production_cell_height(coarse.level);
+        let origin = coarse.world_origin();
+        let extent_blocks = 16 * coarse.extent_chunks();
+        let (y_lo, y_hi) = (origin[1], origin[1] + extent_blocks);
+        let step = 1i32 << fine_level;
+        let n = samples_per_axis(extent_blocks, step);
+
+        let mut d = Vec::with_capacity((n * n) as usize);
+        let (mut fine_max, mut coarse_max) = (i32::MIN, i32::MIN);
+        let (mut sum_x, mut sum_z, mut sum_y, mut count) = (0.0f64, 0.0f64, 0.0f64, 0u32);
+        for iz in 0..n {
+            for ix in 0..n {
+                let x = origin[0] + ix * step;
+                let z = origin[2] + iz * step;
+                let fine_top = top_face(gen, fine_level, x, z);
+                if fine_top < y_lo || fine_top >= y_hi {
+                    continue;
+                }
+                let coarse_top = top_face(gen, coarse.level, x, z);
+                d.push(fine_top - coarse_top);
+                fine_max = fine_max.max(fine_top);
+                coarse_max = coarse_max.max(coarse_top);
+                sum_x += x as f64;
+                sum_z += z as f64;
+                sum_y += (fine_top as f64 + coarse_top as f64) * 0.5;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        let (max_abs, u_up, c_up, u_down, c_down, cells_within) = summarize(&d, delta);
+        let centre = [
+            (sum_x / count as f64) as f32,
+            (sum_y / count as f64) as f32,
+            (sum_z / count as f64) as f32,
+        ];
+        let distance = ((eye[0] - centre[0]).powi(2)
+            + (eye[1] - centre[1]).powi(2)
+            + (eye[2] - centre[2]).powi(2))
+        .sqrt();
+        Some(SwapResidual {
+            coarse_level: coarse.level,
+            cells: count,
+            max_abs,
+            u_up,
+            c_up,
+            u_down,
+            c_down,
+            cells_within,
+            skyline_abs: (fine_max - coarse_max).abs(),
+            distance,
+        })
+    }
+
+    /// Every swap's [`residual`] along a straight flight, at the flights'
+    /// own 1/60 s step (`flight::eye_at`): whenever the streaming centre's
+    /// chunk changes, [`desired_nodes_3d`] is re-run and [`swaps_between`]
+    /// says which coarse nodes swapped, each measured at the eye the swap
+    /// was seen from. CPU-only height lookups: no meshing, no GPU.
+    pub fn flight_residuals(
+        gen: &WorldGen,
+        start: [f32; 3],
+        look: [f32; 3],
+        seconds: f32,
+    ) -> Vec<SwapResidual> {
+        let flight = Flight {
+            start,
+            look,
+            speed: FLY_SPEED,
+            seconds,
+            fps: 60,
+            every: 1.0,
+            size: (1, 1),
+            quality: FarQuality::Off,
+        };
+        let steps = (seconds * 60.0).round().max(0.0) as u32;
+        let mut prev_center: Option<ChunkCoord> = None;
+        let mut prev_nodes: HashSet<NodeKey> = HashSet::new();
+        let mut out = Vec::new();
+        for i in 0..=steps {
+            let t = (i as f32 / 60.0).min(seconds);
+            let eye = eye_at(&flight, t);
+            let center = ChunkCoord::from_world_pos(eye);
+            if prev_center == Some(center) {
+                continue;
+            }
+            let nodes: HashSet<NodeKey> =
+                desired_nodes_3d(center, VERTICAL_LOD_SQUASH, DEFAULT_RING_SCHEDULE)
+                    .into_iter()
+                    .collect();
+            // No `prev_center.is_some()` guard for the first step: `prev_nodes`
+            // starts empty, and `swaps_between(&HashSet::new(), _)` is always
+            // empty too (nothing is in `before`, so neither side's condition
+            // can hold -- `swaps_between_with_nothing_before_finds_no_swaps`
+            // pins it), so the two are equivalent and the guard was dead.
+            for coarse in swaps_between(&prev_nodes, &nodes) {
+                out.extend(residual(gen, coarse, eye));
+            }
+            prev_center = Some(center);
+            prev_nodes = nodes;
+        }
+        out
+    }
+
+    /// `sorted[(len-1) * per_mille / 1000]` -- [`PopStats::of`]'s own
+    /// percentile rule, generalised over the element type so both the
+    /// block and pixel distributions use one function.
+    fn percentile<T: Copy + PartialOrd>(mut v: Vec<T>, per_mille: usize) -> Option<T> {
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(v[(v.len() - 1) * per_mille / 1000])
+    }
+
+    fn pair_label(coarse_level: u32) -> &'static str {
+        match coarse_level {
+            1 => "0<->1",
+            2 => "1<->2",
+            _ => "2<->3",
+        }
+    }
+
+    /// `blocks` converted to pixels at `distance` and `pixel_angle`
+    /// (`ViewSpec::pixel_angle`), `distance` floored to 0.01 so a swap
+    /// whose footprint centre lands on the eye does not divide by zero.
+    /// Pulled out of [`format_row`] so the floor is something a test can
+    /// see without matching the whole printed row.
+    fn to_px(blocks: i32, distance: f32, pixel_angle: f32) -> f32 {
+        blocks as f32 / (distance.max(0.01) * pixel_angle)
+    }
+
+    /// One row of [`format_r6`]'s table, over `group` (every [`SwapResidual`]
+    /// of one level pair, in one flight or summed over all four).
+    fn format_row(
+        label: &str,
+        coarse_level: u32,
+        group: &[SwapResidual],
+        pixel_angle: f32,
+    ) -> String {
+        let pair = pair_label(coarse_level);
+        if group.is_empty() {
+            return format!("| {label} | {pair} | 0 swaps | -- |");
+        }
+        let delta = m4::production_cell_height(coarse_level);
+        let max_abs: Vec<i32> = group.iter().map(|r| r.max_abs).collect();
+        let max_abs_px: Vec<f32> = group
+            .iter()
+            .map(|r| to_px(r.max_abs, r.distance, pixel_angle))
+            .collect();
+        let skyline: Vec<i32> = group.iter().map(|r| r.skyline_abs).collect();
+        let cells: u64 = group.iter().map(|r| r.cells as u64).sum();
+        let within: u64 = group.iter().map(|r| r.cells_within as u64).sum();
+        let (u_up, c_up, u_down, c_down) = group.iter().fold((0i64, 0i64, 0i64, 0i64), |a, r| {
+            (a.0 + r.u_up, a.1 + r.c_up, a.2 + r.u_down, a.3 + r.c_down)
+        });
+        let total = (u_up + c_up + u_down + c_down) as f64;
+        let covered = (c_up + c_down) as f64;
+        let over_delta = group.iter().filter(|r| r.max_abs > delta).count();
+        let best = (u_up as f64 + c_up as f64 / 7.5).max(u_down as f64 + c_down as f64 / 7.5);
+        let t_over_4 = total / 4.0;
+        let go = height_reachable(u_up, c_up, u_down, c_down);
+        let verdict = if coarse_level == 3 {
+            "reported, not acted on".to_string()
+        } else if go {
+            "GO".to_string()
+        } else {
+            "NO-GO".to_string()
+        };
+        format!(
+            "| {label} | {pair} | {} | {delta} | {}/{}/{}/{} | {:.2}/{:.2}/{:.2}/{:.2} | {}/{}/{} | {:.1}% | {:.1}% | {:.1}% | {best:.1} | {t_over_4:.1} | {verdict} |",
+            group.len(),
+            percentile(max_abs.clone(), 500).unwrap(),
+            percentile(max_abs.clone(), 900).unwrap(),
+            percentile(max_abs.clone(), 990).unwrap(),
+            percentile(max_abs, 1000).unwrap(),
+            percentile(max_abs_px.clone(), 500).unwrap(),
+            percentile(max_abs_px.clone(), 900).unwrap(),
+            percentile(max_abs_px.clone(), 990).unwrap(),
+            percentile(max_abs_px, 1000).unwrap(),
+            percentile(skyline.clone(), 500).unwrap(),
+            percentile(skyline.clone(), 990).unwrap(),
+            percentile(skyline, 1000).unwrap(),
+            100.0 * within as f64 / cells.max(1) as f64,
+            100.0 * covered / total.max(1.0),
+            100.0 * over_delta as f64 / group.len() as f64,
+        )
+    }
+
+    /// Decision 8's table (amendment E), per flight and totalled: rows
+    /// 0↔1, 1↔2, 2↔3 (the last reported, never acted on -- amendment E).
+    /// Go/no-go per [`height_reachable`] on the **total** across all four
+    /// flights, for 0↔1 and 1↔2.
+    pub fn format_r6(by_flight: &[(&str, Vec<SwapResidual>)]) -> String {
+        let pixel_angle = ViewSpec::gate().pixel_angle();
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "R6 residual pop per level pair (#380 decision 8, amendment E) -- \
+             d = fine - coarse, Delta = cell_height_blocks(coarse level), \
+             pixels at 1080 rows / 60 degrees FOV, half-fade = 7.5 frames at 60 Hz"
+        );
+        let _ = writeln!(
+            s,
+            "| flight | pair | swaps | Delta | max\\|d\\| p50/p90/p99/max (blocks) | \
+             max\\|d\\| p50/p90/p99/max (px) | skyline p50/p99/max (blocks) | \
+             cells within Delta | height covered | max\\|d\\|>Delta (literal) | best | T/4 | go/no-go |"
+        );
+        let _ = writeln!(s, "|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        let mut totals: [Vec<SwapResidual>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (name, residuals) in by_flight {
+            for level in 1..=3u32 {
+                let group: Vec<SwapResidual> = residuals
+                    .iter()
+                    .copied()
+                    .filter(|r| r.coarse_level == level)
+                    .collect();
+                totals[(level - 1) as usize].extend(group.iter().copied());
+                let _ = writeln!(s, "{}", format_row(name, level, &group, pixel_angle));
+            }
+        }
+        for level in 1..=3u32 {
+            let _ = writeln!(
+                s,
+                "{}",
+                format_row("TOTAL", level, &totals[(level - 1) as usize], pixel_angle)
+            );
+        }
+        s
+    }
+
+    /// The gate's four flights (`check-phase-gate.sh:336-339`), named, for
+    /// [`print_r6_residual_pops`] and `BENCHMARKS.md` alike.
+    fn gate_flights(gen: &WorldGen) -> [(&'static str, [f32; 3], [f32; 3], f32); 4] {
+        let (peak_start, peak_look) = toward_peak(gen);
+        [
+            ("low", [8.0, 120.0, 8.0], [1.0, -0.15, 0.3], 20.0),
+            ("high", [8.0, 400.0, 8.0], [1.0, -0.35, 0.3], 20.0),
+            ("down", [8.0, 450.0, 8.0], [0.4, -0.8, 0.2], 15.0),
+            ("toward-peak", peak_start, peak_look, 30.0),
+        ]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn gen() -> WorldGen {
+            WorldGen::new(World::new().seed())
+        }
+
+        #[test]
+        fn summarize_splits_slide_from_pop() {
+            assert_eq!(summarize(&[3], 1), (3, 2, 1, 0, 0, 0));
+            assert_eq!(summarize(&[-3], 1), (3, 0, 0, 2, 1, 0));
+            // Everything within Delta: no uncovered term on either side, and
+            // every cell (including the flat one) counts as within.
+            assert_eq!(summarize(&[1, -1, 0], 2), (1, 0, 1, 0, 1, 3));
+        }
+
+        #[test]
+        fn height_reachable_matches_the_derivation() {
+            // All covered, two-sided: trivially reachable.
+            assert!(height_reachable(0, 10, 0, 10));
+            // One-sided, uncovered == covered: review's derivation (M1) puts
+            // the break-even covered share at 86.5%, so 50/50 fails it.
+            assert!(!height_reachable(50, 50, 0, 0));
+            // Nothing to cover.
+            assert!(height_reachable(0, 0, 0, 0));
+        }
+
+        #[test]
+        fn swaps_between_finds_a_split_a_merge_and_not_a_plain_departure() {
+            let parent = NodeKey::new(1, [0, 0, 0]);
+            let children: HashSet<NodeKey> = parent.children().into_iter().collect();
+            let just_parent: HashSet<NodeKey> = [parent].into_iter().collect();
+            // Split: parent present, then its children.
+            assert_eq!(swaps_between(&just_parent, &children), vec![parent]);
+            // Merge: children present, then the parent.
+            assert_eq!(swaps_between(&children, &just_parent), vec![parent]);
+            // A node that simply left, nothing of it on the other side.
+            let elsewhere: HashSet<NodeKey> = [NodeKey::new(1, [5, 5, 5])].into_iter().collect();
+            assert_eq!(swaps_between(&just_parent, &elsewhere), Vec::new());
+        }
+
+        /// What makes `flight_residuals`' first step safe without a
+        /// `prev_center.is_some()` guard (the guard was dead: removed after
+        /// `check-tests-can-fail.sh` found the line unprotected by any
+        /// test): with nothing in `before`, no node of `after` can have a
+        /// child in `before`, so there are never any "merges" to find, and
+        /// `before`'s own difference is empty too.
+        #[test]
+        fn swaps_between_with_nothing_before_finds_no_swaps() {
+            let any: HashSet<NodeKey> = NodeKey::new(2, [0, 0, 0])
+                .children()
+                .into_iter()
+                .chain([NodeKey::new(2, [0, 0, 0])])
+                .collect();
+            assert_eq!(swaps_between(&HashSet::new(), &any), Vec::new());
+        }
+
+        #[test]
+        fn top_face_at_level_0_is_the_exact_surface_plus_one() {
+            let gen = gen();
+            assert_eq!(
+                top_face(&gen, 0, 3, 5),
+                m4::exact_face_height(&gen, 3, 5) as i32
+            );
+        }
+
+        #[test]
+        fn residual_sees_a_hand_split_nodes_own_cells() {
+            let gen = gen();
+            let parent = NodeKey::new(1, [0, 0, 0]);
+            let r = residual(&gen, parent, [8.0, 60.0, 8.0]).expect("spawn has a surface");
+            assert_eq!(r.coarse_level, 1);
+            assert!(r.cells > 0 && r.cells <= 32 * 32);
+            assert!(r.distance >= 0.0);
+            // level 0 has no parent to compare against.
+            assert!(residual(&gen, NodeKey::new(0, [0, 0, 0]), [0.0; 3]).is_none());
+        }
+
+        /// `samples_per_axis` is `extent / step`, floored to 1 -- 32 for
+        /// every real node, and 1 (not 0) for a degenerate zero-width
+        /// footprint.
+        #[test]
+        fn samples_per_axis_is_extent_over_step_floored_to_one() {
+            assert_eq!(samples_per_axis(512, 16), 32);
+            assert_eq!(samples_per_axis(16, 1), 16);
+            assert_eq!(
+                samples_per_axis(0, 16),
+                1,
+                "a degenerate footprint floors to 1"
+            );
+        }
+
+        #[test]
+        fn flight_residuals_finds_at_least_one_swap_near_spawn() {
+            let gen = gen();
+            // A short, slow hop that is certain to cross a chunk boundary
+            // and therefore re-run `desired_nodes_3d` at least once.
+            let found = flight_residuals(&gen, [0.0, 80.0, 0.0], [1.0, 0.0, 0.0], 2.0);
+            assert!(!found.is_empty(), "a 48-block hop crosses ring edges");
+            assert!(found.iter().all(|r| (1..=3).contains(&r.coarse_level)));
+        }
+
+        #[test]
+        fn format_r6_reports_an_empty_group_without_panicking() {
+            let table = format_r6(&[("empty", Vec::new())]);
+            assert!(table.contains("0<->1"));
+            assert!(table.contains("TOTAL"));
+        }
+
+        /// `format_row`'s printed "best" and "T/4" columns are amendment E's
+        /// own arithmetic (`best = max(U↑ + C↑/7.5, U↓ + C↓/7.5)`), not just
+        /// report prose: one-sided input (`u_up = 10`, everything else 0)
+        /// pins `best` at 10.0 and `T/4` at 2.5. `go`/`NO-GO` is
+        /// `height_reachable`'s own call, already pinned by
+        /// `height_reachable_matches_the_derivation`; this test is only
+        /// about the two printed numbers next to it.
+        #[test]
+        fn format_row_prints_bests_own_arithmetic_not_height_reachables() {
+            // Two rows, deliberately not matching: cells_within, height
+            // covered and "over Delta" would all read the same wrong-by-
+            // coincidence value with only one row (every mutation this
+            // pins happens to agree with the correct arithmetic at n=1).
+            let a = SwapResidual {
+                coarse_level: 1,
+                cells: 3,
+                max_abs: 1, // not > Delta (1 at level 1).
+                u_up: 6,
+                c_up: 4,
+                u_down: 0,
+                c_down: 0,
+                cells_within: 2,
+                skyline_abs: 0,
+                distance: 10.0,
+            };
+            let b = SwapResidual {
+                coarse_level: 1,
+                cells: 1,
+                max_abs: 5, // > Delta.
+                u_up: 0,
+                c_up: 0,
+                u_down: 0,
+                c_down: 0,
+                cells_within: 1,
+                skyline_abs: 0,
+                distance: 10.0,
+            };
+            let row = format_row("test", 1, &[a, b], ViewSpec::gate().pixel_angle());
+            assert!(
+                // cells_within: (2+1)/(3+1) = 75.0%, not 300.0% (cells.min(1)
+                // instead of .max(1)). height covered: 4/(6+4) = 40.0%, not
+                // 400.0% (total.min(1.0)). over Delta: 1 of 2 rows (b only)
+                // = 50.0%, not 100.0% (`>=` instead of `>`, which also
+                // counts a's max_abs == Delta). best = max(6+4/7.5, 0) =
+                // 6.5333 -> 6.5; T/4 = 10/4 = 2.5; not reachable -> NO-GO.
+                row.contains("| 75.0% | 40.0% | 50.0% | 6.5 | 2.5 | NO-GO |"),
+                "{row}"
+            );
+        }
+
+        /// `to_px`'s distance floor is 0.01, not "whichever is smaller":
+        /// a swap 10 blocks away converts normally, and one at distance
+        /// 0.0 (which would divide by zero without the floor) converts as
+        /// if it were 0.01 away, not as if it were even closer.
+        #[test]
+        fn to_px_floors_distance_to_0_01() {
+            assert_eq!(to_px(1, 10.0, 1.0), 1.0 / 10.0);
+            assert_eq!(to_px(1, 0.0, 1.0), 1.0 / 0.01);
+        }
+
+        /// `format_r6` groups by `coarse_level`, not its complement: two
+        /// level-1 swaps and one level-2 swap must show 2 at "0<->1" and 1
+        /// at "1<->2", never the other way round.
+        #[test]
+        fn format_r6_groups_residuals_by_their_own_coarse_level() {
+            let residual_at = |coarse_level| SwapResidual {
+                coarse_level,
+                cells: 1,
+                max_abs: 0,
+                u_up: 0,
+                c_up: 0,
+                u_down: 0,
+                c_down: 0,
+                cells_within: 1,
+                skyline_abs: 0,
+                distance: 10.0,
+            };
+            let table = format_r6(&[("f", vec![residual_at(1), residual_at(1), residual_at(2)])]);
+            assert!(
+                table.contains("| f | 0<->1 | 2 |"),
+                "two level-1 swaps: {table}"
+            );
+            assert!(
+                table.contains("| f | 1<->2 | 1 |"),
+                "one level-2 swap: {table}"
+            );
+        }
+
+        /// Minutes in release: the gate's four flights, decision 8's table.
+        /// What the PR body and the #380 comment print.
+        #[test]
+        #[ignore = "a measurement: prints #380 decision 8's residual-pop table"]
+        fn print_r6_residual_pops() {
+            let gen = gen();
+            let by_flight: Vec<(&str, Vec<SwapResidual>)> = gate_flights(&gen)
+                .into_iter()
+                .map(|(name, start, look, seconds)| {
+                    (name, flight_residuals(&gen, start, look, seconds))
+                })
+                .collect();
+            println!("\n{}", format_r6(&by_flight));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

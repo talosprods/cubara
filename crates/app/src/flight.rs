@@ -314,6 +314,73 @@ pub fn silhouette_shift(before: &Frame, after: &Frame, boxes: &[ScreenBox]) -> u
         .unwrap_or(0)
 }
 
+/// Pixels inside any of `boxes` that flip between showing [`NOTHING`] and
+/// showing land, from `before` to `after` -- #380's pop-measure diagnostic
+/// (decision 7/D), printed beside the deciding `changed_pixels` number,
+/// never in place of it (#380's plan §4.1: "diagnostics, never deciding").
+/// A subset of what `changed_pixels` counts.
+///
+/// `#[cfg(test)]`: PR 1 of #380 is measurement only (nothing it builds is
+/// wired into `fly()` yet), so this is reachable only from
+/// `print_swap_pop`. PR 2b wires it into the real measurement and drops the
+/// gate.
+#[cfg(test)]
+pub fn land_nothing_flips(before: &Frame, after: &Frame, boxes: &[ScreenBox]) -> u32 {
+    let (b, a) = (
+        before.pixels.as_chunks::<4>().0,
+        after.pixels.as_chunks::<4>().0,
+    );
+    let inside = coverage(boxes, after.width, after.height);
+    a.iter()
+        .zip(b)
+        .zip(inside)
+        .filter(|((pa, pb), inside)| *inside && shows_nothing(&pa[..]) != shows_nothing(&pb[..]))
+        .count() as u32
+}
+
+/// Of the pixels [`changed_pixels`] would count inside `boxes` between
+/// `before` and `after`, the share that are land in *both* frames -- #380's
+/// other pop-measure diagnostic (decision 7/D). This is the part a height
+/// slide cannot spread: where the fine and coarse tops coincide, the
+/// hand-over is a one-frame texture-tile and AO switch over land that was
+/// already there (the review's B1/§0.3 finding), not a silhouette moving.
+/// `0.0` when nothing inside `boxes` changed.
+///
+/// `#[cfg(test)]`: see [`land_nothing_flips`]'s doc comment.
+#[cfg(test)]
+pub fn land_to_land_share(
+    before: &Frame,
+    after: &Frame,
+    boxes: &[ScreenBox],
+    tolerance: u8,
+) -> f64 {
+    let (b, a) = (
+        before.pixels.as_chunks::<4>().0,
+        after.pixels.as_chunks::<4>().0,
+    );
+    let inside = coverage(boxes, after.width, after.height);
+    let (mut changed, mut land_land) = (0u32, 0u32);
+    for ((pa, pb), is_inside) in a.iter().zip(b).zip(inside) {
+        if !is_inside {
+            continue;
+        }
+        let (a_nothing, b_nothing) = (shows_nothing(&pa[..]), shows_nothing(&pb[..]));
+        let is_changed =
+            a_nothing != b_nothing || luminance(&pa[..]).abs_diff(luminance(&pb[..])) > tolerance;
+        if is_changed {
+            changed += 1;
+            if !a_nothing && !b_nothing {
+                land_land += 1;
+            }
+        }
+    }
+    if changed == 0 {
+        0.0
+    } else {
+        land_land as f64 / changed as f64
+    }
+}
+
 /// One swap's pop: what changed on screen inside the swapped nodes' boxes
 /// between the frame before and the frame of the swap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1230,13 +1297,18 @@ impl Streamed {
         })
     }
 
-    /// Stream for `eye` and draw one frame, the way the game's frame does.
-    fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
-        self.nodes.update(&mut self.renderer, &self.world, eye);
-        let hole = self.nodes.far_hole(&self.renderer, eye);
-        self.far.update(&mut self.renderer, eye, hole);
+    /// Stream for `stream_eye` and draw one frame from `camera_eye` -- the
+    /// two are equal for every caller except the #380 pop measure (decision
+    /// 7/D), which holds the camera still while the streaming centre moves.
+    /// [`frame`](Self::frame) is the one-eye case the rest of the module
+    /// uses, so there is still one frame path (`ARCHITECTURE.md` Rule 5).
+    fn frame_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
+        self.nodes
+            .update(&mut self.renderer, &self.world, stream_eye);
+        let hole = self.nodes.far_hole(&self.renderer, stream_eye);
+        self.far.update(&mut self.renderer, stream_eye, hole);
         self.renderer.render(
-            pose(flight, eye),
+            pose(flight, camera_eye),
             None,
             None,
             &[],
@@ -1251,22 +1323,33 @@ impl Streamed {
         );
     }
 
-    /// Stream and draw at `eye` until nothing is left to load, then once more
-    /// so what arrived last is drawn.
-    fn settle(&mut self, flight: &Flight, eye: [f32; 3]) {
+    /// Stream for `eye` and draw one frame, the way the game's frame does.
+    fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
+        self.frame_at(flight, eye, eye);
+    }
+
+    /// Stream for `stream_eye` and draw from `camera_eye` until nothing is
+    /// left to load, then once more so what arrived last is drawn.
+    fn settle_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
         let waiting = Instant::now();
         loop {
-            self.frame(flight, eye);
+            self.frame_at(flight, stream_eye, camera_eye);
             if self.settled() {
                 break;
             }
             if waiting.elapsed() > Duration::from_secs(60) {
-                log::warn!("flight: nothing settled at {eye:?} in a minute");
+                log::warn!("flight: nothing settled at {stream_eye:?} in a minute");
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        self.frame(flight, eye);
+        self.frame_at(flight, stream_eye, camera_eye);
+    }
+
+    /// Stream and draw at `eye` until nothing is left to load, then once more
+    /// so what arrived last is drawn.
+    fn settle(&mut self, flight: &Flight, eye: [f32; 3]) {
+        self.settle_at(flight, eye, eye);
     }
 
     fn settled(&self) -> bool {
@@ -1756,6 +1839,188 @@ fn save(path: &Path, frame: &Frame) {
     }
 }
 
+/// How long [`swap_pop_run`] waits for a step to settle before giving up and
+/// moving on with whatever it drew -- the same ceiling [`Streamed::settle`]
+/// uses.
+#[cfg(test)]
+const SWAP_POP_STEP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How far the streaming eye moves per step of [`swap_pop_run`] (#380
+/// decision 7/D).
+#[cfg(test)]
+const SWAP_POP_STEP_BLOCKS: f32 = 16.0;
+
+/// [`swap_pop_run`]'s eight steps (decision 7/D: "eight times").
+#[cfg(test)]
+const SWAP_POP_STEPS: u32 = 8;
+
+/// One #380 pop-measure run (decision 7/D). **PR 1 is measurement only**
+/// (the issue's "Delivery" note), so this is always today's code -- the
+/// fade-off arm the fade will be measured against once PR 2 builds it.
+///
+/// `#[cfg(test)]`: see [`land_nothing_flips`]'s doc comment -- PR 1 wires
+/// nothing here into `fly()`, so it is reachable only from
+/// `print_swap_pop`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SwapPopRun {
+    /// `changed_pixels` at [`POP_TOLERANCE`], maximised over every
+    /// consecutive frame pair of every step, inside that step's own union
+    /// of swapped-node screen boxes. The deciding number (decision 7/D).
+    max_changed_pixels: u32,
+    /// Diagnostic only, never deciding (decision 7/D): land/nothing flips
+    /// at the same maximisation.
+    max_land_nothing_flips: u32,
+    /// Diagnostic only: the largest silhouette shift, same maximisation.
+    max_silhouette_shift: u32,
+    /// Diagnostic only: [`land_to_land_share`] of the frame pair that gave
+    /// [`max_changed_pixels`](Self::max_changed_pixels) -- "the land→land
+    /// share of the maximum frame" (decision 7/D), not the share's own max.
+    land_to_land_share_at_max: f64,
+}
+
+/// A `(width, height)` pixel size's aspect ratio, `height` floored to 1 so a
+/// malformed zero-height size divides cleanly instead of producing infinity
+/// (`fly`'s own `width as f32 / height.max(1) as f32`, pulled out so a flip
+/// to `.min` is something a test can see).
+#[cfg(test)]
+fn aspect_of(size: (u32, u32)) -> f32 {
+    size.0 as f32 / size.1.max(1) as f32
+}
+
+/// Whether [`swap_pop_run`]'s step-settle loop has waited longer than
+/// `timeout` -- pulled out of the loop (which needs a real GPU and only
+/// runs under `--ignored`) so the comparison itself is something a
+/// no-GPU test can see broken.
+#[cfg(test)]
+fn timed_out(waited: Duration, timeout: Duration) -> bool {
+    waited > timeout
+}
+
+/// Draw one frame at `stream_eye`/`camera_eye` and fold its result into
+/// `frames` and `boxes` -- the same projection [`fly`] uses for
+/// `swapped_out()`'s boxes (issue #379's anchor). `flight.size` gives the
+/// width/height/aspect, so this takes six arguments, not eight.
+#[cfg(test)]
+fn draw_and_collect(
+    live: &mut Streamed,
+    flight: &Flight,
+    stream_eye: [f32; 3],
+    camera_eye: [f32; 3],
+    frames: &mut Vec<Frame>,
+    boxes: &mut Vec<ScreenBox>,
+) {
+    let (width, height) = flight.size;
+    let aspect = aspect_of(flight.size);
+    live.frame_at(flight, stream_eye, camera_eye);
+    let vp = pose(flight, camera_eye).view_proj(aspect, live.renderer.anchor());
+    boxes.extend(
+        live.renderer
+            .swapped_out()
+            .iter()
+            .filter_map(|b| screen_box(b.min.to_array(), b.max.to_array(), vp, width, height)),
+    );
+    frames.push(
+        live.renderer
+            .read_frame()
+            .expect("an offscreen renderer always has a frame"),
+    );
+}
+
+/// Fold one frame pair's measurements into the running maximum (decision
+/// 7/D): `changed`'s own running maximum decides which pair's
+/// `land_to_land_share` is kept ("the land→land share of the maximum
+/// frame", not the share's own maximum); `flips` and `silhouette` each
+/// keep their own maximum independently. Pulled out of [`swap_pop_run`]'s
+/// loop (GPU-only) so the fold itself is testable without one.
+#[cfg(test)]
+fn fold_pop_pair(
+    run: &mut SwapPopRun,
+    changed: u32,
+    flips: u32,
+    silhouette: u32,
+    share_if_max: f64,
+) {
+    if changed >= run.max_changed_pixels {
+        run.max_changed_pixels = changed;
+        run.land_to_land_share_at_max = share_if_max;
+    }
+    run.max_land_nothing_flips = run.max_land_nothing_flips.max(flips);
+    run.max_silhouette_shift = run.max_silhouette_shift.max(silhouette);
+}
+
+/// One run of #380's pop measure (decision 7/D): camera fixed at
+/// `flight.start`/`flight.look`; the streaming eye moves [`SWAP_POP_STEP_BLOCKS`]
+/// in x, [`SWAP_POP_STEPS`] times, each step drawn until [`Streamed::settled`]
+/// (or [`SWAP_POP_STEP_TIMEOUT`]). Per step, over the union of the screen
+/// boxes every node that left the arena in that step reported, the worst
+/// consecutive-frame change inside it; [`SwapPopRun`] is the maximum of each
+/// over the eight steps. `None` without a GPU.
+///
+/// `check-tests-can-fail.sh` found two lines here it cannot pin without a
+/// GPU: the loop's own `if live.settled() { break; }` and `if
+/// timed_out(...) { break; }` guards (every comparison each one calls --
+/// `Streamed::settled`'s own state and [`timed_out`] itself -- already has
+/// its own unit test; only the two `if` statements wrapping them, reachable
+/// only from `print_swap_pop`, do not). Accepted: the same shape as
+/// `Streamed::settle`'s identical, pre-existing `if self.settled() { break; }`
+/// a few lines up, which `check-tests-can-fail.sh` does not flag only
+/// because it predates this branch.
+#[cfg(test)]
+fn swap_pop_run(flight: &Flight) -> Option<SwapPopRun> {
+    let mut live = Streamed::new(flight)?;
+    let camera_eye = flight.start;
+    let mut stream_eye = flight.start;
+    live.settle_at(flight, stream_eye, camera_eye);
+    let mut run = SwapPopRun::default();
+    for _ in 0..SWAP_POP_STEPS {
+        stream_eye[0] += SWAP_POP_STEP_BLOCKS;
+        let mut frames = Vec::new();
+        let mut boxes = Vec::new();
+        let waiting = Instant::now();
+        loop {
+            draw_and_collect(
+                &mut live,
+                flight,
+                stream_eye,
+                camera_eye,
+                &mut frames,
+                &mut boxes,
+            );
+            if live.settled() {
+                break;
+            }
+            if timed_out(waiting.elapsed(), SWAP_POP_STEP_TIMEOUT) {
+                log::warn!("print_swap_pop: a step did not settle at {stream_eye:?} in a minute");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Once more so what arrived last is drawn and read (`Streamed::settle`'s
+        // own convention).
+        draw_and_collect(
+            &mut live,
+            flight,
+            stream_eye,
+            camera_eye,
+            &mut frames,
+            &mut boxes,
+        );
+
+        for pair in frames.windows(2) {
+            let (before, after) = (&pair[0], &pair[1]);
+            fold_pop_pair(
+                &mut run,
+                changed_pixels(before, after, &boxes, POP_TOLERANCE),
+                land_nothing_flips(before, after, &boxes),
+                silhouette_shift(before, after, &boxes),
+                land_to_land_share(before, after, &boxes, POP_TOLERANCE),
+            );
+        }
+    }
+    Some(run)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1912,6 +2177,194 @@ mod tests {
             width,
             height: rows.len() as u32,
             pixels,
+        }
+    }
+
+    /// #380 decision 7/D's two diagnostics: a 2x2 flip (land<->nothing) is
+    /// one for both `changed_pixels` and `land_nothing_flips`, and
+    /// contributes nothing to `land_to_land_share` (it is not land in both
+    /// frames). A land-to-land luminance change over the tolerance is a
+    /// `changed_pixels` hit with no flip, and it is the whole share.
+    #[test]
+    fn land_nothing_flips_and_land_to_land_share_split_the_two_kinds_of_change() {
+        let before = picture(&["##", "##"]);
+        let mut after = before.clone();
+        after.pixels[0] = NOTHING_PX[0];
+        after.pixels[1] = NOTHING_PX[1];
+        after.pixels[2] = NOTHING_PX[2];
+        after.pixels[3] = NOTHING_PX[3];
+        let b = ScreenBox {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        };
+        assert_eq!(changed_pixels(&before, &after, &[b], POP_TOLERANCE), 1);
+        assert_eq!(land_nothing_flips(&before, &after, &[b]), 1);
+        assert_eq!(
+            land_to_land_share(&before, &after, &[b], POP_TOLERANCE),
+            0.0
+        );
+
+        // A second pixel shaded past the tolerance (green dominates
+        // luminance, weight 0.587: +50 moves it well past POP_TOLERANCE's
+        // 12), still land in both.
+        let mut shaded = before.clone();
+        shaded.pixels[5] = LAND_PX[1] + 50;
+        assert_eq!(changed_pixels(&before, &shaded, &[b], POP_TOLERANCE), 1);
+        assert_eq!(land_nothing_flips(&before, &shaded, &[b]), 0);
+        assert_eq!(
+            land_to_land_share(&before, &shaded, &[b], POP_TOLERANCE),
+            1.0
+        );
+
+        // Nothing changed: the share is 0.0, not a division by zero.
+        assert_eq!(
+            land_to_land_share(&before, &before, &[b], POP_TOLERANCE),
+            0.0
+        );
+    }
+
+    /// `land_to_land_share` only looks inside its boxes: a flip at (0,0)
+    /// (inside the top-row-only box) and a land-to-land shade at (0,1)
+    /// (outside it) must not be mixed. If the box were ignored, the
+    /// outside land-to-land pixel would join the count and the share would
+    /// read 0.5 instead of 0.0.
+    #[test]
+    fn land_to_land_share_counts_only_pixels_inside_the_box() {
+        let before = picture(&["##", "##"]);
+        let mut after = before.clone();
+        after.pixels[0] = NOTHING_PX[0];
+        after.pixels[1] = NOTHING_PX[1];
+        after.pixels[2] = NOTHING_PX[2];
+        after.pixels[3] = NOTHING_PX[3]; // (0,0): a flip.
+        after.pixels[9] = LAND_PX[1] + 50; // (0,1): land-to-land, outside the box.
+        let top_row_only = ScreenBox {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        };
+        assert_eq!(land_nothing_flips(&before, &after, &[top_row_only]), 1);
+        assert_eq!(
+            land_to_land_share(&before, &after, &[top_row_only], POP_TOLERANCE),
+            0.0,
+            "the outside land-to-land pixel must not inflate the share"
+        );
+    }
+
+    /// `land_to_land_share`'s luminance test is strictly `>` the tolerance,
+    /// not `>=`: a red-channel change chosen so the two frames' luminance
+    /// differs by exactly [`POP_TOLERANCE`] (12) must not count as changed.
+    #[test]
+    fn land_to_land_share_tolerance_is_strictly_greater_than() {
+        let before = picture(&["#"]);
+        let mut at_tolerance = before.clone();
+        at_tolerance.pixels[0] = LAND_PX[0] + 40; // luminance +12, exactly.
+        let whole = ScreenBox {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        assert_eq!(
+            luminance(&at_tolerance.pixels).abs_diff(luminance(&before.pixels)),
+            POP_TOLERANCE,
+            "fixture check: the luminance delta must land exactly on the tolerance"
+        );
+        assert_eq!(
+            changed_pixels(&before, &at_tolerance, &[whole], POP_TOLERANCE),
+            0,
+            "exactly at the tolerance is not over it"
+        );
+        assert_eq!(
+            land_to_land_share(&before, &at_tolerance, &[whole], POP_TOLERANCE),
+            0.0,
+            "nothing changed, so the share is 0.0"
+        );
+    }
+
+    /// `aspect_of` divides width by height, floored to 1 -- not the other
+    /// way round, and a zero height does not divide by zero.
+    #[test]
+    fn aspect_of_divides_width_by_height_floored_to_one() {
+        assert_eq!(aspect_of((1920, 1080)), 1920.0 / 1080.0);
+        assert_eq!(aspect_of((64, 32)), 2.0);
+        assert_eq!(aspect_of((10, 0)), 10.0, "a zero height floors to 1");
+    }
+
+    /// `timed_out` is strictly greater-than, not always true and not
+    /// always false: under the timeout is not timed out, over it is, and
+    /// exactly at it (the boundary a `>=` flip would also move) is not.
+    #[test]
+    fn timed_out_is_strictly_past_the_limit() {
+        let limit = Duration::from_secs(60);
+        assert!(!timed_out(Duration::from_secs(59), limit));
+        assert!(!timed_out(limit, limit));
+        assert!(timed_out(Duration::from_secs(61), limit));
+    }
+
+    /// `fold_pop_pair`'s three maxima are independent, and the kept
+    /// `land_to_land_share_at_max` is the one from the pair that set
+    /// `max_changed_pixels`, not the share's own maximum: the third fold
+    /// (`changed = 3`) is not a new changed-maximum, so its `share_if_max`
+    /// (0.0) must not overwrite the second fold's 0.9, even though its own
+    /// `flips`/`silhouette` do push their running maxima further.
+    #[test]
+    fn fold_pop_pair_tracks_each_maximum_independently_and_pins_the_share_to_the_max_pair() {
+        let mut run = SwapPopRun::default();
+        fold_pop_pair(&mut run, 5, 2, 1, 0.1);
+        fold_pop_pair(&mut run, 10, 1, 9, 0.9);
+        fold_pop_pair(&mut run, 3, 7, 0, 0.0);
+        assert_eq!(run.max_changed_pixels, 10);
+        assert_eq!(run.land_to_land_share_at_max, 0.9);
+        assert_eq!(run.max_land_nothing_flips, 7);
+        assert_eq!(run.max_silhouette_shift, 9);
+    }
+
+    /// #380 decision 7/D's pop baseline, fade off -- **today's code**: PR 1
+    /// of #380 (issue's "Delivery" note) is measurement only, so this is
+    /// what the fade will be measured against once PR 2 builds it, not the
+    /// fade's own pass/fail. 1920x1080, the low flight's eye and look,
+    /// three runs. Minutes in release (it settles eight streaming moves on
+    /// a real GPU). `None` without a GPU: skip loudly rather than fail.
+    #[test]
+    #[ignore = "a measurement: #380 decision 7/D's pop baseline, fade off"]
+    fn print_swap_pop() {
+        let flight = Flight {
+            start: [8.0, 120.0, 8.0],
+            look: [1.0, -0.15, 0.3],
+            speed: FLY_SPEED,
+            seconds: 20.0,
+            fps: 60,
+            every: 1.0,
+            size: (1920, 1080),
+            quality: FarQuality::High,
+        };
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            match swap_pop_run(&flight) {
+                Some(r) => runs.push(r),
+                None => {
+                    cubara_render::headless::skip_or_require_gpu("print_swap_pop");
+                    return;
+                }
+            }
+        }
+        println!(
+            "\n#380 decision 7/D pop baseline, fade off (PR 1 of #380, today's code), \
+             1920x1080, low flight eye/look, 3 runs:"
+        );
+        for (i, r) in runs.iter().enumerate() {
+            println!(
+                "  run {}: changed_pixels max = {}, land<->nothing flips max = {}, \
+                 silhouette_shift max = {}, land->land share (at the max frame) = {:.3}",
+                i + 1,
+                r.max_changed_pixels,
+                r.max_land_nothing_flips,
+                r.max_silhouette_shift,
+                r.land_to_land_share_at_max,
+            );
         }
     }
 
