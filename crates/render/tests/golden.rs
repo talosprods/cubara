@@ -19,7 +19,6 @@
 //! before committing it — blessing on autopilot turns this file into decoration.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use cubara_render::headless::{self, Frame, Shot};
 use cubara_render::materials::TextureLayers;
@@ -84,28 +83,11 @@ fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
     })
 }
 
-/// Serialises every `wgpu::Instance`/adapter/device creation and teardown in
-/// this binary (issue #265): cargo runs this binary's `#[test]` fns on
-/// several threads by default, and each one independently opens and drops a
-/// Vulkan instance+device. That races against known thread-safety bugs in the
-/// Khronos Vulkan Loader's own instance/device bookkeeping -- see
-/// <https://github.com/KhronosGroup/Vulkan-Loader/issues/200> ("Race condition
-/// in vkCreateDevice()+vkDestroyDevice()+vkGetDeviceProcAddr()"), fixed
-/// upstream the same way this does: a lock around create/destroy. Confirmed
-/// here by two independent crashes faulting at the identical code offset
-/// inside `libvulkan.so.1.4.341` (not wgpu, not the NVIDIA driver, not this
-/// crate) -- `journalctl -k` showed `... in libvulkan.so.1.4.341[236fe,...]`
-/// both times, from different tests, meaning the crashing thread was
-/// incidental, not test-specific. `--test-threads=1` and `--release` (whose
-/// timing apparently never hits the window) always passed, and so does `gdb`
-/// (which serialises/slows scheduling enough to avoid the race), which is why
-/// this could not be pinned down with a debugger.
-///
-/// This is a test-harness lock, not simulation state: `ARCHITECTURE.md` Rule
-/// 2 ("no ambient state") governs the engine and render crates, not a fixture
-/// working around a driver bug. Meshing (the CPU-bound part of a shot) still
-/// runs unlocked and in parallel; only the GPU setup/teardown is serialised.
-static GPU_LIFECYCLE: Mutex<()> = Mutex::new(());
+/// The one GPU setup/teardown lock every GPU test binary in this crate
+/// shares (issues #265 and #412 -- the Khronos Vulkan Loader races on
+/// concurrent instance/device create+destroy); see its own doc comment.
+#[path = "common/gpu_lifecycle.rs"]
+mod gpu_lifecycle;
 
 /// Mesh `world` out to `shot.region_radius` (the same ring-schedule
 /// truncation the live renderer streams, `schedule_for_radius`) and render
@@ -132,7 +114,7 @@ fn render_world(world: &World, shot: Shot) -> Option<Frame> {
     )
     .into_iter()
     .filter_map(to_meshed_node);
-    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = gpu_lifecycle::lock();
     headless::render(meshed, shot)
 }
 
@@ -840,7 +822,7 @@ fn render_frustum_nodes(world: &World, shot: Shot, schedule: &[(u32, i32)]) -> O
     let meshed = mesh_nodes(world, &registry, &layer_of, nodes, real_blocks())
         .into_iter()
         .filter_map(to_meshed_node);
-    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = gpu_lifecycle::lock();
     headless::render(meshed, shot)
 }
 
@@ -949,7 +931,7 @@ fn render_with_and_without_trees(schedule: &[(u32, i32)]) -> Option<(Frame, Fram
         ..Shot::default()
     };
     let render = |built: Vec<cubara_world::mesh::BuiltNode>| {
-        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = gpu_lifecycle::lock();
         headless::render(built.into_iter().filter_map(to_meshed_node), shot.clone())
     };
     let (with_frame, without_frame) = (render(with_trees), render(without_trees));
@@ -1921,7 +1903,7 @@ fn distinct_materials_render_with_distinct_textures() {
     };
 
     let frame = {
-        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = gpu_lifecycle::lock();
         headless::render_chunks(&chunks, shot)
     };
     let Some(frame) = frame else {
@@ -2167,7 +2149,7 @@ fn render_world_with_far(
         hole: Some(([-edge, 0, -edge], [edge + 16, 48, edge + 16])),
         materials: far_materials(),
     };
-    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = gpu_lifecycle::lock();
     headless::render_with_far(meshed, &patches, Some(params), shot)
 }
 
@@ -2304,7 +2286,7 @@ fn far_shading_is_the_aggregate_reference() {
             materials,
         };
         let frame = {
-            let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            let _gpu = gpu_lifecycle::lock();
             headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
         };
         let Some(frame) = frame else {
@@ -2528,7 +2510,7 @@ fn render_anchored(
             node.trees.clear();
         }
     }
-    let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let _gpu = gpu_lifecycle::lock();
     headless::render_with_far(nodes, &[patch], Some(params), shot)
 }
 
@@ -2543,7 +2525,7 @@ fn drawn_fraction(frame: &Frame, shot: &Shot) -> f64 {
         ..shot.clone()
     };
     let sky = {
-        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = gpu_lifecycle::lock();
         headless::render_with_far(Vec::new(), &[], None, empty)
     }
     .expect("adapter was available a moment ago");
@@ -2647,7 +2629,7 @@ fn a_scene_moved_up_a_grid_step_renders_byte_identically() {
             lighting: no_haze,
             ..scene.shot
         };
-        let _gpu = GPU_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu = gpu_lifecycle::lock();
         headless::render_with_far(scene.nodes, &[], None, shot)
     }
     .expect("adapter was available a moment ago");

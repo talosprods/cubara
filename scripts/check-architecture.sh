@@ -58,24 +58,25 @@ done | report "Rule 1" "floating-point trigonometry in a simulation crate — us
 
 # ── Rule 2 — no ambient state ────────────────────────────────────────────────
 # A system that cannot be instantiated twice cannot be tested in isolation.
-# `tests/golden.rs` is excluded by name: its `static GPU_LIFECYCLE: Mutex<()>`
-# holds no world data (the rule's own wording -- ARCHITECTURE.md Rule 2 -- is
-# "no ... `static OnceLock<RwLock<T>>` holding *world data*"). It exists only
-# to serialise this binary's own `#[test]` threads around a thread-safety bug
-# in the Khronos Vulkan Loader itself (issue #265), the same fix upstream used
-# for the same class of loader bug. A second `static` anywhere else, including
-# elsewhere in this same file, still fails here.
-grep -rn --include='*.rs' --exclude='golden.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLock)|static mut |lazy_static" crates \
+# `tests/common/gpu_lifecycle.rs` is excluded by name: its `static
+# GPU_LIFECYCLE: Mutex<()>` holds no world data (the rule's own wording --
+# ARCHITECTURE.md Rule 2 -- is "no ... `static OnceLock<RwLock<T>>` holding
+# *world data*"). It exists only to serialise a test binary's own `#[test]`
+# threads around a thread-safety bug in the Khronos Vulkan Loader itself
+# (issues #265 and #412), the same fix upstream used for the same class of
+# loader bug; every GPU test binary includes that one file (`#[path]`), so
+# there is one copy. A second `static` anywhere else still fails here.
+grep -rn --include='*.rs' --exclude='gpu_lifecycle.rs' -E "static +[A-Z_]+ *: *(OnceLock|Mutex|RwLock|LazyLock)|static mut |lazy_static" crates \
     | report "Rule 2" "global mutable state — pass state in, do not reach for it"
 
 # An `AtomicU64`/`AtomicBool`/etc. held in a `static` is ambient mutable state
 # just as much as a `Mutex` is -- the rule's wording ("no ... singletons")
 # does not carve out lock-free ones. #393 (critical review 2026-11-10, F10):
 # this gap is real, not hypothetical -- the check above only recognised the
-# four lock-based shapes. Same `golden.rs` exclusion as the check above, for
-# the same reason (a second `static` anywhere else, including elsewhere in
-# that file, still fails here).
-grep -rn --include='*.rs' --exclude='golden.rs' -E "static +[A-Z_]+ *: *(std::sync::atomic::)?Atomic[A-Za-z0-9]+" crates \
+# four lock-based shapes. Same `gpu_lifecycle.rs` exclusion as the check
+# above, for the same reason (a second `static` anywhere else, including
+# elsewhere in that file, still fails here).
+grep -rn --include='*.rs' --exclude='gpu_lifecycle.rs' -E "static +[A-Z_]+ *: *(std::sync::atomic::)?Atomic[A-Za-z0-9]+" crates \
     | report "Rule 2" "a static Atomic* — ambient mutable state, pass it in instead"
 
 # ── Rule 3 / 4 — dependency direction, and the sim runs without a GPU ────────

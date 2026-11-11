@@ -87,7 +87,7 @@ const MAX_DRAWS: u32 = 16_384;
 /// 1,585-1,613 resident nodes across four different world positions
 /// (`BENCHMARKS.md` footnote 27) -- 16,384 leaves ~10× headroom, down from
 /// 65,536 (a 4× reduction, ~0.75 MiB saved).
-const MAX_NODES: u32 = 16_384;
+pub(crate) const MAX_NODES: u32 = 16_384;
 
 /// A free-list index allocator over `0..MAX_NODES`, handing out the node
 /// index each resident node uses to find its origin in the storage buffer.

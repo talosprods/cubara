@@ -500,6 +500,24 @@ impl TreeArena {
             self.remove(id);
             return;
         }
+        // The CPU invariant behind `trees.wgsl`'s `node_origins[node_index]`
+        // (issue #412): every instance stored here indexes the `ChunkArena`'s
+        // origins buffer, which is exactly `MAX_NODES` entries long, and a
+        // real slot always comes from that arena's allocator over
+        // `0..MAX_NODES` (`ChunkArena::node_index`, read right after a
+        // successful insert -- `render.rs`'s `ArenaSink::try_insert`). A
+        // standalone caller (a test, a future second arena) that makes up an
+        // index past the buffer would be an out-of-bounds storage read on
+        // the GPU -- zero on a real GPU, a fault on a software rasteriser
+        // with no robust buffer access -- so it is refused here, on the CPU,
+        // never clamped in the shader.
+        debug_assert!(
+            node_index < crate::arena::MAX_NODES,
+            "tree node_index {node_index} is past the node-origins buffer \
+             ({} slots) -- an instance may only reference a slot the ChunkArena \
+             can have handed out",
+            crate::arena::MAX_NODES
+        );
         let (local_min, local_max) = self.local_bounds;
         let mut min = node_local_aabb.min;
         let mut max = node_local_aabb.max;
@@ -770,6 +788,53 @@ mod tests {
         };
         arena.insert(id, 0, [0; 3], TreeModel::Oak, Vec::new(), unit_aabb());
         assert_eq!(arena.node_count(), 0, "an empty insert recorded a node");
+    }
+
+    /// Issue #412: `trees.wgsl` reads `node_origins[node_index]` with no
+    /// bounds check (a clamp there would hide the bug, decision 2), so the
+    /// invariant that every stored instance indexes a slot the origins
+    /// buffer actually has (`0..MAX_NODES`) is enforced on the CPU, at
+    /// `insert`. The live path cannot produce such an index (the slot comes
+    /// from the `ChunkArena`'s own allocator); this pins what happens when a
+    /// standalone caller makes one up. `debug_assert`, so a debug build --
+    /// every test and every CI run -- is what catches it.
+    #[test]
+    #[should_panic(expected = "past the node-origins buffer")]
+    #[cfg(debug_assertions)]
+    fn an_instance_may_not_reference_a_slot_the_origins_buffer_does_not_have() {
+        let mut arena = no_local_bounds();
+        let id = NodeId {
+            level: 1,
+            pos: [0, 0, 0],
+        };
+        arena.insert(
+            id,
+            crate::arena::MAX_NODES,
+            [0; 3],
+            TreeModel::Oak,
+            vec![[0, 0, 0]],
+            unit_aabb(),
+        );
+    }
+
+    /// The companion to the test above: the last slot the arena can hand out
+    /// (`MAX_NODES - 1`) is a valid index, not an off-by-one rejection.
+    #[test]
+    fn the_last_slot_the_arena_can_hand_out_is_a_valid_instance_index() {
+        let mut arena = no_local_bounds();
+        let id = NodeId {
+            level: 1,
+            pos: [0, 0, 0],
+        };
+        arena.insert(
+            id,
+            crate::arena::MAX_NODES - 1,
+            [0; 3],
+            TreeModel::Oak,
+            vec![[0, 0, 0]],
+            unit_aabb(),
+        );
+        assert_eq!(arena.node_count(), 1);
     }
 
     #[test]

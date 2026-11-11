@@ -10,6 +10,11 @@
 
 use cubara_render::{Aabb, CameraUniform, Frustum, NodeId, TreeArena, TreeModel};
 
+/// Serialises instance/device creation and teardown across this binary's
+/// test threads (issues #265 and #412; see the module's own doc comment).
+#[path = "common/gpu_lifecycle.rs"]
+mod gpu_lifecycle;
+
 /// A headless device, or `None` on a CI runner with no GPU adapter -- the
 /// same convention `mesh_arena_integration.rs`'s `test_device` uses.
 fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -48,6 +53,8 @@ fn no_reach() -> (glam::Vec3, glam::Vec3) {
 
 #[test]
 fn only_nodes_in_the_frustum_contribute_instances() {
+    // First, so it drops last -- after the device and queue it protects.
+    let _gpu = gpu_lifecycle::lock();
     let Some((device, queue)) = test_device() else {
         cubara_render::headless::skip_or_require_gpu(
             "only_nodes_in_the_frustum_contribute_instances",
@@ -101,6 +108,8 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
     // simply stops drawing once the camera turns away from it -- proof this
     // is a per-frame re-test against the frustum, not a one-time filter
     // baked in at `insert` time.
+    // First, so it drops last -- after the device and queue it protects.
+    let _gpu = gpu_lifecycle::lock();
     let Some((device, queue)) = test_device() else {
         cubara_render::headless::skip_or_require_gpu(
             "a_node_leaving_the_frustum_stops_contributing_without_being_removed",
@@ -149,6 +158,8 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
 /// frustum while the leaves have not).
 #[test]
 fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does_not() {
+    // First, so it drops last -- after the device and queue it protects.
+    let _gpu = gpu_lifecycle::lock();
     let Some((device, queue)) = test_device() else {
         cubara_render::headless::skip_or_require_gpu(
             "a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does_not",
