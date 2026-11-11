@@ -191,6 +191,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-11 | **Gate eye: ground — `GATE: MET at Medium`**, 2 runs, AC power, battery 100% and charged, lid open, display on; run 1 under agent load, run 2 quiet; 836 draws (464/1,568 nodes)⁸⁹ | -- | -- | **1,018 / 1,155** | **0.476 / 0.423 ms** | 2.021 / 0.974 ms | `0ab0cc3` |
 | 2026-11-11 | Gate eye: hill — `MET at Medium`, 2 runs, same conditions, run 1 under agent load; 446 draws (230/779 nodes)⁸⁹ | -- | -- | 1,010 / 1,135 | 0.475 / 0.422 ms | 2.078 / 0.988 ms | `0ab0cc3` |
 | 2026-11-11 | Gate eye: flight — `MET at Medium`, 2 runs, same conditions, run 1 under agent load; 0 draws⁸⁹ | 0 | far only | 2,968 / 3,461 | 0.167 / 0.144 ms | 1.070 / 0.382 ms | `0ab0cc3` |
+| 2026-11-11 | **Gate eye: ground** at main, A of the A/B for #398 PR A, 3 runs (`GATE: MET at Medium` each), same conditions: AC power, battery 100% and charged, lid open, display on, quiet machine, 3 runs each, alternating A, B, A, B, A, B; 836 draws⁹⁰ | -- | -- | 1,157 / 1,154 / 1,157 | 0.421 / 0.422 / 0.421 ms | 0.988 / 0.973 / 0.990 ms | `16d153f` |
+| 2026-11-11 | Gate eye: ground at PR A, B of the A/B, 3 runs, same conditions⁹⁰ | -- | -- | 1,155 / 1,156 / 1,157 | 0.421 / 0.422 / 0.421 ms | 0.961 / 0.991 / 0.992 ms | `cdc1d08` |
+| 2026-11-11 | Gate eye: hill at main (A), 3 runs, same conditions; 446 draws⁹⁰ | -- | -- | 1,140 / 1,140 / 1,140 | 0.423 / 0.423 / 0.420 ms | 1.011 / 1.017 / 0.980 ms | `16d153f` |
+| 2026-11-11 | Gate eye: hill at PR A (B), 3 runs, same conditions⁹⁰ | -- | -- | 1,139 / 1,140 / 1,141 | 0.422 / 0.422 / 0.422 ms | 1.009 / 1.004 / 1.004 ms | `cdc1d08` |
+| 2026-11-11 | Gate eye: flight at main (A), 3 runs, same conditions; 0 draws⁹⁰ | 0 | far only | 3,491 / 3,489 / 3,489 | 0.142 / 0.142 / 0.142 ms | 0.369 / 0.365 / 0.369 ms | `16d153f` |
+| 2026-11-11 | Gate eye: flight at PR A (B), 3 runs, same conditions⁹⁰ | 0 | far only | 3,489 / 3,484 / 3,491 | 0.142 / 0.142 / 0.142 ms | 0.370 / 0.371 / 0.367 ms | `cdc1d08` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1286,6 +1292,8 @@ the whole frame in the game's own loop (`--bench walk`) in ⁸³.
 | 2026-11-10 | **macOS, Apple M3** (8 GB, Metal), item 0's low flight, 1280×720 to sit beside the rows above⁸⁸ | low, 2 runs | **0.10% / 0.11%** | **1.46% / 1.47%** | **4% / 4%** | 2.7 / 2.9 ms | `874c771` |
 | 2026-11-10 | **macOS, Apple M3**, the same flight at 1920×1080 — what `check-phase-gate.sh` itself runs⁸⁸ | low, 2 runs | 0.10% / 0.09% | 1.49% / 1.50% | 4% / 4% | 2.7 / 2.8 ms | `874c771` |
 | 2026-11-11 | **macOS, Apple M3**, the same 1080p flight after #379's parts 2 and 3 and #405, quiet machine⁸⁹ | low, 2 runs | 0.09% / 0.11% | 1.49% / 1.50% | 4% / 4% | 2.6 / 2.7 ms | `0ab0cc3` |
+| 2026-11-11 | **macOS, Apple M3**, the same 1080p flight at main (A of the A/B for #398 PR A), quiet machine⁹⁰ | low, 3 runs | 0.10% / 0.10% / 0.10% | 1.49% / 1.49% / 1.49% | 4% / 4% / 4% | 2.5 / 2.5 / 2.5 ms | `16d153f` |
+| 2026-11-11 | **macOS, Apple M3**, the same flight at PR A (B), quiet machine⁹⁰ | low, 3 runs | 0.11% / 0.10% / 0.10% | 1.49% / 1.49% / 1.49% | 4% / 4% / 4% | 2.6 / 2.6 / 2.6 ms | `cdc1d08` |
 
 ### Holes while flying — nothing drawn where land belongs (`--bench flight`)
 
@@ -3145,3 +3153,47 @@ For comparison, ⁸⁸'s 1080p flight at 874c771 counted 7 and 6 hole frames and
 and 11 kept stale frames. main has moved since these runs (flight.rs,
 streaming.rs and check-phase-gate.sh changed in #406 after 0ab0cc3), so these
 rows describe 0ab0cc3 and nothing later.
+
+⁹⁰ **#398 PR A against main on the M3, an A/B at 16d153f and cdc1d08,
+macOS, 2026-11-11.** PR A is meant to change no behaviour (the far terrain's
+streaming decisions moved out of the GPU path), so this measures whether it
+did. A = `origin/main` at 16d153f; B = `refactor/398-far-plan` at cdc1d08, whose
+merge-base with main is 16d153f. Both were built in release in one session and
+copied aside; the two builds finished at 03:55:43 and the first run started at
+04:01:02 (5 min 19 s later). Conditions: AC power in every pre and post
+snapshot, battery 100% and charged, lid open, display on; `pmset -g therm`
+recorded no thermal, performance or CPU-power warning (the platform reports
+none, which is not proof of no throttling). Before every run the busiest process
+was at most 14.4% CPU (`loginwindow`, before gate A-2 and gate B-2); all others
+at most 1.8%. Design: `--bench gate` A, B, A, B, A, B, then `--bench flight
+--eye 8,120,8 --look 1,-0.15,0.3 --seconds 20` (1080p, the default size) in
+the same order, about 2 minutes between runs. Every run is in the rows, in run
+order; none was dropped. GPU/frame is `--` because the bench disables GPU
+timing on Metal (#410).
+
+**CPU/frame is equal.** Medians of three, A against B: ground 0.421 / 0.421 ms,
+hill 0.423 / 0.422 ms, flight 0.142 / 0.142 ms. The differences are at most
+0.003 ms and the spread inside either variant is as large, so nothing separates
+them. FPS agrees: 1,157 / 1,156 (ground), 1,140 / 1,140 (hill), 3,489 / 3,489
+(flight) as medians. Every gate run printed `GATE: MET at Medium`; this note
+does not judge the gate.
+
+**The low flight's STALE is 11 kept frames in every run, A and B alike,** inside
+the 11, 12 and 11 of #398 step 1's base runs. Loading (mean 0.10-0.11%, worst
+1.49%), work p99 (2.5 against 2.6 ms), nothing over 16.7 or 33.3 ms, and swap
+lag p99 (117 ms, 2.8 blocks) are unchanged. POPS silhouette p99 is 0 px in all
+six; the max is 6 px except 8 px in B's third run.
+
+**HOLES differed in these six runs and is intermittent on main too.** A: 0 / 0 /
+0 of 1,200 frames. B: 7 / 5 / 7, each time at t of about 10.7 s, eye about
+[253, 83, 82], first hole pixel (549, 391), 1-2 pixels, worst 0.000%, none under
+a late swap. Afterwards, reruns by the PR A author: main (A binary) 5 and 0;
+cdc1d08 (B binary) 0, 0, 0, 0; a logging build of cdc1d08 0, 6, 0, 0. Logging
+builds of both commits produce the same select, remove and insert sequences
+apart from timing-dependent batching. main's own earlier records agree: ⁸⁸
+(874c771) 7 and 6, ⁸⁹ (0ab0cc3) 0 and 6. So 5 to 7 hole frames at about t =
+10.7 s occur on main as well and come and go between runs of one binary; the
+six runs above, three each, cannot attribute them to PR A.
+
+**Judgement: PR A is neutral on CPU/frame and on STALE** on the M3. HOLES cannot
+be assigned to either side from this data.

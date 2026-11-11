@@ -280,25 +280,170 @@ impl Pool {
     }
 }
 
+/// What one frame changes: patches to generate, slots to free, patches to
+/// upload. Empty when nothing changed.
+#[derive(Debug, Default, PartialEq)]
+struct Step {
+    request: Vec<PatchKey>,
+    leave: Vec<PatchKey>,
+    arrive: Vec<PatchKey>,
+}
+
+/// The far terrain's streaming decisions, with no GPU and no threads
+/// (`ARCHITECTURE.md` rule 6: the timing of streaming can only be pinned by a
+/// test if the decisions can run in one).
+///
+/// The plan does not hold what is drawn: [`FarStreaming`]'s `slots` is the one
+/// source of truth for that, and is handed to [`step`](Self::step) each time.
+struct FarPlan {
+    quality: FarQuality,
+    /// [`FAR_VIEW_RADIUS`] in the game; tests use less.
+    radius: f64,
+    /// Every patch generated and still of use: the ones drawn, and the ones
+    /// whose error decides whether their area is split.
+    heights: HashMap<PatchKey, PatchHeights>,
+    in_flight: HashSet<PatchKey>,
+    /// Where the eye was when the selection was last worked out.
+    selected_at: Option<[f64; 3]>,
+    /// The hole the last selection left to the voxels.
+    hole: Option<Hole>,
+    /// The screen height the last selection was made for.
+    screen_height: u32,
+    /// New patches arrived since the last selection.
+    arrived: bool,
+    /// How many times [`far::select`] has run, for tests of what a frame costs.
+    #[cfg(test)]
+    selects: u64,
+}
+
+impl FarPlan {
+    fn new(quality: FarQuality, radius: f64) -> Self {
+        Self {
+            quality,
+            radius,
+            heights: HashMap::new(),
+            in_flight: HashSet::new(),
+            selected_at: None,
+            hole: None,
+            screen_height: 0,
+            arrived: false,
+            #[cfg(test)]
+            selects: 0,
+        }
+    }
+
+    /// Forget every patch, generated or generating, and start the selection
+    /// again (a new world, a new quality).
+    fn clear(&mut self) {
+        self.heights.clear();
+        self.in_flight.clear();
+        self.selected_at = None;
+        self.arrived = false;
+    }
+
+    /// A patch finished generating.
+    fn take(&mut self, patch: PatchHeights) {
+        self.in_flight.remove(&patch.key);
+        self.heights.insert(patch.key, patch);
+        self.arrived = true;
+    }
+
+    /// Nothing generating, and the selection up to date with what has
+    /// arrived.
+    fn settled(&self) -> bool {
+        self.in_flight.is_empty() && !self.arrived
+    }
+
+    /// Work the selection out again on the next [`step`](Self::step), however
+    /// little the eye has moved.
+    fn reselect(&mut self) {
+        self.selected_at = None;
+    }
+
+    /// The heights of a generated patch still held.
+    fn patch(&self, key: PatchKey) -> Option<&PatchHeights> {
+        self.heights.get(&key)
+    }
+
+    /// Decide what this frame changes for an eye at `eye`: work the selection
+    /// out again if the eye has moved or new patches arrived, and say what to
+    /// ask for, free and upload. `drawn` is what the renderer holds now; it is
+    /// called only if the selection is worked out.
+    fn step(
+        &mut self,
+        eye: [f64; 3],
+        screen_height: u32,
+        hole: Hole,
+        drawn: impl FnOnce() -> HashSet<PatchKey>,
+    ) -> Step {
+        let moved = self.selected_at.is_none_or(|at| {
+            let d = (0..3).map(|a| (at[a] - eye[a]).powi(2)).sum::<f64>().sqrt();
+            d > RESELECT_BLOCKS
+        });
+        // The hole is the voxels' to say (`NodeStreaming::far_hole`): where it
+        // shrinks, patches it used to swallow are wanted at once.
+        let hole_moved = self.hole != Some(hole);
+        self.hole = Some(hole);
+        let screen_moved = self.screen_height != screen_height;
+        self.screen_height = screen_height;
+        if !(moved || hole_moved || screen_moved || self.arrived) {
+            return Step::default();
+        }
+        self.selected_at = Some(eye);
+        self.arrived = false;
+        let drawn = drawn();
+
+        let Some(view) = far_view(eye, screen_height, Some(hole), self.quality) else {
+            // Off: nothing beyond the voxels.
+            let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
+            leave.sort();
+            return Step {
+                leave,
+                ..Step::default()
+            };
+        };
+        let view = FarView {
+            radius: self.radius,
+            ..view
+        };
+        #[cfg(test)]
+        {
+            self.selects += 1;
+        }
+        let wanted = far::select(&view, |k| self.heights.get(&k).map(|p| p.error));
+
+        // Ask for what is missing, nearest first: the ground under the eye
+        // matters more than the horizon.
+        let mut request: Vec<PatchKey> = wanted
+            .iter()
+            .copied()
+            .filter(|k| !self.heights.contains_key(k) && !self.in_flight.contains(k))
+            .collect();
+        request.sort_by_key(|k| k.level);
+        self.in_flight.extend(request.iter().copied());
+
+        // Swap the drawn set, never leaving ground uncovered.
+        let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
+        let (leave, arrive) = swap(&drawn, &draw);
+        let keep = to_keep(&wanted, draw);
+        self.heights.retain(|k, _| keep.contains(k));
+        Step {
+            request,
+            leave,
+            arrive,
+        }
+    }
+}
+
 /// The far terrain's streaming state. One per window, beside the voxel
 /// [`crate::streaming::NodeStreaming`].
 pub struct FarStreaming {
     gen: WorldGen,
     seed: u64,
-    quality: FarQuality,
     generation: u64,
     pool: Pool,
-    /// Every patch generated and still of use: the ones drawn, and the ones
-    /// whose error decides whether their area is split.
-    heights: HashMap<PatchKey, PatchHeights>,
-    in_flight: HashSet<PatchKey>,
+    plan: FarPlan,
     slots: HashMap<PatchKey, FarSlot>,
-    /// Where the eye was when the selection was last worked out.
-    selected_at: Option<[f64; 3]>,
-    /// The hole the last selection left to the voxels.
-    hole: Option<Hole>,
-    /// New patches arrived since then.
-    stale: bool,
     materials: Materials,
     /// Said once when the renderer runs out of slots, not every frame.
     warned_full: bool,
@@ -309,15 +454,10 @@ impl FarStreaming {
         Self {
             gen: WorldGen::new(seed),
             seed,
-            quality,
             generation: 0,
             pool: Pool::new(),
-            heights: HashMap::new(),
-            in_flight: HashSet::new(),
+            plan: FarPlan::new(quality, FAR_VIEW_RADIUS),
             slots: HashMap::new(),
-            selected_at: None,
-            hole: None,
-            stale: false,
             materials: far_materials(),
             warned_full: false,
         }
@@ -332,9 +472,9 @@ impl FarStreaming {
     /// the selection starts again, since a patch's heights do not depend on
     /// it but which patches are wanted does.
     pub fn set_quality(&mut self, quality: FarQuality, renderer: &mut Renderer) {
-        if quality != self.quality {
+        if quality != self.plan.quality {
             let seed = self.seed;
-            self.quality = quality;
+            self.plan.quality = quality;
             self.reset(seed, renderer);
         }
     }
@@ -345,19 +485,16 @@ impl FarStreaming {
         for (_, slot) in self.slots.drain() {
             renderer.far_remove(slot);
         }
-        self.heights.clear();
-        self.in_flight.clear();
+        self.plan.clear();
         self.generation += 1;
         self.gen = WorldGen::new(seed);
         self.seed = seed;
-        self.selected_at = None;
-        self.stale = false;
     }
 
     /// Nothing generating, and the selection up to date with what has
     /// arrived (`crate::flight`).
     pub fn settled(&self) -> bool {
-        self.in_flight.is_empty() && !self.stale
+        self.plan.settled()
     }
 
     /// Work the selection out again on the next [`update`](Self::update),
@@ -365,7 +502,7 @@ impl FarStreaming {
     /// needs, which [`RESELECT_BLOCKS`] would otherwise leave to the last
     /// eye's.
     pub fn reselect(&mut self) {
-        self.selected_at = None;
+        self.plan.reselect();
     }
 
     /// Bring the far terrain in line with the camera at `eye`: take in what
@@ -376,62 +513,25 @@ impl FarStreaming {
             if generation != self.generation {
                 continue;
             }
-            self.in_flight.remove(&patch.key);
-            self.heights.insert(patch.key, patch);
-            self.stale = true;
+            self.plan.take(patch);
         }
-        let eye64 = eye.map(|v| v as f64);
-        let moved = self.selected_at.is_none_or(|at| {
-            let d = (0..3)
-                .map(|a| (at[a] - eye64[a]).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            d > RESELECT_BLOCKS
-        });
-        // The hole is the voxels' to say (`NodeStreaming::far_hole`): where it
-        // shrinks, patches it used to swallow are wanted at once.
-        let hole_moved = self.hole != Some(hole);
-        self.hole = Some(hole);
         renderer.set_far_params(to_far_params(hole, self.materials));
-        if !(moved || hole_moved || self.stale) {
-            return;
-        }
-        self.selected_at = Some(eye64);
-        self.stale = false;
+        let eye64 = eye.map(|v| v as f64);
+        let slots = &self.slots;
+        let step = self.plan.step(eye64, renderer.size().1, hole, || {
+            slots.keys().copied().collect()
+        });
 
-        let Some(view) = far_view(eye64, renderer.size().1, Some(hole), self.quality) else {
-            // Off: nothing beyond the voxels.
-            for (_, slot) in self.slots.drain() {
-                renderer.far_remove(slot);
-            }
-            return;
-        };
-        let wanted = far::select(&view, |k| self.heights.get(&k).map(|p| p.error));
-
-        // Ask for what is missing, nearest first: the ground under the eye
-        // matters more than the horizon.
-        let mut missing: Vec<PatchKey> = wanted
-            .iter()
-            .copied()
-            .filter(|k| !self.heights.contains_key(k) && !self.in_flight.contains(k))
-            .collect();
-        missing.sort_by_key(|k| k.level);
-        for key in missing {
-            self.in_flight.insert(key);
+        for key in step.request {
             let _ = self.pool.jobs.send((self.generation, self.gen, key));
         }
-
-        // Swap the drawn set, never leaving ground uncovered.
-        let drawn: HashSet<PatchKey> = self.slots.keys().copied().collect();
-        let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
-        let (leave, arrive) = swap(&drawn, &draw);
-        for key in leave {
+        for key in step.leave {
             if let Some(slot) = self.slots.remove(&key) {
                 renderer.far_remove(slot);
             }
         }
-        for key in arrive {
-            let Some(patch) = self.heights.get(&key) else {
+        for key in step.arrive {
+            let Some(patch) = self.plan.patch(key) else {
                 continue;
             };
             match renderer.far_insert(to_far_patch(patch)) {
@@ -447,9 +547,6 @@ impl FarStreaming {
                 None => {}
             }
         }
-
-        let keep = to_keep(&wanted, draw);
-        self.heights.retain(|k, _| keep.contains(k));
     }
 }
 
@@ -679,5 +776,477 @@ mod tests {
     fn the_renderer_and_the_world_agree_on_the_patch_size() {
         assert_eq!(cubara_render::FAR_QUADS, far::PATCH_QUADS);
         assert_eq!(cubara_render::FAR_VERTS, far::PATCH_VERTS);
+    }
+
+    // --- The plan without a GPU (#398, rule 6) --------------------------
+
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// Smaller than the game's radius so a flight of 600 frames runs in
+    /// seconds; the cost report uses the game's.
+    const TEST_RADIUS: f64 = 4096.0;
+
+    /// The gate's low flight: from (8, 120, 8) along (1, -0.15, 0.3) at the
+    /// speed `flight::FLY_SPEED`, one eye per frame at 60 Hz.
+    fn low_flight(frames: usize) -> Vec<[f64; 3]> {
+        let (dx, dy, dz) = (1.0f64, -0.15f64, 0.3f64);
+        let n = (dx * dx + dy * dy + dz * dz).sqrt();
+        (0..frames)
+            .map(|f| {
+                let s = crate::flight::FLY_SPEED as f64 * f as f64 / 60.0 / n;
+                [8.0 + dx * s, 120.0 + dy * s, 8.0 + dz * s]
+            })
+            .collect()
+    }
+
+    /// What the worker pool does, in frames: `workers` workers over one FIFO
+    /// in request order, each patch taking `service_frames` frames.
+    struct PoolModel {
+        workers: usize,
+        service_frames: u32,
+        queue: VecDeque<PatchKey>,
+        busy: Vec<(PatchKey, u32)>,
+    }
+
+    impl PoolModel {
+        fn new(workers: usize, service_frames: u32) -> Self {
+            Self {
+                workers,
+                service_frames,
+                queue: VecDeque::new(),
+                busy: Vec::new(),
+            }
+        }
+
+        /// Every worker is as fast as a frame and there are plenty: what
+        /// arrives is what was asked for in the frame before.
+        fn instant() -> Self {
+            Self::new(100_000, 1)
+        }
+
+        fn fill(&mut self) {
+            while self.busy.len() < self.workers {
+                let Some(key) = self.queue.pop_front() else {
+                    break;
+                };
+                self.busy.push((key, self.service_frames));
+            }
+        }
+
+        fn request(&mut self, keys: &[PatchKey]) {
+            self.queue.extend(keys.iter().copied());
+            self.fill();
+        }
+
+        /// One frame passes: what finished.
+        fn tick(&mut self) -> Vec<PatchKey> {
+            for (_, left) in &mut self.busy {
+                *left -= 1;
+            }
+            let done = self
+                .busy
+                .iter()
+                .filter(|(_, left)| *left == 0)
+                .map(|(k, _)| *k)
+                .collect();
+            self.busy.retain(|(_, left)| *left > 0);
+            self.fill();
+            done
+        }
+
+        /// Everything asked for, finished now.
+        fn flush(&mut self) -> Vec<PatchKey> {
+            let mut all: Vec<PatchKey> = self.busy.drain(..).map(|(k, _)| k).collect();
+            all.extend(self.queue.drain(..));
+            all
+        }
+    }
+
+    /// A plan, a pool, and what a renderer would hold. Tests compare `shown`,
+    /// never anything the plan believes.
+    struct Sim {
+        plan: FarPlan,
+        pool: PoolModel,
+        shown: HashSet<PatchKey>,
+        /// Generated heights, shared by the pool and the reference (a
+        /// per-test cache, not a static: rule 2).
+        memo: RefCell<HashMap<PatchKey, PatchHeights>>,
+        gen: WorldGen,
+        hole: Hole,
+        radius: f64,
+        /// `fly` asserts that drawn, still-wanted ground stays covered.
+        check_coverage: bool,
+    }
+
+    /// Is the ground of `key` covered by `shown`: by `key` itself, by a
+    /// coarser patch holding it, or by finer patches that together fill it?
+    fn covered(shown: &HashSet<PatchKey>, key: PatchKey) -> bool {
+        shown.contains(&key)
+            || ancestors(key, 20).any(|a| shown.contains(&a))
+            || (key.level > 0 && key.children().iter().all(|c| covered(shown, *c)))
+    }
+
+    impl Sim {
+        fn new(radius: f64, hole: Hole, pool: PoolModel) -> Self {
+            let seed = cubara_world::World::new().seed();
+            Self {
+                plan: FarPlan::new(FarQuality::High, radius),
+                pool,
+                shown: HashSet::new(),
+                memo: RefCell::new(HashMap::new()),
+                gen: WorldGen::new(seed),
+                hole,
+                radius,
+                check_coverage: false,
+            }
+        }
+
+        fn heights(&self, key: PatchKey) -> PatchHeights {
+            self.memo
+                .borrow_mut()
+                .entry(key)
+                .or_insert_with(|| far::generate(&self.gen, key))
+                .clone()
+        }
+
+        /// The converged selection at `eye`: select against what is known,
+        /// generate what is missing, repeat (the loop of `far::build`, and of
+        /// `keeping_the_ancestors_keeps_the_selection_still`).
+        fn exact(&self, eye: [f64; 3]) -> HashSet<PatchKey> {
+            let view = FarView {
+                radius: self.radius,
+                ..far_view(eye, 1080, Some(self.hole), FarQuality::High).unwrap()
+            };
+            loop {
+                let wanted = far::select(&view, |k| self.memo.borrow().get(&k).map(|p| p.error));
+                let missing: Vec<PatchKey> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|k| !self.memo.borrow().contains_key(k))
+                    .collect();
+                if missing.is_empty() {
+                    return wanted.into_iter().collect();
+                }
+                for k in missing {
+                    self.heights(k);
+                }
+            }
+        }
+
+        /// One frame: what the pool finished arrives, the plan decides, the
+        /// renderer applies it (asserting it is consistent), and the new
+        /// requests go to the pool.
+        fn frame(&mut self, eye: [f64; 3], finished: Vec<PatchKey>) -> Step {
+            for key in finished {
+                let patch = self.heights(key);
+                self.plan.take(patch);
+            }
+            let shown = &self.shown;
+            let step = self.plan.step(eye, 1080, self.hole, || shown.clone());
+            for key in &step.leave {
+                assert!(self.shown.remove(key), "{key:?} left but was not shown");
+            }
+            for key in &step.arrive {
+                assert!(
+                    self.plan.patch(*key).is_some(),
+                    "{key:?} arrived without heights"
+                );
+                assert!(self.shown.insert(*key), "{key:?} arrived twice");
+            }
+            self.pool.request(&step.request);
+            step
+        }
+
+        /// Fly `eyes` through the modelled pool; `shown` after each frame.
+        ///
+        /// With `check_coverage`, every frame also asserts #262's rule at the
+        /// renderer: ground that was covered by something shown last frame
+        /// and is still wanted (by the exact selection at this eye) is still
+        /// covered -- by the same patch, a coarser one, or finer ones.
+        fn fly(&mut self, eyes: &[[f64; 3]]) -> Vec<HashSet<PatchKey>> {
+            let check = self.check_coverage;
+            eyes.iter()
+                .enumerate()
+                .map(|(frame, &eye)| {
+                    let before = self.shown.clone();
+                    let done = self.pool.tick();
+                    self.frame(eye, done);
+                    if check {
+                        for want in self.exact(eye) {
+                            assert!(
+                                !covered(&before, want) || covered(&self.shown, want),
+                                "frame {frame}: ground of {want:?} was drawn and is wanted, \
+                                 and the renderer no longer covers it"
+                            );
+                        }
+                    }
+                    self.shown.clone()
+                })
+                .collect()
+        }
+
+        /// What a finished frame at `eye` is (`FarStreaming::settled`): ask
+        /// again, and wait for everything with an instant pool.
+        fn settle(&mut self, eye: [f64; 3]) {
+            self.plan.reselect();
+            for _ in 0..500 {
+                let done = self.pool.flush();
+                let step = self.frame(eye, done);
+                if step == Step::default() && self.plan.settled() && self.pool.queue.is_empty() {
+                    return;
+                }
+            }
+            panic!("the plan never settled");
+        }
+    }
+
+    fn sim_at_start(pool: PoolModel) -> (Sim, [f64; 3]) {
+        let start = low_flight(1)[0];
+        let hole = voxel_hole(start.map(|v| v as f32));
+        (Sim::new(TEST_RADIUS, hole, pool), start)
+    }
+
+    /// Behaviour of today's `RESELECT_BLOCKS`, pinned so that the plan that
+    /// replaces it (#398 PR B) has something to differ from. Replaced by
+    /// `the_live_selection_is_the_exact_one_on_every_frame` there.
+    #[test]
+    fn today_the_live_selection_trails_the_exact_one() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let eyes = low_flight(180);
+        let shown = sim.fly(&eyes);
+        let behind = eyes
+            .iter()
+            .zip(&shown)
+            .filter(|(eye, shown)| **shown != sim.exact(**eye))
+            .count();
+        println!(
+            "{behind} of {} frames show something other than the exact selection",
+            eyes.len()
+        );
+        assert!(
+            behind > 0,
+            "the live selection never differed from the exact one in 3 s"
+        );
+    }
+
+    /// With everything arrived and the eye where it was, what is shown is the
+    /// converged selection -- the reference the flight's settled pass uses.
+    #[test]
+    fn a_settled_plan_shows_the_exact_selection() {
+        let (mut sim, start) = sim_at_start(PoolModel::new(4, 2));
+        sim.settle(start);
+        assert_eq!(sim.shown, sim.exact(start));
+        assert!(sim.shown.len() > 100, "{} patches", sim.shown.len());
+    }
+
+    /// A settled plan at a standing eye costs nothing: no step, no select.
+    #[test]
+    fn standing_still_selects_nothing() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let selects = sim.plan.selects;
+        for _ in 0..100 {
+            let done = sim.pool.tick();
+            assert_eq!(sim.frame(start, done), Step::default());
+        }
+        assert_eq!(sim.plan.selects, selects, "a standing eye selected again");
+    }
+
+    /// The things that make the plan work again besides the eye: a new hole,
+    /// a new screen height, and `reselect`.
+    #[test]
+    fn a_new_hole_screen_height_or_reselect_works_the_selection_out_again() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let n = sim.plan.selects;
+        let (hole, shown) = (sim.hole, sim.shown.clone());
+        sim.plan.reselect();
+        sim.plan.step(start, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "reselect did nothing");
+        sim.plan.step(start, 720, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 2, "a new screen height did nothing");
+        let hole = Hole {
+            min: [hole.min[0] + 16.0, hole.min[1], hole.min[2]],
+            ..hole
+        };
+        sim.plan.step(start, 720, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 3, "a new hole did nothing");
+        sim.plan.step(start, 720, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 3, "nothing changed but it selected");
+    }
+
+    /// `Off` draws nothing beyond the voxels: everything shown leaves, and
+    /// nothing is asked for.
+    #[test]
+    fn off_removes_everything_and_asks_for_nothing() {
+        let mut plan = FarPlan::new(FarQuality::Off, TEST_RADIUS);
+        let drawn: HashSet<PatchKey> = [
+            PatchKey::new(3, 2, 2),
+            PatchKey::new(3, 1, 5),
+            PatchKey::new(4, 0, 0),
+        ]
+        .into();
+        let hole = voxel_hole([8.0, 120.0, 8.0]);
+        let step = plan.step([8.0, 120.0, 8.0], 1080, hole, || drawn.clone());
+        let mut sorted: Vec<_> = drawn.into_iter().collect();
+        sorted.sort();
+        assert_eq!(step.leave, sorted);
+        assert!(step.request.is_empty() && step.arrive.is_empty());
+    }
+
+    /// A patch asked for is not asked for again while it is generating, and
+    /// the ones nearest the eye (finest levels) go first.
+    #[test]
+    fn requests_are_made_once_and_finest_first() {
+        let (mut sim, start) = sim_at_start(PoolModel::new(4, 2));
+        let step = sim.frame(start, Vec::new());
+        assert!(!step.request.is_empty());
+        assert!(
+            step.request.windows(2).all(|w| w[0].level <= w[1].level),
+            "not finest first"
+        );
+        sim.plan.reselect();
+        let again = sim.frame(start, Vec::new());
+        assert!(
+            again.request.iter().all(|k| !step.request.contains(k)),
+            "a patch still generating was asked for again"
+        );
+    }
+
+    /// `far_plan_cost_report`'s flight, timed: what one `step` costs on the
+    /// main thread (#398 §6.2). Not a check -- a machine's clock is not CI's:
+    ///
+    /// ```text
+    /// cargo test --release -p cubara --bin cubara -- --ignored --nocapture far_plan_cost_report
+    /// ```
+    ///
+    /// The game's radius, the low flight at 60 Hz for 600 frames, the pool
+    /// modelled as 4 workers (the M3's `cores / 2`) at 2 frames a patch (a
+    /// placeholder until #398 step 1's measured service time is applied:
+    /// 6-9 ms, i.e. one frame). The memo is warmed by a first, untimed
+    /// flight so generation is not in the numbers.
+    #[test]
+    #[ignore = "a measurement, not a check: prints what the plan's step costs"]
+    fn far_plan_cost_report() {
+        let eyes = low_flight(600);
+        let start = eyes[0];
+        let hole = voxel_hole(start.map(|v| v as f32));
+        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        sim.settle(start);
+        sim.fly(&eyes);
+        // The timed flight, from a fresh plan over the warm memo.
+        let memo = std::mem::take(&mut sim.memo);
+        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        sim.memo = memo;
+        sim.settle(start);
+        let selects_before = sim.plan.selects;
+        let mut times = Vec::new();
+        for &eye in &eyes {
+            let finished = sim.pool.tick();
+            for key in finished {
+                let patch = sim.heights(key);
+                sim.plan.take(patch);
+            }
+            let shown = &sim.shown;
+            let t = std::time::Instant::now();
+            let step = sim.plan.step(eye, 1080, hole, || shown.clone());
+            times.push(t.elapsed());
+            for key in &step.leave {
+                sim.shown.remove(key);
+            }
+            sim.shown.extend(step.arrive.iter().copied());
+            sim.pool.request(&step.request);
+        }
+        let ms = |d: &std::time::Duration| d.as_secs_f64() * 1e3;
+        let sum: f64 = times.iter().map(ms).sum();
+        let mut sorted: Vec<f64> = times.iter().map(ms).collect();
+        sorted.sort_by(f64::total_cmp);
+        let p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
+        println!(
+            "FAR_PLAN_COST frames {} sum {sum:.2} ms mean {:.4} ms p99 {p99:.3} ms max {:.3} ms; \
+             selects {} (exact; no prefetch in this version); shown {}",
+            times.len(),
+            sum / times.len() as f64,
+            sorted.last().unwrap(),
+            sim.plan.selects - selects_before,
+            sim.shown.len(),
+        );
+    }
+
+    /// Past `RESELECT_BLOCKS` the selection is worked out again; within it,
+    /// with nothing arrived, it is not.
+    #[test]
+    fn the_eye_moving_past_the_reselect_distance_selects_again() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let n = sim.plan.selects;
+        let (hole, shown) = (sim.hole, sim.shown.clone());
+        let near = [start[0] + RESELECT_BLOCKS * 0.5, start[1], start[2]];
+        sim.plan.step(near, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n, "a small move selected");
+        // Exactly the distance is not past it (a move of 32 is exact in f64).
+        let edge = [start[0] + RESELECT_BLOCKS, start[1], start[2]];
+        let from = [start[0], start[1], start[2]];
+        sim.plan.selected_at = Some(from);
+        sim.plan.step(edge, 1080, hole, || shown.clone());
+        assert_eq!(
+            sim.plan.selects, n,
+            "a move of exactly the distance selected"
+        );
+        let far = [start[0] + RESELECT_BLOCKS * 2.0, start[1], start[2]];
+        sim.plan.step(far, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "a move past the distance did not");
+    }
+
+    /// A patch taken in is not "settled" until a selection has seen it; and
+    /// clearing forgets what was being generated.
+    #[test]
+    fn settled_means_nothing_generating_and_nothing_unseen() {
+        let (mut sim, start) = sim_at_start(PoolModel::new(4, 2));
+        let step = sim.frame(start, Vec::new());
+        assert!(!sim.plan.settled(), "patches are generating");
+        sim.plan.clear();
+        assert!(sim.plan.settled(), "clear kept what was generating");
+        let patch = sim.heights(step.request[0]);
+        sim.plan.take(patch);
+        assert!(!sim.plan.settled(), "an arrival no selection has seen");
+    }
+
+    /// Patches nothing wants any more are dropped: after moving far away and
+    /// settling, the plan holds the exact selection's patches and their
+    /// ancestors, not everything it ever generated.
+    #[test]
+    fn what_is_no_longer_wanted_is_dropped() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let there = [start[0] + 3_000.0, start[1], start[2] + 900.0];
+        sim.hole = voxel_hole(there.map(|v| v as f32));
+        sim.settle(there);
+        assert_eq!(sim.shown, sim.exact(there));
+        let ever = sim.memo.borrow().len();
+        assert!(
+            sim.plan.heights.len() < ever,
+            "{} held of {ever} generated: nothing was dropped",
+            sim.plan.heights.len()
+        );
+        assert!(sim.shown.iter().all(|k| sim.plan.heights.contains_key(k)));
+    }
+
+    /// #262's rule, seen from the renderer: nothing is taken away before what
+    /// replaces it exists. Flown through the modelled pool (4 workers, 2
+    /// frames a patch), so patches do arrive late and `draw_set` has to hold
+    /// the old ones; `fly` asserts the coverage on every frame.
+    #[test]
+    fn drawn_ground_stays_covered_while_flying() {
+        let (mut sim, start) = sim_at_start(PoolModel::new(4, 2));
+        sim.settle(start);
+        sim.check_coverage = true;
+        let eyes = low_flight(180);
+        let shown = sim.fly(&eyes);
+        // Not vacuous: the drawn set really changed while flying.
+        let changes = shown.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(changes >= 3, "only {changes} frames changed what is shown");
     }
 }

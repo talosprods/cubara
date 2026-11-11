@@ -854,6 +854,77 @@ pub(crate) mod tests {
             p90(&unbounded)
         );
     }
+
+    /// A fixed, cheap stand-in for a patch's error: 0 to 8 blocks from a
+    /// small integer hash of its key. Known for every patch, so the pin does
+    /// not need generated heights.
+    fn pinned_error(key: PatchKey) -> Option<f32> {
+        let h = (key.level as u64)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add((key.x as i64 as u64).wrapping_mul(0x85EB_CA6B))
+            .wrapping_add((key.z as i64 as u64).wrapping_mul(0xC2B2_AE35));
+        Some(((h >> 7) % 9) as f32)
+    }
+
+    /// FNV-1a over each key's level, x and z as little-endian bytes, in order.
+    fn fnv1a(keys: &[PatchKey]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for k in keys {
+            let bytes = k
+                .level
+                .to_le_bytes()
+                .into_iter()
+                .chain(k.x.to_le_bytes())
+                .chain(k.z.to_le_bytes());
+            for b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Rule 6: `select` is shared by the game, `far::build`, the screenshot,
+    /// the census and the bench, and the streaming work of #398 touches how it
+    /// is called. Its output, for eyes the game uses and a few it does not
+    /// (the origin, a half-block off it, far from it), is pinned as a count
+    /// and a hash of the keys in order. The constants were recorded by
+    /// running this on `main`'s `select`, before any change.
+    #[test]
+    fn select_output_is_pinned() {
+        let eyes = [
+            [8.0, 120.0, 8.0],
+            [8.0, 400.0, 8.0],
+            [8.0, 450.0, 8.0],
+            [0.0, 120.0, 0.0],
+            [-0.5, 120.0, -0.5],
+            [100000.3, 300.0, -70000.6],
+        ];
+        let mut got = Vec::new();
+        for radius in [20_000.0, 262_144.0] {
+            for eye in eyes {
+                let keys = select(&view(eye, radius), pinned_error);
+                got.push((keys.len(), fnv1a(&keys)));
+            }
+        }
+        println!("{got:#?}");
+        assert_eq!(got, PINNED.to_vec());
+    }
+
+    const PINNED: [(usize, u64); 12] = [
+        (3244, 0xd021a1cba451d8ac),
+        (3163, 0x13ece4e45f7f0178),
+        (3091, 0xc3014d635e724bc3),
+        (3193, 0x46c4a11da0776b26),
+        (3214, 0xc0be892670ab4cdc),
+        (3275, 0x4527efdc119d1c28),
+        (3996, 0x7969cf5fccbeeb8c),
+        (3915, 0x885bd8907365cb40),
+        (3843, 0xdf78212800f279bb),
+        (3945, 0x784387a30e13173e),
+        (3962, 0x2a19a00bd6d33854),
+        (4017, 0x4b10f89ba487b11e),
+    ];
 }
 
 #[cfg(test)]

@@ -172,7 +172,10 @@ while IFS= read -r diffline; do
             current="${diffline#+++ b/}"
             test_cutoff=999999999
             if [ -f "$current" ]; then
-                n="$(grep -n '^#\[cfg(test)\]' "$current" 2>/dev/null | head -1 | cut -d: -f1)"
+                # The `#[cfg(test)]` that opens a test module, not an earlier
+                # `#[cfg(test)] use ...`: far_streaming.rs has one at line 15,
+                # which made every line added after it count as test code.
+                n="$(awk '/^#\[cfg\(test\)\]/ {p=NR; next} p && /^(pub(\([a-z]+\))? )?mod / {print p; exit} {p=0}' "$current" 2>/dev/null)"
                 [ -n "$n" ] && test_cutoff="$n"
             fi
             ;;
