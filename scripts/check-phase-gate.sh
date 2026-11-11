@@ -327,7 +327,8 @@ if [ "$phase" = "3" ]; then
     # the swap -- a silhouette moving. STALE counts kept frames showing
     # nothing where the finished frame has land inside land -- a coarse node
     # still drawn late -- and says how much of it lay under a swap whose lag
-    # (#378) was open.
+    # (#378) was open, under a visible node not yet resident (#398: still
+    # loading), or under neither.
     # T1 and T4 are both CPU-only (T4 on the M4 ray-marching harness, #381 as
     # amended); T4's one GPU golden (`golden.rs`,
     # `the_288_m_edge_matches_a_finer_ring_on_screen`) counts in the normal

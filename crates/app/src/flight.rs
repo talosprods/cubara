@@ -24,7 +24,7 @@ use cubara_render::{CameraPose, Frame, Renderer};
 use cubara_world::World;
 
 use crate::far_streaming::{FarQuality, FarStreaming, FAR_VIEW_RADIUS};
-use crate::streaming::NodeStreaming;
+use crate::streaming::{BlockBox, NodeStreaming};
 
 /// Blocks per second: `cubara_sim::player`'s free-fly speed.
 pub const FLY_SPEED: f32 = 24.0;
@@ -440,8 +440,127 @@ pub struct Sample {
     /// shows land: stale terrain ([`stale_pixels`]).
     pub stale: f64,
     /// The share of its pixels that are stale *and* lie inside the screen box
-    /// of a node whose swap lag was open on that frame ([`under_boxes`]).
+    /// of a node whose swap lag was open on that frame ([`attribute_stale`],
+    /// share (a)).
     pub stale_late: f64,
+    /// The share of its pixels that are stale, under no open swap, and inside
+    /// the screen box of a node the search could see that was not resident
+    /// yet ([`attribute_stale`], share (b)): land still loading, with the far
+    /// terrain or a coarser node standing in.
+    pub stale_loading: f64,
+}
+
+/// Where a kept frame's stale pixels fall (issue #398 decision 1): under a
+/// node whose swap lag is open (`late`, share (a)); else under a node the
+/// search could see that is not resident yet (`loading`, share (b)); else
+/// nowhere this measurement can name (`other`, share (c)) -- the far
+/// terrain's own error at the join, for one. Counts of pixels; the three sum
+/// to the stale pixels given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StaleShares {
+    pub late: usize,
+    pub loading: usize,
+    pub other: usize,
+}
+
+/// Attribute `pixels` (indices into a frame `width` wide, [`stale_pixels`])
+/// to the three shares of [`StaleShares`], when `late` are the screen boxes
+/// of the nodes whose swap lag was open and `loading` those of the visible
+/// nodes not yet resident. A pixel under both counts as late: a held node
+/// and the children replacing it cover the same ground, so every late pixel
+/// is under a loading box too, and the swap is the lever that moves it.
+///
+/// A pixel under neither box is asked of `in_strip`: whether what it looks
+/// at lies where the voxel nodes should draw but do not yet
+/// ([`in_voxel_strip`], the far terrain standing in) -- loading too, by a
+/// node no list names yet because the search for the eye's chunk has not
+/// answered. Only those pixels are asked, so the caller can afford a ray
+/// march per answer.
+pub fn attribute_stale(
+    pixels: &[u32],
+    width: u32,
+    late: &[ScreenBox],
+    loading: &[ScreenBox],
+    mut in_strip: impl FnMut(u32) -> bool,
+) -> StaleShares {
+    let mut shares = StaleShares::default();
+    for &i in pixels {
+        let (x, y) = (i % width, i / width);
+        let under = |boxes: &[ScreenBox]| boxes.iter().any(|b| b.contains(x, y));
+        if under(late) {
+            shares.late += 1;
+        } else if under(loading) || in_strip(i) {
+            shares.loading += 1;
+        } else {
+            shares.other += 1;
+        }
+    }
+    shares
+}
+
+/// Whether the point `p` (blocks) lies inside the box `want` the voxel nodes
+/// should draw and outside the box `hole` they draw now
+/// (`NodeStreaming::far_strip`): the strip the far terrain stands in for
+/// until the nodes there are drawn. Boxes are `max` exclusive.
+pub fn in_voxel_strip(p: [f32; 3], hole: BlockBox, want: BlockBox) -> bool {
+    in_box(p, want) && !in_box(p, hole)
+}
+
+/// Whether `p` lies in the box, `max` exclusive.
+fn in_box(p: [f32; 3], (min, max): BlockBox) -> bool {
+    (0..3).all(|a| min[a] <= p[a] && p[a] < max[a])
+}
+
+/// Where a stale pixel's ray met the ground: how far along it, and the
+/// point, in blocks.
+pub type Hit = (f32, [f32; 3]);
+
+/// Where share (c)'s pixels look, from their rays' hits ([`surface_hit`]):
+/// how many meet ground beyond `reach`, the box the voxel nodes cover (the
+/// far terrain's), how many meet nothing (sky), and the nearest and farthest
+/// hit. What says whether (c) is the far terrain's (issue #398 decision 3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarLook {
+    pub far: usize,
+    pub sky: usize,
+    pub nearest: f32,
+    pub farthest: f32,
+}
+
+impl FarLook {
+    pub fn of(hits: impl IntoIterator<Item = Option<Hit>>, reach: BlockBox) -> Self {
+        let mut look = Self {
+            far: 0,
+            sky: 0,
+            nearest: f32::MAX,
+            farthest: 0.0,
+        };
+        for hit in hits {
+            match hit {
+                Some((d, p)) => {
+                    look.nearest = look.nearest.min(d);
+                    look.farthest = look.farthest.max(d);
+                    if !in_box(p, reach) {
+                        look.far += 1;
+                    }
+                }
+                None => look.sky += 1,
+            }
+        }
+        look
+    }
+}
+
+/// What was still loading when a kept frame was drawn (issue #398).
+#[derive(Clone, Debug, Default)]
+struct Loading {
+    /// `NodeStreaming::loading_nodes`: boxes in blocks.
+    nodes: Vec<BlockBox>,
+    /// `NodeStreaming::far_strip`: the hole the far terrain leaves and the
+    /// box the voxels want, while they differ.
+    strip: Option<(BlockBox, BlockBox)>,
+    /// `NodeStreaming::search_behind`.
+    search_behind: bool,
 }
 
 /// The pixels (indices) where `live` shows nothing and `settled` shows land
@@ -492,6 +611,49 @@ pub fn under_boxes(pixels: &[u32], width: u32, boxes: &[ScreenBox]) -> usize {
             boxes.iter().any(|b| b.contains(x, y))
         })
         .count()
+}
+
+/// The direction through the centre of pixel `(x, y)` of a `width` x
+/// `height` screen seen from a camera looking along `look` -- the renderer's
+/// own projection: a 60-degree vertical field of view, `Y` up. Normalised.
+pub fn pixel_ray(look: [f32; 3], width: u32, height: u32, x: u32, y: u32) -> [f32; 3] {
+    let forward = glam::Vec3::from(look).normalize_or(glam::Vec3::X);
+    let right = forward.cross(glam::Vec3::Y).normalize_or(glam::Vec3::Z);
+    let up = right.cross(forward);
+    let aspect = width as f32 / height.max(1) as f32;
+    let t = 30f32.to_radians().tan();
+    let ndc_x = (x as f32 + 0.5) / width.max(1) as f32 * 2.0 - 1.0;
+    let ndc_y = 1.0 - (y as f32 + 0.5) / height.max(1) as f32 * 2.0;
+    (forward + right * (ndc_x * t * aspect) + up * (ndc_y * t))
+        .normalize()
+        .to_array()
+}
+
+/// How far along `dir` from `eye` the terrain surface is first met, marching
+/// `step` blocks at a time out to `max`: the first sample at or below the
+/// surface (`height(x, z)` is the surface block's top, so a sample under
+/// `height + 1` is in the ground). `None` when the ray leaves `max` without
+/// touching ground -- sky. For placing a stale pixel in the world (issue
+/// #398): the generator's height field, so no GPU and no streaming state.
+pub fn surface_hit(
+    height: impl Fn(i32, i32) -> i32,
+    eye: [f32; 3],
+    dir: [f32; 3],
+    max: f32,
+    step: f32,
+) -> Option<f32> {
+    let (eye, dir) = (glam::Vec3::from(eye), glam::Vec3::from(dir));
+    let step = step.max(1e-3);
+    let mut d = 0.0;
+    while d <= max {
+        let p = eye + dir * d;
+        let h = height(p.x.floor() as i32, p.z.floor() as i32);
+        if p.y < h as f32 + 1.0 {
+            return Some(d);
+        }
+        d += step;
+    }
+    None
 }
 
 /// Draw a red ring, two pixels thick, around the pixels at `indices` (into
@@ -674,8 +836,9 @@ impl FlightReport {
     /// reads (issue #384) -- `HOLES:` (geometry missing, confirmed by the
     /// finished frame), `POPS:` (what a detail swap changed on screen) and
     /// `STALE:` (a kept frame showing nothing where the finished frame has
-    /// land, and how much of that lay under a swap that was running late) --
-    /// and the swap lag. `scripts/check-phase-gate.sh` parses it; change a
+    /// land, and its three shares, issue #398: under a swap that was running
+    /// late, under a node still loading, and under neither) -- and the swap
+    /// lag. `scripts/check-phase-gate.sh` parses it; change a
     /// term's wording and the script's pattern together.
     pub fn line(&self) -> String {
         let worst = self.worst().unwrap_or(Sample {
@@ -684,6 +847,7 @@ impl FlightReport {
             loading: 0.0,
             stale: 0.0,
             stale_late: 0.0,
+            stale_loading: 0.0,
         });
         let tail = WorkTail::of(&self.work_times);
         let (any, worst_px) = self.hole_frames();
@@ -708,7 +872,8 @@ impl FlightReport {
              POPS: {} swaps, pixels p50/p99/max {}/{}/{}, \
              silhouette px p50/p99/max {}/{}/{} | \
              STALE: {stale_frames} kept frames with nothing where the finished frame \
-             has land, worst {:.3}%, of which under a late swap {:.0}% | \
+             has land, worst {:.3}%, of which under a late swap {:.0}%, under a node \
+             still loading {:.0}%, neither {:.0}% | \
              SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
              ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {}",
             self.mean() * 100.0,
@@ -734,6 +899,8 @@ impl FlightReport {
             p.silhouette_max,
             stale_worst * 100.0,
             self.stale_under_late_swap() * 100.0,
+            self.stale_under_loading() * 100.0,
+            self.stale_under_neither() * 100.0,
             s.count,
             s.p50_ms,
             s.p90_ms,
@@ -772,11 +939,30 @@ impl FlightReport {
     /// of the stale terrain that is swap lag showing (issue #384 decision 3).
     /// Zero when nothing was stale.
     pub fn stale_under_late_swap(&self) -> f64 {
+        self.stale_share(|s| s.stale_late)
+    }
+
+    /// Of all the kept frames' stale pixels, the share under no open swap
+    /// but inside the screen box of a visible node not yet resident (issue
+    /// #398 decision 1, share (b)): terrain still loading. Zero when nothing
+    /// was stale.
+    pub fn stale_under_loading(&self) -> f64 {
+        self.stale_share(|s| s.stale_loading)
+    }
+
+    /// Of all the kept frames' stale pixels, the share under neither (share
+    /// (c)): what no open swap and no loading node accounts for.
+    pub fn stale_under_neither(&self) -> f64 {
+        self.stale_share(|s| s.stale - s.stale_late - s.stale_loading)
+    }
+
+    /// `part`'s share of the stale pixels, summed over the kept frames.
+    fn stale_share(&self, part: impl Fn(&Sample) -> f64) -> f64 {
         let stale: f64 = self.samples.iter().map(|s| s.stale).sum();
         if stale <= 0.0 {
             return 0.0;
         }
-        self.samples.iter().map(|s| s.stale_late).sum::<f64>() / stale
+        self.samples.iter().map(part).sum::<f64>() / stale
     }
 }
 
@@ -1056,6 +1242,18 @@ const HOLE_DUMPS: usize = 20;
 /// class of what is *not* counted (a pop, usually) read the same way.
 const REJECTED_DUMPS: usize = 10;
 
+/// Kept frames with stale pixels written as frame dumps, the pixels ringed
+/// (issue #398): what the three shares attribute, read rather than guessed.
+const STALE_DUMPS: usize = 10;
+
+/// How far a stale pixel's ray is marched for ground ([`surface_hit`]), in
+/// blocks, and how far each step is. Eight times the voxel nodes' reach: far
+/// enough to tell "beyond the voxels" from "sky" for any ridge big enough to
+/// be a stale pixel, cheap enough (2,000 height lookups a pixel) to run on
+/// every stale pixel of a kept frame in the settled pass.
+const STALE_RAY_MAX: f32 = 8192.0;
+const STALE_RAY_STEP: f32 = 4.0;
+
 /// Keeps the live frames a dump may need -- every candidate frame and the
 /// frame before it -- as PNG bytes, encoded on its own thread so the
 /// real-time pass pays a clone and a channel send per frame rather than an
@@ -1124,8 +1322,10 @@ impl KeptFrames {
 /// there as `worst-live.png` and `worst-settled.png`, every kept frame over
 /// 1% loading as `tNN.NN-live.png`/`-settled.png`, the first [`HOLE_DUMPS`]
 /// counted holes as `hole-fNNNN-live.png`/`-finished.png` with the pixels
-/// ringed in red ([`mark_pixel`]), and the first [`REJECTED_DUMPS`] rejected
-/// candidate frames as `pop-fNNNN-...`. `None` without a GPU.
+/// ringed in red ([`mark_pixels`]), the first [`REJECTED_DUMPS`] rejected
+/// candidate frames as `pop-fNNNN-...`, and the first [`STALE_DUMPS`] kept
+/// frames with stale pixels as `stale-tNN.NN-live.png`/`-settled.png`, the
+/// pixels ringed. `None` without a GPU.
 pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     // The real-time pass: what a player sees -- once the start is loaded, as
     // it is for a player who has been standing there. Loading a world from
@@ -1142,9 +1342,13 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     let mut eyes: Vec<(f32, [f32; 3])> = Vec::new();
     // Per frame: the boxes, in blocks, of the nodes whose swap lag was open
     // when it was drawn -- what a stale pixel, or a hole, is laid under.
-    let mut open_swaps: Vec<Vec<([f32; 3], [f32; 3])>> = Vec::new();
+    let mut open_swaps: Vec<Vec<BlockBox>> = Vec::new();
     // The kept frames, by frame.
     let mut kept: BTreeMap<u32, Frame> = BTreeMap::new();
+    // Per kept frame: what was still loading when it was drawn -- what a
+    // stale pixel under no open swap is laid under (issue #398 decision 1,
+    // share (b)).
+    let mut kept_loading: BTreeMap<u32, Loading> = BTreeMap::new();
     // The last `HOLE_MAX_FRAMES + 1` frames, oldest first: a candidate run
     // closes at most that far back, and a pop compares with the frame before.
     let mut recent: VecDeque<Frame> = VecDeque::new();
@@ -1225,6 +1429,14 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
             );
             let shown = recent.back()?.clone();
             kept.insert(frame, shown);
+            kept_loading.insert(
+                frame,
+                Loading {
+                    nodes: live.nodes.loading_nodes(),
+                    strip: live.nodes.far_strip(),
+                    search_behind: live.nodes.search_behind(),
+                },
+            );
             next_keep += flight.every;
         }
         // Paced like a display showing `fps` frames a second: a frame that
@@ -1265,7 +1477,8 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     let mut confirmed = vec![0u32; eyes.len()];
     let mut confirmed_late = vec![0u32; eyes.len()];
     let mut candidate_frames = 0usize;
-    let (mut hole_dumps, mut rejected_dumps) = (0usize, 0usize);
+    let (mut hole_dumps, mut rejected_dumps, mut stale_dumps) = (0usize, 0usize, 0usize);
+    let gen = cubara_world::WorldGen::new(settled.world.seed());
     for (frame, &(t, eye)) in eyes.iter().enumerate() {
         let frame = frame as u32;
         let kept_here = kept.remove(&frame);
@@ -1333,19 +1546,97 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         if let Some(shown) = kept_here {
             let loading = loading_fraction(&shown, &reference);
             let stale = stale_pixels(&shown, &reference);
-            let late = under_boxes(&stale, width, &late_boxes);
+            let still = kept_loading.remove(&frame).unwrap_or_default();
+            let loading_boxes: Vec<ScreenBox> = still
+                .nodes
+                .iter()
+                .filter_map(|&(min, max)| screen_box(min, max, vp, width, height))
+                .collect();
+            // A pixel under neither box: where its ray meets the ground,
+            // against the generator's surface (no GPU, no streaming state),
+            // and whether that is in the strip the voxels have yet to draw.
+            // The hits are kept for the log below, which places share (c)
+            // in the world: inside the voxel nodes' reach, beyond it in the
+            // far terrain, or at nothing (issue #398 decision 3's question).
+            let mut hits: Vec<(Option<Hit>, bool)> = Vec::new();
+            let shares = attribute_stale(&stale, width, &late_boxes, &loading_boxes, |i| {
+                let dir = pixel_ray(flight.look, width, height, i % width, i / width);
+                let hit = surface_hit(
+                    |x, z| gen.surface_height(x, z),
+                    eye,
+                    dir,
+                    STALE_RAY_MAX,
+                    STALE_RAY_STEP,
+                )
+                .map(|d| {
+                    let p = glam::Vec3::from(eye) + glam::Vec3::from(dir) * d;
+                    (d, p.to_array())
+                });
+                let in_strip = match (hit, still.strip) {
+                    (Some((_, p)), Some((hole, want))) => in_voxel_strip(p, hole, want),
+                    _ => false,
+                };
+                hits.push((hit, in_strip));
+                in_strip
+            });
             let n = shown.pixels.len() as f64 / 4.0;
             log::info!(
-                "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading, {} stale px ({:.3}%), \
-                 {late} under one of {} late swaps",
+                "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading, {} stale px ({:.3}%): \
+                 {} under one of {} late swaps, {} under one of {} loading nodes, {} under \
+                 neither{}",
                 loading * 100.0,
                 stale.len(),
                 stale.len() as f64 * 100.0 / n,
+                shares.late,
                 open.len(),
+                shares.loading,
+                still.nodes.len(),
+                shares.other,
+                if still.search_behind {
+                    " (the search for this chunk was still running)"
+                } else {
+                    ""
+                },
             );
             if let Some(dir) = frames.filter(|_| loading > 0.01) {
                 for (kind, f) in [("live", &shown), ("settled", &reference)] {
                     save(&dir.join(format!("t{:05.2}-{kind}.png", t)), f);
+                }
+            }
+            if shares.other > 0 {
+                // Where share (c) looks: the voxel nodes reach the edge of
+                // the box they cover around the eye; ground met beyond it is
+                // the far terrain's.
+                let reach = {
+                    let b = cubara_world::node::covered_box_3d(
+                        cubara_voxel::ChunkCoord::from_world_pos(eye),
+                        cubara_world::node::DEFAULT_RING_SCHEDULE,
+                    );
+                    (b.0.map(|c| (c * 16) as f32), b.1.map(|c| (c * 16) as f32))
+                };
+                let look = FarLook::of(
+                    hits.iter()
+                        .filter(|(_, in_strip)| !in_strip)
+                        .map(|(hit, _)| *hit),
+                    reach,
+                );
+                log::info!(
+                    "flight: t {t:5.2} s: of the {} stale px under neither, {} look at ground \
+                     beyond the voxel nodes' reach (far terrain), {} at nothing within \
+                     {STALE_RAY_MAX} blocks; hits {:.0}..{:.0} blocks away",
+                    shares.other,
+                    look.far,
+                    look.sky,
+                    look.nearest,
+                    look.farthest,
+                );
+            }
+            if let Some(dir) = frames.filter(|_| !stale.is_empty() && stale_dumps < STALE_DUMPS) {
+                stale_dumps += 1;
+                for (kind, f) in [("live", &shown), ("settled", &reference)] {
+                    let mut marked = f.clone();
+                    mark_pixels(&mut marked, &stale);
+                    save(&dir.join(format!("stale-t{:05.2}-{kind}.png", t)), &marked);
                 }
             }
             samples.push(Sample {
@@ -1353,7 +1644,8 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
                 eye,
                 loading,
                 stale: stale.len() as f64 / n,
-                stale_late: late as f64 / n,
+                stale_late: shares.late as f64 / n,
+                stale_loading: shares.loading as f64 / n,
             });
             keep_worst(&mut worst, loading, (shown, reference));
         }
@@ -1464,6 +1756,7 @@ mod tests {
             loading,
             stale: 0.0,
             stale_late: 0.0,
+            stale_loading: 0.0,
         };
         let r = FlightReport {
             samples: vec![sample(0.0), sample(0.02), sample(0.005), sample(0.1)],
@@ -1790,21 +2083,243 @@ mod tests {
         assert_eq!(PopStats::of(&[]), PopStats::default());
     }
 
-    /// The summary line carries the three terms gate item 0 parses
-    /// (`scripts/check-phase-gate.sh`), in the words its patterns look for,
-    /// and the stale share under a late swap is the share of stale pixels,
-    /// not of the screen.
+    /// Issue #398 decision 1: every stale pixel falls under exactly one of
+    /// the three shares -- late swap first, then a loading node, then
+    /// neither -- and a pixel under both a late swap and a loading node is
+    /// the late swap's (a held node and its replacements share a box).
     #[test]
-    fn the_line_prints_holes_pops_and_stale_as_three_terms() {
-        let sample = |stale, stale_late| Sample {
+    fn a_stale_pixel_is_a_late_swap_else_a_loading_node_else_neither() {
+        let finished = picture(&["######", "######", "######", "######"]);
+        let live = picture(&["######", "#.#.##", "###..#", "######"]);
+        let stale = stale_pixels(&live, &finished);
+        assert_eq!(stale, vec![7, 9, 15, 16]);
+        let late = ScreenBox {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        };
+        // Covers the late box's pixel too, and (3,1) and (3,2); not (4,2).
+        let loading = ScreenBox {
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 3,
+        };
+        let never = |_: u32| false;
+        assert_eq!(
+            attribute_stale(&stale, 6, &[late], &[loading], never),
+            StaleShares {
+                late: 1,
+                loading: 2,
+                other: 1,
+            }
+        );
+        assert_eq!(
+            attribute_stale(&stale, 6, &[], &[loading], never),
+            StaleShares {
+                late: 0,
+                loading: 3,
+                other: 1,
+            },
+            "with no swap open, the shared pixel is the loading node's"
+        );
+        assert_eq!(
+            attribute_stale(&stale, 6, &[], &[], never),
+            StaleShares {
+                late: 0,
+                loading: 0,
+                other: 4,
+            },
+            "nothing to lay them under: all three shares' remainder"
+        );
+        assert_eq!(
+            attribute_stale(&[], 6, &[late], &[loading], never),
+            StaleShares::default()
+        );
+        // The strip is asked only about pixels under neither box, and a
+        // pixel it claims is loading: (4,2) is the one under neither.
+        let mut asked = Vec::new();
+        let shares = attribute_stale(&stale, 6, &[late], &[loading], |i| {
+            asked.push(i);
+            i == 16
+        });
+        assert_eq!(asked, vec![16], "only the pixel under neither box");
+        assert_eq!(
+            shares,
+            StaleShares {
+                late: 1,
+                loading: 3,
+                other: 0,
+            }
+        );
+    }
+
+    /// Share (c) placed in the world: a hit beyond the voxel nodes' reach is
+    /// the far terrain's, one inside it is not, a miss is sky, and the
+    /// nearest and farthest hits are the nearest and farthest.
+    #[test]
+    fn where_the_unattributed_pixels_look_is_told_by_their_hits() {
+        let reach = ([-1024.0, -1024.0, -1024.0], [1024.0, 1024.0, 1024.0]);
+        let look = FarLook::of(
+            [
+                Some((1800.0, [1700.0, 200.0, 500.0])),
+                Some((530.0, [500.0, 100.0, 150.0])),
+                None,
+                Some((1500.0, [1023.0, 100.0, 1100.0])),
+            ],
+            reach,
+        );
+        assert_eq!(
+            look,
+            FarLook {
+                far: 2,
+                sky: 1,
+                nearest: 530.0,
+                farthest: 1800.0,
+            }
+        );
+        assert_eq!(FarLook::of([], reach).far, 0);
+    }
+
+    /// The strip the far terrain stands in for is what the voxels want and
+    /// do not draw yet: a point in the new part of the box is in it, one in
+    /// the part already drawn is not, and neither is one outside both.
+    #[test]
+    fn the_voxel_strip_is_the_wanted_box_less_the_drawn_one() {
+        let hole = ([0.0, 0.0, 0.0], [128.0, 128.0, 128.0]);
+        let want = ([64.0, 0.0, 0.0], [192.0, 128.0, 128.0]);
+        assert!(
+            in_voxel_strip([150.0, 10.0, 10.0], hole, want),
+            "new ground"
+        );
+        assert!(
+            !in_voxel_strip([100.0, 10.0, 10.0], hole, want),
+            "drawn already"
+        );
+        assert!(
+            !in_voxel_strip([10.0, 10.0, 10.0], hole, want),
+            "no longer wanted"
+        );
+        assert!(
+            !in_voxel_strip([300.0, 10.0, 10.0], hole, want),
+            "far terrain"
+        );
+        // `max` is exclusive, `min` inclusive: the hole's far face is the
+        // strip's first block.
+        assert!(in_voxel_strip([128.0, 0.0, 0.0], hole, want));
+        assert!(!in_voxel_strip([192.0, 0.0, 0.0], hole, want));
+    }
+
+    /// The report's three shares are shares of the stale pixels over all
+    /// kept frames, they sum to one whenever anything was stale, and are all
+    /// zero when nothing was.
+    #[test]
+    fn the_three_stale_shares_sum_to_one_over_the_kept_frames() {
+        let sample = |stale, stale_late, stale_loading| Sample {
             t: 0.0,
             eye: [0.0; 3],
             loading: 0.0,
             stale,
             stale_late,
+            stale_loading,
+        };
+        let report = |samples| FlightReport {
+            samples,
+            work_times: Vec::new(),
+            holes: Vec::new(),
+            holes_late: Vec::new(),
+            candidates: Vec::new(),
+            checked_every: 1,
+            pixels: 1000,
+            pops: Vec::new(),
+            swap_lags: SwapLagStats::default(),
+            world_clones: WorldClones::default(),
+        };
+        // 10 stale pixels per mille in all: 2 late, 5 loading, 3 neither.
+        let r = report(vec![sample(0.004, 0.002, 0.002), sample(0.006, 0.0, 0.003)]);
+        assert!((r.stale_under_late_swap() - 0.2).abs() < 1e-9);
+        assert!((r.stale_under_loading() - 0.5).abs() < 1e-9);
+        assert!((r.stale_under_neither() - 0.3).abs() < 1e-9);
+        let clean = report(vec![sample(0.0, 0.0, 0.0)]);
+        assert_eq!(clean.stale_under_late_swap(), 0.0);
+        assert_eq!(clean.stale_under_loading(), 0.0);
+        assert_eq!(clean.stale_under_neither(), 0.0);
+    }
+
+    /// A pixel's ray follows the renderer's projection: the screen's centre
+    /// looks along `look`, the top centre 30 degrees above it (half the
+    /// vertical field of view), and the right-hand side to the right of a
+    /// camera looking along -Z. Where a pixel's ray goes agrees with where
+    /// `screen_box` puts a point: the two are inverses.
+    #[test]
+    fn a_pixel_ray_inverts_the_projection() {
+        let look = [0.0, 0.0, -1.0];
+        let (w, h) = (1600, 900);
+        let centre = glam::Vec3::from(pixel_ray(look, w, h, 800, 450));
+        assert!(centre.abs_diff_eq(glam::Vec3::NEG_Z, 2e-3), "{centre}");
+        let top = glam::Vec3::from(pixel_ray(look, w, h, 800, 0));
+        let elevation = top.y.atan2(-top.z).to_degrees();
+        assert!((elevation - 30.0).abs() < 0.1, "{elevation} degrees");
+        let right = glam::Vec3::from(pixel_ray(look, w, h, 1599, 450));
+        assert!(right.x > 0.5, "the right of the screen is +X here: {right}");
+        // The inverse of `screen_box`: a point 20 blocks along the ray of
+        // pixel (1200, 300) projects to a box containing that pixel.
+        let ray = glam::Vec3::from(pixel_ray(look, w, h, 1200, 300)) * 20.0;
+        let vp = CameraPose {
+            eye: glam::DVec3::ZERO,
+            look_dir: glam::Vec3::NEG_Z,
+        }
+        .view_proj(w as f32 / h as f32, cubara_render::anchor::ORIGIN);
+        let b = screen_box((ray - 0.01).to_array(), (ray + 0.01).to_array(), vp, w, h).unwrap();
+        assert!(b.contains(1200, 300), "{b:?}");
+    }
+
+    /// Marching for ground: a ray at 45 degrees down from 10 blocks above a
+    /// flat surface meets it about 10 * sqrt 2 blocks out, within a step; a
+    /// level ray never does; and the surface block's own height counts as
+    /// ground, not the air above it.
+    #[test]
+    fn a_ray_meets_the_surface_where_it_drops_below_it() {
+        let flat = |_: i32, _: i32| 0;
+        let eye = [0.0, 11.0, 0.0];
+        let down = [
+            std::f32::consts::FRAC_1_SQRT_2,
+            -std::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+        ];
+        let d = surface_hit(flat, eye, down, 100.0, 0.5).unwrap();
+        assert!((d - 10.0 * std::f32::consts::SQRT_2).abs() <= 0.5, "{d}");
+        assert_eq!(surface_hit(flat, eye, [1.0, 0.0, 0.0], 100.0, 0.5), None);
+        // A wall 20 blocks tall 5 blocks ahead stops a level ray at 5.
+        let wall = |x: i32, _: i32| if x >= 5 { 20 } else { 0 };
+        assert_eq!(
+            surface_hit(wall, eye, [1.0, 0.0, 0.0], 100.0, 1.0),
+            Some(5.0)
+        );
+        // Beyond `max` is sky, even where ground would be.
+        assert_eq!(surface_hit(wall, eye, [1.0, 0.0, 0.0], 4.0, 1.0), None);
+    }
+
+    /// The summary line carries the three terms gate item 0 parses
+    /// (`scripts/check-phase-gate.sh`), in the words its patterns look for,
+    /// and the stale shares are shares of stale pixels, not of the screen.
+    #[test]
+    fn the_line_prints_holes_pops_and_stale_as_three_terms() {
+        let sample = |stale, stale_late, stale_loading| Sample {
+            t: 0.0,
+            eye: [0.0; 3],
+            loading: 0.0,
+            stale,
+            stale_late,
+            stale_loading,
         };
         let r = FlightReport {
-            samples: vec![sample(0.0, 0.0), sample(0.004, 0.003), sample(0.002, 0.0)],
+            samples: vec![
+                sample(0.0, 0.0, 0.0),
+                sample(0.004, 0.003, 0.0),
+                sample(0.002, 0.0, 0.0015),
+            ],
             work_times: vec![0.002; 10],
             holes: vec![0, 4, 0, 0],
             holes_late: vec![0, 1, 0, 0],
@@ -1836,7 +2351,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("STALE: 2 kept frames with nothing where the finished frame has land, worst 0.400%, of which under a late swap 50%"),
+            line.contains("STALE: 2 kept frames with nothing where the finished frame has land, worst 0.400%, of which under a late swap 50%, under a node still loading 25%, neither 25%"),
             "{line}"
         );
         assert!(!line.contains("sampled"));

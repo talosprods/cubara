@@ -144,6 +144,10 @@ fn can_unload(node: NodeKey, visible: &HashSet<NodeKey>, resident: &HashSet<Node
     replacements.is_empty() || replacements.iter().all(|r| resident.contains(r))
 }
 
+/// A box in blocks, `(min, max)` with `max` exclusive: what the streamer
+/// reports a node's, or the far hole's, extent as to a measurement.
+pub type BlockBox = ([f32; 3], [f32; 3]);
+
 /// A node's box, in chunks, `max` exclusive.
 fn node_box(node: NodeKey) -> ([i32; 3], [i32; 3]) {
     let o = node.chunk_origin();
@@ -796,17 +800,72 @@ impl NodeStreaming {
     /// replaces them has not landed. What `--bench flight` attributes a kept
     /// frame's stale terrain to (issue #384 decision 3). Sorted, so the
     /// `HashMap`'s order never reaches a result.
-    pub fn open_swaps(&self) -> Vec<([f32; 3], [f32; 3])> {
+    pub fn open_swaps(&self) -> Vec<BlockBox> {
         let mut nodes: Vec<NodeKey> = self.swap_pending.keys().copied().collect();
         nodes.sort();
-        nodes
-            .into_iter()
-            .map(|n| {
-                let (min, max) = node_box(n);
-                (min.map(|c| (c * 16) as f32), max.map(|c| (c * 16) as f32))
-            })
-            .collect()
+        boxes_in_blocks(nodes)
     }
+
+    /// The boxes, in blocks (`max` exclusive), of the nodes the last search
+    /// could see that are not drawn yet: being meshed, or awaiting their
+    /// request -- the frontier the search marked seen but has not searched
+    /// through, since its links have not arrived. Where a kept frame shows
+    /// the far terrain, or nothing, in place of land that is still loading
+    /// (issue #398 decision 1, share (b)). Sorted, like
+    /// [`open_swaps`](Self::open_swaps).
+    pub fn loading_nodes(&self) -> Vec<BlockBox> {
+        let mut nodes: Vec<NodeKey> = loading_nodes(&self.visible, &self.resident);
+        nodes.sort();
+        boxes_in_blocks(nodes)
+    }
+
+    /// Whether the search for the camera's current chunk has not been applied
+    /// yet: the visible set is still the previous chunk's, so a node the new
+    /// chunk wants and the old did not is in nobody's list (issue #398, the
+    /// "not yet searched" part of share (b) that
+    /// [`loading_nodes`](Self::loading_nodes) cannot name). For the
+    /// measurement's log.
+    pub fn search_behind(&self) -> bool {
+        self.center.is_some() && self.searched != self.center
+    }
+
+    /// The box, in blocks, the far terrain currently leaves to the voxel
+    /// nodes, and the box it should leave once they are drawn
+    /// ([`far_hole`](Self::far_hole)); `None` while the two agree. Where
+    /// they differ, the far terrain stands in for nodes not drawn yet --
+    /// requested, in flight, or not even searched for -- so ground seen
+    /// there in a kept frame is land still loading (issue #398 decision 1,
+    /// share (b)), whichever list the node is or is not in yet.
+    pub fn far_strip(&self) -> Option<(BlockBox, BlockBox)> {
+        (self.far_hole != self.far_want).then(|| {
+            let blocks = |(min, max): ([i32; 3], [i32; 3])| {
+                (min.map(|c| (c * 16) as f32), max.map(|c| (c * 16) as f32))
+            };
+            (blocks(self.far_hole), blocks(self.far_want))
+        })
+    }
+}
+
+/// The nodes in `visible` that are not in `resident`: seen, wanted, not
+/// drawn -- in flight on the mesh pool or about to be requested. Pure, so
+/// the rule is tested on its own.
+fn loading_nodes(visible: &HashSet<NodeKey>, resident: &HashSet<NodeKey>) -> Vec<NodeKey> {
+    visible
+        .iter()
+        .filter(|n| !resident.contains(n))
+        .copied()
+        .collect()
+}
+
+/// `nodes`' boxes in blocks, `max` exclusive, in the order given.
+fn boxes_in_blocks(nodes: Vec<NodeKey>) -> Vec<BlockBox> {
+    nodes
+        .into_iter()
+        .map(|n| {
+            let (min, max) = node_box(n);
+            (min.map(|c| (c * 16) as f32), max.map(|c| (c * 16) as f32))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1211,5 +1270,70 @@ mod tests {
     fn swap_lags_starts_empty() {
         let s = real_streaming();
         assert!(s.swap_lags().is_empty());
+    }
+
+    /// Issue #398 decision 1, share (b): a node the search can see and the
+    /// renderer does not draw yet is loading -- whether it is in flight or
+    /// still waiting to be requested -- and a node that is drawn, or one the
+    /// search cannot see, is not.
+    #[test]
+    fn a_loading_node_is_visible_and_not_resident() {
+        let (drawn, meshing, waiting, unseen) = (
+            NodeKey::new(1, [0, 0, 0]),
+            NodeKey::new(1, [1, 0, 0]),
+            NodeKey::new(2, [1, 0, 1]),
+            NodeKey::new(1, [5, 0, 5]),
+        );
+        let visible = HashSet::from([drawn, meshing, waiting]);
+        let resident = HashSet::from([drawn, unseen]);
+        let mut loading = loading_nodes(&visible, &resident);
+        loading.sort();
+        assert_eq!(loading, vec![meshing, waiting]);
+        // Through the streamer, in blocks and sorted: level 1 at grid x 1 is
+        // blocks 32..64, level 2 at grid (1, 0, 1) is 64..128.
+        let mut s = real_streaming();
+        s.visible = visible;
+        s.resident = resident;
+        assert_eq!(
+            s.loading_nodes(),
+            vec![
+                ([32.0, 0.0, 0.0], [64.0, 32.0, 32.0]),
+                ([64.0, 0.0, 64.0], [128.0, 64.0, 128.0]),
+            ]
+        );
+    }
+
+    /// The far terrain's strip is the two boxes, in blocks, while the hole
+    /// it leaves lags behind what the voxels want; nothing while they agree.
+    #[test]
+    fn the_far_strip_is_the_hole_and_the_want_while_they_differ() {
+        let mut s = real_streaming();
+        assert_eq!(s.far_strip(), None, "nothing wanted yet");
+        s.far_hole = ([0, 0, 0], [8, 8, 8]);
+        s.far_want = ([4, 0, 0], [12, 8, 8]);
+        assert_eq!(
+            s.far_strip(),
+            Some((
+                ([0.0, 0.0, 0.0], [128.0, 128.0, 128.0]),
+                ([64.0, 0.0, 0.0], [192.0, 128.0, 128.0]),
+            ))
+        );
+        s.far_hole = s.far_want;
+        assert_eq!(s.far_strip(), None, "the voxels draw all they want");
+    }
+
+    /// The search is behind the camera between the chunk crossing and the
+    /// answer being applied -- not before the first frame, and not once the
+    /// answer for the current chunk has landed.
+    #[test]
+    fn the_search_is_behind_between_a_crossing_and_its_answer() {
+        let mut s = real_streaming();
+        assert!(!s.search_behind(), "nothing asked for yet");
+        s.center = Some(ChunkCoord::new(3, 0, 3));
+        assert!(s.search_behind(), "crossed, no answer yet");
+        s.searched = Some(ChunkCoord::new(2, 0, 3));
+        assert!(s.search_behind(), "the answer is the old chunk's");
+        s.searched = s.center;
+        assert!(!s.search_behind());
     }
 }
