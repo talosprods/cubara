@@ -5,21 +5,66 @@
 # next -- that is a judgement, and judgements drift. Ordering lives in the issue
 # titles, which carry their ROADMAP.md block number, and this script reads it.
 #
-# Usage:  ./scripts/next-block.sh [phase]      (default: 1)
+# Usage:  ./scripts/next-block.sh [phase]      (default: the active phase)
+#
+# With no argument the phase is the ACTIVE one. CLAUDE.md's "go ahead" procedure
+# calls this with no argument, so the default must not be a fixed phase: when it
+# was phase 1, a session got "No open blocks left in Phase 1" while phase 3 was
+# active and full of open issues. The active phase is found, in order, by:
+#   1. ROADMAP.md's phase table: exactly one row whose status reads **Active.
+#   2. Otherwise the lowest phase whose GitHub milestone has open issues.
+# The script prints one line saying which rule chose the phase.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-phase="${1:-1}"
-case "$phase" in
-    1) milestone="Phase 1 — The engine stands" ;;
-    2) milestone="Phase 2 — The first survival world" ;;
-    3) milestone="Phase 3 — The world" ;;
-    *) echo "unknown phase: $phase (expected 1, 2 or 3)" >&2; exit 2 ;;
-esac
+milestone_for() {
+    case "$1" in
+        1) echo "Phase 1 — The engine stands" ;;
+        2) echo "Phase 2 — The first survival world" ;;
+        3) echo "Phase 3 — The world" ;;
+    esac
+}
 
 if ! command -v gh >/dev/null 2>&1; then
     echo "gh (GitHub CLI) is not installed -- it is how work is tracked here." >&2
     exit 2
+fi
+
+chosen=""
+if [ $# -ge 1 ]; then
+    phase="$1"
+    case "$phase" in
+        1|2|3) ;;
+        *) echo "unknown phase: $phase (expected 1, 2 or 3)" >&2; exit 2 ;;
+    esac
+else
+    active_rows=$(grep -E '^\| \*\*[0-9]+\*\* \|' ROADMAP.md | grep -F '**Active' || true)
+    active_count=$(grep -c . <<<"$active_rows" || true)
+    if [ "$active_count" -eq 1 ]; then
+        phase=$(sed -E 's/^\| \*\*([0-9]+)\*\*.*/\1/' <<<"$active_rows")
+        chosen="(active phase $phase, from ROADMAP.md)"
+    else
+        phase=""
+        for p in 1 2 3; do
+            n=$(gh issue list --milestone "$(milestone_for "$p")" --state open \
+                    --limit 100 --json number --jq 'length')
+            if [ "$n" -gt 0 ]; then
+                phase="$p"
+                break
+            fi
+        done
+        if [ -n "$phase" ]; then
+            chosen="(active phase $phase, lowest phase with open issues; ROADMAP.md has no single Active row)"
+        else
+            phase=3
+            chosen="(no phase has open issues; ROADMAP.md has no single Active row; defaulting to phase 3)"
+        fi
+    fi
+fi
+
+milestone=$(milestone_for "$phase")
+if [ -n "$chosen" ]; then
+    echo "$chosen"
 fi
 
 # A milestone name that does not exist on GitHub must be a loud error, not
