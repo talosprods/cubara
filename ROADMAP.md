@@ -499,6 +499,12 @@ the same day:
      - **no frame shows sky where the finished frame shows terrain** (a hole
        during a detail swap).
      Measured on each machine and recorded in `BENCHMARKS.md`.
+     *Which surface (written down 2026-11-11, #388 — not a change to the terms):*
+     `scripts/check-phase-gate.sh` measures these frame terms offscreen at
+     1920×1080, on a target that is never presented (`--bench flight`,
+     `--bench walk`). The presenting window at the display's resolution is
+     measured by `--bench walk --window` and recorded per machine in
+     `BENCHMARKS.md` as a companion row; it is not a gate term.
    - The LOD tests T1/T4 from `PROPOSAL_LOD_TRANSITIONS.md` pass: no ring edge
      doubles a step on screen.
 1. **Performance.** `--bench gate` holds 1,000+ FPS on every machine, with that

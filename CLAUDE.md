@@ -189,6 +189,14 @@ still there (`sudo -n -l`) rather than taking this paragraph's word for it.
 It covers those three commands and nothing else: every other `sudo`, and any
 install, still goes to him.
 
+**No agents run during a measurement, on any machine** (his answer,
+2026-11-11, in the Linux session). On the M3, four read-only agents streaming
+in the Claude app cost 11–14% FPS and doubled p99 while no process exceeded
+the quiet check (`BENCHMARKS.md` ⁸⁹), so "no process holding a core" is not
+enough: a session stops or pauses every agent it runs -- and checks that no
+other session is running any on that machine -- before the first run, and
+starts them again only after the last.
+
 He also allowed closing his other applications for a clean measurement, on the
 same day, on the same terms: it is for a measurement, and the session says
 afterwards what it closed.
