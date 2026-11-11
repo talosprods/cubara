@@ -188,6 +188,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-10 | **Gate eye: ground — `GATE: MET at Medium`**, 2 runs, AC power (67→71%, charging), no thermal warning recorded, machine idle since the build; 836 draws (464/1,568 nodes)⁸⁸ | -- | -- | **1,118 / 1,148** | **0.444 / 0.424 ms** | 1.350 / 1.223 ms | `874c771` |
 | 2026-11-10 | Gate eye: hill — `MET at Medium`, 2 runs, AC power, no thermal warning recorded; 446 draws (230/779 nodes)⁸⁸ | -- | -- | 1,113 / 1,130 | 0.429 / 0.422 ms | 1.478 / 1.256 ms | `874c771` |
 | 2026-11-10 | Gate eye: flight — `MET at Medium`, 2 runs, AC power, no thermal warning recorded; 0 draws⁸⁸ | 0 | far only | 3,269 / 3,404 | 0.149 / 0.145 ms | 0.543 / 0.400 ms | `874c771` |
+| 2026-11-11 | **Gate eye: ground — `GATE: MET at Medium`**, 2 runs, AC power, battery 100% and charged, lid open, display on; run 1 under agent load, run 2 quiet; 836 draws (464/1,568 nodes)⁸⁹ | -- | -- | **1,018 / 1,155** | **0.476 / 0.423 ms** | 2.021 / 0.974 ms | `0ab0cc3` |
+| 2026-11-11 | Gate eye: hill — `MET at Medium`, 2 runs, same conditions, run 1 under agent load; 446 draws (230/779 nodes)⁸⁹ | -- | -- | 1,010 / 1,135 | 0.475 / 0.422 ms | 2.078 / 0.988 ms | `0ab0cc3` |
+| 2026-11-11 | Gate eye: flight — `MET at Medium`, 2 runs, same conditions, run 1 under agent load; 0 draws⁸⁹ | 0 | far only | 2,968 / 3,461 | 0.167 / 0.144 ms | 1.070 / 0.382 ms | `0ab0cc3` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1282,6 +1285,7 @@ the whole frame in the game's own loop (`--bench walk`) in ⁸³.
 | 2026-11-10 | the same⁸⁷ | toward a peak (`--toward-peak`), 30 s | 0.20% | 2.21% | 6% | 2.5 ms | `8699d1d` |
 | 2026-11-10 | **macOS, Apple M3** (8 GB, Metal), item 0's low flight, 1280×720 to sit beside the rows above⁸⁸ | low, 2 runs | **0.10% / 0.11%** | **1.46% / 1.47%** | **4% / 4%** | 2.7 / 2.9 ms | `874c771` |
 | 2026-11-10 | **macOS, Apple M3**, the same flight at 1920×1080 — what `check-phase-gate.sh` itself runs⁸⁸ | low, 2 runs | 0.10% / 0.09% | 1.49% / 1.50% | 4% / 4% | 2.7 / 2.8 ms | `874c771` |
+| 2026-11-11 | **macOS, Apple M3**, the same 1080p flight after #379's parts 2 and 3 and #405, quiet machine⁸⁹ | low, 2 runs | 0.09% / 0.11% | 1.49% / 1.50% | 4% / 4% | 2.6 / 2.7 ms | `0ab0cc3` |
 
 ### Holes while flying — nothing drawn where land belongs (`--bench flight`)
 
@@ -3075,3 +3079,69 @@ the term is resolution-sensitive: the same flight on this machine at 720p
 counts 1 and 0 hole frames, while the gate script measures at 1080p and every
 row in the holes table above was taken at 720p. Whether 3.0 closes on that is
 the owner's call, not this row's.
+
+⁸⁹ **The M3's gate and 1080p low flight again, at 0ab0cc3 (block 3.0, #386),
+macOS, 2026-11-11.** The runs ⁸⁸ said were missing: the same machine, the same
+commands, after the rest of #379's split and #405 landed. Conditions: AC power,
+battery 100% and charged, lid open, display on during every run. The release
+build finished at 01:25:46. A planning agent's Python estimate held one CPU
+core from about 01:25:50 to 01:27:50 (the agent disclosed it afterwards); that
+ended 4 minutes before any run, so it bears on the cool-down, not on a measured
+frame. The quiet-machine check (no process above 25% CPU) passed at 01:31:46,
+and the first run started then. `--bench gate` twice and
+`--bench flight --eye 8,120,8 --look 1,-0.15,0.3 --seconds 20` twice, all in
+the rows, "run 1 / run 2": neither pair is reduced to its better run.
+
+**Gate run 1 is not a clean measurement.** While it ran, four read-only Claude
+planning agents were active in the Claude app; they were stopped at about 01:33,
+between the two runs. Run 2 and both flights ran on a quiet machine. Run 1 is
+11.9% (ground), 11.0% (hill) and 14.2% (flight) lower in FPS than run 2, with
+12.5%, 12.6% and 16.0% more CPU/frame (0.476, 0.475, 0.167 ms against 0.423,
+0.422, 0.144 ms). ⁸⁸ measured the run-to-run ramp on this machine at +1.5% to
++4.1%, so an 11-14% gap is several times the normal spread and has a known
+cause. The tail suffered far more than the mean: under agent load the p99
+roughly doubled (ground 2.021 vs 0.974 ms). Run 1 is recorded because it
+happened and is labelled, and **the comparison below uses run 2 only**. Run 1 still meets the
+gate (1,018, 1,010 and 2,968 FPS), but only just on the ground and hill eyes,
+which is worth knowing about a machine with other work on it.
+
+**Against 874c771 (⁸⁸), run 2 of this table against both of that one:**
+ground 1,118 / 1,148 -> 1,155 FPS and 0.444 / 0.424 -> 0.423 ms; hill 1,113 /
+1,130 -> 1,135 FPS and 0.429 / 0.422 -> 0.422 ms; flight 3,269 / 3,404 -> 3,461
+FPS and 0.149 / 0.145 -> 0.144 ms. Against ⁸⁸'s second run that is +0.6%, +0.4%
+and +1.7% in FPS: inside the run-to-run ramp ⁸⁸ measured (+1.5% to +4.1%), so
+nothing here shows a cost or a gain from the commits in between. What
+`git log --oneline 874c771..0ab0cc3` adds to the engine: #404, the camera's eye
+as f64 (#379, part 2 of 3); #407, the render anchor (#379, part 3 of 3); and
+#405, mesh jobs holding a world snapshot so the tick no longer clones the world
+(#387). The rest of the range is documentation. With #404 and #407 in, #379's
+split is measured on the M3 for the first time; #405 is visible in the flight
+below. Same caveat as ⁸⁸: #298's warm-up change landed before these rows and ⁷⁵
+says rows before 2026-11-09 read FPS low and CPU/frame high, so a delta against
+a row from before that is partly the measurement; 874c771's rows were taken
+after it, so this comparison is not affected by it.
+
+**GPU/frame is `--` because the bench disables GPU timing on Metal**, exactly as
+in ⁸⁸: every run printed `GPU/frame n/a (disabled after warmup: ...)` with 2 to
+18 valid and about 1,006 to 1,022 invalid warmup samples. Issue #410 tracks it.
+
+**The flight is at 1080p, the bench's default size**, because gate item 0 is
+judged at that size (`check-phase-gate.sh` passes no `--size`). Against item
+0's terms, both runs, quiet machine, 20 s, 80 kept frames:
+- Frames: loading worst 1.49% / 1.50%, work p99 2.6 / 2.7 ms, p99.9 3.1 / 3.2
+  ms, max 6.1 / 5.8 ms, nothing over 16.7 ms or 33.3 ms.
+- HOLES: 0 and 6 of 1,200 frames, worst 0.000% in both, none under a late swap.
+  `HOLES == 0` holds in one run of two.
+- STALE: 11 and 12 kept frames, worst 0.008%, none under a late swap. Item 0's
+  `STALE <= 0` is still missed on the M3.
+- POPS: 118 and 119 swaps, silhouette p50/p99/max 0/0/8 and 0/0/6 px. The p99 of
+  0 px passes `POP_P99_PX=2`.
+- SWAP LAG: p50/p90/p99/max 83/100/117/117 ms in both runs (2.0/2.4/2.8/2.8
+  blocks), n = 16,584.
+- WORLD CLONES: 0 in 20.0 s, 0.0 clones/s, 0 bytes/s, in both runs. That is
+  #405 visible in the numbers.
+
+For comparison, ⁸⁸'s 1080p flight at 874c771 counted 7 and 6 hole frames and 12
+and 11 kept stale frames. main has moved since these runs (flight.rs,
+streaming.rs and check-phase-gate.sh changed in #406 after 0ab0cc3), so these
+rows describe 0ab0cc3 and nothing later.
