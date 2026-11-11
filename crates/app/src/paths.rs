@@ -109,7 +109,7 @@ fn lexical(p: &Path) -> PathBuf {
 
 /// Whether two paths name the same place: equal lexically, or after the
 /// filesystem resolves them (symlinks, Windows `\\?\` prefixes).
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let (la, lb) = (lexical(a), lexical(b));
     if la == lb {
         return true;

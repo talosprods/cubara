@@ -4282,6 +4282,60 @@ mod tests {
         game
     }
 
+    /// Runs `frames` of `script` at 60 Hz the way a loop would: `before`,
+    /// `advance`, `after`.
+    fn run_script(game: &mut Game, script: &mut crate::flight::WalkScript, frames: u32) {
+        for i in 0..frames {
+            script.before(game, i as f32 / 60.0);
+            game.advance(1.0 / 60.0);
+            script.after(game);
+        }
+    }
+
+    #[test]
+    fn the_walk_script_walks_and_jumps() {
+        let mut game = game_with_assets();
+        let (start, tick) = (game.camera_pose().eye, game.sim_tick());
+        let mut script = crate::flight::WalkScript::new(false);
+        // Space is pressed once a second, and not before.
+        script.before(&mut game, 0.0);
+        assert!(!game.jump_pending, "jumped at t = 0");
+        script.before(&mut game, 1.0);
+        assert!(game.jump_pending, "no jump at t = 1 s");
+        script.after(&mut game);
+        let mut highest = start.y;
+        for i in 0..180 {
+            script.before(&mut game, i as f32 / 60.0);
+            game.advance(1.0 / 60.0);
+            script.after(&mut game);
+            highest = highest.max(game.camera_pose().eye.y);
+        }
+        assert!(
+            highest > start.y + 0.2,
+            "Space never lifted the player: highest {highest}, start {}",
+            start.y
+        );
+        assert!(game.sim_tick() > tick, "the sim did not tick");
+        assert!(!game.is_spectating(), "the walk script must not fly");
+        let moved = (game.camera_pose().eye - start).length();
+        assert!(
+            moved > 1.0,
+            "the walk script moved the player {moved} blocks"
+        );
+    }
+
+    #[test]
+    fn the_fly_script_spectates_after_its_first_frame() {
+        let mut game = game_with_assets();
+        let mut script = crate::flight::WalkScript::new(true);
+        run_script(&mut game, &mut script, 5);
+        assert!(game.is_spectating(), "F4 was not pressed");
+        let before = game.camera_pose().eye;
+        run_script(&mut game, &mut script, 60);
+        let moved = (game.camera_pose().eye - before).length();
+        assert!(moved > 1.0, "the fly script moved the eye {moved} blocks");
+    }
+
     #[test]
     fn a_world_survives_being_closed_and_reopened() {
         // **#179's test, and the one that was missing.** The save *format* was

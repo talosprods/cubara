@@ -27,6 +27,7 @@ mod game;
 mod lod_probe;
 mod options;
 mod paths;
+mod present;
 mod screenshot;
 mod settings;
 mod streaming;
@@ -131,6 +132,34 @@ struct App {
     /// When the last frame was drawn. The app loop owns the clock and hands `dt`
     /// to the game; the renderer keeps its own timing only for the FPS readout.
     last_frame: Option<std::time::Instant>,
+    /// `--bench walk --window`: the recorder and the walk script, inside this
+    /// same loop (Rule 5: no second game loop).
+    bench: Option<WindowBench>,
+    /// `--no-tune`: never start the start-up `--bench tune` child.
+    no_tune: bool,
+    /// `--present fifo|mailbox|immediate`: asked for when the surface offers it.
+    present: Option<wgpu::PresentMode>,
+}
+
+/// What a windowed walk records while the game runs (`present.rs` turns it
+/// into the line). Impure on purpose: it holds clocks and the key script.
+struct WindowBench {
+    process_start: std::time::Instant,
+    seconds: f32,
+    fly: bool,
+    fullscreen: bool,
+    size: Option<(u32, u32)>,
+    rebuild_at: Option<f32>,
+    trace_path: Option<std::path::PathBuf>,
+    script: flight::WalkScript,
+    script_start: Option<std::time::Instant>,
+    trace: present::Trace,
+    focus_lost: u32,
+    tune_started: bool,
+    tune_done: Option<f64>,
+    rebuild_asked: Option<f64>,
+    /// Where the walk began and the sim tick it began on.
+    start: Option<(glam::DVec3, u64)>,
 }
 
 /// Whether *any* screen is up -- the inventory, the pause menu, or the
@@ -458,9 +487,18 @@ impl ApplicationHandler for App {
         if self.renderer.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("Cubara");
+        let mut attrs = Window::default_attributes().with_title("Cubara");
+        if let Some(b) = &self.bench {
+            if let Some((w, h)) = b.size {
+                attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            }
+            if b.fullscreen {
+                attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+            }
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let (renderer, mesh_assets) = Renderer::new(window.clone(), self.game.camera_pose());
+        let (renderer, mesh_assets) =
+            Renderer::new(window.clone(), self.game.camera_pose(), self.present);
         let layers = mesh_assets.layers;
         let registry = std::sync::Arc::new(mesh_assets.registry);
         let items = load_item_registry();
@@ -515,8 +553,11 @@ impl ApplicationHandler for App {
             .as_ref()
             .map(|r| r.adapter_name().to_string())
             .unwrap_or_default();
-        if self.settings.needs_tuning(self.target_fps, &gpu) {
+        if !self.no_tune && self.settings.needs_tuning(self.target_fps, &gpu) {
             self.start_tuning();
+        }
+        if let Some(b) = self.bench.as_mut() {
+            b.tune_started = self.tuning.is_some();
         }
     }
 
@@ -554,7 +595,15 @@ impl ApplicationHandler for App {
                 // from a report.
                 log::info!("window focused (captured: {})", self.cursor_captured);
             }
+            WindowEvent::Occluded(true) => {
+                if let Some(b) = self.bench.as_mut() {
+                    b.focus_lost += 1;
+                }
+            }
             WindowEvent::Focused(false) => {
+                if let Some(b) = self.bench.as_mut() {
+                    b.focus_lost += 1;
+                }
                 log::info!("window lost focus: mouse released");
                 let out = capture::apply(
                     self.cursor_captured,
@@ -758,6 +807,12 @@ impl ApplicationHandler for App {
                     .map(|t| (now - t).as_secs_f32())
                     .unwrap_or(0.0);
                 self.last_frame = Some(now);
+                if let Some(b) = self.bench.as_mut() {
+                    let began = *b.script_start.get_or_insert(now);
+                    b.start
+                        .get_or_insert((self.game.camera_pose().eye, self.game.sim_tick()));
+                    b.script.before(&mut self.game, (now - began).as_secs_f32());
+                }
                 // The only place `Instant::now()` appears -- `Game::advance` turns
                 // this wall-clock `dt` into fixed sim ticks without ever reading
                 // the clock itself (`ARCHITECTURE.md` Rule 1, §9).
@@ -768,6 +823,11 @@ impl ApplicationHandler for App {
                 // `advance` just applied -- so this is where the mouse learns.
                 self.follow_screen();
                 self.poll_tuning();
+                if let Some(b) = self.bench.as_mut() {
+                    if b.tune_started && b.tune_done.is_none() && self.tuning.is_none() {
+                        b.tune_done = Some(b.process_start.elapsed().as_secs_f64());
+                    }
+                }
                 self.watch_frame(dt);
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
@@ -815,6 +875,25 @@ impl ApplicationHandler for App {
                     tooltip: hovered.as_deref(),
                     gauges: self.game.furnace_gauges(),
                 });
+                // `--rebuild-at`: ask the window for a slightly different size,
+                // through the game's own `Resized` path.
+                if let Some(b) = self.bench.as_mut() {
+                    let due = b
+                        .rebuild_at
+                        .is_some_and(|at| b.process_start.elapsed().as_secs_f32() >= at);
+                    if due && b.rebuild_asked.is_none() {
+                        let (w, h) = renderer.size();
+                        b.rebuild_asked = Some(b.process_start.elapsed().as_secs_f64());
+                        let asked = winit::dpi::PhysicalSize::new(w, h.saturating_sub(2));
+                        match renderer.window().request_inner_size(asked) {
+                            Some(s) if (s.width, s.height) != (w, h) => {
+                                renderer.resize(s.width, s.height);
+                            }
+                            Some(_) => log::warn!("rebuild: the window refused the resize"),
+                            None => {}
+                        }
+                    }
+                }
                 let others = self.game.other_players();
                 let menu = if self.options_open {
                     Some(options::options_text(
@@ -825,7 +904,7 @@ impl ApplicationHandler for App {
                 } else {
                     menu_text(&self.game)
                 };
-                renderer.render(
+                let presented = renderer.render(
                     camera,
                     self.game.selected_block(),
                     self.game.cracking(),
@@ -844,6 +923,52 @@ impl ApplicationHandler for App {
                     // anything a player can see.
                     far_streaming::FAR_VIEW_RADIUS as f32,
                 );
+                if let Some(b) = self.bench.as_mut() {
+                    b.script.after(&mut self.game);
+                    b.trace.record(presented.map(|p| {
+                        (
+                            (p.at - b.process_start).as_secs_f64(),
+                            p.acquire.as_secs_f32(),
+                        )
+                    }));
+                    if b.process_start.elapsed().as_secs_f32() >= b.seconds {
+                        let (eye0, tick0) = b.start.unwrap_or_default();
+                        let report = present::PresentReport {
+                            presents: std::mem::take(&mut b.trace.presents),
+                            acquires: std::mem::take(&mut b.trace.acquires),
+                            size: renderer.size(),
+                            mode: renderer
+                                .present_mode()
+                                .map_or_else(String::new, |m| format!("{m:?}")),
+                            refresh_hz: self.target_fps,
+                            fullscreen: b.fullscreen,
+                            skipped: b.trace.skipped,
+                            focus_lost: b.focus_lost,
+                            tune: match (self.no_tune, b.tune_started, b.tune_done) {
+                                (true, _, _) => present::Tune::Off,
+                                (_, false, _) => present::Tune::NotNeeded,
+                                (_, true, Some(at)) => present::Tune::Finished(at),
+                                (_, true, None) => present::Tune::StillRunning,
+                            },
+                            far: self.settings.far.name().to_string(),
+                            rebuild: b.rebuild_asked,
+                            fly: b.fly,
+                            moved: (self.game.camera_pose().eye - eye0).length() as f32,
+                            ticks: self.game.sim_tick() - tick0,
+                        };
+                        log::info!("{}", report.line());
+                        if let Some(path) = &b.trace_path {
+                            let csv = present::trace_csv(&present::gaps(&report.presents));
+                            if let Err(e) = std::fs::write(path, csv) {
+                                log::error!("--trace {}: {e}", path.display());
+                            }
+                        }
+                        // No `game.save()`: a measurement leaves the world alone.
+                        self.tuning = None; // dropping the child kills it
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 // Immediately queue the next frame — we render continuously.
                 renderer.window().request_redraw();
             }
@@ -852,6 +977,10 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        // A mouse nudged during a measured walk must not turn it.
+        if self.bench.is_some() {
+            return;
+        }
         // Raw mouse motion drives first-person look, but only while captured.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if self.cursor_captured {
@@ -862,6 +991,7 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    let process_start = std::time::Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -900,9 +1030,100 @@ fn main() {
         return;
     }
 
+    // Diagnostic switches that also work on a normal start; absent, they change
+    // nothing. `--no-tune` never starts the start-up tuning child; `--present`
+    // asks for a present mode when the surface offers it.
+    // `--bench walk --window` is the one place the arguments can be wrong in a
+    // way that must stop the run (`present::check_window_args`).
+    let window_walk = present::check_window_args(&args, &paths).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
+    let no_tune = args.iter().any(|a| a == "--no-tune");
+    let present = args.iter().position(|a| a == "--present").map(|i| {
+        args.get(i + 1)
+            .and_then(|m| present::parse_present(m))
+            .unwrap_or_else(|| {
+                eprintln!("--present needs fifo, mailbox or immediate");
+                std::process::exit(2);
+            })
+    });
+
+    // `--bench walk --window`: the same walk, in the game's own window, with
+    // the real presenting surface (issue #388). It is the normal start below
+    // with a recorder attached, not another loop.
+    let bench = window_walk.then(|| {
+        let value = |name: &str| {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|j| args.get(j + 1))
+        };
+        let number = |name: &str| {
+            value(name).map(|t| {
+                t.parse::<f32>().unwrap_or_else(|_| {
+                    eprintln!("{name} needs a number");
+                    std::process::exit(2);
+                })
+            })
+        };
+        let size = args.iter().any(|a| a == "--size").then(|| {
+            value("--size")
+                .and_then(|s| bench::parse_size(s))
+                .unwrap_or_else(|| {
+                    eprintln!("--size needs WIDTHxHEIGHT, e.g. --size 2560x1440");
+                    std::process::exit(2);
+                })
+        });
+        let fullscreen = args.iter().any(|a| a == "--fullscreen");
+        let rebuild_at = number("--rebuild-at");
+        if fullscreen && rebuild_at.is_some() {
+            eprintln!("--rebuild-at: a fullscreen window cannot be resized");
+            std::process::exit(2);
+        }
+        let fly = args.iter().any(|a| a == "--fly");
+        WindowBench {
+            process_start,
+            seconds: number("--seconds").unwrap_or(60.0),
+            fly,
+            fullscreen,
+            size,
+            rebuild_at,
+            trace_path: value("--trace").map(std::path::PathBuf::from),
+            script: flight::WalkScript::new(fly),
+            script_start: None,
+            trace: present::Trace::default(),
+            focus_lost: 0,
+            tune_started: false,
+            tune_done: None,
+            rebuild_asked: None,
+            start: None,
+        }
+    });
+
+    // A watchdog: an occluded window can stop redrawing, and under Fifo
+    // `nextDrawable` blocks inside `render`, so nothing in the loop could end
+    // the run. Past the run's length plus a slack, say so and stop.
+    if let Some(b) = &bench {
+        let limit =
+            std::time::Duration::from_secs_f64(f64::from(b.seconds) + present::WATCHDOG_SLACK);
+        let start = b.process_start;
+        std::thread::spawn(move || {
+            std::thread::sleep(limit.saturating_sub(start.elapsed()));
+            eprintln!(
+                "--bench walk --window: no result {:.0} s after start (window occluded or not redrawing?); aborting",
+                limit.as_secs_f64()
+            );
+            std::process::exit(3);
+        });
+    }
+
     // Headless benchmark mode:
     // `cargo run --release -- --bench [radius] [--size WIDTHxHEIGHT]`.
-    if let Some(i) = args.iter().position(|a| a == "--bench") {
+    if let Some(i) = args
+        .iter()
+        .position(|a| a == "--bench")
+        .filter(|_| !window_walk)
+    {
         let target = bench::parse_target(args.get(i + 1).map(String::as_str));
         let size = match args.iter().position(|a| a == "--size") {
             // Refused rather than defaulted: a typo silently measuring 1080p
@@ -981,6 +1202,10 @@ fn main() {
             // `--bench walk [--seconds S] [--fps F] [--fly]`: the whole frame's
             // time while a scripted player walks (or, with `--fly`, spectates
             // flying forward).
+            // `--bench walk --window --world DIR [--seconds S] [--fly]
+            // [--fullscreen] [--size WxH] [--no-tune] [--present MODE]
+            // [--rebuild-at S] [--trace FILE]`: the same walk in the game's own
+            // window for 60 s from process start, timed present to present.
             // `--bench edits [--ticks N]`: the tick's CPU cost with 0 and
             // 10,000 edits, a mesh job's snapshot held across every tick
             // (issue #387). No GPU.
@@ -1154,6 +1379,9 @@ fn main() {
         connect_to,
         game: Game::with_paths(paths.clone()),
         paths,
+        bench,
+        no_tune,
+        present,
         ..App::default()
     };
     event_loop.run_app(&mut app).expect("run app");

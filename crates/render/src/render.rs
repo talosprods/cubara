@@ -679,7 +679,11 @@ impl Renderer {
     /// caller streams the initial view in via
     /// [`apply_node_updates`](Self::apply_node_updates) exactly like every
     /// later frame.
-    pub fn new(window: Arc<Window>, camera: CameraPose) -> (Self, MeshAssets) {
+    pub fn new(
+        window: Arc<Window>,
+        camera: CameraPose,
+        present: Option<wgpu::PresentMode>,
+    ) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
         let instance = crate::new_instance();
@@ -739,7 +743,7 @@ impl Renderer {
             //
             // Choosing from what the surface actually offers means the answer is
             // in `present_mode` instead of hidden behind a word.
-            present_mode: chosen_present_mode(&caps),
+            present_mode: present_mode_for(present, &caps.present_modes),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -753,6 +757,12 @@ impl Renderer {
             caps.present_modes,
             config.present_mode
         );
+        if let Some(m) = present.filter(|m| *m != config.present_mode) {
+            log::warn!(
+                "--present {m:?} is not offered here; using {:?}",
+                config.present_mode
+            );
+        }
         surface.configure(&device, &config);
 
         let (width, height) = (config.width, config.height);
@@ -999,11 +1009,24 @@ impl Renderer {
         }
     }
 
+    /// The present mode a window surface was configured with; `None` offscreen.
+    pub fn present_mode(&self) -> Option<wgpu::PresentMode> {
+        match &self.target {
+            Target::Window { config, .. } => Some(config.present_mode),
+            Target::Offscreen { .. } => None,
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
         match &mut self.target {
+            // Already this size: winit may say so twice (a direct resize, then
+            // its `Resized`), and a pipeline rebuild is not free.
+            Target::Window { config, .. } if (config.width, config.height) == (width, height) => {
+                return;
+            }
             Target::Window {
                 surface, config, ..
             } => {
@@ -1020,7 +1043,12 @@ impl Renderer {
                 (*w, *h) = (width, height);
             }
         }
+        let rebuilding = std::time::Instant::now();
         self.scene.resize(&self.device, width, height);
+        log::info!(
+            "resize to {width}x{height}: depth and mesh pipeline rebuilt in {:.2} ms",
+            rebuilding.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     /// The last frame an [`offscreen`](Self::offscreen) renderer drew, as
@@ -1083,6 +1111,10 @@ impl Renderer {
     /// is how far the caller's own streaming actually reaches (`ARCHITECTURE.md`
     /// Rule 3 again: this crate has no schedule of its own to derive it from) --
     /// used only to fade distance fog out at that real edge.
+    ///
+    /// Returns when `present` returned and how long the acquire took, for a
+    /// window frame that was presented; `None` offscreen or when the surface
+    /// had no texture to give (the frame was skipped).
     pub fn render(
         &mut self,
         camera: CameraPose,
@@ -1091,7 +1123,7 @@ impl Renderer {
         players: &[crate::figure::PlayerView],
         hud: crate::scene::Hud<'_>,
         render_radius_blocks: f32,
-    ) {
+    ) -> Option<Presented> {
         let crate::scene::Hud {
             hotbar,
             panel,
@@ -1108,6 +1140,7 @@ impl Renderer {
             Target::Window {
                 surface, config, ..
             } => {
+                let acquiring = std::time::Instant::now();
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -1119,13 +1152,14 @@ impl Renderer {
                     | wgpu::CurrentSurfaceTexture::Lost
                     | wgpu::CurrentSurfaceTexture::Validation => {
                         surface.configure(&self.device, config);
-                        return;
+                        return None;
                     }
                 };
+                let acquire = acquiring.elapsed();
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
-                (Some(frame), view)
+                (Some((frame, acquire)), view)
             }
             Target::Offscreen { color, .. } => {
                 // A measurement reads every frame back, so each must be drawn
@@ -1198,11 +1232,12 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        if let Some(frame) = frame {
-            self.queue.present(frame);
-        }
+        let presented = frame.map(|(frame, acquire)| {
+            present_timed(frame, acquire, |frame| self.queue.present(frame))
+        });
 
         self.report_fps();
+        presented
     }
 
     /// Give the HUD its item icons; see [`crate::SceneRenderer::set_icons`].
@@ -1616,27 +1651,56 @@ pub const fn figure_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// The pipeline that draws other players.
+/// The present mode to configure: `wanted` when this surface offers it,
+/// otherwise the fastest it offers.
 ///
-/// Depth-tested and back-face culled like the terrain, so a figure behind a
-/// hill is behind it. Camera bind group only: the vertices come in already
-/// placed, so there is no per-figure uniform to bind or to keep in step.
-/// The fastest presentation this surface actually offers.
-///
-/// `Mailbox` first (no tearing, no waiting), then `Immediate` (no waiting),
-/// then `Fifo`, which every surface supports and which is vsync. Returning a
-/// concrete mode rather than `AutoNoVsync` is the point: the caller can then log
-/// what it got, and "we asked for no vsync" stops being mistakable for "we got
-/// no vsync".
-pub fn chosen_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-    for wanted in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
-        if caps.present_modes.contains(&wanted) {
-            return wanted;
+/// Fastest is `Mailbox` first (no tearing, no waiting), then `Immediate` (no
+/// waiting), then `Fifo`, which every surface supports and which is vsync.
+/// Returning a concrete mode rather than `AutoNoVsync` is the point: the caller
+/// can then log what it got, and "we asked for no vsync" stops being mistakable
+/// for "we got no vsync". Never a mode the surface did not list -- Metal's
+/// backend panics on one.
+pub fn present_mode_for(
+    wanted: Option<wgpu::PresentMode>,
+    offered: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    if let Some(m) = wanted.filter(|m| offered.contains(m)) {
+        return m;
+    }
+    for fast in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
+        if offered.contains(&fast) {
+            return fast;
         }
     }
     wgpu::PresentMode::Fifo
 }
 
+/// Run `present` on `frame` and stamp the instant it returned. The stamp is
+/// taken *after* the call, never before: a present that blocks (vsync, a full
+/// queue) is exactly the time the instrument exists to see.
+fn present_timed<F>(frame: F, acquire: std::time::Duration, present: impl FnOnce(F)) -> Presented {
+    present(frame);
+    Presented {
+        at: std::time::Instant::now(),
+        acquire,
+    }
+}
+
+/// One window frame that reached `present`.
+#[derive(Clone, Copy, Debug)]
+pub struct Presented {
+    /// When `present` returned, on the calling thread.
+    pub at: std::time::Instant,
+    /// How long `get_current_texture` took -- under vsync, the wait for the
+    /// display to release a drawable.
+    pub acquire: std::time::Duration,
+}
+
+/// The pipeline that draws other players.
+///
+/// Depth-tested and back-face culled like the terrain, so a figure behind a
+/// hill is behind it. Camera bind group only: the vertices come in already
+/// placed, so there is no per-figure uniform to bind or to keep in step.
 pub fn build_figure_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -2041,6 +2105,42 @@ impl Sink<MeshedNode> for ArenaSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a GPU: the stamp must come after the present call returned.
+    #[test]
+    fn the_present_instant_is_taken_after_present_returns() {
+        let before = std::time::Instant::now();
+        let p = present_timed(7u8, std::time::Duration::from_millis(3), |f| {
+            assert_eq!(f, 7);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        assert!(p.at - before >= std::time::Duration::from_millis(20));
+        assert_eq!(p.acquire, std::time::Duration::from_millis(3));
+    }
+
+    #[test]
+    fn a_wanted_present_mode_is_used_when_offered() {
+        use wgpu::PresentMode::*;
+        assert_eq!(present_mode_for(Some(Fifo), &[Fifo, Immediate]), Fifo);
+    }
+
+    /// The M3's case: Metal offers no Mailbox.
+    #[test]
+    fn a_wanted_present_mode_that_is_not_offered_falls_back_to_the_fastest() {
+        use wgpu::PresentMode::*;
+        assert_eq!(
+            present_mode_for(Some(Mailbox), &[Fifo, Immediate]),
+            Immediate
+        );
+    }
+
+    #[test]
+    fn no_wish_picks_mailbox_then_immediate_then_fifo() {
+        use wgpu::PresentMode::*;
+        assert_eq!(present_mode_for(None, &[Fifo, Immediate, Mailbox]), Mailbox);
+        assert_eq!(present_mode_for(None, &[Fifo, Immediate]), Immediate);
+        assert_eq!(present_mode_for(None, &[Fifo]), Fifo);
+    }
 
     /// Review finding S1 (#379): a tree instance carries its node's slot in
     /// `node_origins`, so when a re-insert frees the slot and then fails

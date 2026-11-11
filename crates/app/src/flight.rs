@@ -1031,6 +1031,69 @@ impl WalkReport {
     }
 }
 
+/// The keys `--bench walk` presses, for whichever loop runs it: W held, Space
+/// once a second -- or, with `fly`, F4 on the first frame and then W.
+pub struct WalkScript {
+    fly: bool,
+    phase: WalkPhase,
+    next_jump: f32,
+    jumping: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WalkPhase {
+    Start,
+    ReleaseF4,
+    Moving,
+}
+
+impl WalkScript {
+    pub fn new(fly: bool) -> Self {
+        Self {
+            fly,
+            phase: WalkPhase::Start,
+            next_jump: 1.0,
+            jumping: false,
+        }
+    }
+
+    /// Before a frame's `Game::advance`; `t` is seconds since the script began.
+    pub fn before(&mut self, game: &mut crate::game::Game, t: f32) {
+        use winit::keyboard::KeyCode;
+        match self.phase {
+            WalkPhase::Start if self.fly => {
+                game.key_input(KeyCode::F4, true);
+                self.phase = WalkPhase::ReleaseF4;
+                return;
+            }
+            WalkPhase::Start => {
+                game.key_input(KeyCode::KeyW, true);
+                self.phase = WalkPhase::Moving;
+            }
+            WalkPhase::ReleaseF4 | WalkPhase::Moving => {}
+        }
+        if matches!(self.phase, WalkPhase::Moving) && !self.fly && t >= self.next_jump {
+            game.key_input(KeyCode::Space, true);
+            self.next_jump += 1.0;
+            self.jumping = true;
+        }
+    }
+
+    /// After that frame.
+    pub fn after(&mut self, game: &mut crate::game::Game) {
+        use winit::keyboard::KeyCode;
+        if matches!(self.phase, WalkPhase::ReleaseF4) {
+            game.key_input(KeyCode::F4, false);
+            game.key_input(KeyCode::KeyW, true);
+            self.phase = WalkPhase::Moving;
+        }
+        if self.jumping {
+            game.key_input(KeyCode::Space, false);
+            self.jumping = false;
+        }
+    }
+}
+
 /// `--bench walk`: the game's own loop, offscreen -- [`Game::advance`] (the
 /// simulation and the server, in process), the voxel and far streaming, the
 /// renderer -- while a scripted player walks forward for `seconds`, jumping
@@ -1044,8 +1107,6 @@ impl WalkReport {
 /// with the simulation still ticking.
 pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkReport> {
     use crate::game::{load_item_registry, load_recipe_book, Game};
-    use winit::keyboard::KeyCode;
-
     let mut game = Game::new();
     let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
     let layers = assets.layers;
@@ -1099,32 +1160,25 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     let start_pos = game.camera_pose().eye;
     let ticks_before = game.sim_tick();
     let clones_before = game.world().clone_generation();
+    let mut script = WalkScript::new(fly);
+    script.before(&mut game, 0.0); // F4, or W
     if fly {
-        game.key_input(KeyCode::F4, true);
         frame(&mut game, budget.as_secs_f32(), &mut renderer);
-        game.key_input(KeyCode::F4, false);
+        script.after(&mut game); // F4 up, W down
     }
-    game.key_input(KeyCode::KeyW, true);
     let mut frame_times = Vec::new();
     let start = Instant::now();
     let mut last = start;
-    let mut next_jump = 1.0;
     let mut next_frame = start;
     while start.elapsed().as_secs_f32() < seconds {
         let t = start.elapsed().as_secs_f32();
-        let jump = !fly && t >= next_jump;
-        if jump {
-            game.key_input(KeyCode::Space, true);
-            next_jump += 1.0;
-        }
+        script.before(&mut game, t);
         let began = Instant::now();
         let dt = (began - last).as_secs_f32();
         last = began;
         frame(&mut game, dt, &mut renderer);
         frame_times.push(began.elapsed().as_secs_f32());
-        if jump {
-            game.key_input(KeyCode::Space, false);
-        }
+        script.after(&mut game);
         next_frame += budget;
         let now = Instant::now();
         match next_frame.checked_duration_since(now) {
