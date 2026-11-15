@@ -105,6 +105,14 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-09 | **Haze replaces the edge fog (F5)** — gate eye ground (High)⁷⁶ | 1,940 | 819,928 voxel + far | ~3,478 | within noise | within noise | *(this PR)* |
 | 2026-11-09 | Haze (F5) — gate eye hill (High)⁷⁶ | 869 | 436,690 voxel + far | ~3,601 | within noise | within noise | *(this PR)* |
 | 2026-11-09 | Haze (F5) — gate eye flight (High)⁷⁶ | 0 | far only | ~5,389 | within noise | within noise | *(this PR)* |
+| 2026-11-15 | `main` before: **cave eye** (16.5, −24.4, 16.5), far terrain Off⁹¹ | 10 of 28 | 4,409 voxel | ~13,426 | 0.073 ms | 0.165 ms | `4cd962d` |
+| 2026-11-15 | `main` before: cave eye, far terrain High — all of it drawn, none of it seen⁹¹ | 10 of 28 | 4,409 voxel + 716,736 far drawn | ~5,228 | 0.150 ms | 0.481 ms | `4cd962d` |
+| 2026-11-15 | `main` before: eye in solid rock (8, −40, 8), far terrain High⁹¹ | 1 of 9 | 78 voxel + 718,771 far drawn | ~5,332 | 0.162 ms | 0.416 ms | `4cd962d` |
+| 2026-11-15 | `main` before: gate eye ground (8, 40, 8), far terrain High, `--bench 64 --eye`⁹¹ | 464 of 1,568 | 213,381 voxel + 720,819 far drawn | ~3,241 | 0.197 ms | 0.489 ms | `4cd962d` |
+| 2026-11-15 | **Underground the far terrain is not drawn (#424)** — cave eye, far terrain High⁹¹ | 10 of 28 | 4,409 voxel + **0** far drawn | **~13,347** | 0.047 ms | 0.146 ms | *(this PR)* |
+| 2026-11-15 | Underground the far terrain is not drawn — cave eye, far terrain Off⁹¹ | 10 of 28 | 4,409 voxel | ~12,760 | 0.053 ms | 0.205 ms | *(this PR)* |
+| 2026-11-15 | Underground the far terrain is not drawn — eye in solid rock, far terrain High⁹¹ | 1 of 9 | 78 voxel + **0** far drawn | **~29,145** | 0.034 ms | 0.125 ms | *(this PR)* |
+| 2026-11-15 | Underground the far terrain is not drawn — gate eye ground, far terrain High: unchanged⁹¹ | 464 of 1,568 | 213,381 voxel + 720,819 far drawn | ~3,249 | 0.108 ms | 0.279 ms | *(this PR)* |
 
 ### macOS — Apple M3, 8 GB (integrated GPU, Metal)
 
@@ -3197,3 +3205,52 @@ six runs above, three each, cannot attribute them to PR A.
 
 **Judgement: PR A is neutral on CPU/frame and on STALE** on the M3. HOLES cannot
 be assigned to either side from this data.
+
+⁹¹ **Underground, the far terrain is neither seen nor paid for (#424), Windows,
+2026-11-15.** The owner's play-test of 2026-11-14 found a striped curtain
+underground and a lower frame rate in caves than above them. Issue #424's first
+decision is to measure before building, so: `--bench 64 --eye X,Y,Z` without
+and with `--far` (the far terrain Off and High), alternating, twice each, at
+three eyes of the default world. The cave eye stands in a sealed cave of
+16,260 air blocks found by flood fill, 42 blocks under the surface; the second
+eye is 80 blocks under the ground gate eye, inside solid rock, as a spectator
+is; the third is the ground gate eye itself. Each row is the mean of two runs.
+
+| eye | far | `main` FPS | `main` GPU/frame | `main` far triangles | this PR FPS | this PR GPU/frame | this PR far triangles |
+|---|---|---|---|---|---|---|---|
+| cave (16.5, −24.4, 16.5) | Off | 13,426 | 0.045 ms | -- | 12,275 / 13,245 | 0.045 ms | -- |
+| cave | High | 5,134 / 5,321 | 0.151 / 0.154 ms | 716,736 | 13,643 / 13,050 | 0.046 / 0.045 ms | 0 |
+| in rock (8, −40, 8) | Off | 13,727 | 0.006 ms | -- | 30,496 / 28,019 | 0.005 ms | -- |
+| in rock | High | 5,332 / 5,802 | 0.153 / 0.147 ms | 718,771 | 29,483 / 28,806 | 0.005 ms | 0 |
+| ground (8, 40, 8) | Off | 5,005 / 5,709 | 0.138 / 0.126 ms | -- | 5,098 / 5,449 | 0.130 / 0.134 ms | -- |
+| ground | High | 3,215 / 3,267 | 0.255 / 0.244 ms | 720,819 | 3,295 / 3,202 | 0.252 / 0.248 ms | 720,819 |
+
+**What it confirms.** Off closes the gap, so the cost is the far pass and it
+is on the GPU: 29 visible nodes and 4,409 voxel triangles, with 716,736 far
+triangles drawn on top for +0.10 ms of GPU time and nothing seen. It is not
+the visibility search or cave streaming. After the change the search says the
+eye is shut in, the far pass draws nothing, and High is within noise of Off.
+The ground eye, which is open to the sky, draws the same 720,819 triangles
+for the same GPU time.
+
+**What it does not confirm.** A cave *slower than the surface* was not
+reproduced here: on the RTX 4060 the cave eye with High ran at 5,200 FPS on
+`main` against the ground eye's 3,200. What is measured is the waste, not the
+dip. On the M3, which is bound by the far terrain's triangles, the same waste
+is a larger share of a frame; that row is the owner's to add there.
+
+**Read GPU/frame and the triangle counts, not CPU/frame, across the two
+columns.** The `main` runs shared the machine with other sessions' work (a
+build was running before four of the twelve; where there was a choice the
+table has the clean run, which is why two `main` cells hold one number), and
+the runs of this PR had it to themselves. CPU/frame is lower in every one of
+them for that reason (ground, High: 0.197 ms against 0.108 ms on identical
+work), and the in-rock eye's Off going from 13,727 to 29,000 FPS is the same
+effect, not this change.
+
+**The curtain** is fixed in `far.wgsl` and is not a frame-rate matter on this
+GPU; `golden.rs` counts it instead. From (8, −40, 8) with no voxels drawn,
+looking level at a side of the voxels' box, 121,660 of 129,600 pixels were far
+terrain on `main`; now 30,337 are, all of them skirts at and beyond the box's
+side, and none in the lowest two fifths of the frame where `main` filled all
+51,840.
