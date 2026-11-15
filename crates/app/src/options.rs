@@ -129,30 +129,71 @@ pub struct FrameWatch {
     elapsed: f32,
     frames: u32,
     missed: u32,
+    /// Whether the window can be seen. Hidden, its frames say nothing: under
+    /// vsync an occluded or minimised window may wait far longer than a
+    /// refresh for a drawable, or not draw at all.
+    visible: bool,
+}
+
+/// The time one refresh lasts at `target_fps`, in seconds.
+fn budget_for(target_fps: u32) -> f32 {
+    1.0 / target_fps.max(1) as f32
 }
 
 impl FrameWatch {
     pub fn new(target_fps: u32) -> Self {
         Self {
-            budget: 1.0 / target_fps.max(1) as f32,
+            budget: budget_for(target_fps),
             settling: SETTLE_SECONDS,
             elapsed: 0.0,
             frames: 0,
             missed: 0,
+            visible: true,
         }
+    }
+
+    /// The window is on a monitor refreshing at `target_fps` now. A change is
+    /// a new budget and a new settling period: frames paced for the old
+    /// monitor are not judged against this one. Without it a window started
+    /// at 144 Hz and moved to a 60 Hz screen would see every vsynced frame as
+    /// a miss, and step the quality down to Off (review of #426).
+    pub fn set_target(&mut self, target_fps: u32) {
+        let budget = budget_for(target_fps);
+        if budget != self.budget {
+            self.budget = budget;
+            self.settle();
+        }
+    }
+
+    /// The window became hidden (occluded, minimised) or visible again. While
+    /// hidden no frame counts; either change discards the stretch being
+    /// judged, so nothing from before is held against what comes after.
+    pub fn set_visible(&mut self, visible: bool) {
+        if visible != self.visible {
+            self.visible = visible;
+            self.discard();
+        }
+    }
+
+    /// Forget the stretch being judged.
+    fn discard(&mut self) {
+        self.elapsed = 0.0;
+        self.frames = 0;
+        self.missed = 0;
     }
 
     /// Start counting again after a settling period: a new world, a new
     /// quality, a benchmark finishing.
     pub fn settle(&mut self) {
         self.settling = SETTLE_SECONDS;
-        self.elapsed = 0.0;
-        self.frames = 0;
-        self.missed = 0;
+        self.discard();
     }
 
     /// One frame took `dt` seconds. `true`: step the quality down now.
     pub fn frame(&mut self, dt: f32) -> bool {
+        if !self.visible {
+            return false;
+        }
         if self.settling > 0.0 {
             self.settling -= dt;
             return false;
@@ -169,9 +210,7 @@ impl FrameWatch {
         if too_many {
             self.settle();
         } else {
-            self.elapsed = 0.0;
-            self.frames = 0;
-            self.missed = 0;
+            self.discard();
         }
         too_many
     }
@@ -293,6 +332,67 @@ mod tests {
         };
         assert!(steps_down(60, &every(3)));
         assert!(!steps_down(60, &every(20)));
+    }
+
+    /// Review of #426: started on a 144 Hz monitor, moved to a 60 Hz one.
+    /// Fifo now paces every frame at 16.7 ms, 2.4 times the old budget; told
+    /// about the new monitor, the watch must not call any of them a miss.
+    #[test]
+    fn frames_paced_for_the_new_monitor_do_not_step_down() {
+        let mut w = FrameWatch::new(144);
+        let at_144 = fifo_frames(144, (0..144 * 20).map(|_| 0.002), 0.1);
+        assert!(!at_144.iter().any(|&dt| w.frame(dt)), "settled at 144 Hz");
+        w.set_target(60);
+        let at_60 = fifo_frames(60, (0..60 * 60).map(|_| 0.002), 0.1);
+        assert!(
+            !at_60.iter().any(|&dt| w.frame(dt)),
+            "stepped down at 60 Hz"
+        );
+        // And it still judges, against the new budget: missing 60 Hz counts.
+        let missing = fifo_frames(60, (0..60 * 30).map(|_| 0.018), 0.1);
+        assert!(
+            missing.iter().any(|&dt| w.frame(dt)),
+            "blind after the move"
+        );
+    }
+
+    /// The other direction: 60 Hz frames are fine until the monitor is a
+    /// 144 Hz one, and then they are misses -- after a settling period.
+    #[test]
+    fn a_new_budget_starts_a_new_settling_period() {
+        let mut w = FrameWatch::new(60);
+        let slow = 1.0 / 60.0;
+        assert!(!run(&mut w, 60 * 20, slow));
+        w.set_target(144);
+        let settling = (SETTLE_SECONDS / slow) as u32 - 5;
+        assert!(!run(&mut w, settling, slow), "judged while settling");
+        assert!(run(&mut w, 60 * 5, slow), "60 FPS on a 144 Hz monitor");
+        // The same target again is no change: no new settling period.
+        let mut w = FrameWatch::new(60);
+        assert!(!run(&mut w, 290, 2.0 / 60.0));
+        w.set_target(60);
+        assert!(run(&mut w, 150, 2.0 / 60.0), "settled again for no change");
+    }
+
+    /// A hidden window's frames -- a long wait for a drawable under vsync --
+    /// are not misses, and are not held against the frames after it.
+    #[test]
+    fn frames_of_a_hidden_window_do_not_count() {
+        let mut w = FrameWatch::new(60);
+        assert!(!run(&mut w, 60 * 12, 1.0 / 60.0), "settled");
+        w.set_visible(false);
+        assert!(!run(&mut w, 200, 1.0), "a hidden window stepped down");
+        w.set_visible(true);
+        assert!(!run(&mut w, 60 * 30, 1.0 / 60.0));
+        // Half a stretch of misses, hidden, then visible: the half is gone.
+        let mut w = FrameWatch::new(60);
+        assert!(!run(&mut w, 60 * 10 + 5, 1.0 / 60.0), "settled");
+        assert!(!run(&mut w, 40, 2.0 / 60.0), "under three seconds");
+        w.set_visible(false);
+        w.set_visible(true);
+        assert!(!run(&mut w, 60 * 4, 1.0 / 60.0), "the old misses counted");
+        // Visible, it still judges.
+        assert!(run(&mut w, 150, 2.0 / 60.0));
     }
 
     #[test]

@@ -139,6 +139,10 @@ struct App {
     no_tune: bool,
     /// `--present fifo|mailbox|immediate`: asked for when the surface offers it.
     present: Option<wgpu::PresentMode>,
+    /// Whether the window is covered, and whether it is minimised: either
+    /// way its frames are not judged (`FrameWatch::set_visible`).
+    occluded: bool,
+    minimised: bool,
 }
 
 /// What a windowed walk records while the game runs (`present.rs` turns it
@@ -376,8 +380,41 @@ impl App {
         if let (Some(far), Some(renderer)) = (self.far.as_mut(), self.renderer.as_mut()) {
             far.set_quality(quality, renderer);
         }
+        self.follow_monitor();
         if let Some(w) = self.frame_watch.as_mut() {
             w.settle();
+        }
+    }
+
+    /// The frame rate to hold is that of the monitor the window is on *now*:
+    /// read it again whenever it may have changed (the window moved or was
+    /// resized, the display's settings changed) and hand it to the frame
+    /// watch. Read once at start, a window dragged from a 144 Hz monitor to a
+    /// 60 Hz one had every vsynced frame counted as a miss (review of #426).
+    fn follow_monitor(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let fps = options::target_fps(
+            renderer
+                .window()
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz()),
+        );
+        if fps != self.target_fps {
+            log::info!("the monitor refreshes at {fps} Hz, was {}", self.target_fps);
+            self.target_fps = fps;
+        }
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.set_target(fps);
+        }
+    }
+
+    /// Tell the frame watch whether the window can be seen.
+    fn follow_visibility(&mut self) {
+        let visible = !(self.occluded || self.minimised);
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.set_visible(visible);
         }
     }
 
@@ -456,6 +493,7 @@ impl App {
                 present::present_mode_for(cap, window_use, wanted, offered)
             });
         }
+        self.follow_monitor();
         if let Some(w) = self.frame_watch.as_mut() {
             w.settle();
         }
@@ -526,10 +564,15 @@ impl ApplicationHandler for App {
         // mode (issue #425).
         self.settings = settings::load(&self.paths.settings).unwrap_or_default();
         let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
-        let (renderer, mesh_assets) =
-            Renderer::new(window.clone(), self.game.camera_pose(), |offered| {
-                present::present_mode_for(cap, window_use, wanted, offered)
-            });
+        let (renderer, mesh_assets) = Renderer::new(
+            window.clone(),
+            self.game.camera_pose(),
+            |offered| present::present_mode_for(cap, window_use, wanted, offered),
+            // GPU work for F3 is the game's; a measuring window draws
+            // exactly what it drew before (issue #425: bench behaviour is
+            // out of scope).
+            window_use == present::WindowUse::Play,
+        );
         if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
             log::warn!("--present {m:?} is not offered here");
         }
@@ -625,6 +668,16 @@ impl ApplicationHandler for App {
                 if self.cursor_captured {
                     grab_cursor(renderer.window(), true);
                 }
+                // Maximising or going fullscreen may land on another monitor,
+                // and a minimised window is 0 x 0.
+                self.minimised = size.width == 0 || size.height == 0;
+                self.follow_visibility();
+                self.follow_monitor();
+            }
+            // The window may be on another monitor now, or its monitor's
+            // settings may have changed.
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.follow_monitor();
             }
             WindowEvent::Focused(true) => {
                 // Deliberately not a recapture -- see `capture::apply`. Logged
@@ -632,10 +685,12 @@ impl ApplicationHandler for App {
                 // from a report.
                 log::info!("window focused (captured: {})", self.cursor_captured);
             }
-            WindowEvent::Occluded(true) => {
-                if let Some(b) = self.bench.as_mut() {
+            WindowEvent::Occluded(occluded) => {
+                if let Some(b) = self.bench.as_mut().filter(|_| occluded) {
                     b.focus_lost += 1;
                 }
+                self.occluded = occluded;
+                self.follow_visibility();
             }
             WindowEvent::Focused(false) => {
                 if let Some(b) = self.bench.as_mut() {

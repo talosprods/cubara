@@ -697,10 +697,15 @@ impl Renderer {
     /// offers. The policy is the caller's (`cubara-app`'s `present.rs`, from
     /// the frame-cap setting); this crate only guarantees the surface is never
     /// configured with a mode it did not list ([`offered_or_fifo`]).
+    ///
+    /// `time_gpu` asks for the GPU work reading ([`gpu_work_ms`](Self::gpu_work_ms))
+    /// where the adapter has timestamps: pass-scoped timestamp writes on the
+    /// scene pass, so a window that is itself a measurement says `false`.
     pub fn new(
         window: Arc<Window>,
         camera: CameraPose,
         choose_present: impl FnOnce(&[wgpu::PresentMode]) -> wgpu::PresentMode,
+        time_gpu: bool,
     ) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
@@ -788,6 +793,7 @@ impl Renderer {
             adapter_name,
             (format, width, height),
             camera,
+            time_gpu,
         )
     }
 
@@ -831,6 +837,8 @@ impl Renderer {
             adapter_name,
             (OFFSCREEN_FORMAT, width, height),
             camera,
+            // A measurement's renderer is left exactly as it was.
+            false,
         ))
     }
 
@@ -841,6 +849,7 @@ impl Renderer {
         adapter_name: String,
         (format, width, height): (wgpu::TextureFormat, u32, u32),
         camera: CameraPose,
+        time_gpu: bool,
     ) -> (Self, MeshAssets) {
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
         let tree_models = load_tree_models(&device, &queue, &mesh_assets);
@@ -868,10 +877,11 @@ impl Renderer {
         let arena = ChunkArena::new(&device, multi_draw, anchor);
         let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY, anchor);
 
-        // GPU work for F3, for the game window only: an offscreen renderer is
-        // a measurement's, and is left exactly as it was.
-        let gpu_timing = (matches!(target, Target::Window { .. })
-            && device.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+        // GPU work for F3, only where it was asked for (the game's window).
+        let gpu_timing = wants_gpu_timing(
+            time_gpu,
+            device.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        )
         .then(|| WindowGpuTiming {
             timer: crate::gpu_timer::GpuTimer::new(&device, &queue, WINDOW_GPU_SLOTS),
             frame: 0,
@@ -1813,6 +1823,13 @@ fn smoothed(reading: f32, sample: f32) -> f32 {
     }
 }
 
+/// Whether a renderer times its scene pass on the GPU: only when asked
+/// (`time_gpu`: the game's window, never a measurement) and only where the
+/// adapter has `TIMESTAMP_QUERY`.
+fn wants_gpu_timing(time_gpu: bool, supported: bool) -> bool {
+    time_gpu && supported
+}
+
 /// How many timestamp slots the window keeps in flight. Chosen, not derived:
 /// a reading is back within a frame or two at the display's pace, and an
 /// uncapped window that outruns eight slots skips readings, which costs
@@ -2312,6 +2329,16 @@ mod tests {
             work_time(frame, Duration::from_micros(16_700)),
             Duration::ZERO
         );
+    }
+
+    /// A measuring window and an offscreen renderer ask for none, and get
+    /// none whatever the adapter can do.
+    #[test]
+    fn gpu_timing_is_only_for_a_renderer_that_asked() {
+        assert!(wants_gpu_timing(true, true));
+        assert!(!wants_gpu_timing(false, true), "a measurement was timed");
+        assert!(!wants_gpu_timing(true, false), "no TIMESTAMP_QUERY");
+        assert!(!wants_gpu_timing(false, false));
     }
 
     #[test]
