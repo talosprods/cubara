@@ -325,6 +325,22 @@ blocks.
   multiples of 128 blocks, and so does every quad edge near them, so no
   triangle straddles the edge. The triangles touching it from inside slope down
   from it, and that slope is a wall that closes the seam between the two.
+  *Changed by issue #424 (2026-11-15):* that wall ran from the surface to the
+  box's floor, a kilometre from the eye on every side, with its lit side
+  facing inward. The voxels hide it from above the ground and nothing hides it
+  from under it: the owner's striped curtain. Still no discard. Now only the
+  first ring of vertices inside the box drops, straight down from the box's
+  side and only a skirt deep, which closes the seam the way the skirt of a
+  patch ending on the box's side always did. Every vertex deeper goes *above*
+  the box when the eye is inside it and all the ground over the box is above
+  its floor, so the triangles reaching it show the eye their underside and
+  back-face culling drops them before a fragment is shaded
+  (`cubara_render::far::join`). Where any ground lies under the floor -- an
+  eye a thousand blocks up -- they go under the box as before: that ground is
+  not inside the box and stays put, and a vertex hidden next to it must stay
+  next to it (`far::hidden_height`). And when the
+  eye's visibility search finds no way out to the sky at all, the far terrain
+  is not drawn (`cubara_world::visibility::Sight::open_to_sky`).
 - At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about
   2 px, so the join is slightly visible there. The join distance can be made to
   follow the resolution.

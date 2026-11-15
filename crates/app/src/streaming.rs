@@ -295,9 +295,13 @@ pub struct NodeStreaming {
     /// are drawn. Empty (`min == max`) before the first frame.
     far_hole: ([i32; 3], [i32; 3]),
     far_want: ([i32; 3], [i32; 3]),
-    /// The nodes the camera could see ([`visibility::visible_nodes`]); the only
+    /// The nodes the camera could see ([`visibility::search`]); the only
     /// ones meshed and drawn.
     visible: HashSet<NodeKey>,
+    /// Whether that search found a way out to the sky
+    /// ([`visibility::Sight::open_to_sky`]): what the far terrain is drawn
+    /// for ([`far_in_sight`](Self::far_in_sight)).
+    open_to_sky: bool,
     /// New links arrived since the last search was started.
     visibility_stale: bool,
     /// Frames since the last search was started, to spread searches over a
@@ -353,6 +357,7 @@ struct SearchDone {
     center: ChunkCoord,
     desired: HashSet<NodeKey>,
     visible: HashSet<NodeKey>,
+    open_to_sky: bool,
 }
 
 /// A thread that works out the render distance and what of it is visible.
@@ -382,14 +387,15 @@ impl Searcher {
                     .into_iter()
                     .collect();
                     let links = &job.links;
-                    let visible =
-                        visibility::visible_nodes(job.center, &desired, |n| links.get(&n).copied());
+                    let sight =
+                        visibility::search(job.center, &desired, |n| links.get(&n).copied());
                     let answer = SearchDone {
                         generation: job.generation,
                         frame: job.frame,
                         center: job.center,
                         desired,
-                        visible,
+                        visible: sight.nodes,
+                        open_to_sky: sight.open_to_sky,
                     };
                     if done_tx.send(answer).is_err() {
                         break;
@@ -403,6 +409,34 @@ impl Searcher {
             _thread: thread,
         }
     }
+}
+
+/// What is known of the last search, for [`far_in_sight`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchState {
+    /// The chunk the last search applied was run from; `None` before the
+    /// first.
+    pub searched: Option<ChunkCoord>,
+    /// Another search is running or due: the last answer may be out of date.
+    pub pending: bool,
+    /// The last search's [`visibility::Sight::open_to_sky`].
+    pub open_to_sky: bool,
+}
+
+/// Whether any of the far terrain could be seen from `eye`'s chunk -- issue
+/// #424: an eye shut in underground sees none of it, and should pay for none
+/// of it.
+///
+/// **Not drawn only when the search says so about this very place**: its
+/// answer is for the chunk the eye is in now, nothing has changed since, and
+/// it found no way out to the sky. Whenever that is not certain -- the eye
+/// has crossed into a chunk not searched from yet, a search is running, the
+/// world was just replaced -- the far terrain is drawn. Drawing it unseen
+/// costs a few frames of time; not drawing it where it can be seen is a hole
+/// in the horizon, at the mouth of every cave.
+pub fn far_in_sight(search: SearchState, eye: ChunkCoord) -> bool {
+    let sure = search.searched == Some(eye) && !search.pending;
+    !sure || search.open_to_sky
 }
 
 /// How many frames arriving meshes may wait before another search is started.
@@ -441,6 +475,7 @@ impl NodeStreaming {
             center: None,
             links: Arc::new(HashMap::new()),
             visible: HashSet::new(),
+            open_to_sky: true,
             visibility_stale: false,
             frames_since_visibility: 0,
             searcher: Searcher::new(),
@@ -535,6 +570,7 @@ impl NodeStreaming {
         // What the old world's air joined says nothing about the new one's.
         self.links = Arc::new(HashMap::new());
         self.visible.clear();
+        self.open_to_sky = true;
         self.visibility_stale = false;
         // A search still running was for the old world's links; moving the
         // generation on is what makes its answer land ignored.
@@ -576,6 +612,7 @@ impl NodeStreaming {
         let desired = done.desired;
         Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
         self.visible = done.visible;
+        self.open_to_sky = done.open_to_sky;
 
         let stale: Vec<NodeKey> = self
             .resident
@@ -689,6 +726,22 @@ impl NodeStreaming {
                     overlaps(b, want) && !contains(have, b)
                 })
                 .all(|n| self.resident.contains(n))
+    }
+
+    /// Whether any of the far terrain could be seen by an eye at `eye`
+    /// ([`far_in_sight`]): what the renderer is told before it draws
+    /// (`Renderer::set_far_shown`).
+    pub fn far_in_sight(&self, eye: [f32; 3]) -> bool {
+        far_in_sight(
+            SearchState {
+                searched: self.searched,
+                // A search running, or due because links arrived or a block
+                // changed, may answer differently from the last one.
+                pending: self.searching || self.visibility_stale,
+                open_to_sky: self.open_to_sky,
+            },
+            ChunkCoord::from_world_pos(eye),
+        )
     }
 
     /// How many nodes are drawn, held for a replacement, being meshed, and
@@ -871,6 +924,40 @@ fn boxes_in_blocks(nodes: Vec<NodeKey>) -> Vec<BlockBox> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #424: the far terrain is left out only on the search's own
+    /// word, about the chunk the eye is in, with nothing pending.
+    #[test]
+    fn the_far_terrain_is_out_of_sight_only_when_the_search_is_sure() {
+        let here = ChunkCoord::new(0, -3, 0);
+        let shut_in = SearchState {
+            searched: Some(here),
+            pending: false,
+            open_to_sky: false,
+        };
+        assert!(!far_in_sight(shut_in, here), "shut in underground");
+        // A cave mouth, or the surface: the search found the sky.
+        let open = SearchState {
+            open_to_sky: true,
+            ..shut_in
+        };
+        assert!(far_in_sight(open, here));
+        // The eye has walked into the next chunk, not searched from yet: it
+        // may be the one with the shaft in its roof.
+        assert!(far_in_sight(shut_in, ChunkCoord::new(1, -3, 0)));
+        // A block was dug out, or meshes arrived: the answer may change.
+        let pending = SearchState {
+            pending: true,
+            ..shut_in
+        };
+        assert!(far_in_sight(pending, here));
+        // Nothing searched yet: the first frame, or a new world.
+        let nothing = SearchState {
+            searched: None,
+            ..shut_in
+        };
+        assert!(far_in_sight(nothing, here));
+    }
 
     fn real_streaming() -> NodeStreaming {
         let registry = Arc::new(cubara_render::load_registry());

@@ -102,6 +102,9 @@ fn step_of(face: Face) -> [i32; 3] {
     [n[0] as i32, n[1] as i32, n[2] as i32]
 }
 
+/// The coarsest level a region's nodes are looked for at.
+const MAX_LEVEL: u32 = 8;
+
 /// The nodes being searched, numbered, so per-sub-block state is a flat array.
 struct Index<'a> {
     nodes: Vec<NodeKey>,
@@ -146,6 +149,38 @@ impl<'a> Index<'a> {
         Some((self.of[&node], (i(2) * GRAIN + i(1)) * GRAIN + i(0)))
     }
 
+    /// A block just outside the face `d` of sub-block `c` of `node`, `along`
+    /// quarters of the way across it.
+    fn beyond(&self, node: NodeKey, c: [usize; 3], d: [i32; 3], along: [i32; 2]) -> [i32; 3] {
+        let origin = node.world_origin();
+        let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
+        let mut t = 0;
+        [0, 1, 2].map(|k| {
+            let min = origin[k] + c[k] as i32 * size;
+            match d[k] {
+                1 => min + size,
+                -1 => min - 1,
+                _ => {
+                    let at = min + size * along[t] / 4;
+                    t += 1;
+                    at
+                }
+            }
+        })
+    }
+
+    /// Whether `face` of sub-block `sub` of node `n` is the outside of the
+    /// whole region: no node of any size holds the block beyond it. (That
+    /// [`neighbours`](Self::neighbours) finds nothing there does not say so --
+    /// from a camera inside the region it never looks into finer nodes.)
+    fn leaves_region(&self, n: u32, sub: usize, face: Face) -> bool {
+        let node = self.nodes[n as usize];
+        let c = [sub % GRAIN, sub / GRAIN % GRAIN, sub / GRAIN / GRAIN];
+        let p = self.beyond(node, c, step_of(face), [2, 2]);
+        let chunk = ChunkCoord::from_block(p[0], p[1], p[2]);
+        !(0..=MAX_LEVEL).any(|l| self.set.contains(&NodeKey::containing(chunk, l)))
+    }
+
     /// The sub-blocks across `face` of sub-block `sub` of node `n`: its
     /// sibling, or the same-level or one-coarser sub-block beyond the face --
     /// or, when [`finer`](Self::finer) steps are allowed and neither exists,
@@ -159,24 +194,7 @@ impl<'a> Index<'a> {
             let m = [0, 1, 2].map(|k| (c[k] as i32 + d[k]) as usize);
             return vec![(n, (m[2] * GRAIN + m[1]) * GRAIN + m[0])];
         }
-        let origin = node.world_origin();
-        let size = (Chunk::SIZE / GRAIN) as i32 * node.extent_chunks();
-        // A block just outside the face, `along` of the way across it.
-        let beyond = |along: [i32; 2]| {
-            let mut t = 0;
-            [0, 1, 2].map(|k| {
-                let min = origin[k] + c[k] as i32 * size;
-                match d[k] {
-                    1 => min + size,
-                    -1 => min - 1,
-                    _ => {
-                        let at = min + size * along[t] / 4;
-                        t += 1;
-                        at
-                    }
-                }
-            })
-        };
+        let beyond = |along: [i32; 2]| self.beyond(node, c, d, along);
         if let Some(found) = self.locate(beyond([2, 2]), &[node.level, node.level + 1]) {
             return vec![found];
         }
@@ -285,8 +303,44 @@ fn stand_in(node: NodeKey, links: &impl Fn(NodeKey) -> Option<NodeLinks>) -> Opt
     None
 }
 
+/// What a search from the camera found: [`search`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sight {
+    /// Every node a line of sight from anywhere in the camera's node could
+    /// reach.
+    pub nodes: HashSet<NodeKey>,
+    /// Whether a line of sight could leave the region for the sky: out of
+    /// its top or one of its sides, where the far terrain is drawn
+    /// (`docs/PROPOSAL_FAR_VIEW.md` §3.4).
+    ///
+    /// `false` only when the search is sure: every path it followed ended at
+    /// rock, inside the region. An eye shut in underground -- the owner's
+    /// cave of 2026-11-14 (issue #424). Anything the search cannot tell is
+    /// `true`: a path stopping at a node nothing is known about (it may be
+    /// air), a camera outside the region, an empty region.
+    ///
+    /// The floor does not count. Nothing is drawn below it, so a cave that
+    /// runs out of the bottom of the region shows no far terrain.
+    ///
+    /// This is exact in the way the search is: the same paths, so by the
+    /// proof in this module's header every straight line to the sky is one of
+    /// them. A fixed depth below the surface would be wrong at a cave mouth
+    /// and under an overhang.
+    pub open_to_sky: bool,
+}
+
 /// Every node in `nodes` a line of sight from anywhere in `camera`'s node could
-/// reach.
+/// reach: [`search`]'s [`Sight::nodes`].
+pub fn visible_nodes(
+    camera: ChunkCoord,
+    nodes: &HashSet<NodeKey>,
+    links: impl Fn(NodeKey) -> Option<NodeLinks>,
+) -> HashSet<NodeKey> {
+    search(camera, nodes, links).nodes
+}
+
+/// Every node in `nodes` a line of sight from anywhere in `camera`'s node could
+/// reach, and whether one could reach the sky ([`Sight::open_to_sky`]).
 ///
 /// `links(node)` is what joins what inside each of a node's sub-blocks; `None`
 /// means not known yet (not generated). An unknown node is included -- it may
@@ -298,18 +352,23 @@ fn stand_in(node: NodeKey, links: &impl Fn(NodeKey) -> Option<NodeLinks>) -> Opt
 /// The search starts from **every** sub-block of the camera's node, not only
 /// the one the camera is in, so the result holds for any position in that
 /// node and only needs working out again when the camera changes node.
-pub fn visible_nodes(
+pub fn search(
     camera: ChunkCoord,
     nodes: &HashSet<NodeKey>,
     links: impl Fn(NodeKey) -> Option<NodeLinks>,
-) -> HashSet<NodeKey> {
+) -> Sight {
     let mut visible = HashSet::new();
-    let start = (0..=8)
+    let start = (0..=MAX_LEVEL)
         .map(|level| NodeKey::containing(camera, level))
         .find(|n| nodes.contains(n));
     if nodes.is_empty() {
-        return visible;
+        return Sight {
+            nodes: visible,
+            open_to_sky: true,
+        };
     }
+    // From outside the region the camera is already under the sky.
+    let mut open_to_sky = start.is_none();
     let index = Index::new(nodes, start.is_none());
     let subs = GRAIN * GRAIN * GRAIN;
     let known: Vec<Option<NodeLinks>> = index
@@ -380,13 +439,19 @@ pub fn visible_nodes(
         };
         *slot = taken;
         let Some(inside) = known[n as usize] else {
+            // Nothing is known of it: it may be open air.
+            open_to_sky = true;
             continue;
         };
         for out in FACES {
             if taken & bit(opposite(out)) != 0 || !inside[sub].joins(entered_by, out) {
                 continue;
             }
-            for (m, s) in index.neighbours(n, sub, out) {
+            let next = index.neighbours(n, sub, out);
+            if next.is_empty() && out != Face::NegY && index.leaves_region(n, sub, out) {
+                open_to_sky = true;
+            }
+            for (m, s) in next {
                 queue.push_back((m, s, opposite(out), taken | bit(out)));
             }
         }
@@ -396,7 +461,10 @@ pub fn visible_nodes(
             visible.insert(index.nodes[i]);
         }
     }
-    visible
+    Sight {
+        nodes: visible,
+        open_to_sky,
+    }
 }
 
 #[cfg(test)]
@@ -458,10 +526,20 @@ mod tests {
 
     impl Scene {
         fn around(world: &World, camera: ChunkCoord, registry: &BlockRegistry) -> Self {
+            Self::of(world, camera, registry, 2, &[(0u32, 3), (1, 6), (2, 12)])
+        }
+
+        fn of(
+            world: &World,
+            camera: ChunkCoord,
+            registry: &BlockRegistry,
+            squash: i32,
+            schedule: &[(u32, i32)],
+        ) -> Self {
             let blocks = TerrainBlocks::from_registry(registry);
-            let schedule = &[(0u32, 3), (1, 6), (2, 12)];
-            let nodes: HashSet<NodeKey> =
-                desired_nodes_3d(camera, 2, schedule).into_iter().collect();
+            let nodes: HashSet<NodeKey> = desired_nodes_3d(camera, squash, schedule)
+                .into_iter()
+                .collect();
             let mut chunks = HashMap::new();
             let mut links = HashMap::new();
             for &n in &nodes {
@@ -740,6 +818,205 @@ mod tests {
         assert!(
             culled_something,
             "nothing was culled anywhere, so this proves nothing"
+        );
+    }
+
+    /// A cube of level-0 nodes around `camera`, each solid rock unless
+    /// `links` says otherwise -- and whether a search from `camera` finds a
+    /// way out to the sky.
+    fn sky_from(camera: ChunkCoord, links: impl Fn(NodeKey) -> Option<NodeLinks>) -> bool {
+        let nodes: HashSet<NodeKey> = desired_nodes_3d(camera, 1, &[(0u32, 4)])
+            .into_iter()
+            .collect();
+        assert!(nodes.contains(&NodeKey::containing(camera, 0)));
+        search(camera, &nodes, links).open_to_sky
+    }
+
+    const ROCK: NodeLinks = [FaceLinks::NONE; GRAIN * GRAIN * GRAIN];
+
+    /// **Issue #424's rule, on worlds small enough to read.** The far terrain
+    /// is drawn for an eye that a line of sight could leave the region from,
+    /// by its top or a side; it is not for one shut in.
+    #[test]
+    fn only_a_way_out_of_the_region_is_open_to_the_sky() {
+        let camera = ChunkCoord::new(3, -5, 7);
+        let column = |n: NodeKey| n.pos[0] == camera.x && n.pos[2] == camera.z;
+        let row = |n: NodeKey| n.pos[1] == camera.y && n.pos[2] == camera.z;
+
+        // Rock on every side.
+        assert!(!sky_from(camera, |_| Some(ROCK)), "shut in");
+        // A shaft straight up to the top of the region.
+        let shaft = |n: NodeKey| {
+            Some(if column(n) && n.pos[1] > camera.y {
+                OPEN
+            } else {
+                ROCK
+            })
+        };
+        assert!(sky_from(camera, shaft), "a shaft up");
+        // The same shaft, blocked one node short of the top.
+        let top = (camera.y + 1..)
+            .take_while(|&y| shaft_node_exists(camera, y))
+            .last()
+            .expect("nodes above the camera");
+        let blocked = |n: NodeKey| {
+            if n.pos[1] == top {
+                Some(ROCK)
+            } else {
+                shaft(n)
+            }
+        };
+        assert!(!sky_from(camera, blocked), "a shaft that stops short");
+        // A tunnel out of a side.
+        let tunnel = |n: NodeKey| {
+            Some(if row(n) && n.pos[0] < camera.x {
+                OPEN
+            } else {
+                ROCK
+            })
+        };
+        assert!(sky_from(camera, tunnel), "a tunnel out of a side");
+        // A shaft down and out of the floor: nothing is drawn below it.
+        let pit = |n: NodeKey| {
+            Some(if column(n) && n.pos[1] < camera.y {
+                OPEN
+            } else {
+                ROCK
+            })
+        };
+        assert!(!sky_from(camera, pit), "a pit out of the floor");
+        // A node nothing is known about may be air.
+        let unknown = NodeKey::new(0, [camera.x, camera.y + 1, camera.z]);
+        assert!(
+            sky_from(camera, |n| (n.level == 0 && n != unknown).then_some(ROCK)),
+            "an unknown node next to the camera"
+        );
+        // ...but not one the search never reaches.
+        let unreached = NodeKey::new(0, [camera.x, camera.y + 3, camera.z]);
+        assert!(
+            !sky_from(camera, |n| (n.level == 0 && n != unreached).then_some(ROCK)),
+            "an unknown node behind rock"
+        );
+        // From outside the region, or with no region, nothing is sure.
+        let nodes: HashSet<NodeKey> = desired_nodes_3d(camera, 1, &[(0u32, 4)])
+            .into_iter()
+            .collect();
+        let outside = ChunkCoord::new(camera.x + 40, camera.y, camera.z);
+        assert!(search(outside, &nodes, |_| Some(ROCK)).open_to_sky);
+        assert!(search(camera, &HashSet::new(), |_| Some(ROCK)).open_to_sky);
+    }
+
+    /// A cavern spanning two levels of detail, with rock all round it, is
+    /// still shut in: the search carries the answer across a change of level.
+    ///
+    /// (This does not tell `leaves_region` from "no neighbour found". The two
+    /// differ only where a path steps from a coarse node towards finer ones,
+    /// which a path that never reverses does not do while detail only
+    /// coarsens away from the camera. The check stays because paths are
+    /// merged by intersecting what they have taken, and nothing proves a
+    /// merged path keeps that property.)
+    #[test]
+    fn a_coarse_node_beside_finer_ones_is_not_the_edge_of_the_region() {
+        let camera = ChunkCoord::new(3, -5, 7);
+        let nodes: HashSet<NodeKey> = desired_nodes_3d(camera, 1, &[(0u32, 3), (1, 10)])
+            .into_iter()
+            .collect();
+        // Open: every node wholly within 6 chunks of the camera.
+        let near = |n: NodeKey| {
+            let (o, e) = (n.chunk_origin(), n.extent_chunks());
+            let c = [camera.x, camera.y, camera.z];
+            [o.x, o.y, o.z]
+                .iter()
+                .zip(c)
+                .all(|(&lo, c)| lo >= c - 6 && lo + e - 1 <= c + 6)
+        };
+        let open: Vec<NodeKey> = nodes.iter().copied().filter(|&n| near(n)).collect();
+        assert!(
+            open.iter().any(|n| n.level == 0) && open.iter().any(|n| n.level == 1),
+            "the cavern is all one level, so this proves nothing"
+        );
+        let sight = search(camera, &nodes, |n| Some(if near(n) { OPEN } else { ROCK }));
+        assert!(open.iter().all(|n| sight.nodes.contains(n)));
+        assert!(!sight.open_to_sky, "a cavern walled in by rock");
+    }
+
+    /// Whether the cube around `camera` has a node at height `y` in the
+    /// camera's column.
+    fn shaft_node_exists(camera: ChunkCoord, y: i32) -> bool {
+        desired_nodes_3d(camera, 1, &[(0u32, 4)])
+            .contains(&NodeKey::new(0, [camera.x, y, camera.z]))
+    }
+
+    /// **The owner's cave, and its mouth** (issue #424), in the real world:
+    /// a room dug out of solid rock under the ground sees no sky, the surface
+    /// above it does, and so does the same room once a shaft is dug from it
+    /// to the surface -- the cave mouth a depth threshold gets wrong.
+    #[test]
+    fn a_room_underground_is_shut_in_until_a_shaft_opens_it() {
+        let registry = registry();
+        let mut world = World::new();
+        let gen = crate::WorldGen::new(world.seed());
+        let size = Chunk::SIZE as i32;
+        let solid_chunk = |c: ChunkCoord| {
+            let o = [c.x * size, c.y * size, c.z * size];
+            (0..size).all(|x| {
+                (0..size).all(|y| (0..size).all(|z| gen.is_solid(o[0] + x, o[1] + y, o[2] + z)))
+            })
+        };
+        // The first chunk under the ground near the origin with rock on all
+        // six sides: nothing natural can lead out of a room inside it.
+        let room = (0..400)
+            .map(|i| {
+                let (cx, cz) = (i % 20 - 10, i / 20 - 10);
+                let lowest = (0..size)
+                    .flat_map(|x| (0..size).map(move |z| (x, z)))
+                    .map(|(x, z)| world.surface_height(cx * size + x, cz * size + z))
+                    .min()
+                    .expect("a chunk has columns");
+                ChunkCoord::new(cx, lowest.div_euclid(size) - 2, cz)
+            })
+            .find(|&c| {
+                [
+                    [0, 0, 0],
+                    [1, 0, 0],
+                    [-1, 0, 0],
+                    [0, 1, 0],
+                    [0, -1, 0],
+                    [0, 0, 1],
+                    [0, 0, -1],
+                ]
+                .into_iter()
+                .all(|d| solid_chunk(ChunkCoord::new(c.x + d[0], c.y + d[1], c.z + d[2])))
+            })
+            .expect("solid rock under the ground somewhere near the origin");
+        let o = [room.x * size, room.y * size, room.z * size];
+        for x in 4..12 {
+            for y in 4..12 {
+                for z in 4..12 {
+                    world.set_block(o[0] + x, o[1] + y, o[2] + z, BlockId::AIR);
+                }
+            }
+        }
+        let sky = |world: &World, camera: ChunkCoord| {
+            let scene = Scene::of(world, camera, &registry, 1, &[(0u32, 4)]);
+            search(camera, &scene.nodes, |n| scene.links.get(&n).copied()).open_to_sky
+        };
+        assert!(!sky(&world, room), "a room in solid rock sees no sky");
+        // Standing on the ground above it.
+        let surface = world.surface_height(o[0] + 8, o[2] + 8);
+        let above = ChunkCoord::from_block(o[0] + 8, surface + 3, o[2] + 8);
+        assert!(sky(&world, above), "the surface is under the sky");
+        // The shaft: the room's own width, up through everything above it.
+        for x in 4..12 {
+            for z in 4..12 {
+                for y in o[1] + 12..=surface + 2 {
+                    world.set_block(o[0] + x, y, o[2] + z, BlockId::AIR);
+                }
+            }
+        }
+        assert!(
+            sky(&world, room),
+            "the same room, with a shaft to the surface"
         );
     }
 }

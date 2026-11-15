@@ -1198,6 +1198,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         nodes.update(renderer, game.world(), eye);
         let hole = nodes.far_hole(renderer, eye);
         far.update(renderer, eye, hole);
+        renderer.set_far_shown(nodes.far_in_sight(eye));
         renderer.render(
             camera,
             game.selected_block(),
@@ -1307,6 +1308,8 @@ impl Streamed {
             .update(&mut self.renderer, &self.world, stream_eye);
         let hole = self.nodes.far_hole(&self.renderer, stream_eye);
         self.far.update(&mut self.renderer, stream_eye, hole);
+        self.renderer
+            .set_far_shown(self.nodes.far_in_sight(stream_eye));
         self.renderer.render(
             pose(flight, camera_eye),
             None,
