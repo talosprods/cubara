@@ -463,6 +463,23 @@ pub fn face_light(n: Vec3, lighting: &Lighting) -> Vec3 {
     lighting.sun_color * (ambient + diffuse)
 }
 
+/// How much of a face's light `mesh.wgsl` keeps at a corner whose baked
+/// ambient occlusion is `ao_raw` (0 = darkest, 3 = open), on a face whose
+/// cell is `2^log2_width` blocks wide: `vs_main`'s expression, for the CPU.
+/// At a width of one block it is `mix(ao_floor, 1, ao_raw / 3)`; a wider
+/// cell's dark end moves toward 1 (R1c, issue #327 decision 5).
+///
+/// The shader is the definition. This is its twin for the GPU-free checks
+/// that compare what a coarse node shows with what its blocks show
+/// (`tests/t3_coarse_ao.rs`, `tests/lod_consistency.rs`), as [`face_light`]
+/// is for the lighting.
+pub fn ao_fraction(ao_raw: u32, log2_width: u32, ao_floor: f32) -> f32 {
+    let ao_frac = ao_raw as f32 / 3.0;
+    let width = (1u32 << log2_width) as f32;
+    let floor = ao_floor + (1.0 - ao_floor) * (1.0 - 1.0 / width);
+    floor + (1.0 - floor) * ao_frac
+}
+
 /// The mean colours of a slope's faces, in linear light, and how deep the soil
 /// goes: what a column of the world is made of, top down.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -316,3 +316,197 @@ Iteration order over the edits is still total and fixed by the contents
 position order; nothing depended on that (`dirty_chunks` sorts, the hash
 reads chunks, a client applies a snapshot's edits in any order), and the
 cross-platform fixture hashes are unchanged.
+
+## §9 Render consistency: one ground for every level (block 3.0b, [#423](../../issues/423))
+
+The owner's play-test of 2026-11-14: approaching a mountain, it changes --
+*"from afar it is mostly stone; right in front of it, much more grass"*, and
+*"the shape of the mountain is really different"*. Three renderers draw the
+same ground (level-0 blocks, the coarse voxel levels 1-3, the far terrain),
+and each derived it its own way. This section is the audit of those ways,
+the measurement that defines "the same ground", and the one rule that
+replaces them. Written with PR 1 (the harness and the API, no behaviour
+change); PR 2 (the voxels on the rule) and #422 (the far terrain on it) add
+their measured results below.
+
+### 9.1 Audit: how each representation derived the ground (main at `4fe57c4`)
+
+| | height and shape | material per face | light, AO, texture |
+|---|---|---|---|
+| **Level 0** (`WorldGen::block_at`, `Chunk`, `mesh.wgsl`) | `surface_height(x, z)` per column | by depth below **that column's** surface: grass, `SOIL_DEPTH` of soil, stone (`material_at`) | `face_light` per face; AO baked per block corner (`face_ao`); one tile per block |
+| **Voxel levels 1-3** (`generate_aniso`, same mesher and shader) | `cell_surface_height`: the mean of four columns of the cell, rounded down; at level 3 rounded again to rows of 4 | `material_at` by depth below the **cell's** surface at the row's own `y` (`probe`), the top cell forced to grass (`top_cell`, #296) | the same light; top-face AO scaled by the cell's width (R1c), wall AO not; one tile per cell, so stretched 2^L times |
+| **Far terrain** (`far::generate`, `aggregate.rs`, `far.wgsl`) | per vertex, the mean of up to 4 x 4 columns over a quad-wide square; drawn smooth | per vertex: `riser_colour` of the **smoothed** gradient across two quads -- a staircase model, layered by depth below each step | `face_light`, weighted by `visible_weights`; **no AO**; mean colours, no texture |
+
+Every divergence that follows from that table:
+
+1. **Height.** A coarse cell's top is a mean of four samples, the far
+   terrain's a mean of sixteen: neither is level 0's, and both sit under
+   every peak and ridge. Level 3 rounds its mean to rows of four as well.
+2. **Riser material (the owner's stone).** A cell `w` blocks wide on a slope
+   of `s` meets its neighbour at one riser `w * s` tall, and wears soil and
+   stone below its first block by the *riser's* depth. Level 0 covers the
+   same slope with `w` risers of `s`, each the grass side of its own column.
+   The far terrain has the opposite error: its smoothed gradient is below
+   the block-scale one (`E|grad h| >= |grad E[h]|`), so it shows no stone
+   short of a mean slope of 4.
+3. **Riser area.** Coarse levels and the far terrain draw less riser than
+   level 0 (bumps inside a cell or under a quad vanish).
+4. **Top-face AO.** On a slope every level-0 top carries the shade of the
+   step above it. A coarse top's shade is scaled away with the cell's width
+   (right for one cliff, wrong for a staircase of `w` steps), and the far
+   terrain has none. This is the largest colour difference on any slope.
+5. **Wall AO.** A level-0 riser is shaded at its foot, every block of a
+   staircase; a coarse riser once, at the foot of the whole wall.
+6. **Texture scale.** One tile per cell rather than per block. The mean
+   colour is the same; the pattern is 2^L times larger (#380 found this and
+   the AO to be most of what changes land-to-land at a swap).
+7. **Caves.** Level 0 carves them at every depth and through the surface; a
+   coarse cell is cave where most of it is and only within
+   `DISTANT_CAVE_DEPTH` of the surface; the far terrain has none. Left as it
+   is (PHASE1 §8.6); the harness counts it and keeps it apart from the rest.
+8. **Trees** stand on `drawn_top` of their own column, not on the cell that
+   draws the ground under them (R2's recorded risk).
+
+### 9.2 The definition: `crates/render/tests/lod_consistency`
+
+"Consistent" is a measurement, GPU-free, over a **seeded** set of 64-block
+footprints -- ten each of rolling hills, gentle grassy slopes (the owner's
+case), steep mountain faces and cliffs, drawn by a printed seed, not picked:
+
+- **Voxels** are measured from the real thing: the node the game generates
+  and the quads the game's mesher makes of it, each quad its texture's mean
+  colour, lit by `aggregate::face_light` and darkened by its own baked AO
+  through `aggregate::ao_fraction` -- the shader's CPU twins. Only what the
+  sky can see is counted (a top that is the highest in its column, a side
+  whose front cell is above that column's top), each level judged against
+  its own drawn tops. `level_0_draws_its_surface` holds that walk to a
+  block-by-block count of the world, exactly.
+- **The far terrain** is measured from what `far.wgsl`'s `shade` says is
+  there: one unit of top per unit of ground, `|g|` of riser along each axis,
+  coloured by `riser_colour`, the gradient taken as the shader takes it.
+- Per representation, against level 0 over the same footprint: **shape**
+  (the drawn top over every column, the skyline, the peak, in blocks; level
+  0 is the height field `surface_height + 1`), **T3** (the area-weighted lit
+  colour per face direction, /255 in linear light as `t3_coarse_ao.rs` has
+  always measured it), and **the stone share** per direction.
+
+`consistency_report` (ignored; `cargo test -p cubara-render --test
+lod_consistency -- --ignored --nocapture consistency_report`) prints all of
+it. **Before** (main at `4fe57c4`, pooled over ten footprints a kind):
+
+| steep mountain | L1 | L2 | L3 | far, quad 8 | far, quad 32 |
+|---|---|---|---|---|---|
+| stone share of side faces (level 0: 4.0%) | 10.1% | 34.0% | 44.4% | 0.0% | 0.0% |
+| T3, tops (+Y), /255 | 6.7 | 10.9 | 14.0 | 17.3 | 17.3 |
+| T3, worst side direction, /255 | 2.0 | 8.2 | 10.8 | 3.9 | 5.1 |
+| peak, blocks | -1.3 | -2.6 | -5.7 | -3.6 | -17.1 |
+| skyline, mean, blocks | -1.2 | -2.2 | -4.0 | -2.4 | -12.5 |
+
+| | L1 | L2 | L3 |
+|---|---|---|---|
+| stone share of sides, cliffs (level 0: 2.8%) | 14.0% | 40.0% | 49.8% |
+| stone share of sides, gentle slope (level 0: 6.2%) | 7.1% | 11.9% | 16.7% |
+| T3 tops, gentle slope | 2.5 | 5.4 | 7.8 |
+| T3 tops, rolling hills | 0.3 | 1.3 | 3.5 |
+
+On the rolling hills level 1 is within 2/255 in every direction; that is the
+one thing the harness asserts of today's coarse levels
+(`level_1_matches_level_0_on_the_rolling_hills`). The existing T3
+(`t3_coarse_ao.rs`) passes because it samples around the origin, which
+`MOUNTAIN_SEED_MIX` keeps in the hills.
+
+### 9.3 The rule
+
+**One pure column function, and every level derives its ground from it**
+(Rule 5; #423 decisions 1, 2). All in `cubara_world::WorldGen`:
+
+```rust
+/// The column function, and level 0 itself: the y of a column's surface block.
+pub fn surface_height(&self, x: i32, z: i32) -> i32;
+
+/// What a column is made of `depth` blocks below ITS OWN surface.
+pub fn ground_layer(depth: i32) -> GroundLayer; // Surface | Soil | Stone
+
+/// A cell's drawn top block: the MAX of surface_height over the columns
+/// [x0, x0 + w) x [z0, z0 + w), rounded to rows of v. cell_top(x, z, 1, 1)
+/// is surface_height(x, z).
+pub fn cell_top(&self, x0: i32, z0: i32, w: i32, v: i32) -> i32;
+
+/// The same over an n x n grid of the cell's columns: the single
+/// implementation (cell_top is this at n = w).
+pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, v: i32, n: i32) -> i32;
+
+/// What level 0 shows over a square: riser area per direction and layer,
+/// and how open (un-occluded) its tops and risers are.
+pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
+```
+
+- **Height: the max, rounded the same way at every level.** A coarse cell's
+  top, a far quad's top and a level-0 column's top are `cell_top` at three
+  widths. A peak keeps its height at every level, and a parent cell's exact
+  top is the highest of its children's (`exact_tops_nest`), so a coarser
+  level never shows sky where a finer one has land. The rounding to rows of
+  `v` is the one `drawn_top` already had; `drawn_top` is now `cell_top` at
+  `w = 1`.
+- **Material: by depth below each column's own surface.** `ground_layer` is
+  the only depth rule; `material_at` reads it. A coarse riser's row at
+  height `y` wears `ground_layer(s - y)`, where `s` is the lowest covered
+  surface that is at or above `y` -- level 0's staircase projected onto the
+  riser, so a gentle slope's coarse riser is grass side row after row, and
+  stone shows where a covered column really stands more than `1 +
+  SOIL_DEPTH` blocks proud (PR 2). A far wall, which cannot band, takes the
+  mix `ground_faces(..).sides[d]` gives for its quad's footprint (#422).
+- **Light: level 0's openness.** `ground_faces` carries how open level 0's
+  tops and risers are, from the mesher's own corner rule
+  (`cubara_voxel::face_ao_of`, which `face_ao` now delegates to), so a
+  representation with no blocks to occlude each other can still be lit
+  `ao_floor + (1 - ao_floor) * open`, as `mesh.wgsl` lights a block.
+- **`ground_faces` is held to the real mesher**:
+  `ground_faces_are_what_the_level_0_mesher_draws` counts the game's level-0
+  quads over the same square and requires every count equal -- tops, and
+  riser area per direction and layer -- wherever no cave touches the
+  surface. The openness is within 0.08 on tops and 0.14 on a direction's
+  risers, and the test shows where the rest goes: **the mesher bakes a
+  chunk's AO without looking into the next chunk**, so faces at a chunk's
+  edge come out more open than the height field says (up to 0.06 of
+  openness on steep ground, about 2/255 on a grass top). Asked with that
+  blindness put in, the same corner rule gives the mesher's number to the
+  last bit. `ground_faces` reports the true neighbours; the chunk-edge
+  blindness is a level-0 mesher property, recorded here and not fixed by
+  this block.
+
+**The far-terrain interface** (#422 calls these; nothing else decides a far
+quad's height or a far face's colour):
+
+- quad top face = `cell_top(x0, z0, q, v) + 1` for `q <= 8`. With `q = 8,
+  v = 4` a far quad and a level-3 cell cover the same 64 columns and get the
+  same number, so the 1,024 m join is exact (both are on the 8-block grid).
+- above 8 blocks the exact max costs `q^2` heights a quad, so the far
+  terrain calls `cell_top_sampled` with `n = 4`. It can only be lower than
+  the exact top, and it does not nest (a child can stand above its parent);
+  the harness's `stepped` rows measure it per quad width.
+- wall colour facing direction `d` = the `Materials` mixed by
+  `ground_faces(x0, z0, q, n).sides[d]`, times the openness; top colour =
+  `Materials.top` times `top_open`. Not `riser_colour` of the wall's own
+  height, which is divergence 2 again.
+
+**What the max costs in shape** -- measured, not guessed
+(`stepped_top_rule_report`; drawn minus level 0, mean over columns, with the
+skyline's mean in brackets and the peak last):
+
+| steep mountain, cell width | max (#423 d1) | mean of the columns, for comparison |
+|---|---|---|
+| 2 (level 1) | +1.2 (+0.6), peak 0 | 0.0 (-0.3), peak -0.7 |
+| 4 (level 2) | +3.5 (+1.8), peak 0 | 0.0 (-1.4), peak -1.8 |
+| 8 (level 3, far join) | +8.0 (+3.9), peak 0 | 0.0 (-3.5), peak -5.5 |
+| 16 | +16.5 (+7.9), peak 0 | 0.0 (-7.6), peak -13 |
+| 32 | +31 (+15), peak 0 | 0.0 (-15), peak -27 |
+| 64 | +50 (+23), peak 0 | 0.0 (-27), peak -50 |
+
+The max keeps every peak and raises slopes by about half a cell width times
+the slope; a mean keeps the bulk and lowers every peak and ridge by as much.
+On screen either is about half a cell, since cells are sized in pixels. The
+max is the decision (#423 d1, confirmed by the lead on 2026-11-15: a top
+never below level 0 never shows sky where level 0 has land). That distant
+mountains come out slightly fuller is the owner's to look at, with PR 2's
+images; changing it is one aggregator in `cell_top_sampled`.

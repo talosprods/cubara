@@ -233,6 +233,58 @@ impl TerrainBlocks {
     }
 }
 
+/// What a column of unedited ground is made of at one depth below **its own**
+/// surface: the one answer every level of detail reads ([`WorldGen::ground_layer`];
+/// issue #423 decision 2, `docs/PHASE3_ARCHITECTURE.md` "Render consistency").
+/// The discriminants index [`GroundFaces::sides`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroundLayer {
+    /// The surface block (grass): its top on a top face, its side on a riser.
+    Surface = 0,
+    /// The [`SOIL_DEPTH`] blocks under it.
+    Soil = 1,
+    /// Everything deeper.
+    Stone = 2,
+}
+
+/// The four ways a riser can face, as `(dx, dz)`: the order of
+/// [`GroundFaces::sides`] and [`GroundFaces::side_open`].
+pub const GROUND_DIRECTIONS: [[i32; 2]; 4] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+/// What level 0 shows over a square of ground, from the height field alone
+/// ([`WorldGen::ground_faces`]): the faces a coarser representation of that
+/// square stands for, so that it can show the same mix.
+///
+/// Caves are not in it -- it is the height field's faces, which is what a
+/// level too coarse to draw a cave mouth can know.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct GroundFaces {
+    /// Columns counted: one top face each.
+    pub columns: u32,
+    /// The riser area level 0 draws, in block faces, per direction
+    /// ([`GROUND_DIRECTIONS`]) and per [`GroundLayer`]: a column standing
+    /// `k` blocks above its neighbour shows that neighbour one surface-block
+    /// side, then up to [`SOIL_DEPTH`] of soil, then stone.
+    pub sides: [[f32; 3]; 4],
+    /// How open level 0's top faces are to the sky, 0 to 1: the mean over
+    /// their corners of the baked ambient occlusion level
+    /// (`cubara_voxel::face_ao_of`) divided by 3. A renderer lights a face
+    /// `ao_floor + (1 - ao_floor) * open` of the way (`mesh.wgsl`).
+    pub top_open: f32,
+    /// The same for each direction's risers, weighted by area. 1 where a
+    /// direction has none.
+    pub side_open: [f32; 4],
+}
+
+impl GroundFaces {
+    /// The share of direction `d`'s risers that is `layer`, or `None` where
+    /// level 0 has no riser facing that way.
+    pub fn share(&self, d: usize, layer: GroundLayer) -> Option<f32> {
+        let area: f32 = self.sides[d].iter().sum();
+        (area > 0.0).then(|| self.sides[d][layer as usize] / area)
+    }
+}
+
 /// How many blocks of soil separate the grass surface from stone beneath --
 /// a simple, fixed depth rule (carried over from block 1.4c). Real layered
 /// biomes with varying depth are out of phase 1's scope (§8's own "out of
@@ -628,13 +680,179 @@ impl WorldGen {
     /// of 4 from level 2 up), so the row grid a tree needs to stand on is the
     /// same regardless of which node its column happens to belong to.
     pub fn drawn_top(&self, x: i32, z: i32, v: i32) -> i32 {
-        let surface = self.surface_height(x, z);
+        self.cell_top(x, z, 1, v)
+    }
+
+    /// What a column is made of `depth` blocks below its own surface
+    /// (`depth = surface - y`): the surface block at the surface, soil for
+    /// the next [`SOIL_DEPTH`], stone beneath. **The one depth rule**: level
+    /// 0's blocks ([`material_at`](Self::material_at)), a coarse riser and a
+    /// far wall all read it, each from the surface of the column the face
+    /// stands for and never from the height of the face itself (issue #423
+    /// decision 2).
+    pub fn ground_layer(depth: i32) -> GroundLayer {
+        if depth <= 0 {
+            GroundLayer::Surface
+        } else if depth <= SOIL_DEPTH {
+            GroundLayer::Soil
+        } else {
+            GroundLayer::Stone
+        }
+    }
+
+    /// The `y` of the top block a cell `w` blocks wide and deep, with rows
+    /// `v` blocks tall, draws over the columns `[x0, x0 + w) x [z0, z0 + w)`:
+    /// **the highest of their level-0 surfaces** (issue #423 decision 1: the
+    /// max, so a peak or a ridge keeps its height at every level), rounded to
+    /// the row that holds it the same way at every level. The top *face* is
+    /// one above.
+    ///
+    /// At `w = 1, v = 1` this is [`surface_height`](Self::surface_height)
+    /// itself: level 0 is the same function, not a special case.
+    ///
+    /// **The rounding** (`v > 1`): a row is solid while its own middle
+    /// (`row * v + (v - 1) / 2`) is at or under the surface, so the top drawn
+    /// is the top block of the last such row -- within `-1..=+2` blocks of
+    /// the surface at `v = 4`. The same boundary `density_at_v` tests, which
+    /// is what a coarse node meshes.
+    ///
+    /// Costs `w * w` surface heights. [`cell_top_sampled`](Self::cell_top_sampled)
+    /// is the cheaper form for a cell too wide to visit every column of.
+    pub fn cell_top(&self, x0: i32, z0: i32, w: i32, v: i32) -> i32 {
+        self.cell_top_sampled(x0, z0, w, v, w)
+    }
+
+    /// [`cell_top`](Self::cell_top) over an `n` x `n` grid of the cell's
+    /// columns instead of all of them: `min(n, w)^2` surface heights. **The
+    /// one implementation** -- `cell_top` is this at `n = w`, and for any
+    /// `n >= w` the two are the same number.
+    ///
+    /// The sample columns are fixed by the cell alone: `x0 + a * (w / n)` for
+    /// `a` in `0..n`, and the same along `z` (`w / n` rounded down, at least
+    /// one block). So the answer is a pure function of `(seed, x0, z0, w, v,
+    /// n)`, the same on every machine and whichever neighbour asks.
+    ///
+    /// It can miss a peak narrower than the spacing, and so can only be
+    /// *lower* than the exact top; by how much is measured, per cell width,
+    /// by `stepped_top_rule_report` in `crates/render/tests/lod_consistency`.
+    /// **It does not nest**: a cell half as wide sampled with the same `n`
+    /// looks at columns its parent skips, so a child's top can stand above
+    /// its parent's. With the exact form a parent's top is the highest of
+    /// its children's, always.
+    pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, v: i32, n: i32) -> i32 {
+        let mut top = i32::MIN;
+        for (x, z) in Self::sample_columns(x0, z0, w, n) {
+            top = top.max(self.surface_height(x, z));
+        }
+        Self::row_top(top, v)
+    }
+
+    /// The columns an `n` x `n` sampling of a cell `w` blocks wide from
+    /// `(x0, z0)` visits: every column when `n >= w`. Shared by
+    /// [`cell_top_sampled`](Self::cell_top_sampled) and
+    /// [`ground_faces`](Self::ground_faces), so the top and the faces of one
+    /// cell are judged on the same columns.
+    fn sample_columns(x0: i32, z0: i32, w: i32, n: i32) -> impl Iterator<Item = (i32, i32)> {
+        let w = w.max(1);
+        let count = n.clamp(1, w);
+        let step = w / count;
+        (0..count).flat_map(move |b| (0..count).map(move |a| (x0 + a * step, z0 + b * step)))
+    }
+
+    /// The top block of the last row of `v` blocks whose middle is at or
+    /// under `surface`: [`cell_top`](Self::cell_top)'s rounding.
+    fn row_top(surface: i32, v: i32) -> i32 {
         if v <= 1 {
             return surface;
         }
         let bound = surface + 1 - (v - 1) / 2;
         let row = (bound - 1).div_euclid(v);
         row * v + (v - 1)
+    }
+
+    /// What level 0 shows over the columns `[x0, x0 + w) x [z0, z0 + w)`:
+    /// see [`GroundFaces`]. An `n` x `n` grid of them is counted -- the
+    /// columns [`cell_top_sampled`](Self::cell_top_sampled) visits, all of
+    /// them when `n >= w` -- each with the eight columns around it: about
+    /// `9 * n^2` surface heights sampled, `(w + 2)^2` exact.
+    ///
+    /// A riser is counted for the column it belongs to -- the higher one --
+    /// whichever side of the square's edge its lower neighbour is on.
+    ///
+    /// Pure, like everything here: the far terrain's wall colours and any
+    /// other aggregate of the ground are this, never a second rule that
+    /// happens to agree (`ARCHITECTURE.md` Rule 5).
+    pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces {
+        // Heights are asked for more than once per column (a column is its
+        // neighbours' neighbour); when every column is counted they are all
+        // in the square and one ring around it, so they are worked out once.
+        let exact = n >= w;
+        let side = (w + 2) as usize;
+        let grid: Vec<i32> = if exact {
+            (0..side * side)
+                .map(|k| {
+                    self.surface_height(x0 - 1 + (k % side) as i32, z0 - 1 + (k / side) as i32)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let height = |x: i32, z: i32| -> i32 {
+            if exact {
+                grid[(z - z0 + 1) as usize * side + (x - x0 + 1) as usize]
+            } else {
+                self.surface_height(x, z)
+            }
+        };
+
+        let mut out = GroundFaces::default();
+        let (mut top_open, mut side_open) = (0f64, [0f64; 4]);
+        for (x, z) in Self::sample_columns(x0, z0, w, n) {
+            {
+                // The nine heights this column's faces can be occluded by.
+                let mut near = [[0i32; 3]; 3];
+                for (dz, row) in near.iter_mut().enumerate() {
+                    for (dx, h) in row.iter_mut().enumerate() {
+                        *h = height(x + dx as i32 - 1, z + dz as i32 - 1);
+                    }
+                }
+                let h = near[1][1];
+                // The height field as blocks: solid at and under a surface.
+                let solid = |bx: i32, by: i32, bz: i32| -> bool {
+                    by <= near[(bz - z + 1) as usize][(bx - x + 1) as usize]
+                };
+                out.columns += 1;
+                // The top face: the mesher's own sweep axes for `d = 1`.
+                let ao = cubara_voxel::face_ao_of(&solid, 1, 2, 0, h + 1, z, x);
+                top_open += ao.iter().map(|&a| a as f64).sum::<f64>() / 12.0;
+                for (d, [dx, dz]) in GROUND_DIRECTIONS.into_iter().enumerate() {
+                    let below = near[(1 + dz) as usize][(1 + dx) as usize];
+                    for y in below + 1..=h {
+                        out.sides[d][Self::ground_layer(h - y) as usize] += 1.0;
+                        let ao = if dx != 0 {
+                            cubara_voxel::face_ao_of(&solid, 0, 1, 2, x + dx, y, z)
+                        } else {
+                            cubara_voxel::face_ao_of(&solid, 2, 0, 1, z + dz, x, y)
+                        };
+                        side_open[d] += ao.iter().map(|&a| a as f64).sum::<f64>() / 12.0;
+                    }
+                }
+            }
+        }
+        out.top_open = if out.columns > 0 {
+            (top_open / out.columns as f64) as f32
+        } else {
+            1.0
+        };
+        for (d, open) in side_open.into_iter().enumerate() {
+            let area: f32 = out.sides[d].iter().sum();
+            out.side_open[d] = if area > 0.0 {
+                (open / area as f64) as f32
+            } else {
+                1.0
+            };
+        }
+        out
     }
 
     /// Every tree whose trunk chunk column `node` covers, standing on
@@ -766,13 +984,10 @@ impl WorldGen {
     /// breaches it, and a breach is exactly where grass at a cave wall
     /// would be correct anyway).
     fn material_at(&self, x: i32, y: i32, z: i32, surface: i32, blocks: TerrainBlocks) -> BlockId {
-        let depth = surface - y;
-        if depth <= 0 {
-            blocks.grass
-        } else if depth <= SOIL_DEPTH {
-            blocks.soil
-        } else {
-            self.ore_or(x, y, z, blocks.stone, blocks.ores)
+        match Self::ground_layer(surface - y) {
+            GroundLayer::Surface => blocks.grass,
+            GroundLayer::Soil => blocks.soil,
+            GroundLayer::Stone => self.ore_or(x, y, z, blocks.stone, blocks.ores),
         }
     }
 
@@ -1694,6 +1909,209 @@ mod tests {
             "a tree changed size crossing the edge"
         );
         assert_eq!(same_tree.canopy_radius, level0.canopy_radius);
+    }
+
+    // ---- One ground for every level (issue #423) -------------------------
+
+    /// Seeds and corners the ground tests walk: hills, and the default
+    /// seed's mountains.
+    const GROUND_CORNERS: [(i32, i32); 5] = [
+        (0, 0),
+        (-300, 170),
+        (-848, 4832),
+        (1200, 900),
+        (-5000, 2040),
+    ];
+
+    #[test]
+    fn ground_layer_is_the_depth_rule() {
+        assert_eq!(WorldGen::ground_layer(-3), GroundLayer::Surface);
+        assert_eq!(WorldGen::ground_layer(0), GroundLayer::Surface);
+        for depth in 1..=SOIL_DEPTH {
+            assert_eq!(WorldGen::ground_layer(depth), GroundLayer::Soil, "{depth}");
+        }
+        assert_eq!(WorldGen::ground_layer(SOIL_DEPTH + 1), GroundLayer::Stone);
+        assert_eq!(WorldGen::ground_layer(500), GroundLayer::Stone);
+    }
+
+    /// Level 0 is the same function, not a special case; and a cell's top is
+    /// the highest column in it, found here by looking at every one.
+    #[test]
+    fn a_cells_top_is_its_highest_column() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        for (ox, oz) in GROUND_CORNERS {
+            assert_eq!(gen.cell_top(ox, oz, 1, 1), gen.surface_height(ox, oz));
+            for w in [2, 4, 8, 16] {
+                for (cx, cz) in [(0, 0), (3, 1), (-2, 5)] {
+                    let (x0, z0) = (ox + cx * w, oz + cz * w);
+                    let highest = (0..w)
+                        .flat_map(|dz| (0..w).map(move |dx| (dx, dz)))
+                        .map(|(dx, dz)| gen.surface_height(x0 + dx, z0 + dz))
+                        .max()
+                        .unwrap();
+                    assert_eq!(gen.cell_top(x0, z0, w, 1), highest, "w {w} at ({x0}, {z0})");
+                    // Rows of four: the top block of a row, within the
+                    // rounding's -1..=+2 of the surface.
+                    let rounded = gen.cell_top(x0, z0, w, 4);
+                    assert_eq!(rounded.rem_euclid(4), 3);
+                    assert!(
+                        (-1..=2).contains(&(rounded - highest)),
+                        "{rounded} vs {highest}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A parent's exact top is the highest of its four children's: what
+    /// keeps a coarser level from ever standing below a finer one.
+    #[test]
+    fn exact_tops_nest() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        for (ox, oz) in GROUND_CORNERS {
+            for w in [2, 4, 8, 16] {
+                let (x0, z0) = (ox.div_euclid(w) * w, oz.div_euclid(w) * w);
+                let h = w / 2;
+                let children = [(0, 0), (h, 0), (0, h), (h, h)]
+                    .map(|(dx, dz)| gen.cell_top(x0 + dx, z0 + dz, h, 1));
+                assert_eq!(
+                    gen.cell_top(x0, z0, w, 1),
+                    *children.iter().max().unwrap(),
+                    "w {w} at ({x0}, {z0})"
+                );
+            }
+        }
+    }
+
+    /// The sampled top is the exact one once it samples every column, never
+    /// above it, and at one sample it is the corner column alone.
+    #[test]
+    fn a_sampled_top_is_exact_at_full_count_and_never_higher() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let mut lower = 0;
+        for (ox, oz) in GROUND_CORNERS {
+            for w in [4, 8, 16, 32] {
+                let exact = gen.cell_top(ox, oz, w, 1);
+                assert_eq!(gen.cell_top_sampled(ox, oz, w, 1, w), exact);
+                assert_eq!(gen.cell_top_sampled(ox, oz, w, 1, 4 * w), exact);
+                assert_eq!(
+                    gen.cell_top_sampled(ox, oz, w, 1, 1),
+                    gen.surface_height(ox, oz)
+                );
+                for n in [2, 4] {
+                    let sampled = gen.cell_top_sampled(ox, oz, w, 1, n);
+                    assert!(sampled <= exact, "w {w} n {n}: {sampled} above {exact}");
+                    // The columns it says it visits, and no others.
+                    let step = w / n.min(w);
+                    let by_hand = (0..n.min(w))
+                        .flat_map(|b| (0..n.min(w)).map(move |a| (a, b)))
+                        .map(|(a, b)| gen.surface_height(ox + a * step, oz + b * step))
+                        .max()
+                        .unwrap();
+                    assert_eq!(sampled, by_hand, "w {w} n {n}");
+                    if sampled < exact {
+                        lower += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            lower > 0,
+            "no sampled top ever missed a column: nothing was tested"
+        );
+    }
+
+    /// `ground_faces` against counting level 0's faces block by block, from
+    /// `block_at`-free arithmetic on the heights: a column shows its lower
+    /// neighbour one face per block it stands above it, layered by depth
+    /// below its own surface.
+    #[test]
+    fn ground_faces_are_level_0s_risers() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let mut stone = 0.0;
+        // And a cliff, found rather than assumed: the first column standing
+        // six blocks over its neighbour.
+        let cliff = (-2048..2048)
+            .step_by(4)
+            .flat_map(|x| (-2048..2048).step_by(4).map(move |z| (x, z)))
+            .find(|&(x, z)| gen.surface_height(x, z) - gen.surface_height(x + 1, z) >= 6)
+            .expect("a cliff within 2,048 blocks");
+        for (x0, z0) in GROUND_CORNERS
+            .into_iter()
+            .chain([(cliff.0 - 8, cliff.1 - 8)])
+        {
+            let w = 16;
+            let faces = gen.ground_faces(x0, z0, w, w);
+            assert_eq!(faces.columns, (w * w) as u32);
+            let mut expected = [[0f32; 3]; 4];
+            let mut any_step = false;
+            for z in z0..z0 + w {
+                for x in x0..x0 + w {
+                    let h = gen.surface_height(x, z);
+                    for (d, [dx, dz]) in GROUND_DIRECTIONS.into_iter().enumerate() {
+                        let below = gen.surface_height(x + dx, z + dz);
+                        for y in (below + 1)..=h {
+                            any_step = true;
+                            let layer = if y == h {
+                                0
+                            } else if h - y <= SOIL_DEPTH {
+                                1
+                            } else {
+                                2
+                            };
+                            expected[d][layer] += 1.0;
+                        }
+                    }
+                }
+            }
+            assert_eq!(faces.sides, expected, "at ({x0}, {z0})");
+            stone += faces.sides.iter().map(|s| s[2]).sum::<f32>();
+            assert!((0.0..=1.0).contains(&faces.top_open));
+            for d in 0..4 {
+                assert!((0.0..=1.0).contains(&faces.side_open[d]));
+                let share: f32 = [GroundLayer::Surface, GroundLayer::Soil, GroundLayer::Stone]
+                    .iter()
+                    .filter_map(|&l| faces.share(d, l))
+                    .sum();
+                let area: f32 = faces.sides[d].iter().sum();
+                assert!(area == 0.0 || (share - 1.0).abs() < 1e-5);
+            }
+            // A step above a top face shades it.
+            assert_eq!(any_step, faces.top_open < 1.0, "at ({x0}, {z0})");
+            // Sampling every column is the exact count.
+            assert_eq!(gen.ground_faces(x0, z0, w, 4 * w), faces);
+            // Sampling fewer counts fewer columns, on the sampled grid.
+            let sampled = gen.ground_faces(x0, z0, w, 4);
+            assert_eq!(sampled.columns, 16);
+        }
+        assert!(
+            stone > 0.0,
+            "no cliff in the sample: the stone layer was not tested"
+        );
+    }
+
+    /// Open ground is fully open, and a riser's foot is not: the openness is
+    /// the mesher's corner rule, on a slope whose answer can be worked out
+    /// by hand. A column one block under its +x neighbour and level with the
+    /// rest has two of its top's four corners shaded one step by the wall and
+    /// one more by the wall's continuation along z: `(3 + 3 + 1 + 1) / 12`.
+    #[test]
+    fn openness_is_the_meshers_corner_rule() {
+        // A west-east staircase of the real generator is not to be had on
+        // demand, so the rule is checked through `face_ao_of` on one, the
+        // way `ground_faces` calls it.
+        let stairs = |x: i32, y: i32, _z: i32| y <= x;
+        // The top of the column at x = 5 (surface y = 5): air layer y = 6.
+        let ao = cubara_voxel::face_ao_of(&stairs, 1, 2, 0, 6, 0, 5);
+        let mut sorted = ao;
+        sorted.sort_unstable();
+        assert_eq!(sorted, [1, 1, 3, 3]);
+        // Its riser facing -x, one block tall: the lower column's top is at
+        // its foot, so its two bottom corners are shaded.
+        let ao = cubara_voxel::face_ao_of(&stairs, 0, 1, 2, 4, 5, 0);
+        let mut sorted = ao;
+        sorted.sort_unstable();
+        assert_eq!(sorted, [1, 1, 3, 3]);
     }
 
     #[test]

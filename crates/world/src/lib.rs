@@ -33,5 +33,6 @@ pub use chunk_state::{ChunkState, ChunkStates, Woken};
 pub use raycast::{raycast, RayHit};
 pub use world::{simulation_box, EditMap, RegionEdits, RegionKey, World, WorldSnapshot};
 pub use worldgen::{
-    OreGen, OreSet, TerrainBlocks, TreeSite, WorldGen, MAX_ORES, SOIL_DEPTH, WORLDGEN_VERSION,
+    GroundFaces, GroundLayer, OreGen, OreSet, TerrainBlocks, TreeSite, WorldGen, GROUND_DIRECTIONS,
+    MAX_ORES, SOIL_DEPTH, WORLDGEN_VERSION,
 };
