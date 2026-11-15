@@ -108,7 +108,8 @@ struct Row {
     off_screen: f64,
     /// Two of its corners are the same point (the skirt's corners).
     zero_area: f64,
-    /// All three corners strictly inside the voxels' hole, so sunk below it.
+    /// All three corners strictly inside the voxels' hole, so moved out of
+    /// sight (`cubara_render::far::join`).
     in_hole: f64,
 }
 
@@ -221,7 +222,22 @@ fn triangles(
             let mut p = Vec3::new(ox as f32 + i as f32 * quad, y, oz as f32 + j as f32 * quad);
             let inside = p.cmpgt(hole.0).all() && p.cmplt(hole.1).all();
             if inside {
-                p.y = hole.0.y - 1.0;
+                // `far.wgsl`'s join (issue #424), through the function that
+                // defines it.
+                let lo = [(p.x - hole.0.x) / quad, (p.z - hole.0.z) / quad];
+                let hi = [(hole.1.x - p.x) / quad, (hole.1.z - p.z) / quad];
+                match cubara_render::far::join([i as i32, j as i32], lo, hi) {
+                    cubara_render::far::Join::Skirt([si, sj]) => {
+                        p = Vec3::new(
+                            ox as f32 + si as f32 * quad,
+                            patch.heights[sj as usize * PATCH_VERTS + si as usize] - skirt_depth,
+                            oz as f32 + sj as f32 * quad,
+                        );
+                    }
+                    cubara_render::far::Join::Hidden => {
+                        p.y = cubara_render::far::hidden_height(hole.0, hole.1, eye);
+                    }
+                }
             }
             world.push(p);
             sunk.push(inside);

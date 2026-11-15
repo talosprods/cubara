@@ -975,6 +975,13 @@ impl Renderer {
         self.far.set_params(&self.queue, params);
     }
 
+    /// Whether any of the far terrain can be seen from where the eye is
+    /// ([`crate::far::FarTerrain::set_shown`]): while it cannot, none of it
+    /// is culled or drawn.
+    pub fn set_far_shown(&mut self, shown: bool) {
+        self.far.set_shown(shown);
+    }
+
     /// Clear frames to `color` instead of the sky -- see
     /// [`SceneRenderer::set_clear_color`]. For measurement only.
     pub fn set_clear_color(&mut self, color: wgpu::Color) {

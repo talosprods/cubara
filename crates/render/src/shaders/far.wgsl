@@ -84,8 +84,8 @@ fn vs_main(
     let gx = vertex % GRID;
     let gz = vertex / GRID;
     // Grid 0 and 34 are the skirt ring; 1..=33 are the patch's own vertices.
-    let i = clamp(i32(gx) - 1, 0, QUADS);
-    let j = clamp(i32(gz) - 1, 0, QUADS);
+    var i = clamp(i32(gx) - 1, 0, QUADS);
+    var j = clamp(i32(gz) - 1, 0, QUADS);
     let skirt = gx == 0u || gx == GRID - 1u || gz == 0u || gz == GRID - 1u;
     // The heights are absolute world heights (a rebase leaves the heights
     // buffer alone); every other position here is relative to the render
@@ -100,15 +100,45 @@ fn vs_main(
         y,
         tile.origin.y + f32(j) * tile.quad,
     );
-    // Strictly inside the voxels' box, the ground is theirs: sink it to the
-    // box's floor, under everything they draw. The box's edges fall on
-    // multiples of 128 blocks and every quad edge near them does too, so no
-    // triangle straddles the edge -- the ones touching it from inside slope
-    // down from it, and that slope is a wall closing the seam between the
-    // two. No fragment is ever discarded (on a tile-based GPU a discard turns
-    // off hidden-surface removal for the whole pipeline).
+    // Strictly inside the voxels' box, the ground is theirs, and nothing of
+    // this is seen there (`far::join` is this rule, and its tests say why).
+    // The box's edges fall on multiples of 128 blocks and every quad edge near
+    // them does too, so no triangle straddles the edge. No fragment is ever
+    // discarded (on a tile-based GPU a discard turns off hidden-surface
+    // removal for the whole pipeline); it is all done by moving vertices.
     if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
-        world.y = params.hole_min.y - 1.0;
+        // How many quads to the nearest side of the box along each axis, as
+        // a step in the grid: negative towards the low side.
+        let lo = (world.xz - params.hole_min.xz) / tile.quad;
+        let hi = (params.hole_max.xz - world.xz) / tile.quad;
+        let step = vec2<i32>(round(select(-lo, hi, hi < lo)));
+        let ti = i + step.x;
+        let tj = j + step.y;
+        // The first ring inside becomes a skirt: it drops straight down from
+        // the vertex on the box's side next to it, as far as the patch's own
+        // skirt does. That closes the seam to the voxels, as the skirt of a
+        // patch that ends on the box's side already did.
+        let snap_x = abs(step.x) == 1 && ti >= 0 && ti <= QUADS;
+        let snap_z = abs(step.y) == 1 && tj >= 0 && tj <= QUADS;
+        if snap_x || snap_z {
+            i = select(i, ti, snap_x);
+            j = select(j, tj, snap_z);
+            world = vec3<f32>(
+                tile.origin.x + f32(i) * tile.quad,
+                height(base, i, j) - frame.anchor.y - tile.skirt,
+                tile.origin.y + f32(j) * tile.quad,
+            );
+        } else {
+            // Everything deeper goes where the eye sees only its underside,
+            // which is culled: above the box for an eye inside it -- the
+            // game's, always -- and under it otherwise. Sinking it under the
+            // box whatever the eye, as this used to, hung a wall from the
+            // surface to the box's floor a kilometre away on every side: the
+            // owner's curtain underground (issue #424).
+            let eye_inside = all(frame.eye.xyz > params.hole_min.xyz)
+                && all(frame.eye.xyz < params.hole_max.xyz);
+            world.y = select(params.hole_min.y - 1.0, params.hole_max.y + 1.0, eye_inside);
+        }
     }
     // The surface's slope from the neighbouring heights, one-sided at the edge.
     let il = max(i - 1, 0);

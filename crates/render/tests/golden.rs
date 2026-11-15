@@ -2183,6 +2183,181 @@ fn the_far_terrain_reaches_the_horizon() {
     assert_frame_golden("far_terrain_to_the_horizon", with);
 }
 
+/// How many pixels of a frame with the far terrain alone -- no voxels at all
+/// -- are not sky, in the whole frame and in its lowest two fifths, for an eye at `eye` inside a voxel box reaching `REACH`
+/// blocks from the origin every way, as the game's reaches 1,024: the real far
+/// terrain of the default world around it, drawn by the real `far.wgsl`.
+/// One pair of counts per direction in `looks`. `None` without a GPU.
+fn far_pixels_from_inside_the_box(
+    eye: glam::Vec3,
+    looks: &[glam::Vec3],
+) -> Option<Vec<(usize, usize)>> {
+    use cubara_render::far::{FarParams, FarPatch};
+    use cubara_world::far::{build, split_ratio_for, FarView, Hole};
+    const REACH: i32 = 384;
+    let world = World::new();
+    let shot = |look: glam::Vec3| Shot {
+        width: 480,
+        height: 270,
+        camera: Some((eye.as_dvec3(), look)),
+        // No haze: far ground must not fade into the sky it is told from.
+        lighting: cubara_render::Lighting {
+            haze: cubara_render::haze::Haze {
+                density: 0.0,
+                ..Default::default()
+            },
+            ..cubara_render::Lighting::default()
+        },
+        ..Shot::default()
+    };
+    // The box, on the 128-block grid the game's falls on.
+    let floor = (eye.y as i32).div_euclid(128) * 128;
+    let (min, max) = (
+        [-REACH, floor - REACH, -REACH],
+        [REACH, floor + 128 + REACH, REACH],
+    );
+    let fov = std::f64::consts::FRAC_PI_3;
+    let pixel = fov / 270.0;
+    let view = FarView {
+        eye: [eye.x as f64, eye.y as f64, eye.z as f64],
+        split_ratio: split_ratio_for(16.0, 270.0, fov),
+        max_error: 2.0 * pixel,
+        min_quad: 4.0 * pixel,
+        radius: 2_000.0,
+        hole: Some(Hole {
+            min: min.map(f64::from),
+            max: max.map(f64::from),
+        }),
+    };
+    let far = build(&cubara_world::WorldGen::new(world.seed()), &view);
+    assert!(far.len() > 20, "only {} patches", far.len());
+    // The join is only tested if patches cross the box's sides.
+    let crossing = far
+        .iter()
+        .filter(|p| {
+            let [x, z] = p.key.origin();
+            let size = p.key.size();
+            let inside = |lo: i64, hi: i64| lo < REACH as i64 && hi > -REACH as i64;
+            let within = |lo: i64, hi: i64| lo >= -REACH as i64 && hi <= REACH as i64;
+            inside(x, x + size)
+                && inside(z, z + size)
+                && !(within(x, x + size) && within(z, z + size))
+        })
+        .count();
+    assert!(
+        crossing > 0,
+        "no patch crosses the box, so this proves nothing"
+    );
+    let patches: Vec<FarPatch> = far
+        .iter()
+        .map(|p| FarPatch {
+            origin: p.key.origin(),
+            quad: p.key.quad() as f32,
+            heights: &p.heights,
+            skirt: p.skirt(),
+        })
+        .collect();
+    let params = FarParams {
+        hole: Some((min, max)),
+        materials: far_materials(),
+    };
+    let _gpu = gpu_lifecycle::lock();
+    // The sky is one colour whichever way the eye looks: an empty frame's.
+    let empty = headless::render_with_far(Vec::new(), &[], None, shot(looks[0]))?;
+    let sky = *empty.pixels.as_chunks::<4>().0.first()?;
+    assert!(
+        empty.pixels.as_chunks::<4>().0.iter().all(|p| *p == sky),
+        "an empty frame is not one colour, so the sky cannot be told by its colour"
+    );
+    looks
+        .iter()
+        .map(|&look| {
+            let with = headless::render_with_far(Vec::new(), &patches, Some(params), shot(look))?;
+            let far = |p: &&[u8; 4]| (0..3).any(|c| p[c].abs_diff(sky[c]) > 2);
+            let pixels = with.pixels.as_chunks::<4>().0;
+            let low = (with.height * 3 / 5 * with.width) as usize;
+            Some((
+                pixels.iter().filter(far).count(),
+                pixels[low..].iter().filter(far).count(),
+            ))
+        })
+        .collect()
+}
+
+/// **The curtain underground** (issue #424, the owner's play-test of
+/// 2026-11-14): from an eye under the ground, inside the voxels' box, no
+/// far-terrain pixel is drawn where the voxels say rock. The eye looks out
+/// level and a little down, at where the ground meets a side of the box: the
+/// far terrain used to hang a wall there from the surface to the box's floor,
+/// all the way round, and it filled the frame below the horizon.
+///
+/// No voxels are drawn here at all, so nothing can hide a wall: every pixel
+/// that is not sky is the far terrain's. What is left near the horizon is the
+/// skirt on the box's side and the skirts of the patches beyond it, which
+/// are outside the box. In the frame's lowest two fifths every ray leaves the
+/// box through a side far below the surface, and there must be nothing.
+#[test]
+fn no_far_terrain_is_drawn_inside_the_box_from_underground() {
+    // The bench's ground eye, 80 blocks down; and off the box's centre, as
+    // the game's eye always is.
+    for eye in [
+        glam::Vec3::new(8.0, -40.0, 8.0),
+        glam::Vec3::new(-90.0, -75.0, 60.0),
+    ] {
+        // Each side of the box, and a corner.
+        let looks = [
+            glam::Vec3::new(1.0, -0.3, 0.0),
+            glam::Vec3::new(-1.0, -0.3, 0.0),
+            glam::Vec3::new(0.0, -0.3, 1.0),
+            glam::Vec3::new(0.0, -0.3, -1.0),
+            glam::Vec3::new(1.0, -0.42, 1.0),
+        ];
+        let Some(far) = far_pixels_from_inside_the_box(eye, &looks) else {
+            headless::skip_or_require_gpu(
+                "no_far_terrain_is_drawn_inside_the_box_from_underground",
+            );
+            return;
+        };
+        for (look, (all, low)) in looks.iter().zip(far) {
+            eprintln!("eye {eye}, looking {look}: {all} far pixels, {low} low in the frame");
+            assert_eq!(
+                low, 0,
+                "eye {eye}, looking {look}: {low} far-terrain pixels deep under the ground \
+                 ({all} in the whole frame)"
+            );
+        }
+    }
+}
+
+/// ...and from above the ground the far terrain is all still there: what a
+/// cave mouth looks out at. The same boxes and the same shader, so hiding
+/// what is inside the box has not hidden what is beyond it.
+#[test]
+fn the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground() {
+    let world = World::new();
+    let eye = glam::Vec3::new(8.0, world.surface_height(8, 8) as f32 + 12.0, 8.0);
+    let looks = [
+        glam::Vec3::new(1.0, -0.15, 0.0),
+        glam::Vec3::new(-1.0, -0.15, 0.0),
+        glam::Vec3::new(0.0, -0.15, 1.0),
+        glam::Vec3::new(0.0, -0.15, -1.0),
+    ];
+    let Some(far) = far_pixels_from_inside_the_box(eye, &looks) else {
+        headless::skip_or_require_gpu(
+            "the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground",
+        );
+        return;
+    };
+    for (look, (far, _)) in looks.iter().zip(far) {
+        let share = far as f64 / (480.0 * 270.0);
+        assert!(
+            share > 0.05,
+            "looking {look}: the far terrain covers only {:.1}% of the frame",
+            share * 100.0
+        );
+    }
+}
+
 /// **The far terrain's shader is the CPU reference** (`aggregate.rs`, block
 /// F4). A patch that is a plane of known gradient is rendered from a known
 /// direction, and the pixel at the centre of the image, whose ray is exactly

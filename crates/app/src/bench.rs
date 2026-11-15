@@ -338,19 +338,28 @@ pub fn run(
     let links: std::collections::HashMap<_, _> = meshed.iter().map(|b| (b.node, b.links)).collect();
     let searching = Instant::now();
     let mut visible = std::collections::HashSet::new();
+    // Whether any eye could see out to the sky: what the far terrain is
+    // drawn for, as in the game (issue #424).
+    let mut open_to_sky = false;
     for eye in &eyes {
-        visible.extend(cubara_world::visibility::visible_nodes(
-            ChunkCoord::from_world_pos(*eye),
-            &desired,
-            |n| links.get(&n).copied(),
-        ));
+        let sight =
+            cubara_world::visibility::search(ChunkCoord::from_world_pos(*eye), &desired, |n| {
+                links.get(&n).copied()
+            });
+        visible.extend(sight.nodes);
+        open_to_sky |= sight.open_to_sky;
     }
     log::info!(
-        "visible: {} of {} nodes from {} camera position(s), searched in {:.1} ms",
+        "visible: {} of {} nodes from {} camera position(s), searched in {:.1} ms; {}",
         visible.len(),
         built_nodes,
         eyes.len(),
-        searching.elapsed().as_secs_f64() * 1000.0
+        searching.elapsed().as_secs_f64() * 1000.0,
+        if open_to_sky {
+            "open to the sky"
+        } else {
+            "shut in: the far terrain is out of sight"
+        }
     );
     // Collected rather than piped straight into `from_meshed`: trees (issue
     // #332, R2) go into a *second* GPU-side arena (`TreeArena`), built from
@@ -423,6 +432,16 @@ pub fn run(
                 &queue,
                 crate::far_streaming::to_far_params(hole, crate::far_streaming::far_materials()),
             );
+            // The game's own rule (`NodeStreaming::far_in_sight`), for a
+            // search that is always about this eye and never pending.
+            terrain.set_shown(crate::streaming::far_in_sight(
+                crate::streaming::SearchState {
+                    searched: Some(center),
+                    pending: false,
+                    open_to_sky,
+                },
+                center,
+            ));
             Some(terrain)
         }
         _ => None,

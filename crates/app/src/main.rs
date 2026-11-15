@@ -944,6 +944,8 @@ impl ApplicationHandler for App {
                     }
                     let hole = streaming.far_hole(renderer, eye);
                     far.update(renderer, eye, hole);
+                    // Shut in underground, none of it can be seen (#424).
+                    renderer.set_far_shown(streaming.far_in_sight(eye));
                 }
                 // Spectating hides the play HUD (#305): no hotbar, hearts or
                 // crosshair. The outline and cracks go too, because the sim
