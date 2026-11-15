@@ -37,7 +37,9 @@ pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
-pub use gpu_timer::TimestampRing;
+pub use gpu_timer::{
+    classify_sample, timestamp_indices, timing_proven, GpuSample, GpuTimer, TimestampRing,
+};
 pub use headless::{Frame, PanelLayout, Shot};
 pub use instance::new_instance;
 pub use materials::{load_icon, swatch_color, MeshAssets};

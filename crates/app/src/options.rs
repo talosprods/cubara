@@ -6,10 +6,10 @@
 //! routes keys and spawns the benchmark.
 
 use crate::far_streaming::FarQuality;
-use crate::settings::Settings;
+use crate::settings::{FrameCap, Settings};
 
 /// What the options screen says: the far terrain's quality and who chose it,
-/// the keys, and whether a benchmark is running.
+/// the frame cap, the keys, and whether a benchmark is running.
 pub fn options_text(settings: &Settings, target_fps: u32, benchmarking: bool) -> String {
     let who = if settings.by_hand {
         "chosen by you".to_string()
@@ -24,12 +24,18 @@ pub fn options_text(settings: &Settings, target_fps: u32, benchmarking: bool) ->
     } else {
         format!("[B] benchmark this PC for {target_fps} FPS")
     };
+    let cap = match settings.frame_cap {
+        FrameCap::Vsync => format!("the monitor's {target_fps} FPS (vsync)"),
+        FrameCap::Unlimited => "unlimited".to_string(),
+    };
     format!(
         "-- OPTIONS --\n\
          [Esc] back\n\
          Far terrain: {} ({who})\n\
          [1] Off  [2] Low  [3] Medium  [4] High  -- looks or frame rate\n\
          [A] let the benchmark choose\n\
+         Frame rate: {cap}\n\
+         [V] vsync or unlimited\n\
          {bench}",
         settings.far.name()
     )
@@ -44,6 +50,8 @@ pub enum OptionsKey {
     Auto,
     /// Benchmark now.
     Benchmark,
+    /// Cap the window at the monitor's refresh rate, or lift the cap.
+    FrameCap,
 }
 
 /// The options screen's keys, by the character they type.
@@ -55,12 +63,14 @@ pub fn options_key(c: char) -> Option<OptionsKey> {
         '4' => OptionsKey::Quality(FarQuality::High),
         'a' => OptionsKey::Auto,
         'b' => OptionsKey::Benchmark,
+        'v' => OptionsKey::FrameCap,
         _ => return None,
     })
 }
 
 /// Apply `key` to `settings`: a picked quality is the player's, and stays;
-/// `Auto` clears both that and the last benchmark, so one runs again.
+/// `Auto` clears both that and the last benchmark, so one runs again;
+/// `FrameCap` switches between vsync and unlimited.
 pub fn apply(settings: &mut Settings, key: OptionsKey) {
     match key {
         OptionsKey::Quality(q) => {
@@ -72,6 +82,7 @@ pub fn apply(settings: &mut Settings, key: OptionsKey) {
             settings.tuned = None;
         }
         OptionsKey::Benchmark => {}
+        OptionsKey::FrameCap => settings.frame_cap = settings.frame_cap.toggled(),
     }
 }
 
@@ -103,8 +114,10 @@ const MISS_SHARE: f32 = 0.2;
 /// while playing -- the owner's "never below your refresh rate" -- and says
 /// when to step the far terrain down one quality.
 ///
-/// With the display in sync a frame takes a whole number of refreshes, so a
-/// frame that misses one takes about twice its budget. A stretch where a fifth
+/// With the display in sync (vsync, the window's default since issue #425) a
+/// frame takes a whole number of refreshes, so a frame that misses one takes
+/// about twice its budget -- the tests feed it frame times of that shape
+/// (`fifo_frames`). A stretch where a fifth
 /// of frames miss is a machine that cannot hold the rate at this quality; an
 /// occasional hitch is not, and is left alone. It only ever steps *down* --
 /// finding headroom to step up is the benchmark's job, since a frame waiting
@@ -209,6 +222,79 @@ mod tests {
         );
     }
 
+    /// Frame times as Fifo produces them: a frame is shown at the first
+    /// refresh after its work is done, so it lasts a whole number of refresh
+    /// intervals, never less than one. `jitter` is how far the display's own
+    /// timing strays, alternating early and late, as a share of an interval.
+    fn fifo_frames(refresh_hz: u32, work: impl Iterator<Item = f32>, jitter: f32) -> Vec<f32> {
+        let interval = 1.0 / refresh_hz as f32;
+        work.enumerate()
+            .map(|(i, w)| {
+                let refreshes = (w / interval).ceil().max(1.0);
+                let stray = if i % 2 == 0 { jitter } else { -jitter };
+                (refreshes + stray) * interval
+            })
+            .collect()
+    }
+
+    /// Whether `frames` ever ask to step down.
+    fn steps_down(refresh_hz: u32, frames: &[f32]) -> bool {
+        let mut w = FrameWatch::new(refresh_hz);
+        frames.iter().any(|&dt| w.frame(dt))
+    }
+
+    /// Issue #425 decision 4. The model itself first, so the tests below
+    /// cannot pass on frame times Fifo would never produce.
+    #[test]
+    fn fifo_frames_last_whole_refreshes() {
+        let ms =
+            |hz, work_ms: f32| fifo_frames(hz, std::iter::once(work_ms / 1000.0), 0.0)[0] * 1000.0;
+        assert!((ms(60, 2.0) - 16.667).abs() < 0.01, "fast work waits");
+        assert!((ms(60, 16.0) - 16.667).abs() < 0.01);
+        assert!((ms(60, 18.0) - 33.333).abs() < 0.01, "a miss is two");
+        assert!((ms(60, 40.0) - 50.0).abs() < 0.01);
+        assert!((ms(144, 8.0) - 13.889).abs() < 0.01);
+    }
+
+    /// Work that fits the refresh, paced by Fifo, is never a miss -- however
+    /// little or much of the budget it uses, and with the display's jitter.
+    #[test]
+    fn fifo_paced_frames_never_step_down() {
+        for hz in [60, 120, 144] {
+            let interval = 1.0 / hz as f32;
+            for share in [0.1, 0.5, 0.95] {
+                let frames = fifo_frames(hz, (0..hz * 60).map(|_| share * interval), 0.1);
+                assert!(!steps_down(hz, &frames), "{hz} Hz, {share} of the budget");
+            }
+        }
+    }
+
+    /// Work a little over the budget misses every refresh under Fifo: each
+    /// frame lasts two intervals, and that steps down once settled.
+    #[test]
+    fn fifo_frames_that_miss_the_refresh_step_down() {
+        for hz in [60, 120, 144] {
+            let interval = 1.0 / hz as f32;
+            let frames = fifo_frames(hz, (0..hz * 30).map(|_| 1.1 * interval), 0.1);
+            assert!(steps_down(hz, &frames), "{hz} Hz");
+            // Not before the world has had its time to load.
+            let loading = (SETTLE_SECONDS / (2.0 * interval)) as usize - 5;
+            assert!(!steps_down(hz, &frames[..loading]), "{hz} Hz, loading");
+        }
+    }
+
+    /// One Fifo miss in three is a machine too slow; one in twenty a hitch.
+    #[test]
+    fn fifo_misses_step_down_by_their_share() {
+        let interval = 1.0 / 60.0;
+        let every = |n: u32| {
+            let work = (0..60 * 60).map(move |i| if i % n == 0 { 1.2 } else { 0.4 } * interval);
+            fifo_frames(60, work, 0.1)
+        };
+        assert!(steps_down(60, &every(3)));
+        assert!(!steps_down(60, &every(20)));
+    }
+
     #[test]
     fn the_target_is_the_monitors_refresh_rate() {
         assert_eq!(target_fps(Some(59_940)), 60);
@@ -244,6 +330,26 @@ mod tests {
         assert_eq!(options_key('A'), Some(OptionsKey::Auto));
         assert_eq!(options_key('b'), Some(OptionsKey::Benchmark));
         assert_eq!(options_key('5'), None);
+    }
+
+    /// Issue #425: one toggle, and it changes nothing else.
+    #[test]
+    fn v_switches_the_frame_cap_and_the_screen_says_which() {
+        assert_eq!(options_key('v'), Some(OptionsKey::FrameCap));
+        assert_eq!(options_key('V'), Some(OptionsKey::FrameCap));
+        let mut s = Settings::default();
+        let t = options_text(&s, 144, false);
+        assert!(
+            t.contains("Frame rate: the monitor's 144 FPS (vsync)"),
+            "{t}"
+        );
+        apply(&mut s, OptionsKey::FrameCap);
+        assert_eq!(s.frame_cap, FrameCap::Unlimited);
+        assert!(!s.by_hand, "the far quality became the player's");
+        let t = options_text(&s, 144, false);
+        assert!(t.contains("Frame rate: unlimited"), "{t}");
+        apply(&mut s, OptionsKey::FrameCap);
+        assert_eq!(s.frame_cap, FrameCap::Vsync);
     }
 
     #[test]

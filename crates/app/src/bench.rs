@@ -25,13 +25,12 @@
 //! for trying, and can still produce an occasional "valid"-looking sample
 //! that is really garbage (see [`should_disable_gpu_timing`]).
 
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cubara_render::{
     gpu_driven_features, load_mesh_assets, load_structures, load_tree_models, CameraPose,
-    CameraUniform, ChunkArena, Frustum, GpuTimestamps, SceneFrame, SceneRenderer, TimestampRing,
-    TreeArena, TreeDraw,
+    CameraUniform, ChunkArena, Frustum, GpuSample, GpuTimer, SceneFrame, SceneRenderer, TreeArena,
+    TreeDraw,
 };
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::mesh_nodes;
@@ -71,212 +70,6 @@ const VIRTUAL_DT: f32 = 1.0 / 240.0;
 /// avg/p99 -- at a cost that's still just small buffers (a `depth`-sized
 /// query set and `depth` 16-byte readback buffers, created once).
 const GPU_TIMER_DEPTH: usize = 1024;
-
-/// The two query-set indices `slot` writes its begin/end timestamps to.
-/// Pulled out of [`GpuTimer`] as plain arithmetic (no `&self`, no wgpu) so it
-/// is unit-tested without a device: an off-by-one here would have a slot's
-/// `end` alias the next slot's `begin`, silently mixing two frames' readings.
-fn timestamp_indices(slot: usize) -> (u32, u32) {
-    let begin = (slot * 2) as u32;
-    (begin, begin + 1)
-}
-
-/// What [`GpuTimer::take_ms`] found once a slot's map completed.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum GpuSample {
-    /// A plausible pass duration.
-    Ms(f64),
-    /// The two timestamps came back non-increasing -- not a fast pass, a bad
-    /// reading. Counted and reported separately, never averaged in as 0ms.
-    Invalid,
-}
-
-/// Classify a raw `(begin, end)` timestamp pair. `end <= begin` is not a
-/// fast pass, it is a bad reading (a non-monotonic pair off a backend that
-/// isn't giving real per-pass timing -- observed on Metal, where `end` came
-/// back exactly `0` every time) -- reported as [`GpuSample::Invalid`] rather
-/// than folded into the average as 0ms via `saturating_sub`, which would
-/// hide it. Pulled out of `GpuTimer::take_ms` as plain arithmetic (no
-/// `&self`, no wgpu) so the classification itself is unit-tested with fixed
-/// inputs, rather than only reachable by getting a real GPU to produce a
-/// bad reading on purpose.
-fn classify_sample(begin: u64, end: u64, period_ns: f64) -> GpuSample {
-    if end <= begin {
-        GpuSample::Invalid
-    } else {
-        GpuSample::Ms((end - begin) as f64 * period_ns / 1_000_000.0)
-    }
-}
-
-/// Owns a timestamp query set and its readback buffers around the main scene
-/// pass, and turns completed reads into milliseconds. The bookkeeping for
-/// which slot is safe to write or read is [`TimestampRing`]
-/// (`cubara-render`, unit-tested there with no GPU involved); this is the
-/// thin GPU-owning wrapper around it.
-struct GpuTimer {
-    query_set: wgpu::QuerySet,
-    resolve_buffer: wgpu::Buffer,
-    read_buffers: Vec<wgpu::Buffer>,
-    ring: Arc<Mutex<TimestampRing>>,
-    period_ns: f64,
-}
-
-impl GpuTimer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("bench-gpu-timestamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: (GPU_TIMER_DEPTH * 2) as u32,
-        });
-        // Each slot's region in the resolve buffer must start at a multiple
-        // of `wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT` (256 bytes) -- the two
-        // 8-byte timestamps it actually holds don't need that much room, but
-        // `resolve_query_set` validates the destination offset regardless.
-        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bench-gpu-timestamps-resolve"),
-            size: (GPU_TIMER_DEPTH as u64) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let read_buffers = (0..GPU_TIMER_DEPTH)
-            .map(|_| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("bench-gpu-timestamps-read"),
-                    size: 16,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-        Self {
-            query_set,
-            resolve_buffer,
-            read_buffers,
-            ring: Arc::new(Mutex::new(TimestampRing::new(GPU_TIMER_DEPTH))),
-            period_ns: queue.get_timestamp_period() as f64,
-        }
-    }
-
-    /// This frame's slot to write into, or `None` if every slot still has
-    /// outstanding GPU work -- skip GPU timing this frame rather than stall
-    /// waiting for one to free up or overwrite one still in flight.
-    fn write_slot(&self, frame: u64) -> Option<usize> {
-        let slot = (frame as usize) % GPU_TIMER_DEPTH;
-        self.ring.lock().unwrap().can_write(slot).then_some(slot)
-    }
-
-    fn timestamps(&self, slot: usize) -> GpuTimestamps<'_> {
-        let (begin, end) = timestamp_indices(slot);
-        GpuTimestamps {
-            query_set: &self.query_set,
-            begin,
-            end,
-        }
-    }
-
-    /// Resolve `slot`'s two timestamps into the readback buffer -- called
-    /// within the same encoder that wrote them, before submit.
-    fn resolve(&self, encoder: &mut wgpu::CommandEncoder, slot: usize) {
-        let src_offset = (slot as u64) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
-        let (begin, end) = timestamp_indices(slot);
-        encoder.resolve_query_set(
-            &self.query_set,
-            begin..end + 1,
-            &self.resolve_buffer,
-            src_offset,
-        );
-        encoder.copy_buffer_to_buffer(
-            &self.resolve_buffer,
-            src_offset,
-            &self.read_buffers[slot],
-            0,
-            16,
-        );
-    }
-
-    /// Call after submit: marks `slot` in-flight and starts its async map.
-    fn begin_read(&self, slot: usize) {
-        self.ring.lock().unwrap().begin_mapping(slot);
-        let ring = Arc::clone(&self.ring);
-        self.read_buffers[slot]
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                // An error leaves the slot `Mapping` forever -- it just never
-                // contributes another GPU sample, which beats panicking a
-                // whole benchmark run over one dropped reading.
-                if result.is_ok() {
-                    ring.lock().unwrap().mark_ready(slot);
-                }
-            });
-    }
-
-    /// If `slot`'s async map has completed, read its two timestamps, unmap,
-    /// and classify them ([`classify_sample`]).
-    fn take_ms(&self, slot: usize) -> Option<GpuSample> {
-        if !self.ring.lock().unwrap().take_ready(slot) {
-            return None;
-        }
-        let buf = &self.read_buffers[slot];
-        let sample = {
-            let data = buf
-                .slice(..)
-                .get_mapped_range()
-                .expect("read back mapped range");
-            let raw: &[u64] = bytemuck::cast_slice(&data);
-            let (begin, end) = (raw[0], raw[1]);
-            if matches!(
-                classify_sample(begin, end, self.period_ns),
-                GpuSample::Invalid
-            ) {
-                // Unconditional, not just the first few: `log::debug!` costs
-                // nothing unless enabled, and this is exactly the raw data
-                // needed to tell "counter never resolved" (0/0) apart from
-                // "resolved backwards" from a diagnosis a plain "invalid"
-                // count can't -- found necessary on Metal, where every
-                // sample came back this way (see the linked issue).
-                log::debug!(
-                    "GPU timestamp invalid: slot {slot} begin={begin} end={end} \
-                     period_ns={period}",
-                    period = self.period_ns
-                );
-            }
-            classify_sample(begin, end, self.period_ns)
-        };
-        buf.unmap();
-        Some(sample)
-    }
-
-    /// Call once, right after a `device.poll(Maintain::Wait)` -- polls the
-    /// device further, up to a 2-second deadline, until every outstanding
-    /// slot's `map_async` callback has actually fired
-    /// ([`TimestampRing::any_mapping`]), then reads back every slot that has
-    /// ever been written. Returns `(valid, invalid)` counts.
-    ///
-    /// A single `Wait` is not enough on every backend: observed on Metal,
-    /// where a scan taken immediately after `Wait` can see zero classified
-    /// slots even though the underlying GPU work is long finished --
-    /// `Wait` guarantees the *device* has caught up, not that every
-    /// `map_async` callback already ran. Warmup's short window (a few
-    /// hundred frames) makes this matter in practice in a way the much
-    /// longer measured run's own post-loop `Wait` mostly doesn't.
-    fn drain_after_wait(&self, device: &wgpu::Device) -> (u64, u64) {
-        let deadline = Instant::now() + std::time::Duration::from_secs(2);
-        while self.ring.lock().unwrap().any_mapping() && Instant::now() < deadline {
-            let _ = device.poll(wgpu::PollType::Poll);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        let mut valid = 0u64;
-        let mut invalid = 0u64;
-        for slot in 0..GPU_TIMER_DEPTH {
-            match self.take_ms(slot) {
-                Some(GpuSample::Ms(_)) => valid += 1,
-                Some(GpuSample::Invalid) => invalid += 1,
-                None => {}
-            }
-        }
-        (valid, invalid)
-    }
-}
 
 /// Run the benchmark over a streamed square region of the given chunk `radius`
 /// (default 12 = a realistically heavy world). The region streams as LOD nodes
@@ -387,7 +180,7 @@ pub fn parse_gpu_timing_mode(text: &str) -> Option<GpuTimingMode> {
 /// no device, no `GpuTimer` -- so it is unit-tested directly rather than
 /// only reachable through a full, ~20s world-meshing run.
 fn should_disable_gpu_timing(mode: GpuTimingMode, warmup_valid: u64, warmup_invalid: u64) -> bool {
-    mode == GpuTimingMode::Auto && !(warmup_valid > 0 && warmup_invalid == 0)
+    mode == GpuTimingMode::Auto && !cubara_render::timing_proven(warmup_valid, warmup_invalid)
 }
 
 /// What `run` should do about constructing a [`GpuTimer`] at all, given the
@@ -469,7 +262,7 @@ pub fn run(
             log::info!("GPU/frame: {reason}");
             None
         }
-        GpuTimerDecision::Create => Some(GpuTimer::new(&device, &queue)),
+        GpuTimerDecision::Create => Some(GpuTimer::new(&device, &queue, GPU_TIMER_DEPTH)),
     };
 
     // Held for the duration of the benchmark when built with `--features profile`.
@@ -1328,6 +1121,7 @@ pub fn parse_eye(text: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cubara_render::{classify_sample, timestamp_indices};
 
     #[test]
     fn the_warm_up_needs_both_the_frames_and_the_time() {
@@ -1579,7 +1373,7 @@ mod tests {
                 return;
             }
         };
-        let timer = GpuTimer::new(&device, &queue);
+        let timer = GpuTimer::new(&device, &queue, GPU_TIMER_DEPTH);
         let slot = timer
             .write_slot(0)
             .expect("a fresh timer's slot 0 must be writable");

@@ -433,6 +433,31 @@ impl App {
         match key {
             options::OptionsKey::Quality(q) => self.set_far_quality(q),
             options::OptionsKey::Auto | options::OptionsKey::Benchmark => self.start_tuning(),
+            options::OptionsKey::FrameCap => self.apply_frame_cap(),
+        }
+    }
+
+    /// What this window's frames are for: a measurement under
+    /// `--bench walk --window`, the game otherwise.
+    fn window_use(&self) -> present::WindowUse {
+        if self.bench.is_some() {
+            present::WindowUse::Measure
+        } else {
+            present::WindowUse::Play
+        }
+    }
+
+    /// The frame cap changed: choose the window's present mode again, and
+    /// give the frame watch time before it judges frames paced differently.
+    fn apply_frame_cap(&mut self) {
+        let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.choose_present_mode(|offered| {
+                present::present_mode_for(cap, window_use, wanted, offered)
+            });
+        }
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.settle();
         }
     }
 
@@ -497,8 +522,21 @@ impl ApplicationHandler for App {
             }
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Before the surface is configured: the frame cap decides its present
+        // mode (issue #425).
+        self.settings = settings::load(&self.paths.settings).unwrap_or_default();
+        let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
         let (renderer, mesh_assets) =
-            Renderer::new(window.clone(), self.game.camera_pose(), self.present);
+            Renderer::new(window.clone(), self.game.camera_pose(), |offered| {
+                present::present_mode_for(cap, window_use, wanted, offered)
+            });
+        if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
+            log::warn!("--present {m:?} is not offered here");
+        }
+        log::info!(
+            "frame cap {cap:?}: the window presents {:?}",
+            renderer.present_mode()
+        );
         let layers = mesh_assets.layers;
         let registry = std::sync::Arc::new(mesh_assets.registry);
         let items = load_item_registry();
@@ -526,7 +564,6 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.settings = settings::load(&self.paths.settings).unwrap_or_default();
         self.far = Some(far_streaming::FarStreaming::new(
             self.game.world().seed(),
             self.settings.far,
@@ -1282,6 +1319,9 @@ fn main() {
                         gpu: bench::adapter_name().unwrap_or_default(),
                     }),
                     by_hand: false,
+                    // Not the benchmark's to decide: `accept_tuned` keeps
+                    // whatever the settings file says.
+                    frame_cap: settings::FrameCap::default(),
                 };
                 // The player may have picked a quality by hand while this ran;
                 // theirs stands, and the file is left as they wrote it.

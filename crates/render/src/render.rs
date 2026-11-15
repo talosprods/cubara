@@ -572,6 +572,9 @@ enum Target {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
         config: wgpu::SurfaceConfiguration,
+        /// The present modes this surface offers, for a later
+        /// [`Renderer::choose_present_mode`].
+        present_modes: Vec<wgpu::PresentMode>,
     },
     /// A texture nobody sees until it is read back
     /// ([`Renderer::read_frame`]) -- the game's own frame, with no window, for
@@ -656,6 +659,16 @@ pub struct Renderer {
     show_debug: bool,
     /// Smoothed frame time in ms, for a stable on-screen FPS reading.
     frame_ms: f32,
+    /// How long the frame in progress has been blocked getting a drawable and
+    /// presenting -- under vsync, the wait for the display. Taken out of the
+    /// frame time by the next [`update`](Self::update) ([`work_time`]).
+    waited: std::time::Duration,
+    /// Smoothed CPU work per frame in ms: the frame time without `waited`.
+    work_ms: f32,
+    /// The window's GPU timing around the scene pass, where the backend has
+    /// shown it works; `None` offscreen, without `TIMESTAMP_QUERY`, or once
+    /// dropped (Metal, #267).
+    gpu_timing: Option<WindowGpuTiming>,
     /// How far out geometry actually streams in, in blocks -- the caller's
     /// (`cubara-app`'s) idea of its own render radius, handed in each
     /// [`render`](Self::render) call rather than this crate guessing at one
@@ -679,10 +692,15 @@ impl Renderer {
     /// caller streams the initial view in via
     /// [`apply_node_updates`](Self::apply_node_updates) exactly like every
     /// later frame.
+    ///
+    /// `choose_present` picks the present mode from the ones the surface
+    /// offers. The policy is the caller's (`cubara-app`'s `present.rs`, from
+    /// the frame-cap setting); this crate only guarantees the surface is never
+    /// configured with a mode it did not list ([`offered_or_fifo`]).
     pub fn new(
         window: Arc<Window>,
         camera: CameraPose,
-        present: Option<wgpu::PresentMode>,
+        choose_present: impl FnOnce(&[wgpu::PresentMode]) -> wgpu::PresentMode,
     ) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
@@ -729,12 +747,10 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            // Uncapped so we can actually measure FPS against the 1000-FPS
-            // goal -- and **named explicitly** rather than asked for.
-            //
-            // This was `AutoNoVsync`, which is a *request*: the backend resolves
-            // it to Mailbox, Immediate or Fifo and never says which. Reading
-            // `config.present_mode` back gives you `AutoNoVsync` again, so a log
+            // **Named explicitly** rather than asked for. `AutoVsync` and
+            // `AutoNoVsync` are *requests*: the backend resolves them to a
+            // concrete mode and never says which, and reading
+            // `config.present_mode` back gives you the request again, so a log
             // line there prints your own question. On this project's Mac the
             // window sat at exactly 60 while `--bench` reached 1,100 -- and
             // `--bench` never presents at all (`bench.rs` asks for an adapter
@@ -743,7 +759,7 @@ impl Renderer {
             //
             // Choosing from what the surface actually offers means the answer is
             // in `present_mode` instead of hidden behind a word.
-            present_mode: present_mode_for(present, &caps.present_modes),
+            present_mode: offered_or_fifo(choose_present(&caps.present_modes), &caps.present_modes),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -757,12 +773,6 @@ impl Renderer {
             caps.present_modes,
             config.present_mode
         );
-        if let Some(m) = present.filter(|m| *m != config.present_mode) {
-            log::warn!(
-                "--present {m:?} is not offered here; using {:?}",
-                config.present_mode
-            );
-        }
         surface.configure(&device, &config);
 
         let (width, height) = (config.width, config.height);
@@ -770,6 +780,7 @@ impl Renderer {
             window,
             surface,
             config,
+            present_modes: caps.present_modes,
         };
         Self::with_target(
             target,
@@ -857,6 +868,19 @@ impl Renderer {
         let arena = ChunkArena::new(&device, multi_draw, anchor);
         let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY, anchor);
 
+        // GPU work for F3, for the game window only: an offscreen renderer is
+        // a measurement's, and is left exactly as it was.
+        let gpu_timing = (matches!(target, Target::Window { .. })
+            && device.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+        .then(|| WindowGpuTiming {
+            timer: crate::gpu_timer::GpuTimer::new(&device, &queue, WINDOW_GPU_SLOTS),
+            frame: 0,
+            valid: 0,
+            invalid: 0,
+            smoothed_ms: 0.0,
+            ms: None,
+        });
+
         let renderer = Self {
             target,
             device,
@@ -883,6 +907,9 @@ impl Renderer {
             // for.
             show_debug: false,
             frame_ms: 0.0,
+            waited: std::time::Duration::ZERO,
+            work_ms: 0.0,
+            gpu_timing,
             // `0.0`, not a guessed distance: `Lighting::fog_range(0.0)` is
             // `(0.0, 0.0)`, i.e. fog off, which is the honest state before
             // the first `render()` call tells this how far streaming
@@ -1017,6 +1044,41 @@ impl Renderer {
         }
     }
 
+    /// Choose the window's present mode again -- the frame cap was toggled --
+    /// and reconfigure the surface when the answer changed. Nothing offscreen.
+    pub fn choose_present_mode(
+        &mut self,
+        choose: impl FnOnce(&[wgpu::PresentMode]) -> wgpu::PresentMode,
+    ) {
+        let Target::Window {
+            surface,
+            config,
+            present_modes,
+            ..
+        } = &mut self.target
+        else {
+            return;
+        };
+        let mode = offered_or_fifo(choose(present_modes), present_modes);
+        if mode != config.present_mode {
+            config.present_mode = mode;
+            surface.configure(&self.device, config);
+            log::info!("present mode now {mode:?}");
+        }
+    }
+
+    /// Smoothed CPU work per frame in ms: the frame time without the wait for
+    /// the display ([`work_time`]).
+    pub fn work_ms(&self) -> f32 {
+        self.work_ms
+    }
+
+    /// Smoothed GPU time of the scene pass in ms, once the backend's timing
+    /// has been shown to work; `None` before that and where it does not.
+    pub fn gpu_work_ms(&self) -> Option<f32> {
+        self.gpu_timing.as_ref().and_then(|g| g.ms)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -1135,6 +1197,7 @@ impl Renderer {
         puffin::profile_function!();
         self.render_radius_blocks = render_radius_blocks;
         self.update(camera);
+        self.read_gpu_timing();
 
         let (frame, view) = match &self.target {
             Target::Window {
@@ -1189,6 +1252,15 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
+        // This frame's timestamp slot, or none while every slot is still in
+        // flight: skip the reading rather than wait for one.
+        if let Some(g) = self.gpu_timing.as_mut() {
+            g.frame += 1;
+        }
+        let gpu_slot = self
+            .gpu_timing
+            .as_ref()
+            .and_then(|g| g.timer.write_slot(g.frame).map(|slot| (&g.timer, slot)));
 
         {
             puffin::profile_scope!("encode-pass");
@@ -1222,19 +1294,26 @@ impl Renderer {
                     panel,
                     health,
                     crosshair,
-                    // The window doesn't report a GPU/frame reading (only
-                    // `--bench` does, `bench.rs`); the feature is requested
-                    // here too (`gpu_driven_features`) only so it's available
-                    // if that changes later.
-                    gpu_timestamps: None,
+                    // The window's GPU work for F3 (issue #425): the same
+                    // pass-scoped timestamps `--bench` reads.
+                    gpu_timestamps: gpu_slot.map(|(timer, slot)| timer.timestamps(slot)),
                 },
             );
         }
+        if let Some((timer, slot)) = gpu_slot {
+            timer.resolve(&mut encoder, slot);
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        if let Some((timer, slot)) = gpu_slot {
+            timer.begin_read(slot);
+        }
         let presented = frame.map(|(frame, acquire)| {
             present_timed(frame, acquire, |frame| self.queue.present(frame))
         });
+        // What this frame spent blocked rather than working: the next
+        // `update` takes it out of the frame time.
+        self.waited = presented.map_or(std::time::Duration::ZERO, |p| p.acquire + p.present);
 
         self.report_fps();
         presented
@@ -1277,6 +1356,7 @@ impl Renderer {
         format!(
             "Cubara  (F3)\n\
              {fps:.0} fps  ({ms:.2} ms)\n\
+             {work}\n\
              xyz  {x:.1} / {y:.1} / {z:.1}\n\
              chunk  {cx} {cy} {cz}\n\
              anchor  {ax} {ay} {az}\n\
@@ -1284,6 +1364,7 @@ impl Renderer {
              nodes  {vis} drawn / {res} resident\n\
              fog  {fog_start:.0}-{fog_end:.0}",
             ms = self.frame_ms,
+            work = work_text(self.work_ms, self.gpu_work_ms()),
             x = p.x,
             y = p.y,
             z = p.z,
@@ -1305,15 +1386,15 @@ impl Renderer {
     /// on via [`apply_node_updates`](Self::apply_node_updates).
     fn update(&mut self, camera: CameraPose) {
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32();
+        let frame = now - self.last_frame;
+        let dt = frame.as_secs_f32();
         self.last_frame = now;
         // Exponentially-smoothed frame time for a steady on-screen FPS reading.
-        let ms = dt * 1000.0;
-        self.frame_ms = if self.frame_ms == 0.0 {
-            ms
-        } else {
-            self.frame_ms * 0.9 + ms * 0.1
-        };
+        self.frame_ms = smoothed(self.frame_ms, dt * 1000.0);
+        // The same frame without the time it sat waiting for the display:
+        // what the frame cost, whatever the present mode (issue #425).
+        let work = work_time(frame, std::mem::take(&mut self.waited));
+        self.work_ms = smoothed(self.work_ms, work.as_secs_f32() * 1000.0);
         // The render anchor follows the eye (issue #379 decision 2): rarely
         // -- once per 4,096 blocks of travel, or on a jump -- and before
         // this frame's uploads, so a node arriving now is placed against
@@ -1368,6 +1449,43 @@ impl Renderer {
         );
     }
 
+    /// Take whatever GPU timestamps have come back, and judge the backend on
+    /// the first of them ([`crate::gpu_timer::probation`]).
+    fn read_gpu_timing(&mut self) {
+        let Some(g) = self.gpu_timing.as_mut() else {
+            return;
+        };
+        // Lets finished `map_async` callbacks run; it does not wait.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        for slot in 0..WINDOW_GPU_SLOTS {
+            match g.timer.take_ms(slot) {
+                Some(crate::gpu_timer::GpuSample::Ms(ms)) => {
+                    g.valid += 1;
+                    g.smoothed_ms = smoothed(g.smoothed_ms, ms as f32);
+                }
+                Some(crate::gpu_timer::GpuSample::Invalid) => g.invalid += 1,
+                None => {}
+            }
+        }
+        if g.ms.is_some() {
+            // Proven once; a later bad pair is one skipped reading.
+            g.ms = Some(g.smoothed_ms);
+            return;
+        }
+        match crate::gpu_timer::probation(g.valid, g.invalid) {
+            crate::gpu_timer::Probation::Undecided => {}
+            crate::gpu_timer::Probation::Proven => g.ms = Some(g.smoothed_ms),
+            crate::gpu_timer::Probation::Dropped => {
+                log::info!(
+                    "GPU work: timing dropped, {} of {} samples invalid on this backend",
+                    g.invalid,
+                    g.valid + g.invalid
+                );
+                self.gpu_timing = None;
+            }
+        }
+    }
+
     /// Report frames-per-second roughly once per second.
     fn report_fps(&mut self) {
         self.frames += 1;
@@ -1375,7 +1493,8 @@ impl Renderer {
         if elapsed.as_secs_f32() >= 1.0 {
             let fps = self.frames as f32 / elapsed.as_secs_f32();
             log::info!(
-                "{fps:.0} FPS | drawn {}/{} resident nodes",
+                "{fps:.0} FPS | {} | drawn {}/{} resident nodes",
+                work_text(self.work_ms, self.gpu_work_ms()),
                 self.visible_chunks,
                 self.arena.len()
             );
@@ -1651,38 +1770,78 @@ pub const fn figure_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-/// The present mode to configure: `wanted` when this surface offers it,
-/// otherwise the fastest it offers.
-///
-/// Fastest is `Mailbox` first (no tearing, no waiting), then `Immediate` (no
-/// waiting), then `Fifo`, which every surface supports and which is vsync.
-/// Returning a concrete mode rather than `AutoNoVsync` is the point: the caller
-/// can then log what it got, and "we asked for no vsync" stops being mistakable
-/// for "we got no vsync". Never a mode the surface did not list -- Metal's
-/// backend panics on one.
-pub fn present_mode_for(
-    wanted: Option<wgpu::PresentMode>,
+/// `mode` when the surface offers it, else `Fifo`, which every surface
+/// supports. Never a mode the surface did not list: Metal's backend panics on
+/// one. Which mode to *want* is the caller's policy, not this crate's.
+pub fn offered_or_fifo(
+    mode: wgpu::PresentMode,
     offered: &[wgpu::PresentMode],
 ) -> wgpu::PresentMode {
-    if let Some(m) = wanted.filter(|m| offered.contains(m)) {
-        return m;
+    if offered.contains(&mode) {
+        mode
+    } else {
+        log::warn!("present mode {mode:?} is not offered here; using Fifo");
+        wgpu::PresentMode::Fifo
     }
-    for fast in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
-        if offered.contains(&fast) {
-            return fast;
-        }
+}
+
+/// What a frame of `frame` cost when `waited` of it was spent blocked getting
+/// a drawable and presenting: the work, without the wait for the display.
+/// Under vsync the frame time is the refresh interval whatever the frame
+/// cost, so this is the number that still says how fast the engine is
+/// (issue #425 decision 3). Never negative: the two clocks are read apart.
+pub fn work_time(frame: std::time::Duration, waited: std::time::Duration) -> std::time::Duration {
+    frame.saturating_sub(waited)
+}
+
+/// The F3 and log wording for the work per frame; the GPU half reads `n/a`
+/// where the backend has no working timestamps (Metal, #267).
+pub fn work_text(cpu_ms: f32, gpu_ms: Option<f32>) -> String {
+    match gpu_ms {
+        Some(gpu) => format!("work {cpu_ms:.2} ms (cpu) / {gpu:.2} ms (gpu)"),
+        None => format!("work {cpu_ms:.2} ms (cpu) / n/a (gpu)"),
     }
-    wgpu::PresentMode::Fifo
+}
+
+/// One more `sample` into an exponentially-smoothed reading; the first
+/// sample is taken as it is.
+fn smoothed(reading: f32, sample: f32) -> f32 {
+    if reading == 0.0 {
+        sample
+    } else {
+        reading * 0.9 + sample * 0.1
+    }
+}
+
+/// How many timestamp slots the window keeps in flight. Chosen, not derived:
+/// a reading is back within a frame or two at the display's pace, and an
+/// uncapped window that outruns eight slots skips readings, which costs
+/// nothing ([`crate::gpu_timer::GpuTimer::write_slot`]).
+const WINDOW_GPU_SLOTS: usize = 8;
+
+/// The window's GPU timer and what it has read so far.
+struct WindowGpuTiming {
+    timer: crate::gpu_timer::GpuTimer,
+    /// Frames drawn, for the round-robin slot.
+    frame: u64,
+    valid: u64,
+    invalid: u64,
+    smoothed_ms: f32,
+    /// The reading to show; `None` until the probation is passed.
+    ms: Option<f32>,
 }
 
 /// Run `present` on `frame` and stamp the instant it returned. The stamp is
 /// taken *after* the call, never before: a present that blocks (vsync, a full
 /// queue) is exactly the time the instrument exists to see.
 fn present_timed<F>(frame: F, acquire: std::time::Duration, present: impl FnOnce(F)) -> Presented {
+    let presenting = std::time::Instant::now();
     present(frame);
+    let at = std::time::Instant::now();
     Presented {
-        at: std::time::Instant::now(),
+        at,
         acquire,
+        present: at - presenting,
     }
 }
 
@@ -1694,6 +1853,9 @@ pub struct Presented {
     /// How long `get_current_texture` took -- under vsync, the wait for the
     /// display to release a drawable.
     pub acquire: std::time::Duration,
+    /// How long `present` took -- the other place a backend may block for the
+    /// display.
+    pub present: std::time::Duration,
 }
 
 /// The pipeline that draws other players.
@@ -2119,27 +2281,46 @@ mod tests {
     }
 
     #[test]
-    fn a_wanted_present_mode_is_used_when_offered() {
-        use wgpu::PresentMode::*;
-        assert_eq!(present_mode_for(Some(Fifo), &[Fifo, Immediate]), Fifo);
+    fn the_time_inside_present_is_reported() {
+        let p = present_timed((), std::time::Duration::ZERO, |()| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        assert!(p.present >= std::time::Duration::from_millis(20));
     }
 
-    /// The M3's case: Metal offers no Mailbox.
+    /// A surface is never configured with a mode it did not list.
     #[test]
-    fn a_wanted_present_mode_that_is_not_offered_falls_back_to_the_fastest() {
+    fn a_mode_the_surface_does_not_offer_becomes_fifo() {
         use wgpu::PresentMode::*;
+        assert_eq!(offered_or_fifo(Mailbox, &[Fifo, Mailbox]), Mailbox);
+        assert_eq!(offered_or_fifo(Mailbox, &[Fifo, Immediate]), Fifo);
+    }
+
+    /// Issue #425: a 60 Hz frame that waited 14 ms for the display did
+    /// 2.67 ms of work, and a frame with no wait is all work.
+    #[test]
+    fn the_work_time_is_the_frame_without_the_wait() {
+        use std::time::Duration;
+        let frame = Duration::from_micros(16_667);
         assert_eq!(
-            present_mode_for(Some(Mailbox), &[Fifo, Immediate]),
-            Immediate
+            work_time(frame, Duration::from_micros(14_000)),
+            Duration::from_micros(2_667)
+        );
+        assert_eq!(work_time(frame, Duration::ZERO), frame);
+        // Two clocks read apart may disagree by a tick; never negative.
+        assert_eq!(
+            work_time(frame, Duration::from_micros(16_700)),
+            Duration::ZERO
         );
     }
 
     #[test]
-    fn no_wish_picks_mailbox_then_immediate_then_fifo() {
-        use wgpu::PresentMode::*;
-        assert_eq!(present_mode_for(None, &[Fifo, Immediate, Mailbox]), Mailbox);
-        assert_eq!(present_mode_for(None, &[Fifo, Immediate]), Immediate);
-        assert_eq!(present_mode_for(None, &[Fifo]), Fifo);
+    fn the_work_line_names_cpu_and_gpu() {
+        assert_eq!(
+            work_text(1.234, Some(0.5)),
+            "work 1.23 ms (cpu) / 0.50 ms (gpu)"
+        );
+        assert_eq!(work_text(1.234, None), "work 1.23 ms (cpu) / n/a (gpu)");
     }
 
     /// Review finding S1 (#379): a tree instance carries its node's slot in
