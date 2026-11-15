@@ -17,6 +17,7 @@
 
 use crate::flight::WorkTail;
 use crate::paths::{same_path, SavePaths};
+use crate::settings::FrameCap;
 
 /// The part of the run that counts as play, in seconds from process start.
 /// Chosen, not derived: equal to `options::SETTLE_SECONDS`, the game's own
@@ -41,6 +42,50 @@ pub fn parse_present(text: &str) -> Option<wgpu::PresentMode> {
         "immediate" => Some(wgpu::PresentMode::Immediate),
         _ => None,
     }
+}
+
+/// What a window's frames are for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowUse {
+    /// The game, played: the frame cap applies.
+    Play,
+    /// `--bench walk --window`: a measurement, uncapped whatever the setting.
+    Measure,
+}
+
+/// The present mode for a window: the one place this is decided (issue #425
+/// decision 1, Rule 5).
+///
+/// - `wanted` (`--present`) when the surface offers it: asked for by hand.
+/// - Else `Fifo` for the game under [`FrameCap::Vsync`]: one frame per
+///   refresh, which every surface supports.
+/// - Else the fastest offered: `Mailbox` (no tearing, no waiting), then
+///   `Immediate` (no waiting), then `Fifo`.
+///
+/// A concrete mode, never `AutoVsync`/`AutoNoVsync`: those are requests the
+/// backend resolves without saying to what, and the log should name what the
+/// window got. Never a mode the surface did not list.
+///
+/// `--bench` and `--screenshot` do not come here at all: they draw offscreen
+/// and never present.
+pub fn present_mode_for(
+    cap: FrameCap,
+    window: WindowUse,
+    wanted: Option<wgpu::PresentMode>,
+    offered: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    if let Some(m) = wanted.filter(|m| offered.contains(m)) {
+        return m;
+    }
+    if window == WindowUse::Play && cap == FrameCap::Vsync {
+        return wgpu::PresentMode::Fifo;
+    }
+    for fast in [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate] {
+        if offered.contains(&fast) {
+            return fast;
+        }
+    }
+    wgpu::PresentMode::Fifo
 }
 
 /// One gap: when the later present returned (seconds since process start) and
@@ -378,6 +423,82 @@ mod tests {
         ];
         assert_eq!(longest_after(&g, 30.0), Some(g[1]));
         assert_eq!(longest_after(&g, 40.0), None);
+    }
+
+    /// Issue #425: the game is capped by default, on every set of modes a
+    /// surface may offer.
+    #[test]
+    fn the_game_window_is_fifo_under_vsync() {
+        use wgpu::PresentMode::*;
+        for offered in [&[Fifo, Immediate, Mailbox][..], &[Fifo, Immediate], &[Fifo]] {
+            assert_eq!(
+                present_mode_for(FrameCap::Vsync, WindowUse::Play, None, offered),
+                Fifo
+            );
+        }
+        assert_eq!(
+            present_mode_for(FrameCap::default(), WindowUse::Play, None, &[Fifo, Mailbox]),
+            Fifo,
+            "the default setting"
+        );
+    }
+
+    #[test]
+    fn unlimited_picks_mailbox_then_immediate_then_fifo() {
+        use wgpu::PresentMode::*;
+        let pick = |offered: &[wgpu::PresentMode]| {
+            present_mode_for(FrameCap::Unlimited, WindowUse::Play, None, offered)
+        };
+        assert_eq!(pick(&[Fifo, Immediate, Mailbox]), Mailbox);
+        assert_eq!(pick(&[Fifo, Immediate]), Immediate);
+        assert_eq!(pick(&[Fifo]), Fifo);
+    }
+
+    /// The windowed walk measures: the cap in the settings does not reach it.
+    #[test]
+    fn a_measuring_window_is_uncapped_whatever_the_setting() {
+        use wgpu::PresentMode::*;
+        for cap in [FrameCap::Vsync, FrameCap::Unlimited] {
+            let pick = |offered: &[wgpu::PresentMode]| {
+                present_mode_for(cap, WindowUse::Measure, None, offered)
+            };
+            assert_eq!(pick(&[Fifo, Immediate, Mailbox]), Mailbox, "{cap:?}");
+            assert_eq!(pick(&[Fifo, Immediate]), Immediate, "{cap:?}");
+        }
+    }
+
+    /// `--present` is asked for by hand and wins where offered; where it is
+    /// not (the M3: Metal offers no Mailbox) the setting decides.
+    #[test]
+    fn a_wanted_present_mode_wins_when_offered_and_only_then() {
+        use wgpu::PresentMode::*;
+        let offered = [Fifo, Immediate];
+        for window in [WindowUse::Play, WindowUse::Measure] {
+            for cap in [FrameCap::Vsync, FrameCap::Unlimited] {
+                assert_eq!(
+                    present_mode_for(cap, window, Some(Immediate), &offered),
+                    Immediate
+                );
+                assert_eq!(present_mode_for(cap, window, Some(Fifo), &offered), Fifo);
+            }
+        }
+        assert_eq!(
+            present_mode_for(FrameCap::Vsync, WindowUse::Play, Some(Mailbox), &offered),
+            Fifo
+        );
+        assert_eq!(
+            present_mode_for(
+                FrameCap::Unlimited,
+                WindowUse::Play,
+                Some(Mailbox),
+                &offered
+            ),
+            Immediate
+        );
+        assert_eq!(
+            present_mode_for(FrameCap::Vsync, WindowUse::Measure, Some(Mailbox), &offered),
+            Immediate
+        );
     }
 
     #[test]

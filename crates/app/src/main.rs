@@ -139,6 +139,10 @@ struct App {
     no_tune: bool,
     /// `--present fifo|mailbox|immediate`: asked for when the surface offers it.
     present: Option<wgpu::PresentMode>,
+    /// Whether the window is covered, and whether it is minimised: either
+    /// way its frames are not judged (`FrameWatch::set_visible`).
+    occluded: bool,
+    minimised: bool,
 }
 
 /// What a windowed walk records while the game runs (`present.rs` turns it
@@ -376,8 +380,41 @@ impl App {
         if let (Some(far), Some(renderer)) = (self.far.as_mut(), self.renderer.as_mut()) {
             far.set_quality(quality, renderer);
         }
+        self.follow_monitor();
         if let Some(w) = self.frame_watch.as_mut() {
             w.settle();
+        }
+    }
+
+    /// The frame rate to hold is that of the monitor the window is on *now*:
+    /// read it again whenever it may have changed (the window moved or was
+    /// resized, the display's settings changed) and hand it to the frame
+    /// watch. Read once at start, a window dragged from a 144 Hz monitor to a
+    /// 60 Hz one had every vsynced frame counted as a miss (review of #426).
+    fn follow_monitor(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let fps = options::target_fps(
+            renderer
+                .window()
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz()),
+        );
+        if fps != self.target_fps {
+            log::info!("the monitor refreshes at {fps} Hz, was {}", self.target_fps);
+            self.target_fps = fps;
+        }
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.set_target(fps);
+        }
+    }
+
+    /// Tell the frame watch whether the window can be seen.
+    fn follow_visibility(&mut self) {
+        let visible = !(self.occluded || self.minimised);
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.set_visible(visible);
         }
     }
 
@@ -433,6 +470,32 @@ impl App {
         match key {
             options::OptionsKey::Quality(q) => self.set_far_quality(q),
             options::OptionsKey::Auto | options::OptionsKey::Benchmark => self.start_tuning(),
+            options::OptionsKey::FrameCap => self.apply_frame_cap(),
+        }
+    }
+
+    /// What this window's frames are for: a measurement under
+    /// `--bench walk --window`, the game otherwise.
+    fn window_use(&self) -> present::WindowUse {
+        if self.bench.is_some() {
+            present::WindowUse::Measure
+        } else {
+            present::WindowUse::Play
+        }
+    }
+
+    /// The frame cap changed: choose the window's present mode again, and
+    /// give the frame watch time before it judges frames paced differently.
+    fn apply_frame_cap(&mut self) {
+        let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.choose_present_mode(|offered| {
+                present::present_mode_for(cap, window_use, wanted, offered)
+            });
+        }
+        self.follow_monitor();
+        if let Some(w) = self.frame_watch.as_mut() {
+            w.settle();
         }
     }
 
@@ -497,8 +560,26 @@ impl ApplicationHandler for App {
             }
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let (renderer, mesh_assets) =
-            Renderer::new(window.clone(), self.game.camera_pose(), self.present);
+        // Before the surface is configured: the frame cap decides its present
+        // mode (issue #425).
+        self.settings = settings::load(&self.paths.settings).unwrap_or_default();
+        let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
+        let (renderer, mesh_assets) = Renderer::new(
+            window.clone(),
+            self.game.camera_pose(),
+            |offered| present::present_mode_for(cap, window_use, wanted, offered),
+            // GPU work for F3 is the game's; a measuring window draws
+            // exactly what it drew before (issue #425: bench behaviour is
+            // out of scope).
+            window_use == present::WindowUse::Play,
+        );
+        if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
+            log::warn!("--present {m:?} is not offered here");
+        }
+        log::info!(
+            "frame cap {cap:?}: the window presents {:?}",
+            renderer.present_mode()
+        );
         let layers = mesh_assets.layers;
         let registry = std::sync::Arc::new(mesh_assets.registry);
         let items = load_item_registry();
@@ -526,7 +607,6 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.settings = settings::load(&self.paths.settings).unwrap_or_default();
         self.far = Some(far_streaming::FarStreaming::new(
             self.game.world().seed(),
             self.settings.far,
@@ -588,6 +668,16 @@ impl ApplicationHandler for App {
                 if self.cursor_captured {
                     grab_cursor(renderer.window(), true);
                 }
+                // Maximising or going fullscreen may land on another monitor,
+                // and a minimised window is 0 x 0.
+                self.minimised = size.width == 0 || size.height == 0;
+                self.follow_visibility();
+                self.follow_monitor();
+            }
+            // The window may be on another monitor now, or its monitor's
+            // settings may have changed.
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.follow_monitor();
             }
             WindowEvent::Focused(true) => {
                 // Deliberately not a recapture -- see `capture::apply`. Logged
@@ -595,10 +685,12 @@ impl ApplicationHandler for App {
                 // from a report.
                 log::info!("window focused (captured: {})", self.cursor_captured);
             }
-            WindowEvent::Occluded(true) => {
-                if let Some(b) = self.bench.as_mut() {
+            WindowEvent::Occluded(occluded) => {
+                if let Some(b) = self.bench.as_mut().filter(|_| occluded) {
                     b.focus_lost += 1;
                 }
+                self.occluded = occluded;
+                self.follow_visibility();
             }
             WindowEvent::Focused(false) => {
                 if let Some(b) = self.bench.as_mut() {
@@ -1282,6 +1374,9 @@ fn main() {
                         gpu: bench::adapter_name().unwrap_or_default(),
                     }),
                     by_hand: false,
+                    // Not the benchmark's to decide: `accept_tuned` keeps
+                    // whatever the settings file says.
+                    frame_cap: settings::FrameCap::default(),
                 };
                 // The player may have picked a quality by hand while this ran;
                 // theirs stands, and the file is left as they wrote it.

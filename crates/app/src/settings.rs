@@ -1,5 +1,6 @@
 //! Settings that belong to this PC rather than to a world: how finely the far
-//! terrain is drawn, and what that choice was tuned for.
+//! terrain is drawn, what that choice was tuned for, and whether the window
+//! is capped at the monitor's refresh rate.
 //!
 //! The owner's call (2026-09-26): a benchmark decides, per PC, what keeps the
 //! game at or above the monitor's refresh rate, and the player can choose
@@ -12,6 +13,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::far_streaming::FarQuality;
 
+/// How fast the game window draws (issue #425; the owner, 2026-11-14: no
+/// 2,000 frames a second for a screen that shows 60).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameCap {
+    /// One frame per refresh of the monitor.
+    #[default]
+    Vsync,
+    /// As fast as the machine goes.
+    Unlimited,
+}
+
+impl FrameCap {
+    /// The other one: the options screen's toggle.
+    pub fn toggled(self) -> Self {
+        match self {
+            FrameCap::Vsync => FrameCap::Unlimited,
+            FrameCap::Unlimited => FrameCap::Vsync,
+        }
+    }
+}
+
 /// Everything that is this machine's.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -23,6 +45,10 @@ pub struct Settings {
     /// benchmark overrules it, and missed frames do not step it down.
     #[serde(default)]
     pub by_hand: bool,
+    /// Whether the window is capped at the monitor's refresh rate. Absent in
+    /// a file written before the setting existed: capped.
+    #[serde(default)]
+    pub frame_cap: FrameCap,
 }
 
 /// The conditions a benchmark chose the settings under. A different monitor
@@ -56,11 +82,17 @@ impl Settings {
 /// quality by hand ("keys 1-4 pick a quality, which is then the player's own,
 /// so no benchmark or step-down overrules it", `PROPOSAL_FAR_VIEW.md` 6c).
 /// Used by the game when the child ends and by the child before it writes.
+///
+/// A benchmark decides the far quality and nothing else: the frame cap stays
+/// what it is in `current`, whatever the answer carries.
 pub fn accept_tuned(current: &Settings, tuned: Settings) -> Option<Settings> {
     if current.by_hand {
         None
     } else {
-        Some(tuned)
+        Some(Settings {
+            frame_cap: current.frame_cap,
+            ..tuned
+        })
     }
 }
 
@@ -99,6 +131,7 @@ mod tests {
                 gpu: gpu.to_string(),
             }),
             by_hand: false,
+            frame_cap: FrameCap::default(),
         }
     }
 
@@ -122,6 +155,7 @@ mod tests {
                 far,
                 tuned: None,
                 by_hand: true,
+                ..Settings::default()
             };
             assert!(!s.needs_tuning(60, "Apple M3"), "{far:?}");
         }
@@ -135,6 +169,7 @@ mod tests {
             far: FarQuality::High,
             tuned: None,
             by_hand: true,
+            ..Settings::default()
         };
         assert_eq!(accept_tuned(&by_hand, tuned(60, "gpu")), None);
         let auto = Settings::default();
@@ -161,5 +196,67 @@ mod tests {
         std::fs::write(&path, "not ron at all {").unwrap();
         assert_eq!(load(&path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh directory under the system's temp one, never `saves/`.
+    fn temp_settings(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cubara-settings-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.ron");
+        (dir, path)
+    }
+
+    /// Issue #425: the window is capped unless the player says otherwise.
+    #[test]
+    fn the_frame_cap_defaults_to_vsync() {
+        assert_eq!(Settings::default().frame_cap, FrameCap::Vsync);
+        assert_eq!(FrameCap::Vsync.toggled(), FrameCap::Unlimited);
+        assert_eq!(FrameCap::Unlimited.toggled(), FrameCap::Vsync);
+    }
+
+    /// Both values, because a cap that is not written reads back as the
+    /// default and only the other one shows it.
+    #[test]
+    fn the_frame_cap_survives_a_round_trip() {
+        let (dir, path) = temp_settings("cap");
+        for frame_cap in [FrameCap::Unlimited, FrameCap::Vsync] {
+            let s = Settings {
+                frame_cap,
+                ..tuned(60, "gpu")
+            };
+            save(&path, &s).unwrap();
+            assert_eq!(load(&path), Some(s), "{frame_cap:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A settings file from before the cap existed still reads, as capped.
+    #[test]
+    fn settings_written_before_the_frame_cap_read_as_vsync() {
+        let (dir, path) = temp_settings("old");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "(far: Medium, tuned: None, by_hand: true)").unwrap();
+        let s = load(&path).expect("an old file reads");
+        assert_eq!(s.frame_cap, FrameCap::Vsync);
+        assert!(s.by_hand);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The benchmark's answer is a far quality; a cap the player lifted
+    /// while it ran is still lifted afterwards.
+    #[test]
+    fn a_benchmark_result_leaves_the_frame_cap_alone() {
+        let current = Settings {
+            frame_cap: FrameCap::Unlimited,
+            ..Settings::default()
+        };
+        let taken = accept_tuned(&current, tuned(60, "gpu")).expect("not by hand");
+        assert_eq!(taken.frame_cap, FrameCap::Unlimited);
+        assert_eq!(taken.far, FarQuality::Medium);
     }
 }
