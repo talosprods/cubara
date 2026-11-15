@@ -332,9 +332,13 @@ blocks.
   first ring of vertices inside the box drops, straight down from the box's
   side and only a skirt deep, which closes the seam the way the skirt of a
   patch ending on the box's side always did. Every vertex deeper goes *above*
-  the box when the eye is inside it (the game's always is), so the triangles
-  reaching it show the eye their underside and back-face culling drops them
-  before a fragment is shaded (`cubara_render::far::join`). And when the
+  the box when the eye is inside it and all the ground over the box is above
+  its floor, so the triangles reaching it show the eye their underside and
+  back-face culling drops them before a fragment is shaded
+  (`cubara_render::far::join`). Where any ground lies under the floor -- an
+  eye a thousand blocks up -- they go under the box as before: that ground is
+  not inside the box and stays put, and a vertex hidden next to it must stay
+  next to it (`far::hidden_height`). And when the
   eye's visibility search finds no way out to the sky at all, the far terrain
   is not drawn (`cubara_world::visibility::Sight::open_to_sky`).
 - At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about

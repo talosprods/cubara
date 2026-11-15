@@ -95,6 +95,7 @@ struct PatchGpu {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ParamsGpu {
+    /// `w`: the height hidden vertices go to ([`hidden_height`]).
     hole_min: [f32; 4],
     hole_max: [f32; 4],
     top_color: [f32; 4],
@@ -107,7 +108,7 @@ struct ParamsGpu {
 impl ParamsGpu {
     /// `p` with its hole made relative to `anchor` -- the space `far.wgsl`'s
     /// vertices are in.
-    fn new(p: FarParams, anchor: Anchor) -> Self {
+    fn new(p: FarParams, anchor: Anchor, raised: bool) -> Self {
         // No hole: an empty box, min above max, which nothing is inside.
         let (min, max) = match p.hole {
             Some((min, max)) => (anchor::offset(min, anchor), anchor::offset(max, anchor)),
@@ -115,7 +116,13 @@ impl ParamsGpu {
         };
         let m = p.materials;
         Self {
-            hole_min: [min.x, min.y, min.z, 0.0],
+            // The two heights `hidden_height` chooses between.
+            hole_min: [
+                min.x,
+                min.y,
+                min.z,
+                if raised { max.y + 1.0 } else { min.y - 1.0 },
+            ],
             hole_max: [max.x, max.y, max.z, 0.0],
             top_color: m.top.extend(1.0).to_array(),
             side_color: m.side.extend(m.soil_depth).to_array(),
@@ -211,6 +218,10 @@ pub struct FarTerrain {
     /// Whether the far terrain can be seen at all
     /// ([`set_shown`](Self::set_shown)).
     shown: bool,
+    /// Whether hidden vertices were last sent above the box rather than
+    /// under it ([`hidden_height`]): what `params` tells `far.wgsl`. Under
+    /// it until [`prepare`](Self::prepare) says otherwise.
+    raised: bool,
 }
 
 /// A patch as it was inserted, minus its heights (which the anchor does not
@@ -299,7 +310,7 @@ impl FarTerrain {
         queue.write_buffer(
             &params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(params_world, anchor)),
+            bytemuck::bytes_of(&ParamsGpu::new(params_world, anchor, false)),
         );
         let (masking, masking_sampler) = masking_texture(device, queue);
 
@@ -363,6 +374,7 @@ impl FarTerrain {
             anchor,
             drawn: 0,
             shown: true,
+            raised: false,
             hole: None,
         }
     }
@@ -416,7 +428,7 @@ impl FarTerrain {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(self.params_world, anchor)),
+            bytemuck::bytes_of(&ParamsGpu::new(self.params_world, anchor, self.raised)),
         );
     }
 
@@ -463,7 +475,7 @@ impl FarTerrain {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(params, self.anchor)),
+            bytemuck::bytes_of(&ParamsGpu::new(params, self.anchor, self.raised)),
         );
     }
 
@@ -474,6 +486,22 @@ impl FarTerrain {
     /// (issue #379 decision 5).
     /// Patches wholly inside the voxels' hole are not drawn at all.
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum, eye: Vec3) -> u32 {
+        // Where the hidden vertices go depends on the eye and on the ground
+        // over the box, so it is settled here, per frame; it changes only
+        // when the eye enters or leaves the box or the ground crosses its
+        // floor, and is written only then.
+        if let Some(hole) = self.hole.filter(|_| self.shown) {
+            let lowest = lowest_over(&self.boxes, &hole);
+            let raised = hidden_height(hole.min, hole.max, eye, lowest) > hole.max.y;
+            if raised != self.raised {
+                self.raised = raised;
+                queue.write_buffer(
+                    &self.params,
+                    0,
+                    bytemuck::bytes_of(&ParamsGpu::new(self.params_world, self.anchor, raised)),
+                );
+            }
+        }
         let order = slots_to_draw(self.shown, &self.boxes, frustum, self.hole.as_ref(), eye);
         if !order.is_empty() {
             queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&order));
@@ -563,10 +591,25 @@ pub fn join(at: [i32; 2], lo: [f32; 2], hi: [f32; 2]) -> Join {
 }
 
 /// The height [`Join::Hidden`] vertices go to, for a box from `hole_min` to
-/// `hole_max` and an eye at `eye`: just above the box when the eye is
-/// strictly inside it, just under it otherwise.
-pub fn hidden_height(hole_min: Vec3, hole_max: Vec3, eye: Vec3) -> f32 {
-    if eye.cmpgt(hole_min).all() && eye.cmplt(hole_max).all() {
+/// `hole_max`, an eye at `eye`, and far terrain whose lowest point over the
+/// box (skirts included) is `lowest`.
+///
+/// **Just above the box** when the eye is strictly inside it and all of that
+/// ground is above its floor: the eye then sees only the underside of what
+/// reaches up there, which is culled.
+///
+/// **Just under the box otherwise**, as it always was. For an eye outside
+/// the box that is the side it cannot see. And where any ground lies under
+/// the floor -- an eye a thousand blocks up, the floor cutting through the
+/// hills -- that ground is not inside the box and stays where it is, so a
+/// hidden vertex next to it has to stay next to it: raised, the triangle
+/// between the two is a sheet two thousand blocks tall on the near side of
+/// every hill (review of #427). Under the floor it is a step of a block. The
+/// wall this leaves at the box's side is no taller than the ground stands
+/// above the floor, and it is seen from above, where the voxels cover it.
+pub fn hidden_height(hole_min: Vec3, hole_max: Vec3, eye: Vec3, lowest: f32) -> f32 {
+    let eye_inside = eye.cmpgt(hole_min).all() && eye.cmplt(hole_max).all();
+    if eye_inside && lowest > hole_min.y {
         hole_max.y + 1.0
     } else {
         hole_min.y - 1.0
@@ -594,6 +637,25 @@ fn hole_aabb(min: [i32; 3], max: [i32; 3], anchor: Anchor) -> Aabb {
 #[cfg(test)]
 fn patch_box(patch: &FarPatch<'_>) -> Aabb {
     PlacedPatch::of(patch).aabb(anchor::ORIGIN)
+}
+
+/// The lowest point, skirts included, of every patch standing over any of
+/// the hole's ground -- [`hidden_height`]'s `lowest`. Infinity when none
+/// does. A patch that only touches the hole's side counts too: that errs
+/// towards "some ground is under the floor", which is the rule that is right
+/// everywhere but underground.
+pub fn lowest_over(boxes: &[Option<Aabb>], hole: &Aabb) -> f32 {
+    boxes
+        .iter()
+        .flatten()
+        .filter(|b| {
+            b.min.x <= hole.max.x
+                && b.max.x >= hole.min.x
+                && b.min.z <= hole.max.z
+                && b.max.z >= hole.min.z
+        })
+        .map(|b| b.min.y)
+        .fold(f32::INFINITY, f32::min)
 }
 
 /// The slots drawn this frame, in the order they are drawn: none at all
@@ -795,7 +857,7 @@ mod tests {
         (origin, quad, skirt_depth): ([f32; 2], f32, f32),
         height: &dyn Fn(i32, i32) -> f32,
         hole: (Vec3, Vec3),
-        eye: Vec3,
+        hidden: f32,
         rule: &dyn Fn([i32; 2], [f32; 2], [f32; 2]) -> Join,
     ) -> Vec3 {
         let quads = FAR_QUADS as i32;
@@ -816,7 +878,7 @@ mod tests {
                 let [x, z] = at(i, j);
                 Vec3::new(x, height(i, j) - skirt_depth, z)
             }
-            Join::Hidden => Vec3::new(x, hidden_height(hole.0, hole.1, eye), z),
+            Join::Hidden => Vec3::new(x, hidden, z),
         }
     }
 
@@ -839,17 +901,13 @@ mod tests {
         let skirt_depth = 40.0;
         // Rolling ground, so no two neighbours are level.
         let height = |i: i32, j: i32| 60.0 + 9.0 * ((i * 3 + j * 5) % 7) as f32;
+        // Ground well above the floor: what an eye inside the box has
+        // raised out of sight, unless the old rule's height is asked for.
+        let hidden = hidden.unwrap_or_else(|| hidden_height(hole.0, hole.1, eye, 20.0));
         let place = |index: u16| {
             let grid = [index as u32 % GRID, index as u32 / GRID];
             let patch = (origin, quad, skirt_depth);
-            let mut v = vertex(grid, patch, &height, hole, eye, rule);
-            // The old rule's height, whatever the eye.
-            if let Some(y) = hidden {
-                if v.y == hidden_height(hole.0, hole.1, eye) {
-                    v.y = y;
-                }
-            }
-            v
+            vertex(grid, patch, &height, hole, hidden, rule)
         };
         let strictly_inside =
             |p: Vec3| p.x > hole.0.x && p.x < hole.1.x && p.z > hole.0.z && p.z < hole.1.z;
@@ -924,6 +982,59 @@ mod tests {
         }
     }
 
+    /// **No sheet where the ground crosses the box's floor** (review of #427).
+    /// A thousand blocks up, the box's floor cuts through the hills: ground
+    /// under the floor is the far terrain's to draw, and stays where it is,
+    /// while the vertex next to it, just above the floor, is hidden. Hidden
+    /// must then mean *next to it* -- under the floor. Raised above the box
+    /// instead, as an eye inside the box otherwise wants, the triangle
+    /// between the two is a sheet two thousand blocks tall on the near side
+    /// of every hill.
+    #[test]
+    fn no_sheet_where_the_ground_crosses_the_boxs_floor() {
+        let (quad, skirt_depth) = (8.0, 40.0);
+        // Steep ground from 60 to 420, so both floors below cut through it.
+        let height = |i: i32, j: i32| 60.0 + 60.0 * ((i * 3 + j * 5) % 7) as f32;
+        // The tallest triangle of the ground as it is: six steps and a skirt.
+        let bound = 6.0 * 60.0 + skirt_depth + 1.0;
+        for eye_y in [1_100.0, 1_400.0] {
+            let eye = Vec3::new(8.0, eye_y, 8.0);
+            let hole = (
+                Vec3::new(-1024.0, eye_y - 1024.0, -1024.0),
+                Vec3::new(1024.0, eye_y + 1024.0, 1024.0),
+            );
+            // In the middle of the box, across a side of it, and on a corner.
+            for origin in [[0.0, 0.0], [896.0, -128.0], [896.0, 896.0]] {
+                let lowest = (0..=FAR_QUADS as i32)
+                    .flat_map(|i| (0..=FAR_QUADS as i32).map(move |j| (i, j)))
+                    .map(|(i, j)| height(i, j))
+                    .fold(f32::INFINITY, f32::min)
+                    - skirt_depth;
+                assert!(
+                    lowest < hole.0.y && hole.0.y < 420.0,
+                    "the floor does not cut the ground, so this proves nothing"
+                );
+                let hidden = hidden_height(hole.0, hole.1, eye, lowest);
+                let place = |index: u16| {
+                    let grid = [index as u32 % GRID, index as u32 / GRID];
+                    let patch = (origin, quad, skirt_depth);
+                    vertex(grid, patch, &height, hole, hidden, &join)
+                };
+                for t in grid_indices().chunks(3) {
+                    let [a, b, c] = [place(t[0]), place(t[1]), place(t[2])];
+                    let normal = (b - a).cross(c - a);
+                    let faces_the_eye = normal.length() > 1e-3 && normal.dot(eye - a) > 0.0;
+                    let tall = a.y.max(b.y).max(c.y) - a.y.min(b.y).min(c.y);
+                    assert!(
+                        !faces_the_eye || tall <= bound,
+                        "eye at y = {eye_y}, patch at {origin:?}: a triangle {tall} blocks \
+                         tall faces the eye: {a} {b} {c}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The seam to the voxels stays closed: the first ring inside the box
     /// hangs straight under the vertex on the box's side, a skirt deep --
     /// and only the first, and only from a side this patch holds.
@@ -966,11 +1077,34 @@ mod tests {
             Vec3::new(-100.0, -50.0, -100.0),
             Vec3::new(100.0, 70.0, 100.0),
         );
-        assert_eq!(hidden_height(min, max, Vec3::new(0.0, -20.0, 0.0)), 71.0);
-        assert_eq!(hidden_height(min, max, Vec3::new(0.0, 60.0, 99.0)), 71.0);
+        // All the ground above the floor.
+        let above = -10.0;
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(0.0, -20.0, 0.0), above),
+            71.0
+        );
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(0.0, 60.0, 99.0), above),
+            71.0
+        );
         // Above the box, or beside it: under it, as before.
-        assert_eq!(hidden_height(min, max, Vec3::new(0.0, 120.0, 0.0)), -51.0);
-        assert_eq!(hidden_height(min, max, Vec3::new(150.0, 0.0, 0.0)), -51.0);
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(0.0, 120.0, 0.0), above),
+            -51.0
+        );
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(150.0, 0.0, 0.0), above),
+            -51.0
+        );
+        // Ground under the floor, or on it: under the box, next to it.
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(0.0, -20.0, 0.0), -60.0),
+            -51.0
+        );
+        assert_eq!(
+            hidden_height(min, max, Vec3::new(0.0, -20.0, 0.0), -50.0),
+            -51.0
+        );
     }
 
     /// The shader is the rule above: the same steps, in the same order.
@@ -992,7 +1126,8 @@ mod tests {
             "i = select(i, ti, snap_x);",
             "j = select(j, tj, snap_z);",
             "height(base, i, j) - frame.anchor.y - tile.skirt,",
-            "world.y = select(params.hole_min.y - 1.0, params.hole_max.y + 1.0, eye_inside);",
+            // `hidden_height`, worked out on the CPU (`FarTerrain::prepare`).
+            "world.y = params.hole_min.w;",
         ] {
             assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
         }
@@ -1019,5 +1154,25 @@ mod tests {
             vec![2, 3]
         );
         assert!(slots_to_draw(false, &boxes, &frustum, None, Vec3::ZERO).is_empty());
+    }
+
+    /// The ground that decides where hidden vertices go is the ground over
+    /// the box, lowest skirt and all -- not ground a kilometre beyond it.
+    #[test]
+    fn the_lowest_ground_is_looked_for_over_the_box_only() {
+        let b = |x: f32, low: f32| {
+            Some(Aabb {
+                min: Vec3::new(x, low, 0.0),
+                max: Vec3::new(x + 10.0, 500.0, 10.0),
+            })
+        };
+        let hole = Aabb {
+            min: Vec3::new(-100.0, 40.0, -100.0),
+            max: Vec3::new(100.0, 900.0, 100.0),
+        };
+        //           over it      crossing its side  beyond it     free slot
+        let boxes = [b(0.0, 70.0), b(95.0, 55.0), b(300.0, -20.0), None];
+        assert_eq!(lowest_over(&boxes, &hole), 55.0);
+        assert_eq!(lowest_over(&boxes[2..], &hole), f32::INFINITY);
     }
 }

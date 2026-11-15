@@ -200,7 +200,7 @@ fn triangles(
     patch: &PatchHeights,
     hole: (Vec3, Vec3),
     view_proj: glam::Mat4,
-    eye: Vec3,
+    (eye, hidden): (Vec3, f32),
     out: &mut Vec<Triangle>,
     census: &mut Census,
 ) {
@@ -235,7 +235,7 @@ fn triangles(
                         );
                     }
                     cubara_render::far::Join::Hidden => {
-                        p.y = cubara_render::far::hidden_height(hole.0, hole.1, eye);
+                        p.y = hidden;
                     }
                 }
             }
@@ -360,6 +360,18 @@ fn census_at(gen: &WorldGen, gate_eye: &GateEye) -> (FarView, Census) {
         Vec3::from(hole.max.map(|v| v as f32)),
     );
     let in_hole = |b: &Aabb| hole_f32.0.cmple(b.min).all() && b.max.cmple(hole_f32.1).all();
+    // Where the hidden vertices go, as `FarTerrain::prepare` works it out.
+    let hole_box = Aabb {
+        min: hole_f32.0,
+        max: hole_f32.1,
+    };
+    let held: Vec<Option<Aabb>> = boxes.iter().copied().map(Some).collect();
+    let hidden = cubara_render::far::hidden_height(
+        hole_f32.0,
+        hole_f32.1,
+        Vec3::from(eye),
+        cubara_render::far::lowest_over(&held, &hole_box),
+    );
 
     let aspect = SIZE.0 as f32 / SIZE.1 as f32;
     let eye_v = Vec3::from(eye);
@@ -378,7 +390,14 @@ fn census_at(gen: &WorldGen, gate_eye: &GateEye) -> (FarView, Census) {
             }
             census.patches += 1.0;
             tris.clear();
-            triangles(p, hole_f32, view_proj, eye_v, &mut tris, &mut census);
+            triangles(
+                p,
+                hole_f32,
+                view_proj,
+                (eye_v, hidden),
+                &mut tris,
+                &mut census,
+            );
             for t in &tris {
                 census.all.add(t);
                 let octave = t.distance.max(1.0).log2().floor() as i32;

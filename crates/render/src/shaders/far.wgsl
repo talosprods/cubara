@@ -37,6 +37,7 @@ struct Patch {
 struct Params {
     // The box the voxel rings draw themselves: nothing here is drawn inside
     // it. Relative to the render anchor, like every position here.
+    // `hole_min.w`: the height vertices hidden inside it are sent to.
     hole_min: vec4<f32>,
     hole_max: vec4<f32>,
     // What the ground is made of, in linear light (`aggregate::Materials`):
@@ -130,14 +131,14 @@ fn vs_main(
             );
         } else {
             // Everything deeper goes where the eye sees only its underside,
-            // which is culled: above the box for an eye inside it -- the
-            // game's, always -- and under it otherwise. Sinking it under the
+            // which is culled: above the box for an eye inside it with all
+            // the ground above the box's floor, and under it otherwise
+            // (`far::hidden_height`, which is worked out once a frame on the
+            // CPU because it needs to know the ground). Sinking it under the
             // box whatever the eye, as this used to, hung a wall from the
             // surface to the box's floor a kilometre away on every side: the
             // owner's curtain underground (issue #424).
-            let eye_inside = all(frame.eye.xyz > params.hole_min.xyz)
-                && all(frame.eye.xyz < params.hole_max.xyz);
-            world.y = select(params.hole_min.y - 1.0, params.hole_max.y + 1.0, eye_inside);
+            world.y = params.hole_min.w;
         }
     }
     // The surface's slope from the neighbouring heights, one-sided at the edge.
