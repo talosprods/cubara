@@ -19,6 +19,8 @@ mod bench;
 mod caps;
 mod capture;
 #[cfg(test)]
+mod consistency_probe;
+#[cfg(test)]
 mod far_census;
 mod far_streaming;
 mod flight;

@@ -33,7 +33,9 @@ mod trees;
 mod uploads;
 
 pub use anchor::Anchor;
-pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
+pub use arena::{
+    faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId, CAPACITY as ARENA_CAPACITY,
+};
 pub use culling::{Aabb, Frustum};
 pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
