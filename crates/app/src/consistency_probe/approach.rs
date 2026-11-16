@@ -214,8 +214,6 @@ pub fn render_normal(setup: &Setup, scene: &Scene, peak: [i32; 3]) -> Option<(Fr
 pub struct Row {
     pub band: String,
     pub distance: f64,
-    /// What draws the peak in (a).
-    pub normal: Rep,
     /// The level forced for (b).
     pub truth: u32,
     pub metrics: Metrics,
@@ -270,7 +268,6 @@ pub fn run_step(
         row: Row {
             band: step.band.clone(),
             distance: step.distance,
-            normal: rep,
             truth,
             metrics,
             stone_normal: share_normal.stone,
