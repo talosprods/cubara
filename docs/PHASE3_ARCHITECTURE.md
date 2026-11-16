@@ -390,30 +390,59 @@ case), steep mountain faces and cliffs, drawn by a printed seed, not picked:
   colour per face direction, /255 in linear light as `t3_coarse_ao.rs` has
   always measured it), and **the stone share** per direction.
 
+- **The reference is the surface; caves are a separate term** (review of
+  #428, finding B1). What the sky sees is split on level 0's own columns:
+  the *surface* term is the faces over ground whose level-0 columns all
+  stand at the height field, and the *cave* term is the faces of, or
+  facing, ground where a cave has carved a column's top away (the floor of
+  a cave mouth and the walls it bares). **Every level is held to the
+  surface term, and only to it.** The cave term is reported and never
+  asserted, because the levels differ there by design: level 0 draws every
+  cave mouth, a coarse cell is cave where most of it is and only within
+  `DISTANT_CAVE_DEPTH` of the surface, the far terrain draws none. A cave
+  mouth is detail. It is 4 to 12% of level 0's sky-visible area and more
+  than half stone, so counted in with the surface it made a steep slope
+  look 4.0% stone where its surface is 0.1%.
+- **Per footprint, not only pooled** (finding B3): every comparison is made
+  footprint by footprint, the report prints the worst single footprint
+  beside each pooled number, and the assertions hold the worst footprint.
+
 `consistency_report` (ignored; `cargo test -p cubara-render --test
 lod_consistency -- --ignored --nocapture consistency_report`) prints all of
-it. **Before** (main at `4fe57c4`, pooled over ten footprints a kind):
+it. **Before** (main at `4fe57c4`; the surface term, pooled over ten
+footprints a kind, with the worst single footprint in brackets):
 
-| steep mountain | L1 | L2 | L3 | far, quad 8 | far, quad 32 |
-|---|---|---|---|---|---|
-| stone share of side faces (level 0: 4.0%) | 10.1% | 34.0% | 44.4% | 0.0% | 0.0% |
-| T3, tops (+Y), /255 | 6.7 | 10.9 | 14.0 | 17.3 | 17.3 |
-| T3, worst side direction, /255 | 2.0 | 8.2 | 10.8 | 3.9 | 5.1 |
-| peak, blocks | -1.3 | -2.6 | -5.7 | -3.6 | -17.1 |
-| skyline, mean, blocks | -1.2 | -2.2 | -4.0 | -2.4 | -12.5 |
+| steep mountain | L1 | L2 | L3 | far, quad 8 |
+|---|---|---|---|---|
+| stone share of side faces (level 0: 0.1%) | 6.6% | 30.3% | 39.7% | 0.0% |
+| T3, tops (+Y), /255 | 6.9 (7.9) | 11.2 (12.6) | 14.1 (15.3) | 16.4 (18.0) |
+| T3, worst side direction, /255 | 2.0 (4.3) | 8.1 (13.9) | 10.4 (15.7) | 4.4 (6.2) |
+| peak, blocks | -1.3 | -2.6 | -5.7 | -3.9 |
+| skyline, mean, blocks | -1.2 | -2.2 | -4.0 | -2.7 |
 
 | | L1 | L2 | L3 |
 |---|---|---|---|
-| stone share of sides, cliffs (level 0: 2.8%) | 14.0% | 40.0% | 49.8% |
-| stone share of sides, gentle slope (level 0: 6.2%) | 7.1% | 11.9% | 16.7% |
-| T3 tops, gentle slope | 2.5 | 5.4 | 7.8 |
-| T3 tops, rolling hills | 0.3 | 1.3 | 3.5 |
+| stone share of sides, cliffs (level 0: 0.7%) | 11.2% | 37.8% | 47.1% |
+| stone share of sides, gentle slope (level 0: 0.0%) | 0.0% | 4.0% | 9.5% |
+| T3 tops, gentle slope | 2.5 (4.4) | 5.3 (8.0) | 8.0 (10.4) |
+| T3 tops, rolling hills | 0.25 (0.4) | 1.2 (1.5) | 3.6 (4.0) |
 
-On the rolling hills level 1 is within 2/255 in every direction; that is the
-one thing the harness asserts of today's coarse levels
-(`level_1_matches_level_0_on_the_rolling_hills`). The existing T3
-(`t3_coarse_ao.rs`) passes because it samples around the origin, which
-`MOUNTAIN_SEED_MIX` keeps in the hills.
+The cave term, for the record (share of each level's sky-visible area on or
+beside carved ground, steep mountain): level 0 5.8%, L1 7.8%, L2 12.6%, L3
+23.2% -- it grows with the cell, since one carved column puts its whole cell
+there -- and 65% of level 0's cave side faces are stone.
+
+On the rolling hills level 1 is within 2/255 in every direction of every
+single footprint (worst 0.59); that is the one thing the harness asserts of
+today's coarse levels (`level_1_matches_level_0_on_the_rolling_hills`). The
+existing T3 (`t3_coarse_ao.rs`) passes because it samples around the
+origin, which `MOUNTAIN_SEED_MIX` keeps in the hills.
+
+**The measurement is itself seen to fail** (finding B2): non-ignored tests
+go red when the level-0 reference is swapped for a coarse level, when every
+face is lit as a top (`level_0_draws_its_surface`), and when a far row's
+riser direction is swapped or its tops are shifted
+(`the_far_rows_follow_the_ground`).
 
 ### 9.3 The rule
 

@@ -46,31 +46,72 @@ const T3_TOLERANCE: f64 = 2.0;
 /// indication rather than a statistic.
 const FAR_LEVELS: [u32; 7] = [0, 1, 2, 3, 4, 5, 6];
 
-/// One representation's pooled numbers for one kind of terrain.
+/// A direction of one footprint is ranked, and held to a tolerance, only
+/// with this much face area on both sides of the comparison, in square
+/// blocks: a handful of faces is not a colour. **Chosen, not derived.**
+const MIN_AREA: f64 = 64.0;
+
+/// One footprint's numbers for one representation, against level 0.
+struct Compared {
+    /// T3 per direction on the surface term, /255; `None` where either side
+    /// has under [`MIN_AREA`] of faces that way.
+    delta: [Option<f64>; 5],
+    shape: Shape,
+}
+
+fn compare(setup: &Setup, fp: Footprint, level0: &Measure, other: &Measure) -> Compared {
+    let mut delta = [None; 5];
+    for (d, slot) in delta.iter_mut().enumerate() {
+        if level0.faces.area[d] >= MIN_AREA && other.faces.area[d] >= MIN_AREA {
+            *slot = Some(colour_delta(
+                level0.faces.mean_lit(d).expect("area"),
+                other.faces.mean_lit(d).expect("area"),
+            ));
+        }
+    }
+    Compared {
+        delta,
+        shape: Shape::of(&height_field(&setup.gen, fp), other),
+    }
+}
+
+/// One representation's numbers for one kind of terrain: pooled over its
+/// footprints, and the worst single footprint beside each (review of #428,
+/// finding B3: a pooled mean can hide a footprint that is far off).
 #[derive(Clone, Default)]
 struct Pool {
+    /// The surface term: level 0's, and this representation's.
     level0: Faces,
     faces: Faces,
+    /// The cave term, reported only.
+    cave_level0: Faces,
+    cave: Faces,
     shape: Shape,
     /// The worst single footprint's colour difference per direction.
     worst_delta: [f64; 5],
+    /// The worst single footprint's shape: the largest magnitude of the
+    /// mean column difference, the largest mean skyline distance, the
+    /// largest peak difference.
+    worst_column: f64,
+    worst_skyline: f64,
+    worst_peak: f64,
 }
 
 impl Pool {
     fn add(&mut self, setup: &Setup, fp: Footprint, level0: &Measure, other: &Measure) {
         self.level0.add(&level0.faces);
         self.faces.add(&other.faces);
-        self.shape
-            .add(&Shape::of(&height_field(&setup.gen, fp), other));
+        self.cave_level0.add(&level0.cave);
+        self.cave.add(&other.cave);
+        let one = compare(setup, fp, level0, other);
         for d in 0..5 {
-            if let (Some(a), Some(b)) = (level0.faces.mean_lit(d), other.faces.mean_lit(d)) {
-                // A direction with a handful of faces in one footprint says
-                // little: only directions with a real area are ranked.
-                if level0.faces.area[d] >= 64.0 && other.faces.area[d] >= 64.0 {
-                    self.worst_delta[d] = self.worst_delta[d].max(colour_delta(a, b));
-                }
-            }
+            self.worst_delta[d] = self.worst_delta[d].max(one.delta[d].unwrap_or(0.0));
         }
+        let finite = |v: f64| if v.is_nan() { 0.0 } else { v.abs() };
+        self.worst_column = self.worst_column.max(finite(spread(&one.shape.column).0));
+        self.worst_skyline = self.worst_skyline.max(finite(spread(&one.shape.skyline).1));
+        self.worst_peak = self.worst_peak.max(finite(spread(&one.shape.peak).0));
+        self.shape.add(&one.shape);
     }
 
     /// The pooled colour difference of direction `d`, on the 0-255 scale.
@@ -112,7 +153,7 @@ type Pools = std::collections::BTreeMap<(Terrain, Rep), Pool>;
 fn measure_all(setup: &Setup, footprints: &[(Terrain, Footprint)], reps: &[Rep]) -> Pools {
     let mut pools = Pools::new();
     for &(kind, fp) in footprints {
-        let level0 = measure_voxels(setup, fp, 0);
+        let level0 = reference(setup, fp);
         for &rep in reps {
             let other = match rep {
                 Rep::Voxel(l) => measure_voxels(setup, fp, l),
@@ -128,6 +169,14 @@ fn measure_all(setup: &Setup, footprints: &[(Terrain, Footprint)], reps: &[Rep])
     pools
 }
 
+/// **The reference every representation is compared with: level 0**, the
+/// game's own chunks at full detail, as the game meshes them. Its surface
+/// term is what is asserted against; `level_0_draws_its_surface` holds this
+/// very function to the world, block by block.
+fn reference(setup: &Setup, fp: Footprint) -> Measure {
+    measure_voxels(setup, fp, 0)
+}
+
 fn percent(v: Option<f64>) -> String {
     v.map_or("    -".into(), |v| format!("{:5.1}", v * 100.0))
 }
@@ -135,24 +184,38 @@ fn percent(v: Option<f64>) -> String {
 fn report(pools: &Pools) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
+    let models = |r: &Rep| matches!(r, Rep::Stepped(..));
     for kind in TERRAINS {
         let rows: Vec<_> = pools.iter().filter(|((k, _), _)| *k == kind).collect();
         let Some((_, first)) = rows.first() else {
             continue;
         };
+        let sides = |f: &Faces| f.area[1..].iter().sum::<f64>();
+        let all = |f: &Faces| f.area.iter().sum::<f64>();
         writeln!(s, "\n== {kind:?} ==").unwrap();
         writeln!(
             s,
-            "level 0: stone share of sides {}%, of all faces {}%; side area per unit of ground {:.3}",
+            "level 0, SURFACE (the reference): stone share of sides {}%, of all faces {}%; side area per unit of ground {:.3}",
             percent(first.level0.side_share(STONE)),
             percent(first.level0.total_share(STONE)),
-            first.level0.area[1..].iter().sum::<f64>() / first.level0.area[0],
+            sides(&first.level0) / first.level0.area[0],
         )
         .unwrap();
-        writeln!(s, "\n  shape, drawn - level 0, in blocks").unwrap();
         writeln!(
             s,
-            "  {:<24} {:>30} {:>30} {:>14}",
+            "level 0, CAVES (reported, not asserted): {:.1}% of the sky-visible area is on or beside carved ground; stone share of its sides {}%",
+            all(&first.cave_level0) * 100.0 / (all(&first.level0) + all(&first.cave_level0)),
+            percent(first.cave_level0.side_share(STONE)),
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "\n  shape, drawn - level 0's height field, in blocks; pooled, then the worst single footprint"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "  {:<24} {:>30} {:>30} {:>14}   worst: |column mean| skyline peak",
             "", "column: mean |mean| p95 max", "skyline: mean |mean| p95 max", "peak: mean max"
         )
         .unwrap();
@@ -164,22 +227,20 @@ fn report(pools: &Pools) -> String {
             );
             writeln!(
                 s,
-                "  {:<24} {:>+7.2} {:>6.2} {:>6.2} {:>7.2} {:>+8.2} {:>6.2} {:>6.2} {:>7.2} {:>+7.2} {:>6.2}{}",
+                "  {:<24} {:>+7.2} {:>6.2} {:>6.2} {:>7.2} {:>+8.2} {:>6.2} {:>6.2} {:>7.2} {:>+7.2} {:>6.2}   {:>6.2} {:>6.2} {:>6.2}{}",
                 rep.to_string(),
                 c.0, c.1, c.2, c.3, k.0, k.1, k.2, k.3, pk.0, pk.3,
+                p.worst_column, p.worst_skyline, p.worst_peak,
                 if p.shape.undrawn > 0 { format!("  ({} columns undrawn)", p.shape.undrawn) } else { String::new() },
             )
             .unwrap();
         }
         writeln!(
             s,
-            "\n  T3: lit colour against level 0 per direction, /255 pooled (worst footprint); area / level 0's"
+            "\n  T3 on the surface: lit colour against level 0 per direction, /255 pooled (worst footprint); area / level 0's"
         )
         .unwrap();
-        for ((_, rep), p) in rows
-            .iter()
-            .filter(|((_, r), _)| !matches!(r, Rep::Stepped(..)))
-        {
+        for ((_, rep), p) in rows.iter().filter(|((_, r), _)| !models(r)) {
             write!(s, "  {:<24}", rep.to_string()).unwrap();
             for d in 0..5 {
                 match p.delta(d) {
@@ -199,13 +260,10 @@ fn report(pools: &Pools) -> String {
         }
         writeln!(
             s,
-            "\n  stone share, % of area: level 0 -> this level, per direction; then all sides, all faces"
+            "\n  stone share on the surface, % of area: level 0 -> this level, per direction; all sides; all faces; then the cave term's share of this level's area"
         )
         .unwrap();
-        for ((_, rep), p) in rows
-            .iter()
-            .filter(|((_, r), _)| !matches!(r, Rep::Stepped(..)))
-        {
+        for ((_, rep), p) in rows.iter().filter(|((_, r), _)| !models(r)) {
             write!(s, "  {:<24}", rep.to_string()).unwrap();
             for d in 1..5 {
                 write!(
@@ -219,11 +277,13 @@ fn report(pools: &Pools) -> String {
             }
             writeln!(
                 s,
-                "  sides {}->{}  all {}->{}",
+                "  sides {}->{}  all {}->{}  caves {:.1}% (stone of sides {}%)",
                 percent(p.level0.side_share(STONE)),
                 percent(p.faces.side_share(STONE)),
                 percent(p.level0.total_share(STONE)),
                 percent(p.faces.total_share(STONE)),
+                all(&p.cave) * 100.0 / (all(&p.faces) + all(&p.cave)),
+                percent(p.cave.side_share(STONE)),
             )
             .unwrap();
         }
@@ -354,7 +414,16 @@ fn level_0_draws_its_surface() {
     );
     let mut grassy = 0;
     for (kind, fp) in footprints {
-        let m = measure_voxels(&setup, fp, 0);
+        // Through `reference`, the function every comparison takes level 0
+        // from: this test is what says that reference IS level 0.
+        let terms = reference(&setup, fp);
+        // Everything the sky sees, surface and caves together, for the
+        // counts against the world; the two terms are held apart below.
+        let m = {
+            let mut all = terms.clone();
+            all.faces.add(&terms.cave);
+            all
+        };
         let field = height_field(&setup.gen, fp);
         let (mut carved, mut drawn) = (0, 0);
         for (top, surface) in m.tops.iter().zip(&field.tops) {
@@ -443,6 +512,53 @@ fn level_0_draws_its_surface() {
         } else {
             assert_eq!(sides, expected, "{kind:?} {fp:?}: side faces");
         }
+
+        // **The two terms.** The surface term is the uncarved columns'
+        // faces: one grass top each, nothing else on top...
+        let uncarved = setup.carved(fp).iter().filter(|c| !**c).count();
+        assert_eq!(terms.faces.area[0], uncarved as f64, "{kind:?} {fp:?}");
+        assert_eq!(
+            terms.faces.material[0][SURFACE], terms.faces.area[0],
+            "{kind:?} {fp:?}: a surface top that is not the surface block"
+        );
+        // ...and every side face is lit as a side: its own layers' colours
+        // under the light of its own direction, darkened by AO and by
+        // nothing else. (Lit as a top it would be 1.8 to 3 times this.)
+        for (d, face) in DIRECTIONS.iter().enumerate().skip(1) {
+            let f = &terms.faces;
+            if f.area[d] < MIN_AREA {
+                continue;
+            }
+            let light = face_light(Vec3::from(face.normal()), &setup.lighting);
+            let colours = [
+                setup.far_materials.stone,
+                setup.far_materials.soil,
+                setup.far_materials.side,
+            ];
+            for c in 0..3 {
+                let unshaded: f64 = [STONE, SOIL, SURFACE]
+                    .iter()
+                    .map(|&m| f.material[d][m] * (colours[m][c] * light[c]) as f64)
+                    .sum();
+                let floor = setup.lighting.ao_floor as f64;
+                assert!(
+                    f.lit[d][c] <= unshaded * 1.001 && f.lit[d][c] >= unshaded * floor,
+                    "{kind:?} {fp:?}: {} faces lit {} against {unshaded} unshaded",
+                    direction_name(d),
+                    f.lit[d][c]
+                );
+            }
+        }
+        // The claim the split rests on: a steep slope's *surface* is almost
+        // stone-free, and its stone is in the cave mouths.
+        if kind == Terrain::Steep {
+            let stone = terms.faces.side_share(STONE).unwrap_or(0.0);
+            assert!(
+                stone < 0.02,
+                "{kind:?} {fp:?}: {:.1}% of the surface's sides are stone",
+                stone * 100.0
+            );
+        }
     }
     assert!(grassy >= 2, "only {grassy} footprints with all-grass tops");
 }
@@ -527,6 +643,7 @@ fn shape_is_the_difference_in_blocks() {
     let n = (FOOTPRINT * FOOTPRINT) as usize;
     let flat = |h: f64| Measure {
         faces: Faces::default(),
+        cave: Faces::default(),
         tops: vec![h; n],
     };
     let raised = Shape::of(&flat(10.0), &flat(12.0));
@@ -549,27 +666,111 @@ fn shape_is_the_difference_in_blocks() {
 }
 
 /// **What already holds today**, pinned so the fix cannot lose it: on the
-/// rolling hills level 1 shows level 0's colours in every direction, within
-/// T3's 2/255. (Levels 2 and 3, and every level on a slope, do not: that is
+/// rolling hills level 1 shows level 0's surface colours in every direction
+/// -- **in every single footprint**, not only pooled (review of #428,
+/// finding B3), within [`T3_HILLS_PER_FOOTPRINT`]; and pooled within T3's
+/// 2/255. (Levels 2 and 3, and every level on a slope, do not: that is
 /// issue #423, and `consistency_report` has the numbers.)
 #[test]
 fn level_1_matches_level_0_on_the_rolling_hills() {
+    /// T3's own 2/255 holds footprint by footprint here: the worst single
+    /// footprint and direction measured on this seed is 0.59.
+    const T3_HILLS_PER_FOOTPRINT: f64 = T3_TOLERANCE;
     let setup = Setup::new();
     let footprints: Vec<_> = draw_footprints(&setup.gen, FOOTPRINT_SEED, PER_KIND)
         .into_iter()
         .filter(|(k, _)| *k == Terrain::Flat)
         .collect();
     assert_eq!(footprints.len(), PER_KIND, "seed {FOOTPRINT_SEED:#x}");
+    let (mut worst, mut checked) = (0f64, 0);
+    for &(_, fp) in &footprints {
+        let level0 = reference(&setup, fp);
+        let one = compare(&setup, fp, &level0, &measure_voxels(&setup, fp, 1));
+        for (d, delta) in one.delta.iter().enumerate() {
+            let Some(delta) = *delta else {
+                continue;
+            };
+            checked += 1;
+            worst = worst.max(delta);
+            assert!(
+                delta <= T3_HILLS_PER_FOOTPRINT,
+                "level 1, {fp:?}, {}: {delta:.2}/255 off level 0 (seed {FOOTPRINT_SEED:#x})",
+                direction_name(d)
+            );
+        }
+    }
+    println!("level 1 on the hills: worst footprint and direction {worst:.2}/255 of {checked}");
+    assert!(
+        checked >= 2 * PER_KIND,
+        "only {checked} directions had the area"
+    );
     let pools = measure_all(&setup, &footprints, &[Rep::Voxel(1)]);
     let pool = &pools[&(Terrain::Flat, Rep::Voxel(1))];
     for d in 0..5 {
         let delta = pool.delta(d).expect("faces in every direction");
         assert!(
             delta <= T3_TOLERANCE,
-            "level 1, {}: {delta:.2}/255 off level 0 (seed {FOOTPRINT_SEED:#x})",
+            "level 1, {}, pooled: {delta:.2}/255 off level 0 (seed {FOOTPRINT_SEED:#x})",
             direction_name(d)
         );
     }
+}
+
+/// **The far rows measure the far terrain, not something beside it**
+/// (review of #428, finding B2). Two things a wrong far measurement would
+/// get wrong, each held on every steep footprint (that the reference it
+/// is compared with is level 0 is `level_0_draws_its_surface`'s to hold):
+///
+/// - its tops follow the ground: at quads of four blocks the mean drawn top
+///   is within [`FAR_TOP`] blocks of the height field's;
+/// - its risers face downhill: where level 0's risers along an axis face one
+///   way at least twice as much as the other, the far terrain's larger share
+///   faces the same way.
+#[test]
+fn the_far_rows_follow_the_ground() {
+    /// **Chosen, not derived**: three times the largest magnitude measured
+    /// on this seed's steep footprints (0.16).
+    const FAR_TOP: f64 = 0.5;
+    let setup = Setup::new();
+    let footprints: Vec<_> = draw_footprints(&setup.gen, FOOTPRINT_SEED, PER_KIND)
+        .into_iter()
+        .filter(|(k, _)| *k == Terrain::Steep)
+        .collect();
+    assert_eq!(footprints.len(), PER_KIND, "seed {FOOTPRINT_SEED:#x}");
+    let (mut worst_top, mut axes, mut top_gap) = (0f64, 0, 0f64);
+    for &(_, fp) in &footprints {
+        let level0 = reference(&setup, fp);
+        let far = measure_far(&setup, fp, 2);
+        let one = compare(&setup, fp, &level0, &far);
+        let (mean, ..) = spread(&one.shape.column);
+        worst_top = worst_top.max(mean.abs());
+        assert!(
+            mean.abs() <= FAR_TOP,
+            "{fp:?}: the far tops stand {mean:+.2} blocks off the ground (seed {FOOTPRINT_SEED:#x})"
+        );
+        for (plus, minus) in [(1, 2), (3, 4)] {
+            let (a, b) = (level0.faces.area[plus], level0.faces.area[minus]);
+            if a.max(b) < 4.0 * MIN_AREA || a.max(b) < 2.0 * a.min(b) {
+                continue;
+            }
+            axes += 1;
+            let (fa, fb) = (far.faces.area[plus], far.faces.area[minus]);
+            assert_eq!(
+                a > b,
+                fa > fb,
+                "{fp:?}: level 0's risers face {} ({a} against {b}), the far terrain's the other way ({fa} against {fb})",
+                direction_name(if a > b { plus } else { minus })
+            );
+        }
+        if let Some(delta) = one.delta[0] {
+            top_gap = top_gap.max(delta);
+        }
+    }
+    println!("far, quads of 4: worst mean top {worst_top:.2} blocks; {axes} axes checked; tops up to {top_gap:.1}/255 off level 0's");
+    assert!(
+        axes >= PER_KIND,
+        "only {axes} axes had a clear downhill side"
+    );
 }
 
 /// **`WorldGen::ground_faces` is what the level-0 mesher draws.** The far

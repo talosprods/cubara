@@ -10,11 +10,28 @@
 //!
 //! **Only what the sky can see is counted**: a top face is counted where it
 //! is the highest in its column, and a side face where the cell in front of
-//! it is above that column's top. That leaves out cave walls, which level 0
-//! has at every depth and a coarse node only near the surface
-//! (`DISTANT_CAVE_DEPTH`), and the undersides. It is the ground a player
-//! approaching a mountain is looking at, and it is judged per level against
-//! that level's own drawn tops, so no level is filtered by another's shape.
+//! it is above that column's top, each level judged against its own drawn
+//! tops. That leaves out the undersides and every cave wall the sky cannot
+//! reach.
+//!
+//! **What is counted is then split in two, and only the first is the
+//! reference** (review of #428, finding B1):
+//!
+//! - **the surface** ([`Measure::faces`]): faces over ground whose level-0
+//!   columns all stand at the height field (`surface_height`). This is the
+//!   term every level is held to. On it level 0 is the height field's faces
+//!   exactly -- `WorldGen::ground_faces` -- and almost stone-free on a slope.
+//! - **the caves** ([`Measure::cave`]): faces of a cell, or facing a cell,
+//!   under which a cave has carved some level-0 column's top away -- the
+//!   floor of a cave mouth and the walls it bares. Reported, never asserted.
+//!   A cave mouth is detail: level 0 draws every one, a coarse cell is cave
+//!   where most of it is (`WorldGen::cave_at`) and only near the surface, the
+//!   far terrain draws none. Counted in with the surface, level 0's pits
+//!   made a steep slope look 4% stone where its surface is 0.1%, and every
+//!   coarse level was being compared with that.
+//!
+//! The split is made on level 0's columns for every representation alike
+//! ([`Setup::carved`]), so each level's surface term covers the same ground.
 //!
 //! Side faces on the footprint's own boundary are left out at every level:
 //! what stands in front of them is outside the footprint. The boundary is a
@@ -279,7 +296,11 @@ pub fn colour_delta(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// One representation of one footprint.
 #[derive(Clone, Debug)]
 pub struct Measure {
+    /// The surface term: the reference, and what is asserted.
     pub faces: Faces,
+    /// The cave term: faces on or beside ground a cave has carved at level
+    /// 0. Reported only.
+    pub cave: Faces,
     /// The drawn top face's height over each level-0 column, row by row (`z`
     /// outer): `surface + 1` at level 0. `NaN` where nothing is drawn.
     pub tops: Vec<f64>,
@@ -290,6 +311,9 @@ impl Measure {
         self.tops[(j * FOOTPRINT + i) as usize]
     }
 }
+
+/// Per footprint (by its corner), which of its level-0 columns are carved.
+type CarvedMasks = HashMap<(i32, i32), std::rc::Rc<Vec<bool>>>;
 
 /// What the harness needs of the game's data, loaded once.
 pub struct Setup {
@@ -305,6 +329,8 @@ pub struct Setup {
     /// Each layer's material: [`STONE`], [`SOIL`] or [`SURFACE`].
     materials: Vec<Option<usize>>,
     pub far_materials: Materials,
+    /// Per footprint, which level-0 columns a cave has carved ([`Setup::carved`]).
+    carved: std::cell::RefCell<CarvedMasks>,
 }
 
 impl Setup {
@@ -345,7 +371,21 @@ impl Setup {
             colours,
             materials,
             far_materials: cubara_render::far::ground_materials(SOIL_DEPTH as f32),
+            carved: Default::default(),
         }
+    }
+
+    /// Which level-0 columns of `fp` a cave has carved, row by row (`z`
+    /// outer): those whose drawn top is not `surface_height + 1`, or that
+    /// draw nothing near it. From the real level-0 chunks, once per
+    /// footprint; every representation's faces are split on it.
+    pub fn carved(&self, fp: Footprint) -> std::rc::Rc<Vec<bool>> {
+        if let Some(mask) = self.carved.borrow().get(&(fp.x0, fp.z0)) {
+            return mask.clone();
+        }
+        // Measuring level 0 works the mask out and files it.
+        measure_voxels(self, fp, 0);
+        self.carved.borrow()[&(fp.x0, fp.z0)].clone()
     }
 
     pub fn layer_of(&self, name: &str) -> u32 {
@@ -460,7 +500,30 @@ pub fn measure_voxels_within(
         }
     }
 
+    // The ground a cave has carved, from level 0's columns: level 0 finds
+    // it in its own tops (and files it for the other levels), every other
+    // representation asks for it.
+    let carved: std::rc::Rc<Vec<bool>> = if level == 0 {
+        let mask: Vec<bool> = (0..FOOTPRINT)
+            .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
+            .map(|(i, j)| {
+                let c = column(fp.x0 + i, fp.z0 + j).expect("inside the footprint");
+                top[c] != Some(setup.gen.surface_height(fp.x0 + i, fp.z0 + j) + 1)
+            })
+            .collect();
+        setup
+            .carved
+            .borrow_mut()
+            .entry((fp.x0, fp.z0))
+            .or_insert_with(|| std::rc::Rc::new(mask))
+            .clone()
+    } else {
+        setup.carved(fp)
+    };
+    let cell_carved = |x: i32, z: i32| any_carved(&carved, fp, x, z, w);
+
     let mut faces = Faces::default();
+    let mut cave = Faces::default();
     for (origin, mesh) in &meshes {
         for quad in mesh.indices.chunks(6) {
             let base = *quad.iter().min().expect("six indices") as usize;
@@ -497,14 +560,15 @@ pub fn measure_voxels_within(
                 [a[0].max(p[0]), a[1].max(p[1]), a[2].max(p[2])]
             });
             // The area of this quad the sky sees, cell by cell.
-            let mut seen = 0f64;
+            // ... on the surface, and on or beside carved ground.
+            let mut seen = [0f64; 2];
             match face {
                 Face::PosY => {
                     for z in (min[2]..max[2]).step_by(w as usize) {
                         for x in (min[0]..max[0]).step_by(w as usize) {
                             if counted(x, z) && column(x, z).is_some_and(|c| top[c] == Some(min[1]))
                             {
-                                seen += (w * w) as f64;
+                                seen[cell_carved(x, z) as usize] += (w * w) as f64;
                             }
                         }
                     }
@@ -537,23 +601,28 @@ pub fn measure_voxels_within(
                             // Open sky in front: the column there is drawn no
                             // higher than this cell's foot (or not at all).
                             if top[f].is_none_or(|t| t <= y) {
-                                seen += (w * v) as f64;
+                                let beside_a_cave =
+                                    cell_carved(own[0], own[2]) || cell_carved(front[0], front[2]);
+                                seen[beside_a_cave as usize] += (w * v) as f64;
                             }
                         }
                     }
                 }
                 Face::NegY => unreachable!("filtered above"),
             }
-            if seen == 0.0 {
-                continue;
-            }
-            faces.area[d] += seen;
-            faces.open[d] += corners.iter().map(|c| c.ao() as f64).sum::<f64>() / 12.0 * seen;
-            for c in 0..3 {
-                faces.lit[d][c] += lit[c] as f64 * ao_mean * seen;
-            }
-            if let Some(m) = setup.materials[layer] {
-                faces.material[d][m] += seen;
+            let open = corners.iter().map(|c| c.ao() as f64).sum::<f64>() / 12.0;
+            for (term, area) in [(&mut faces, seen[0]), (&mut cave, seen[1])] {
+                if area == 0.0 {
+                    continue;
+                }
+                term.area[d] += area;
+                term.open[d] += open * area;
+                for c in 0..3 {
+                    term.lit[d][c] += lit[c] as f64 * ao_mean * area;
+                }
+                if let Some(m) = setup.materials[layer] {
+                    term.material[d][m] += area;
+                }
             }
         }
     }
@@ -565,7 +634,16 @@ pub fn measure_voxels_within(
             top[c].map_or(f64::NAN, |t| t as f64)
         })
         .collect();
-    Measure { faces, tops }
+    Measure { faces, cave, tops }
+}
+
+/// Whether a cave has carved any level-0 column under the `w`-block cell at
+/// `(x, z)` (clipped to the footprint; a cell outside it is not).
+fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
+    (z.max(fp.z0)..(z + w).min(fp.z0 + FOOTPRINT)).any(|cz| {
+        (x.max(fp.x0)..(x + w).min(fp.x0 + FOOTPRINT))
+            .any(|cx| carved[((cz - fp.z0) * FOOTPRINT + (cx - fp.x0)) as usize])
+    })
 }
 
 /// How far above and below a node column's level-0 surface its nodes are
@@ -604,7 +682,9 @@ pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
     };
     debug_assert_eq!((STONE, SOIL, SURFACE), (0, 1, 2));
 
+    let carved = setup.carved(fp);
     let mut faces = Faces::default();
+    let mut cave = Faces::default();
     let quads = (FOOTPRINT as i64 / q).max(1);
     // A quad wider than the footprint is weighed by the footprint's share.
     let ground = (FOOTPRINT as f64 / quads as f64).powi(2);
@@ -614,6 +694,20 @@ pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
             let patch = patch_at(&mut patches, &setup.gen, level, x, z);
             let [ox, oz] = patch.key.origin();
             let (i, j) = (((x - ox) / q) as usize, ((z - oz) / q) as usize);
+            // A quad over ground a cave has carved at level 0 goes to the
+            // cave term, as a voxel cell over it does: the far terrain
+            // draws no cave, and what it draws there is not the surface's.
+            let faces = if any_carved(
+                &carved,
+                fp,
+                x as i32,
+                z as i32,
+                q.min(FOOTPRINT as i64) as i32,
+            ) {
+                &mut cave
+            } else {
+                &mut faces
+            };
             // A quad is drawn with its four vertices' colours blended, so it
             // is weighed as their mean.
             for (vi, vj) in [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)] {
@@ -655,7 +749,7 @@ pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
                 .height_at(x as f64 + 0.5, z as f64 + 0.5)
         })
         .collect();
-    Measure { faces, tops }
+    Measure { faces, cave, tops }
 }
 
 /// The slope `far.wgsl`'s `vs_main` shades vertex `(i, j)` of a patch with:
@@ -717,6 +811,7 @@ pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) 
     }
     Measure {
         faces: Faces::default(),
+        cave: Faces::default(),
         tops,
     }
 }
@@ -748,6 +843,7 @@ pub struct Shape {
 pub fn height_field(gen: &WorldGen, fp: Footprint) -> Measure {
     Measure {
         faces: Faces::default(),
+        cave: Faces::default(),
         tops: (0..FOOTPRINT)
             .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
             .map(|(i, j)| gen.surface_height(fp.x0 + i, fp.z0 + j) as f64 + 1.0)
