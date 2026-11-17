@@ -1981,6 +1981,25 @@ mod tests {
                 );
             }
         }
+        // **Rows of four do not nest exactly** (level 3, `v = 4`): a top is
+        // rounded to the row that holds it, within -1..=+2 blocks of the
+        // exact one. So a level-3 cell can stand a block BELOW the highest
+        // level-2 cell it covers, and up to two above; all four occur.
+        let mut seen = std::collections::BTreeSet::new();
+        for (ox, oz) in GROUND_CORNERS {
+            for (dx, dz) in (0..8).flat_map(|a| (0..8).map(move |b| (a, b))) {
+                let (x0, z0) = (ox.div_euclid(8) * 8 + dx * 8, oz.div_euclid(8) * 8 + dz * 8);
+                let children = [(0, 0), (4, 0), (0, 4), (4, 4)]
+                    .map(|(cx, cz)| gen.cell_top(x0 + cx, z0 + cz, 4, 1));
+                let off = gen.cell_top(x0, z0, 8, 4) - *children.iter().max().unwrap();
+                assert!(
+                    (-1..=2).contains(&off),
+                    "the level-3 cell at ({x0}, {z0}) stands {off} off its highest child"
+                );
+                seen.insert(off);
+            }
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [-1, 0, 1, 2]);
     }
 
     /// The sampled top is the exact one once it samples every column, never

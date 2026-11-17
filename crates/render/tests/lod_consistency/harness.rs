@@ -31,7 +31,19 @@
 //!   coarse level was being compared with that.
 //!
 //! The split is made on level 0's columns for every representation alike
-//! ([`Setup::carved`]), so each level's surface term covers the same ground.
+//! ([`Setup::carved`]), cell by cell: a cell (or a far quad) with one carved
+//! column under it goes to the cave term whole. A wider cell therefore
+//! leaves more ground out -- on a steep slope 6% of level 0's sky-visible
+//! area is cave term, 23% of level 3's -- so **level 0 is measured again for
+//! every comparison, split on the cells of the level it is compared with**
+//! ([`Drawn::measure`]'s `mask`): both sides of a comparison then cover
+//! exactly the same ground (second review of #428, point 1).
+//!
+//! A column is *carved* where level 0 is not the height field: its drawn
+//! top is not `surface_height + 1`, or a block of its side that a lower
+//! neighbour bares is missing (a cave under an intact top opening a hole in
+//! a riser). Everywhere else level 0's faces are the height field's, face
+//! for face and layer for layer, which `level_0_draws_its_surface` asserts.
 //!
 //! Side faces on the footprint's own boundary are left out at every level:
 //! what stands in front of them is outside the footprint. The boundary is a
@@ -376,16 +388,30 @@ impl Setup {
     }
 
     /// Which level-0 columns of `fp` a cave has carved, row by row (`z`
-    /// outer): those whose drawn top is not `surface_height + 1`, or that
-    /// draw nothing near it. From the real level-0 chunks, once per
-    /// footprint; every representation's faces are split on it.
+    /// outer): those whose drawn top is not `surface_height + 1` (or that
+    /// draw nothing near it), and those with a hole in a side a lower
+    /// neighbour bares. From the real level-0 chunks, once per footprint;
+    /// every representation's faces are split on it.
     pub fn carved(&self, fp: Footprint) -> std::rc::Rc<Vec<bool>> {
         if let Some(mask) = self.carved.borrow().get(&(fp.x0, fp.z0)) {
             return mask.clone();
         }
-        // Measuring level 0 works the mask out and files it.
-        measure_voxels(self, fp, 0);
+        // Drawing level 0 works the mask out and files it.
+        draw_voxels(self, fp, 0, &|node| self.world.node_at(node, self.blocks));
         self.carved.borrow()[&(fp.x0, fp.z0)].clone()
+    }
+
+    /// Which level-0 columns of `fp` are in the surface term of a
+    /// representation whose cells are `w` blocks wide, row by row (`z`
+    /// outer): those whose cell stands on ground no cave has carved. The
+    /// split the faces are counted by, for the shape ([`Shape::over`]).
+    pub fn on_the_surface(&self, fp: Footprint, w: i32) -> Vec<bool> {
+        let carved = self.carved(fp);
+        let w = w.clamp(1, FOOTPRINT);
+        (0..FOOTPRINT)
+            .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
+            .map(|(i, j)| !any_carved(&carved, fp, fp.x0 + i / w * w, fp.z0 + j / w * w, w))
+            .collect()
     }
 
     pub fn layer_of(&self, name: &str) -> u32 {
@@ -399,7 +425,8 @@ impl Setup {
 /// A node's generated cells, for whoever stands in for `World::node_at`.
 pub type NodeSource<'a> = &'a dyn Fn(NodeKey) -> Option<NodeChunk>;
 
-/// The voxels of `level` over `fp`, as the game generates and meshes them.
+/// The voxels of `level` over `fp`, as the game generates and meshes them,
+/// split on the level's own cells.
 pub fn measure_voxels(setup: &Setup, fp: Footprint, level: u32) -> Measure {
     measure_voxels_from(setup, fp, level, &|node| {
         setup.world.node_at(node, setup.blocks)
@@ -414,31 +441,30 @@ pub fn measure_voxels_from(
     level: u32,
     source: NodeSource,
 ) -> Measure {
-    measure_voxels_within(setup, fp, level, source, 0)
+    let drawn = draw_voxels(setup, fp, level, source);
+    drawn.measure(setup, 0, drawn.w)
 }
 
-/// [`measure_voxels_from`], counting only the faces of columns at least
-/// `inner` blocks inside the footprint's edge. At `inner = 0` a side face
-/// counts when the column in front of it is in the footprint too; further
-/// in, every face of a counted column has its front column in the footprint,
-/// so nothing is left out -- which is what lets the count be held against
-/// `WorldGen::ground_faces` over the same inner square, face for face.
-pub fn measure_voxels_within(
-    setup: &Setup,
+/// One level's voxels over a footprint, generated and meshed: what
+/// [`Drawn::measure`] counts, as often as there are masks to count it by.
+pub struct Drawn {
     fp: Footprint,
-    level: u32,
-    source: NodeSource,
-    inner: i32,
-) -> Measure {
-    let counted = |x: i32, z: i32| {
-        (fp.x0 + inner..fp.x0 + FOOTPRINT - inner).contains(&x)
-            && (fp.z0 + inner..fp.z0 + FOOTPRINT - inner).contains(&z)
-    };
+    /// A cell's width and height, in blocks.
+    pub w: i32,
+    pub v: i32,
+    /// Each lattice column's drawn top: one above its highest solid cell.
+    top: Vec<Option<i32>>,
+    /// Every node's mesh, with the node's origin.
+    meshes: Vec<([i32; 3], cubara_voxel::Mesh)>,
+}
+
+/// Generate and mesh the voxels of `level` over `fp`, the nodes' cells from
+/// `source`.
+pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource) -> Drawn {
     let probe = NodeKey::new(level, [0, 0, 0]);
     let (w, v) = (probe.extent_chunks(), probe.cell_height_blocks());
     let node_size = 16 * w;
     let cells = FOOTPRINT / w;
-    // Each lattice column's drawn top: one above its highest solid cell.
     let mut top: Vec<Option<i32>> = vec![None; (cells * cells) as usize];
     let column = |x: i32, z: i32| -> Option<usize> {
         fp.holds(x, z)
@@ -500,141 +526,207 @@ pub fn measure_voxels_within(
         }
     }
 
-    // The ground a cave has carved, from level 0's columns: level 0 finds
-    // it in its own tops (and files it for the other levels), every other
-    // representation asks for it.
-    let carved: std::rc::Rc<Vec<bool>> = if level == 0 {
+    // The ground a cave has carved, from level 0's own columns: found here
+    // and filed for every representation's split.
+    if level == 0 {
         let mask: Vec<bool> = (0..FOOTPRINT)
             .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
             .map(|(i, j)| {
-                let c = column(fp.x0 + i, fp.z0 + j).expect("inside the footprint");
-                top[c] != Some(setup.gen.surface_height(fp.x0 + i, fp.z0 + j) + 1)
+                let (x, z) = (fp.x0 + i, fp.z0 + j);
+                let surface = setup.gen.surface_height(x, z);
+                if top[column(x, z).expect("inside the footprint")] != Some(surface + 1) {
+                    return true;
+                }
+                // A hole in a side a lower neighbour bares: a cave under an
+                // intact top.
+                let lowest = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .into_iter()
+                    .map(|(dx, dz)| setup.gen.surface_height(x + dx, z + dz))
+                    .min()
+                    .expect("four neighbours");
+                (lowest + 1..surface).any(|y| !setup.world.is_solid_at(x, y, z, setup.blocks))
             })
             .collect();
         setup
             .carved
             .borrow_mut()
             .entry((fp.x0, fp.z0))
-            .or_insert_with(|| std::rc::Rc::new(mask))
-            .clone()
-    } else {
-        setup.carved(fp)
-    };
-    let cell_carved = |x: i32, z: i32| any_carved(&carved, fp, x, z, w);
+            .or_insert_with(|| std::rc::Rc::new(mask));
+    }
+    Drawn {
+        fp,
+        w,
+        v,
+        top,
+        meshes,
+    }
+}
 
-    let mut faces = Faces::default();
-    let mut cave = Faces::default();
-    for (origin, mesh) in &meshes {
-        for quad in mesh.indices.chunks(6) {
-            let base = *quad.iter().min().expect("six indices") as usize;
-            let corners = &mesh.vertices[base..base + 4];
-            let face = corners[0].face();
-            let Some(d) = direction_index(face) else {
-                continue;
-            };
-            let ao: Vec<f64> = corners
-                .iter()
-                .map(|c| ao_fraction(c.ao(), c.ao_width_log2(), setup.lighting.ao_floor) as f64)
-                .collect();
-            // The mean of the two triangles the quad is drawn as: the corners
-            // on the shared diagonal count in both.
-            let ao_mean = if quad[0] as usize == base {
-                (2.0 * (ao[0] + ao[2]) + ao[1] + ao[3]) / 6.0
-            } else {
-                (2.0 * (ao[1] + ao[3]) + ao[0] + ao[2]) / 6.0
-            };
-            let layer = corners[0].tex_layer() as usize;
-            let light = face_light(Vec3::from(face.normal()), &setup.lighting);
-            let lit = setup.colours[layer] * light;
-            let pos = |c: &cubara_voxel::Vertex| {
-                [
-                    origin[0] + c.x() as i32,
-                    origin[1] + c.y() as i32,
-                    origin[2] + c.z() as i32,
-                ]
-            };
-            let min = corners.iter().map(pos).fold([i32::MAX; 3], |a, p| {
-                [a[0].min(p[0]), a[1].min(p[1]), a[2].min(p[2])]
-            });
-            let max = corners.iter().map(pos).fold([i32::MIN; 3], |a, p| {
-                [a[0].max(p[0]), a[1].max(p[1]), a[2].max(p[2])]
-            });
-            // The area of this quad the sky sees, cell by cell.
-            // ... on the surface, and on or beside carved ground.
-            let mut seen = [0f64; 2];
-            match face {
-                Face::PosY => {
-                    for z in (min[2]..max[2]).step_by(w as usize) {
-                        for x in (min[0]..max[0]).step_by(w as usize) {
-                            if counted(x, z) && column(x, z).is_some_and(|c| top[c] == Some(min[1]))
-                            {
-                                seen[cell_carved(x, z) as usize] += (w * w) as f64;
-                            }
-                        }
-                    }
-                }
-                Face::PosX | Face::NegX | Face::PosZ | Face::NegZ => {
-                    let axis = if matches!(face, Face::PosX | Face::NegX) {
-                        0
-                    } else {
-                        2
-                    };
-                    let along = 2 - axis;
-                    let positive = matches!(face, Face::PosX | Face::PosZ);
-                    for a in (min[along]..max[along]).step_by(w as usize) {
-                        // The cell behind the face, and the one in front.
-                        let mut own = [0i32; 3];
-                        let mut front = [0i32; 3];
-                        own[along] = a;
-                        front[along] = a;
-                        own[axis] = if positive { min[axis] - w } else { min[axis] };
-                        front[axis] = if positive { min[axis] } else { min[axis] - w };
-                        let (Some(_), Some(f)) =
-                            (column(own[0], own[2]), column(front[0], front[2]))
-                        else {
-                            continue;
-                        };
-                        if !counted(own[0], own[2]) {
-                            continue;
-                        }
-                        for y in (min[1]..max[1]).step_by(v as usize) {
-                            // Open sky in front: the column there is drawn no
-                            // higher than this cell's foot (or not at all).
-                            if top[f].is_none_or(|t| t <= y) {
-                                let beside_a_cave =
-                                    cell_carved(own[0], own[2]) || cell_carved(front[0], front[2]);
-                                seen[beside_a_cave as usize] += (w * v) as f64;
-                            }
-                        }
-                    }
-                }
-                Face::NegY => unreachable!("filtered above"),
-            }
-            let open = corners.iter().map(|c| c.ao() as f64).sum::<f64>() / 12.0;
-            for (term, area) in [(&mut faces, seen[0]), (&mut cave, seen[1])] {
-                if area == 0.0 {
+/// [`measure_voxels_from`], counting only the faces of columns at least
+/// `inner` blocks inside the footprint's edge. At `inner = 0` a side face
+/// counts when the column in front of it is in the footprint too; further
+/// in, every face of a counted column has its front column in the footprint,
+/// so nothing is left out -- which is what lets the count be held against
+/// `WorldGen::ground_faces` over the same inner square, face for face.
+pub fn measure_voxels_within(
+    setup: &Setup,
+    fp: Footprint,
+    level: u32,
+    source: NodeSource,
+    inner: i32,
+) -> Measure {
+    let drawn = draw_voxels(setup, fp, level, source);
+    drawn.measure(setup, inner, drawn.w)
+}
+
+impl Drawn {
+    /// What the sky sees of these voxels, in the two terms (`harness.rs`'s
+    /// module doc): the faces of columns at least `inner` blocks inside the
+    /// footprint, split on cells `mask` blocks wide -- the level's own width
+    /// for the level itself, and **the width of the level it is compared
+    /// with for level 0**, so that the reference and the level it is held
+    /// against leave out exactly the same ground.
+    pub fn measure(&self, setup: &Setup, inner: i32, mask: i32) -> Measure {
+        let (fp, w, v) = (self.fp, self.w, self.v);
+        assert!(
+            mask >= w && mask % w == 0,
+            "a mask of {mask} blocks cannot split cells of {w}"
+        );
+        let (top, meshes) = (&self.top, &self.meshes);
+        let cells = FOOTPRINT / w;
+        let column = |x: i32, z: i32| -> Option<usize> {
+            fp.holds(x, z)
+                .then(|| (((z - fp.z0) / w) * cells + (x - fp.x0) / w) as usize)
+        };
+        let counted = |x: i32, z: i32| {
+            (fp.x0 + inner..fp.x0 + FOOTPRINT - inner).contains(&x)
+                && (fp.z0 + inner..fp.z0 + FOOTPRINT - inner).contains(&z)
+        };
+        let carved = setup.carved(fp);
+        let mask = mask.min(FOOTPRINT);
+        let cell_carved = |x: i32, z: i32| {
+            let (mx, mz) = (
+                fp.x0 + (x - fp.x0).div_euclid(mask) * mask,
+                fp.z0 + (z - fp.z0).div_euclid(mask) * mask,
+            );
+            any_carved(&carved, fp, mx, mz, mask)
+        };
+
+        let mut faces = Faces::default();
+        let mut cave = Faces::default();
+        for (origin, mesh) in meshes {
+            for quad in mesh.indices.chunks(6) {
+                let base = *quad.iter().min().expect("six indices") as usize;
+                let corners = &mesh.vertices[base..base + 4];
+                let face = corners[0].face();
+                let Some(d) = direction_index(face) else {
                     continue;
+                };
+                let ao: Vec<f64> = corners
+                    .iter()
+                    .map(|c| ao_fraction(c.ao(), c.ao_width_log2(), setup.lighting.ao_floor) as f64)
+                    .collect();
+                // The mean of the two triangles the quad is drawn as: the corners
+                // on the shared diagonal count in both.
+                let ao_mean = if quad[0] as usize == base {
+                    (2.0 * (ao[0] + ao[2]) + ao[1] + ao[3]) / 6.0
+                } else {
+                    (2.0 * (ao[1] + ao[3]) + ao[0] + ao[2]) / 6.0
+                };
+                let layer = corners[0].tex_layer() as usize;
+                let light = face_light(Vec3::from(face.normal()), &setup.lighting);
+                let lit = setup.colours[layer] * light;
+                let pos = |c: &cubara_voxel::Vertex| {
+                    [
+                        origin[0] + c.x() as i32,
+                        origin[1] + c.y() as i32,
+                        origin[2] + c.z() as i32,
+                    ]
+                };
+                let min = corners.iter().map(pos).fold([i32::MAX; 3], |a, p| {
+                    [a[0].min(p[0]), a[1].min(p[1]), a[2].min(p[2])]
+                });
+                let max = corners.iter().map(pos).fold([i32::MIN; 3], |a, p| {
+                    [a[0].max(p[0]), a[1].max(p[1]), a[2].max(p[2])]
+                });
+                // The area of this quad the sky sees, cell by cell.
+                // ... on the surface, and on or beside carved ground.
+                let mut seen = [0f64; 2];
+                match face {
+                    Face::PosY => {
+                        for z in (min[2]..max[2]).step_by(w as usize) {
+                            for x in (min[0]..max[0]).step_by(w as usize) {
+                                if counted(x, z)
+                                    && column(x, z).is_some_and(|c| top[c] == Some(min[1]))
+                                {
+                                    seen[cell_carved(x, z) as usize] += (w * w) as f64;
+                                }
+                            }
+                        }
+                    }
+                    Face::PosX | Face::NegX | Face::PosZ | Face::NegZ => {
+                        let axis = if matches!(face, Face::PosX | Face::NegX) {
+                            0
+                        } else {
+                            2
+                        };
+                        let along = 2 - axis;
+                        let positive = matches!(face, Face::PosX | Face::PosZ);
+                        for a in (min[along]..max[along]).step_by(w as usize) {
+                            // The cell behind the face, and the one in front.
+                            let mut own = [0i32; 3];
+                            let mut front = [0i32; 3];
+                            own[along] = a;
+                            front[along] = a;
+                            own[axis] = if positive { min[axis] - w } else { min[axis] };
+                            front[axis] = if positive { min[axis] } else { min[axis] - w };
+                            let (Some(_), Some(f)) =
+                                (column(own[0], own[2]), column(front[0], front[2]))
+                            else {
+                                continue;
+                            };
+                            if !counted(own[0], own[2]) {
+                                continue;
+                            }
+                            for y in (min[1]..max[1]).step_by(v as usize) {
+                                // Open sky in front: the column there is drawn no
+                                // higher than this cell's foot (or not at all).
+                                if top[f].is_none_or(|t| t <= y) {
+                                    let beside_a_cave = cell_carved(own[0], own[2])
+                                        || cell_carved(front[0], front[2]);
+                                    seen[beside_a_cave as usize] += (w * v) as f64;
+                                }
+                            }
+                        }
+                    }
+                    Face::NegY => unreachable!("filtered above"),
                 }
-                term.area[d] += area;
-                term.open[d] += open * area;
-                for c in 0..3 {
-                    term.lit[d][c] += lit[c] as f64 * ao_mean * area;
-                }
-                if let Some(m) = setup.materials[layer] {
-                    term.material[d][m] += area;
+                let open = corners.iter().map(|c| c.ao() as f64).sum::<f64>() / 12.0;
+                for (term, area) in [(&mut faces, seen[0]), (&mut cave, seen[1])] {
+                    if area == 0.0 {
+                        continue;
+                    }
+                    term.area[d] += area;
+                    term.open[d] += open * area;
+                    for c in 0..3 {
+                        term.lit[d][c] += lit[c] as f64 * ao_mean * area;
+                    }
+                    if let Some(m) = setup.materials[layer] {
+                        term.material[d][m] += area;
+                    }
                 }
             }
         }
-    }
 
-    let tops = (0..FOOTPRINT)
-        .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
-        .map(|(i, j)| {
-            let c = column(fp.x0 + i, fp.z0 + j).expect("inside the footprint");
-            top[c].map_or(f64::NAN, |t| t as f64)
-        })
-        .collect();
-    Measure { faces, cave, tops }
+        let tops = (0..FOOTPRINT)
+            .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
+            .map(|(i, j)| {
+                let c = column(fp.x0 + i, fp.z0 + j).expect("inside the footprint");
+                top[c].map_or(f64::NAN, |t| t as f64)
+            })
+            .collect();
+        Measure { faces, cave, tops }
+    }
 }
 
 /// Whether a cave has carved any level-0 column under the `w`-block cell at
@@ -837,6 +929,9 @@ pub struct Shape {
     pub peak: Vec<f64>,
     /// Columns where this representation draws nothing.
     pub undrawn: usize,
+    /// Columns left out of the comparison: on ground a cave has carved
+    /// ([`Shape::over`]).
+    pub left_out: usize,
 }
 
 /// The level-0 height field over `fp`, as a [`Measure`] with no faces.
@@ -852,11 +947,25 @@ pub fn height_field(gen: &WorldGen, fp: Footprint) -> Measure {
 }
 
 impl Shape {
-    /// `other` against the level-0 height field `level0`.
+    /// `other` against the level-0 height field `level0`, over every column.
     pub fn of(level0: &Measure, other: &Measure) -> Self {
+        Self::over(level0, other, &[])
+    }
+
+    /// [`Shape::of`] over the columns `counted` only (row by row, `z` outer;
+    /// empty for all of them) -- the same columns on both sides. With
+    /// [`Setup::on_the_surface`] this is the shape of the surface term, the
+    /// ground a level is held to: a cave mouth lowers a drawn top by as much
+    /// as the cave is deep, and one under a footprint's highest column would
+    /// otherwise be read as a lost peak (level 0 itself "lost" six blocks of
+    /// one that way).
+    pub fn over(level0: &Measure, other: &Measure, counted: &[bool]) -> Self {
+        let counts = |k: usize| counted.is_empty() || counted[k];
         let mut s = Shape::default();
-        for (a, b) in level0.tops.iter().zip(&other.tops) {
-            if b.is_nan() {
+        for (k, (a, b)) in level0.tops.iter().zip(&other.tops).enumerate() {
+            if !counts(k) {
+                s.left_out += 1;
+            } else if b.is_nan() {
                 s.undrawn += 1;
             } else {
                 s.column.push(b - a);
@@ -864,7 +973,9 @@ impl Shape {
         }
         let skyline = |m: &Measure, rows: bool, k: i32| {
             (0..FOOTPRINT)
-                .map(|n| if rows { m.top(n, k) } else { m.top(k, n) })
+                .map(|n| if rows { (n, k) } else { (k, n) })
+                .filter(|&(i, j)| counts((j * FOOTPRINT + i) as usize))
+                .map(|(i, j)| m.top(i, j))
                 .filter(|t| !t.is_nan())
                 .fold(f64::NEG_INFINITY, f64::max)
         };
@@ -879,8 +990,9 @@ impl Shape {
         let peak = |m: &Measure| {
             m.tops
                 .iter()
-                .filter(|t| !t.is_nan())
-                .fold(f64::NEG_INFINITY, |a, &t| a.max(t))
+                .enumerate()
+                .filter(|(k, t)| counts(*k) && !t.is_nan())
+                .fold(f64::NEG_INFINITY, |a, (_, &t)| a.max(t))
         };
         if peak(level0).is_finite() && peak(other).is_finite() {
             s.peak.push(peak(other) - peak(level0));
@@ -893,6 +1005,7 @@ impl Shape {
         self.skyline.extend_from_slice(&other.skyline);
         self.peak.extend_from_slice(&other.peak);
         self.undrawn += other.undrawn;
+        self.left_out += other.left_out;
     }
 }
 
