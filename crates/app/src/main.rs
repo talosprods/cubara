@@ -1291,7 +1291,7 @@ fn main() {
             // -- written to its settings. What the game runs on its own, with
             // its monitor's refresh rate and its window's size.
             // `--bench flight [--eye X,Y,Z] [--look DX,DY,DZ] [--toward-peak] [--seconds S]
-            // [--speed B] [--fps F] [--frames DIR]`: how much of the screen is
+            // [--speed B] [--fps F] [--frames DIR [--frames-every N]]`: how much of the screen is
             // still loading while flying at the game's speed.
             // `--bench walk [--seconds S] [--fps F] [--fly]`: the whole frame's
             // time while a scripted player walks (or, with `--fly`, spectates
@@ -1356,7 +1356,26 @@ fn main() {
                     size,
                     quality: far_streaming::FarQuality::High,
                 };
-                match flight::fly(&flight, flag("--frames").map(std::path::Path::new)) {
+                // `--frames-every N`: also write every Nth rendered frame to
+                // the `--frames` directory, numbered, for a video.
+                let video_every = flag("--frames-every").map(|t| {
+                    t.parse::<u32>()
+                        .ok()
+                        .filter(|&n| n >= 1)
+                        .unwrap_or_else(|| {
+                            eprintln!("--frames-every needs a whole number of at least 1");
+                            std::process::exit(2);
+                        })
+                });
+                if video_every.is_some() && flag("--frames").is_none() {
+                    eprintln!("--frames-every needs --frames DIR");
+                    std::process::exit(2);
+                }
+                match flight::fly(
+                    &flight,
+                    flag("--frames").map(std::path::Path::new),
+                    video_every,
+                ) {
                     Some(report) => log::info!("{}", report.line()),
                     None => log::error!("FLIGHT: no GPU to fly on"),
                 }

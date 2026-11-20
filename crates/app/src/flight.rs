@@ -1457,6 +1457,78 @@ impl KeptFrames {
     }
 }
 
+/// Whether rendered frame `frame` is a video frame when every `every`th is
+/// kept: frames 0, `every`, 2 `every`, ... (`every` 0 counts as 1).
+fn video_frame_selected(frame: u32, every: u32) -> bool {
+    frame.is_multiple_of(every.max(1))
+}
+
+/// The file a video frame is written as: its number among the video frames,
+/// then the flight time it was drawn at, so a sheet can print the time.
+fn video_frame_name(index: u32, t: f32) -> String {
+    format!("v{index:05}-t{t:07.3}.png")
+}
+
+/// Writes every Nth rendered frame to a directory as it is drawn (`--bench
+/// flight --frames DIR --frames-every N`), encoded on its own thread. The
+/// channel is bounded, so a slow disk slows the flight rather than filling
+/// memory; this is for videos, not for a measurement.
+struct VideoDump {
+    every: u32,
+    send: std::sync::mpsc::SyncSender<(u32, f32, Frame)>,
+    done: std::thread::JoinHandle<u32>,
+}
+
+impl VideoDump {
+    fn new(dir: &Path, every: u32) -> Self {
+        let dir = dir.to_path_buf();
+        let (send, recv) = std::sync::mpsc::sync_channel::<(u32, f32, Frame)>(32);
+        let done = std::thread::spawn(move || {
+            let mut written = 0;
+            for (index, t, f) in recv {
+                let file = match std::fs::File::create(dir.join(video_frame_name(index, t))) {
+                    Ok(file) => std::io::BufWriter::new(file),
+                    Err(e) => {
+                        log::error!("flight: video frame {index}: {e}");
+                        continue;
+                    }
+                };
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    file,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::Sub,
+                );
+                let ok = image::ImageEncoder::write_image(
+                    encoder,
+                    &f.pixels,
+                    f.width,
+                    f.height,
+                    image::ExtendedColorType::Rgba8,
+                );
+                match ok {
+                    Ok(()) => written += 1,
+                    Err(e) => log::error!("flight: video frame {index}: {e}"),
+                }
+            }
+            written
+        });
+        Self { every, send, done }
+    }
+
+    /// Writes `f`, rendered as frame `frame` at time `t`, if it is selected.
+    fn offer(&self, frame: u32, t: f32, f: &Frame) {
+        if video_frame_selected(frame, self.every) {
+            let _ = self.send.send((frame / self.every.max(1), t, f.clone()));
+        }
+    }
+
+    /// How many frames were written, once the writer has caught up.
+    fn finish(self) -> u32 {
+        drop(self.send);
+        self.done.join().unwrap_or(0)
+    }
+}
+
 /// Fly `flight` and compare what was on screen with what should have been.
 /// With `frames`, the worst kept frame and its finished version are written
 /// there as `worst-live.png` and `worst-settled.png`, every kept frame over
@@ -1466,7 +1538,11 @@ impl KeptFrames {
 /// candidate frames as `pop-fNNNN-...`, and the first [`STALE_DUMPS`] kept
 /// frames with stale pixels as `stale-tNN.NN-live.png`/`-settled.png`, the
 /// pixels ringed. `None` without a GPU.
-pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
+pub fn fly(
+    flight: &Flight,
+    frames: Option<&Path>,
+    video_every: Option<u32>,
+) -> Option<FlightReport> {
     // The real-time pass: what a player sees -- once the start is loaded, as
     // it is for a player who has been standing there. Loading a world from
     // nothing is a different question, with its own answer.
@@ -1494,6 +1570,11 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
     let mut recent: VecDeque<Frame> = VecDeque::new();
     // Candidate frames' live frames and the frame before each, for the dumps.
     let keeper = frames.map(|_| FrameKeeper::new());
+    // `--frames-every N`: every Nth rendered frame written to `--frames DIR`
+    // as it is drawn, for assembling a video.
+    let video = frames
+        .zip(video_every)
+        .map(|(dir, every)| VideoDump::new(dir, every));
     let mut work_times = Vec::new();
     let mut holes: Option<HoleTracker> = None;
     let mut pops = Vec::new();
@@ -1514,6 +1595,9 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         // so the readback is not counted as the game's.
         let shown = live.renderer.read_frame()?;
         let frame = eyes.len() as u32;
+        if let Some(video) = &video {
+            video.offer(frame, t, &shown);
+        }
         eyes.push((t, eye));
         open_swaps.push(live.nodes.open_swaps());
         // A swap this frame applied (nodes left the arena): its pop is what
@@ -1589,6 +1673,9 @@ pub fn fly(flight: &Flight, frames: Option<&Path>) -> Option<FlightReport> {
         }
     }
     drop(recent);
+    if let Some(video) = video {
+        log::info!("flight: {} video frames written", video.finish());
+    }
     let kept_frames = keeper.map(FrameKeeper::finish);
     // The live pass only (#378): the settled pass below jumps the eye around
     // to reconstruct each kept frame, which is not a swap a player ever
@@ -2027,6 +2114,39 @@ fn swap_pop_run(flight: &Flight) -> Option<SwapPopRun> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_nth_frame_is_a_video_frame() {
+        let kept: Vec<u32> = (0..10).filter(|&f| video_frame_selected(f, 3)).collect();
+        assert_eq!(kept, [0, 3, 6, 9]);
+        assert!((0..5).all(|f| video_frame_selected(f, 1)));
+        assert!((0..5).all(|f| video_frame_selected(f, 0)), "0 counts as 1");
+        assert_eq!(video_frame_name(7, 1.5), "v00007-t001.500.png");
+    }
+
+    #[test]
+    fn video_dump_writes_only_the_selected_frames() {
+        let dir = std::env::temp_dir().join(format!("cubara-video-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dump = VideoDump::new(&dir, 2);
+        let f = Frame {
+            width: 2,
+            height: 2,
+            pixels: vec![200; 16],
+        };
+        for frame in 0..5 {
+            dump.offer(frame, frame as f32 / 60.0, &f);
+        }
+        assert_eq!(dump.finish(), 3, "frames 0, 2, 4");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[1], "v00001-t000.033.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn flight() -> Flight {
         Flight {
