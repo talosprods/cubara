@@ -528,12 +528,37 @@ pub fn face_ao(
     uu: i32,
     vv: i32,
 ) -> [u8; 4] {
+    face_ao_of(
+        &|x, y, z| registry.is_solid(block_at(x, y, z)),
+        d,
+        u,
+        v,
+        air_d,
+        uu,
+        vv,
+    )
+}
+
+/// [`face_ao`], asked of anything that can say whether a cell is solid --
+/// the one corner rule, for a caller with no blocks to look up:
+/// `cubara_world`'s `WorldGen::ground_faces` works out how open level 0's
+/// faces are from the height field alone, and must use the rule the mesher
+/// bakes rather than a copy of it (`ARCHITECTURE.md` Rule 5).
+pub fn face_ao_of(
+    solid: &impl Fn(i32, i32, i32) -> bool,
+    d: usize,
+    u: usize,
+    v: usize,
+    air_d: i32,
+    uu: i32,
+    vv: i32,
+) -> [u8; 4] {
     let occluded = |du: i32, dv: i32| -> bool {
         let mut p = [0i32; 3];
         p[d] = air_d;
         p[u] = uu + du;
         p[v] = vv + dv;
-        registry.is_solid(block_at(p[0], p[1], p[2]))
+        solid(p[0], p[1], p[2])
     };
     let mut ao = [3u8; 4];
     for (k, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].iter().enumerate() {

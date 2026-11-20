@@ -12,12 +12,10 @@
 //! - [`cubara_render::aggregate::face_light`] -- `mesh.wgsl`'s ambient+diffuse
 //!   term, already kept as a CPU twin of the shader for the far terrain's own
 //!   aggregate shading.
-//! - [`ao_lit_fraction`] mirrors `mesh.wgsl`'s `vs_main` AO formula exactly
-//!   (`ao_floor_scaled = mix(ao_floor, 1.0, 1 - 1/width)`, then `mix` with
-//!   the per-corner fraction) -- duplicated here because it is three lines of
-//!   shader-only arithmetic with no CPU-side home of its own, the same way
-//!   `face_light` itself originally had none until the far terrain needed
-//!   one.
+//! - [`cubara_render::aggregate::ao_fraction`] -- `mesh.wgsl`'s `vs_main` AO
+//!   formula (`ao_floor_scaled = mix(ao_floor, 1.0, 1 - 1/width)`, then `mix`
+//!   with the per-corner fraction), kept beside `face_light` as the shader's
+//!   one CPU twin.
 //!
 //! **"Area-weighted... over the same footprint" is read as a whole sampled
 //! region, not per individual cell**, and that reading is load-bearing, not
@@ -79,14 +77,11 @@ fn lit_materials() -> Materials {
     }
 }
 
-/// `mesh.wgsl` `vs_main`'s AO formula, exactly (R1c): at `width = 1`
-/// (`log2_width = 0`, every level-0 vertex and every wall) this is
-/// `mix(ao_floor, 1.0, ao_frac)`, unchanged from before R1c.
+/// `mesh.wgsl` `vs_main`'s AO formula: [`cubara_render::aggregate::ao_fraction`],
+/// the one CPU twin of it (it lived here until the consistency harness
+/// needed it too).
 pub fn ao_lit_fraction(ao_raw: u8, log2_width: u32, ao_floor: f32) -> f32 {
-    let ao_frac = ao_raw as f32 / 3.0;
-    let width = (1u32 << log2_width) as f32;
-    let ao_floor_scaled = ao_floor + (1.0 - ao_floor) * (1.0 - 1.0 / width);
-    ao_floor_scaled + (1.0 - ao_floor_scaled) * ao_frac
+    cubara_render::aggregate::ao_fraction(ao_raw as u32, log2_width, ao_floor)
 }
 
 /// The average of a top face's four corners' AO fraction -- the average of
