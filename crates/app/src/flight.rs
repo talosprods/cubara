@@ -1276,10 +1276,14 @@ struct Streamed {
 }
 
 impl Streamed {
-    fn new(flight: &Flight) -> Option<Self> {
+    /// `sky`: frames clear to the real sky (a video) rather than to
+    /// [`NOTHING`] (the hole count, which a sky-cleared run cannot make).
+    fn new(flight: &Flight, sky: bool) -> Option<Self> {
         let camera = pose(flight, flight.start);
         let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
-        renderer.set_clear_color(NOTHING);
+        if !sky {
+            renderer.set_clear_color(NOTHING);
+        }
         let layers = assets.layers;
         let registry = Arc::new(assets.registry);
         let nodes = NodeStreaming::new(
@@ -1546,7 +1550,7 @@ pub fn fly(
     // The real-time pass: what a player sees -- once the start is loaded, as
     // it is for a player who has been standing there. Loading a world from
     // nothing is a different question, with its own answer.
-    let mut live = Streamed::new(flight)?;
+    let mut live = Streamed::new(flight, video_every.is_some())?;
     live.settle(flight, flight.start);
     // The flight ticks no simulation: nothing here calls `Arc::make_mut` on
     // the world, so this can only count a clone something else makes.
@@ -1571,7 +1575,8 @@ pub fn fly(
     // Candidate frames' live frames and the frame before each, for the dumps.
     let keeper = frames.map(|_| FrameKeeper::new());
     // `--frames-every N`: every Nth rendered frame written to `--frames DIR`
-    // as it is drawn, for assembling a video.
+    // as it is drawn, for assembling a video. Those frames clear to the real
+    // sky, so the hole and stale counts of such a run mean nothing.
     let video = frames
         .zip(video_every)
         .map(|(dir, every)| VideoDump::new(dir, every));
@@ -1698,7 +1703,7 @@ pub fn fly(
     // hole only where the finished frame shows land (decision 1). In flight
     // order, so the settled world has little to load from one eye to the
     // next.
-    let mut settled = Streamed::new(flight)?;
+    let mut settled = Streamed::new(flight, false)?;
     let mut samples = Vec::with_capacity(kept.len());
     let mut worst: Option<(f64, (Frame, Frame))> = None;
     let mut confirmed = vec![0u32; eyes.len()];
@@ -2058,7 +2063,7 @@ fn fold_pop_pair(
 /// because it predates this branch.
 #[cfg(test)]
 fn swap_pop_run(flight: &Flight) -> Option<SwapPopRun> {
-    let mut live = Streamed::new(flight)?;
+    let mut live = Streamed::new(flight, false)?;
     let camera_eye = flight.start;
     let mut stream_eye = flight.start;
     live.settle_at(flight, stream_eye, camera_eye);
