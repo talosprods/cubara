@@ -35,7 +35,10 @@ mod uploads;
 pub use anchor::Anchor;
 pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
-pub use far::{FarParams, FarPatch, FarSlot, FarTerrain, FAR_QUADS, FAR_VERTS};
+pub use far::{
+    FarDir, FarFace, FarParams, FarPatch, FarSlot, FarTerrain, FarVertex, FAR_MAX_RISE, FAR_QUADS,
+    FAR_TOP_RANGE,
+};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
 pub use gpu_timer::{
     classify_sample, timestamp_indices, timing_proven, GpuSample, GpuTimer, TimestampRing,

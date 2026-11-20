@@ -205,6 +205,55 @@ shows that rings of cubes flatten the land and are made of rectangles. Instead:
 - **Vertical precision is not tied to cell size.** Heights are real numbers, not
   lattice steps, which is exactly what table A's cubes lack.
 
+**Revised 2026-11-15 (issue #422): the height field is drawn as blocks.** The
+owner's play-test of 2026-11-14 found the smooth surface wanting: "you can
+clearly see these are no longer real blocks in the distance". The patches, the
+split rule and the heights above are unchanged -- the height field is still
+the data -- but a patch is no longer a smooth grid of triangles. Each quad is
+a flat top at a whole number of blocks (`far::quad_top`), with a vertical wall
+wherever two neighbouring tops differ, exactly as tall as the step
+(`far::mesh`), on the block grid and so on the grid of the voxel rings'
+coarse cells. The top is the rule that one ground serves every level (issue
+#423, `WorldGen::cell_top_sampled`): the highest level-0 surface among the
+quad's columns, on the rows of the voxel level of the same cell width -- so
+a level-3 quad and a level-3 voxel cell over the same eight columns have the
+same top. Vertical precision is a block (a row of four from level 3), not
+the quad's width: the flattening of table A does not come back. What that
+changes below:
+
+- **Skirts are walls.** A patch's edge carries a wall for every quad, down to
+  the neighbouring patch's quad as the patch's own level sees it and the old
+  skirt's depth below that, for a neighbour of another level. Over three
+  seeded views, 66,752 stretches of edge between patches of different levels
+  all close; without the skirt the worst is open by 108 blocks.
+- **3.3's block-aggregate shading is no longer what the far terrain is drawn
+  with.** A top wears the top material, and a wall the mix of surface
+  block, soil and stone that level 0's own risers facing its way are over
+  the same ground (`WorldGen::ground_faces`: by depth below each column's
+  own surface, not by the wall's height). Each is lit as `mesh.wgsl` lights
+  a face of that normal -- one WGSL function, `face.wgsl`'s
+  `face_brightness`, in both pipelines -- and keeps as much of that light
+  as level 0's faces there are open to the sky on average, by `mesh.wgsl`'s
+  ambient-occlusion rule. `aggregate.rs` remains as the reference for what
+  many blocks look like in one pixel.
+- **Heights above eight-block quads are sampled**, four columns a side, and
+  so do not nest: a quad's top can stand above its parent's (in 22% of
+  parent quads at 8-block children, by 5 blocks on average and 12 at worst;
+  in 76% at 1,024-block children, by 43 on average and 148 at worst --
+  `far::measure::a_child_above_its_parent`). Where a patch swaps for its
+  coarser parent the ground there drops by that much. Exact tops nest, and
+  cost a surface height per column.
+- **The cost.** Greedy merging of equal tops recovers almost nothing on the
+  generated terrain: more than half of all quad edges carry a step, at every
+  level, and the join to the voxels keeps faces from merging across chunk
+  lines (`far::JOIN_GRID`). As blocks the far terrain is 59-76% more
+  triangles than the smooth surface was at the same quality, after leaving
+  out the walls that face away from the eye; drawn 1.5 times as coarse it
+  costs what the smooth surface did.
+  The counts per gate eye and quality are in the PR of #422
+  (`far_census.rs` prints them); the trade between quad size and triangle
+  count is the owner's.
+
 ### 3.3 Block-aggregate shading: making it look like every block
 
 A slope made of blocks is a staircase. From far away, each pixel covers many

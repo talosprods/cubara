@@ -1,12 +1,16 @@
 // The far terrain (`docs/PROPOSAL_FAR_VIEW.md` §3.2): beyond the voxel rings,
-// the land as a height field.
+// the land as a height field -- drawn as the blocks it is made of (issue
+// #422). Every face is a flat top at a whole number of blocks or a vertical
+// wall exactly as tall as the step between two tops (`cubara_world::far::
+// mesh`), flat-shaded with the light a voxel face of the same normal gets
+// (`face.wgsl`, shared with `mesh.wgsl`).
 //
-// There is no vertex buffer. Every patch is the same 35 x 35 grid of vertex
-// indices, drawn once per patch as an instance: the inner 33 x 33 are the
-// patch's heights, read from a storage buffer, and the outer ring repeats the
-// edge vertex dropped by the patch's skirt depth -- so the skirts that hide the
-// seam against a coarser neighbour cost no geometry of their own. One draw for
-// the whole far terrain, whatever its size.
+// There is no vertex buffer. A face is three packed words (12 bytes) in a storage buffer
+// (`far.rs`'s `FarFace::pack`); an instance is one run of a patch's faces --
+// those that can face the eye -- and a vertex index is a face of the run and
+// one of its four corners. Runs are drawn by size class, one draw a class,
+// each run padded to the class's size with zero-area faces: at most 17 draws
+// for the whole far terrain, whatever its size.
 
 // Same `Frame` the other pipelines bind (`render.rs`'s `FrameUniform`): one sun,
 // one fog, one camera.
@@ -20,14 +24,15 @@ struct Frame {
     fog: vec4<f32>,
     haze: vec4<f32>,
     // The render anchor (issue #379): every position in this shader, `eye`
-    // included, is relative to it. The heights buffer is the exception --
+    // included, is relative to it. A vertex's height is the exception --
     // absolute, so `vs_main` subtracts `anchor.y` -- and the height haze
     // wants it back.
     anchor: vec4<f32>,
 };
 
 // One patch: its lowest corner (relative to the render anchor, issue #379),
-// the width of one quad, and how far its skirt drops, all in blocks.
+// the width of one quad, and how far the walls on its edge hang below the
+// step they show, all in blocks.
 struct Patch {
     origin: vec2<f32>,
     quad: f32,
@@ -50,64 +55,136 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(1) @binding(0) var<storage, read> heights: array<f32>;
-@group(1) @binding(1) var<storage, read> patches: array<Patch>;
-@group(1) @binding(2) var<storage, read> draw_slots: array<u32>;
-@group(1) @binding(3) var<uniform> params: Params;
-// `aggregate::MaskingTable`: 16 x 16 x (16 x 16), its last two axes stacked.
-@group(1) @binding(4) var masking: texture_3d<f32>;
-@group(1) @binding(5) var masking_sampler: sampler;
+@group(1) @binding(0) var<storage, read> patches: array<Patch>;
+@group(1) @binding(1) var<uniform> params: Params;
+@group(1) @binding(2) var<storage, read> faces: array<Face>;
+@group(1) @binding(3) var<storage, read> runs: array<Run>;
+
+// One face, packed (`far.rs`'s `FarFace::pack`).
+struct Face {
+    // i0:6 j0:6 i1:6 j1:6 dir:3 border:1
+    word0: u32,
+    // top + 131072 : 18, rise : 14
+    word1: u32,
+    // surface:8 soil:8 open:8, each in 255ths
+    word2: u32,
+};
+
+// One run of faces: its patch's slot, its first face, and how many it is.
+struct Run {
+    slot: u32,
+    first: u32,
+    count: u32,
+};
 
 const QUADS: i32 = 32;
-const VERTS: u32 = 33u;
-const GRID: u32 = 35u;
+
+// `far.rs`'s `FarDir`, in its order.
+const DIR_TOP: u32 = 0u;
+const DIR_POS_X: u32 = 1u;
+const DIR_NEG_X: u32 = 2u;
+const DIR_POS_Z: u32 = 3u;
+const FACE_NORMALS = array<vec3<f32>, 5>(
+    vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0),
+    vec3<f32>(0.0, 0.0, -1.0),
+);
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
-    // The shaded, fogged colour, worked out per vertex (see `shade`).
+    // The lit, fogged colour. The light is the face's, the same at all four
+    // corners; the fog is worked out per vertex and interpolated.
     @location(0) color: vec3<f32>,
 };
-
-fn height(base: u32, i: i32, j: i32) -> f32 {
-    let ci = u32(clamp(i, 0, QUADS));
-    let cj = u32(clamp(j, 0, QUADS));
-    return heights[base + cj * VERTS + ci];
-}
 
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex: u32,
     @builtin(instance_index) instance: u32,
 ) -> VertexOut {
-    let slot = draw_slots[instance];
-    let tile = patches[slot];
-    let base = slot * VERTS * VERTS;
-    let gx = vertex % GRID;
-    let gz = vertex / GRID;
-    // Grid 0 and 34 are the skirt ring; 1..=33 are the patch's own vertices.
-    var i = clamp(i32(gx) - 1, 0, QUADS);
-    var j = clamp(i32(gz) - 1, 0, QUADS);
-    let skirt = gx == 0u || gx == GRID - 1u || gz == 0u || gz == GRID - 1u;
-    // The heights are absolute world heights (a rebase leaves the heights
-    // buffer alone); every other position here is relative to the render
-    // anchor, so the anchor's y comes off here -- the eye, the hole and the
-    // voxels are all measured from it (issue #379, review finding B1).
-    var y = height(base, i, j) - frame.anchor.y;
-    if skirt {
-        y = y - tile.skirt;
+    let run = runs[instance];
+    let nth = vertex / 4u;
+    if nth >= run.count {
+        // Padding up to the class's size: every corner the same point, so
+        // the face has no area and nothing is rasterised.
+        var none: VertexOut;
+        none.clip_pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        none.color = vec3<f32>(0.0);
+        return none;
+    }
+    let face = faces[run.first + nth];
+    let word0 = face.word0;
+    let word1 = face.word1;
+    let word2 = face.word2;
+    let dir = (word0 >> 24u) & 0x7u;
+    let border = ((word0 >> 27u) & 1u) != 0u;
+    let wall = dir != DIR_TOP;
+    // Which of the face's four corners (`FarFace::shader_corner` is these
+    // lines, and a test holds it against `FarFace::corners`): bit 0 of the
+    // corner is the high end of the face's ground axis, bit 1 the high end
+    // of the other -- up, for a wall. The two wall directions that would
+    // otherwise wind clockwise run backwards.
+    let k = vertex % 4u;
+    let flip = u32(dir == DIR_NEG_X || dir == DIR_POS_Z);
+    let e = (k & 1u) ^ flip;
+    let u = k >> 1u;
+    let corner = e | (u << 1u);
+    let i0 = word0 & 0x3Fu;
+    let j0 = (word0 >> 6u) & 0x3Fu;
+    let di = ((word0 >> 12u) & 0x3Fu) - i0;
+    let dj = ((word0 >> 18u) & 0x3Fu) - j0;
+    var i = i32(i0 + e * di);
+    var j = i32(j0 + select(u, e, wall) * dj);
+    let tile = patches[run.slot];
+    // The heights are absolute world heights; every other position here is
+    // relative to the render anchor, so the anchor's y comes off here -- the
+    // eye, the hole and the voxels are all measured from it (issue #379,
+    // review finding B1).
+    let top = f32(i32(word1 & 0x3FFFFu) - 131072) - frame.anchor.y;
+    let rise = f32(word1 >> 18u);
+    // A wall's lower corners hang the step below its top, and on the patch's
+    // edge a skirt below that.
+    var y = top;
+    if wall && (corner & 2u) == 0u {
+        y = top - rise - select(0.0, tile.skirt, border);
     }
     var world = vec3<f32>(
         tile.origin.x + f32(i) * tile.quad,
         y,
         tile.origin.y + f32(j) * tile.quad,
     );
-    // Strictly inside the voxels' box, the ground is theirs, and nothing of
-    // this is seen there (`far::join` is this rule, and its tests say why).
-    // The box's edges fall on multiples of 128 blocks and every quad edge near
-    // them does too, so no triangle straddles the edge. No fragment is ever
-    // discarded (on a tile-based GPU a discard turns off hidden-surface
-    // removal for the whole pipeline); it is all done by moving vertices.
-    if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
+    // Inside the voxels' box, the ground is theirs, and nothing of this is
+    // seen there. The box's sides fall on chunk edges, no face crosses one of
+    // those lines and a top that touches one is a single quad deep
+    // (`cubara_world::far::JOIN_GRID`). No fragment is ever discarded (on a
+    // tile-based GPU a discard turns off hidden-surface removal for the whole
+    // pipeline); it is all done by moving vertices.
+    let faces_x = dir == DIR_POS_X || dir == DIR_NEG_X;
+    var seal = CRACK_SEAL;
+    if wall {
+        // A wall is in the box or out of it as a whole (`far::wall_in_hole`):
+        // by a point half a quad along it from this corner, which is the same
+        // side of every line for all four corners, and by its top. In the box
+        // it is cut off at the box's floor: nothing of it is left above, and
+        // what the ground shows under the floor is still drawn.
+        let inward = select(0.5, -0.5, (corner & 1u) != 0u) * tile.quad;
+        let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);
+        if all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)
+            && top > params.hole_min.y && top < params.hole_max.y {
+            world.y = min(world.y, params.hole_min.y);
+            // What is left of it, if anything, is under the box. A wall cut
+            // down to nothing must stay nothing: sealed, its corners would
+            // move apart again, and thousands of walls each a tenth of a
+            // pixel tall lie on the box's floor, in sight of an eye
+            // underground (seen as three pixels in `golden.rs`'s curtain
+            // test).
+            seal = 0.0;
+        }
+    } else if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
+        // A top's corner strictly inside the box (`far::join` is this rule,
+        // and its tests say why).
         // How many quads to the nearest side of the box along each axis, as
         // a step in the grid: negative towards the low side.
         let lo = (world.xz - params.hole_min.xz) / tile.quad;
@@ -116,9 +193,9 @@ fn vs_main(
         let ti = i + step.x;
         let tj = j + step.y;
         // The first ring inside becomes a skirt: it drops straight down from
-        // the vertex on the box's side next to it, as far as the patch's own
-        // skirt does. That closes the seam to the voxels, as the skirt of a
-        // patch that ends on the box's side already did.
+        // the corner on the box's side next to it, as far as the patch's own
+        // skirt does. That closes the seam to the voxels, as the wall on the
+        // edge of a patch that ends on the box's side already does.
         let snap_x = abs(step.x) == 1 && ti >= 0 && ti <= QUADS;
         let snap_z = abs(step.y) == 1 && tj >= 0 && tj <= QUADS;
         if snap_x || snap_z {
@@ -126,7 +203,7 @@ fn vs_main(
             j = select(j, tj, snap_z);
             world = vec3<f32>(
                 tile.origin.x + f32(i) * tile.quad,
-                height(base, i, j) - frame.anchor.y - tile.skirt,
+                y - tile.skirt,
                 tile.origin.y + f32(j) * tile.quad,
             );
         } else {
@@ -141,125 +218,66 @@ fn vs_main(
             world.y = params.hole_min.w;
         }
     }
-    // The surface's slope from the neighbouring heights, one-sided at the edge.
-    let il = max(i - 1, 0);
-    let ir = min(i + 1, QUADS);
-    let jl = max(j - 1, 0);
-    let jr = min(j + 1, QUADS);
-    let dx = (height(base, ir, j) - height(base, il, j)) / (f32(ir - il) * tile.quad);
-    let dz = (height(base, i, jr) - height(base, i, jl)) / (f32(jr - jl) * tile.quad);
+    // Seal the T-junctions a greedy mesh leaves, as `mesh.wgsl` does and by
+    // the same amount (`face.wgsl`'s `CRACK_SEAL`): each corner moves out of
+    // its face along the face's two in-plane axes. `corner` bit 0: the high
+    // end of the face's ground axis (x for a top and a wall facing along z,
+    // z for a wall facing along x); bit 1: the high end of the other (z for
+    // a top, up for a wall).
+    let su = select(-1.0, 1.0, (corner & 1u) != 0u);
+    let sv = select(-1.0, 1.0, (corner & 2u) != 0u);
+    var outward = vec3<f32>(su, 0.0, sv);
+    if wall {
+        outward = select(vec3<f32>(su, sv, 0.0), vec3<f32>(0.0, sv, su), faces_x);
+    }
+    let sealed = world + outward * (seal * distance(world, frame.eye.xyz));
 
     var out: VertexOut;
-    out.clip_pos = frame.view_proj * vec4<f32>(world, 1.0);
-    out.color = shade(world, vec2<f32>(dx, dz));
+    out.clip_pos = frame.view_proj * vec4<f32>(sealed, 1.0);
+    out.color = shade(sealed, face_colour(dir, word2) * face_open(word2), FACE_NORMALS[dir]);
     return out;
 }
 
 // ---------------------------------------------------------------------------
-// Block-aggregate shading (`docs/PROPOSAL_FAR_VIEW.md` §3.3). The definition is
-// `crates/render/src/aggregate.rs`; every function below is the one of the
-// same name there, and its tests are what say this is right.
+// What a face shows. `far.rs`'s `face_colour` and `face_open` are the CPU's
+// form of these two.
 // ---------------------------------------------------------------------------
 
-const TABLE_LAST: f32 = 15.0;
-// `aggregate::TABLE_MAX_SLOPE`, as steepness `s / (1 + s)`.
-const TABLE_MAX_STEEPNESS: f32 = 0.8501038;
+// **The one place a face's colour is decided** (the seam issue #422 asks
+// for): a top wears the top of the surface block, a wall the mix of the
+// surface block's side, soil and stone its third word carries -- what level
+// 0's risers facing its way are made of (issue #423 decision 2).
+fn face_colour(dir: u32, word2: u32) -> vec3<f32> {
+    if dir == DIR_TOP {
+        return params.top_color.rgb;
+    }
+    let surface = f32(word2 & 0xFFu) / 255.0;
+    let soil = f32((word2 >> 8u) & 0xFFu) / 255.0;
+    return params.side_color.rgb * surface + params.soil_color.rgb * soil
+        + params.stone_color.rgb * (1.0 - surface - soil);
+}
 
-// `MaskingTable::top_fraction`: the top fraction when the risers along one
-// axis (A) face the eye and those along the other (B) hide what is behind
-// them. Slopes and view components are magnitudes.
-fn masked_top(g_a: f32, g_b: f32, v_a: f32, v_b: f32, v_y: f32) -> f32 {
-    let slope = length(vec2<f32>(g_a, g_b));
-    let seen = v_y + g_a * v_a;
-    let at = clamp(
-        vec4<f32>(
-            sqrt(slope / (1.0 + slope) / TABLE_MAX_STEEPNESS),
-            g_b / (g_a + g_b),
-            g_a * v_a / seen,
-            1.0 - sqrt(1.0 - min(g_b * v_b / seen, 1.0)),
-        ) * TABLE_LAST,
-        vec4<f32>(0.0),
-        vec4<f32>(TABLE_LAST),
+// How much of its light a face keeps: `mesh.wgsl`'s ambient occlusion,
+// `mix(ao_floor, 1, open)`, for a face as open as level 0's are on average
+// over the same ground.
+fn face_open(word2: u32) -> f32 {
+    let open = f32((word2 >> 16u) & 0xFFu) / 255.0;
+    return mix(frame.ambient.z, 1.0, open);
+}
+
+// A face of colour `colour` and normal `n` at `p`: lit as `mesh.wgsl` lights
+// a block face (`face.wgsl`'s `face_brightness`, with the terms `mesh.wgsl`
+// gets as pipeline constants read from the frame here -- both are
+// `Lighting`'s), without texture or ambient occlusion; then the fog.
+fn shade(p: vec3<f32>, colour: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let brightness = face_brightness(
+        n,
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
     );
-    // The fourth axis by hand, between two stacks the filter never mixes.
-    let stack = min(floor(at.w), TABLE_LAST - 1.0);
-    let blend = at.w - stack;
-    let xy = (at.xy + 0.5) / 16.0;
-    let near = textureSampleLevel(masking, masking_sampler, vec3<f32>(xy, (at.z + 16.0 * stack + 0.5) / 256.0), 0.0).r;
-    let far = textureSampleLevel(masking, masking_sampler, vec3<f32>(xy, (at.z + 16.0 * (stack + 1.0) + 0.5) / 256.0), 0.0).r;
-    return mix(near, far, blend);
-}
-
-// `visible_weights`: how much of the pixel tops, x-risers and z-risers cover,
-// for a slope of gradient `g` seen along `v` (unit, toward the eye).
-fn visible_weights(g: vec2<f32>, v: vec3<f32>) -> vec3<f32> {
-    // A riser faces the eye when the eye is on its downhill side.
-    let x_faces = g.x * v.x < 0.0;
-    let z_faces = g.y * v.z < 0.0;
-    let x_hides = g.x * v.x > 0.0;
-    let z_hides = g.y * v.z > 0.0;
-    if x_faces && z_hides {
-        let top = masked_top(abs(g.x), abs(g.y), abs(v.x), abs(v.z), v.y);
-        return vec3<f32>(top, 1.0 - top, 0.0);
-    }
-    if z_faces && x_hides {
-        let top = masked_top(abs(g.y), abs(g.x), abs(v.z), abs(v.x), v.y);
-        return vec3<f32>(top, 0.0, 1.0 - top);
-    }
-    // Nothing hides: each face's share of the projected area.
-    let top = max(v.y, 0.0);
-    let x = select(0.0, abs(g.x * v.x), x_faces);
-    let z = select(0.0, abs(g.y * v.z), z_faces);
-    let sum = top + x + z;
-    // A fragment of a slope facing away (the CPU's `None`): the smooth
-    // surface's own silhouette. Call it top.
-    if sum <= 1e-6 {
-        return vec3<f32>(1.0, 0.0, 0.0);
-    }
-    return vec3<f32>(top, x, z) / sum;
-}
-
-// `face_light`: `mesh.wgsl`'s lighting for a face of normal `n`, before
-// texture and ambient occlusion -- open ground from kilometres away has
-// nothing near enough to occlude it.
-fn face_light(n: vec3<f32>) -> vec3<f32> {
-    let ambient = mix(frame.ambient.x, frame.ambient.y, n.y * 0.5 + 0.5);
-    let diffuse = max(dot(n, frame.sun_dir.xyz), 0.0) * frame.sun_color.w;
-    return frame.sun_color.rgb * (ambient + diffuse);
-}
-
-// `riser_colour`: the mean side colour of the risers on a slope of `slope`
-// blocks per block -- the surface block's side at the top of each, then
-// soil, then stone.
-fn riser_colour(slope: f32) -> vec3<f32> {
-    let s = abs(slope);
-    if s <= 0.0 {
-        return params.side_color.rgb;
-    }
-    let depth = params.side_color.w;
-    let surface = min(s, 1.0);
-    let soil = clamp(s - 1.0, 0.0, depth);
-    let stone = max(s - 1.0 - depth, 0.0);
-    return (params.side_color.rgb * surface + params.soil_color.rgb * soil
-        + params.stone_color.rgb * stone) / s;
-}
-
-// The colour of the ground at `p`, whose slope is `g` blocks per block: the
-// faces a staircase of that slope really has, as much of each as the eye
-// sees, each lit as `mesh.wgsl` lights a block face; then the fog.
-//
-// Per vertex, not per fragment. Quads are at most about 16 px across (the
-// split rule), so the view direction barely turns across one, and the slope
-// is interpolated either way. Per fragment this cost 0.37 ms at the flight
-// eye on a GTX 1060; per vertex it runs about a quarter as often.
-fn shade(p: vec3<f32>, g: vec2<f32>) -> vec3<f32> {
-    let v = normalize(frame.eye.xyz - p);
-    let w = visible_weights(g, v);
-    let riser_x = vec3<f32>(select(1.0, -1.0, g.x > 0.0), 0.0, 0.0);
-    let riser_z = vec3<f32>(0.0, 0.0, select(1.0, -1.0, g.y > 0.0));
-    let lit = params.top_color.rgb * face_light(vec3<f32>(0.0, 1.0, 0.0)) * w.x
-        + riser_colour(g.x) * face_light(riser_x) * w.y
-        + riser_colour(g.y) * face_light(riser_z) * w.z;
+    let lit = colour * frame.sun_color.rgb * brightness;
 
     let dist = distance(p, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);

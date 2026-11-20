@@ -9,14 +9,20 @@
 //! CPU, so the model is pinned with no GPU. The three shader sources that
 //! include the WGSL are defined here, once, as consts.
 
-/// `haze.wgsl` prepended to `mesh.wgsl`.
+/// What a block face is in both pipelines that draw blocks -- its light and
+/// its crack seal (`face.wgsl`), defined once and prepended to each.
+#[cfg(test)]
+pub(crate) const FACE_WGSL: &str = include_str!("shaders/face.wgsl");
+/// `haze.wgsl` and `face.wgsl` prepended to `mesh.wgsl`.
 pub(crate) const MESH_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/face.wgsl"),
     include_str!("shaders/mesh.wgsl")
 );
-/// `haze.wgsl` prepended to `far.wgsl`.
+/// `haze.wgsl` and `face.wgsl` prepended to `far.wgsl`.
 pub(crate) const FAR_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/face.wgsl"),
     include_str!("shaders/far.wgsl")
 );
 /// `haze.wgsl` prepended to `figure.wgsl`.

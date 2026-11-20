@@ -7,8 +7,9 @@
 //! not depend on the world crate (Rule 3), so a patch arrives as a
 //! [`FarPatch`] and leaves as a [`FarSlot`].
 
-use crate::aggregate::{MaskingTable, Materials, TABLE_SIZE};
+use crate::aggregate::Materials;
 use crate::anchor::{self, Anchor};
+use crate::arena::SlabAllocator;
 use crate::culling::{Aabb, Frustum};
 use crate::render::far_bind_group_layout;
 use glam::Vec3;
@@ -17,15 +18,265 @@ use glam::Vec3;
 /// `cubara_world::far::PATCH_QUADS`; the app asserts the second.
 pub const FAR_QUADS: usize = 32;
 
-/// Heights along one side of a patch.
-pub const FAR_VERTS: usize = FAR_QUADS + 1;
+/// The most faces one patch can have: a top for every quad, and a wall on
+/// every quad line beside every quad, both ways.
+pub const FAR_MAX_FACES: usize = FAR_QUADS * FAR_QUADS + 2 * (FAR_QUADS + 1) * FAR_QUADS;
 
-/// The vertex grid one patch is drawn with: its own vertices plus a ring
-/// around them that `far.wgsl` drops into the skirt.
-const GRID: u32 = FAR_VERTS as u32 + 2;
+/// Which way a [`FarFace`] looks. `far.wgsl`'s `DIR_*` and `FACE_NORMALS`
+/// are in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FarDir {
+    Top = 0,
+    PosX = 1,
+    NegX = 2,
+    PosZ = 3,
+    NegZ = 4,
+}
+
+impl FarDir {
+    pub const ALL: [FarDir; 5] = [
+        FarDir::Top,
+        FarDir::PosX,
+        FarDir::NegX,
+        FarDir::PosZ,
+        FarDir::NegZ,
+    ];
+
+    /// The unit vector a face of this direction looks along.
+    pub fn normal(self) -> Vec3 {
+        match self {
+            FarDir::Top => Vec3::Y,
+            FarDir::PosX => Vec3::X,
+            FarDir::NegX => Vec3::NEG_X,
+            FarDir::PosZ => Vec3::Z,
+            FarDir::NegZ => Vec3::NEG_Z,
+        }
+    }
+
+    /// Whether this is a wall standing on a line of constant x.
+    fn faces_x(self) -> bool {
+        matches!(self, FarDir::PosX | FarDir::NegX)
+    }
+}
+
+/// One rectangle of a patch drawn as blocks -- a flat top or a wall
+/// (`cubara_world::far::Face`, which this mirrors field for field because
+/// this crate does not depend on that one, Rule 3).
+///
+/// In quads from the patch's low corner. A top spans `i0..i1` by `j0..j1` at
+/// height `top`; a wall stands on one quad line (`i0 == i1` facing along x,
+/// `j0 == j1` facing along z), runs along the other axis, and hangs from
+/// `top` down `rise` blocks -- and, on the patch's edge (`border`), the
+/// patch's skirt below that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FarFace {
+    pub dir: FarDir,
+    pub i0: u8,
+    pub j0: u8,
+    pub i1: u8,
+    pub j1: u8,
+    /// The height of a top, or of a wall's upper edge, in whole blocks.
+    pub top: i32,
+    /// A wall: the blocks of step it shows. Zero for a top.
+    pub rise: u32,
+    pub border: bool,
+    /// A wall: the share of it, in 255ths, that is the surface block's side
+    /// and that is soil; the rest is stone. Zero for a top.
+    pub mix: [u8; 2],
+    /// How open the face is to the sky, in 255ths: what ambient occlusion
+    /// leaves of its light ([`face_open`]).
+    pub open: u8,
+}
+
+/// One corner of a [`FarFace`]: what `far.wgsl` is handed per vertex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FarVertex {
+    /// The corner's place on the patch's grid of quad corners, `0..=32`.
+    pub at: [i32; 2],
+    pub dir: FarDir,
+    /// Which corner of its face: bit 0, the high end of the face's ground
+    /// axis (x for a top and for a wall facing along z, z for a wall facing
+    /// along x); bit 1, the high end of the other (z for a top, **up** for a
+    /// wall, so a wall's lower corners are the ones without it).
+    pub corner: u8,
+    pub top: i32,
+    pub rise: u32,
+    pub border: bool,
+}
+
+/// The heights a face can carry: 18 bits, biased.
+pub const FAR_TOP_RANGE: std::ops::RangeInclusive<i32> = -131_072..=131_071;
+/// The tallest step a face can carry: 14 bits.
+pub const FAR_MAX_RISE: u32 = 16_383;
+
+impl FarVertex {
+    /// The corner's height, in blocks, in a patch whose skirt is `skirt`
+    /// deep: the face's top, but for a wall's lower corners.
+    pub fn y(&self, skirt: f32) -> f32 {
+        let low = self.dir != FarDir::Top && self.corner & 2 == 0;
+        let drop = if low {
+            self.rise as f32 + if self.border { skirt } else { 0.0 }
+        } else {
+            0.0
+        };
+        self.top as f32 - drop
+    }
+
+    /// The direction `face.wgsl`'s `CRACK_SEAL` moves this corner in: out of
+    /// its face along the face's two in-plane axes.
+    pub fn outward(&self) -> Vec3 {
+        let su = if self.corner & 1 != 0 { 1.0 } else { -1.0 };
+        let sv = if self.corner & 2 != 0 { 1.0 } else { -1.0 };
+        match self.dir {
+            FarDir::Top => Vec3::new(su, 0.0, sv),
+            d if d.faces_x() => Vec3::new(0.0, sv, su),
+            _ => Vec3::new(su, sv, 0.0),
+        }
+    }
+}
+
+impl FarFace {
+    /// The three words `far.wgsl` unpacks: `i0:6 j0:6 i1:6 j1:6 dir:3
+    /// border:1`, then `top + 131072 : 18, rise : 14`, then `surface:8
+    /// soil:8 open:8`. A height or a step beyond what fits is clamped -- the
+    /// terrain's own range is a small part of either (the app asserts it,
+    /// `far_streaming`).
+    pub fn pack(&self) -> [u32; 3] {
+        let top = self.top.clamp(*FAR_TOP_RANGE.start(), *FAR_TOP_RANGE.end());
+        let rise = self.rise.min(FAR_MAX_RISE);
+        [
+            self.i0 as u32
+                | (self.j0 as u32) << 6
+                | (self.i1 as u32) << 12
+                | (self.j1 as u32) << 18
+                | (self.dir as u32) << 24
+                | (self.border as u32) << 27,
+            (top - FAR_TOP_RANGE.start()) as u32 | rise << 18,
+            self.mix[0] as u32 | (self.mix[1] as u32) << 8 | (self.open as u32) << 16,
+        ]
+    }
+
+    /// [`pack`](Self::pack), undone.
+    pub fn unpack([w0, w1, w2]: [u32; 3]) -> Self {
+        let six = |shift: u32| ((w0 >> shift) & 0x3F) as u8;
+        Self {
+            i0: six(0),
+            j0: six(6),
+            i1: six(12),
+            j1: six(18),
+            dir: FarDir::ALL[((w0 >> 24) & 0x7) as usize],
+            border: (w0 >> 27) & 1 != 0,
+            top: (w1 & 0x3_FFFF) as i32 + FAR_TOP_RANGE.start(),
+            rise: w1 >> 18,
+            mix: [(w2 & 0xFF) as u8, ((w2 >> 8) & 0xFF) as u8],
+            open: ((w2 >> 16) & 0xFF) as u8,
+        }
+    }
+
+    /// The corner `far.wgsl` makes of this face for the `k`th of its four
+    /// vertices -- the shader's own steps, so a test can hold them against
+    /// [`corners`](Self::corners), which is the definition.
+    pub fn shader_corner(&self, k: u32) -> FarVertex {
+        let wall = self.dir != FarDir::Top;
+        // The two wall directions that would wind clockwise run backwards.
+        let flip = matches!(self.dir, FarDir::NegX | FarDir::PosZ) as u32;
+        let e = (k & 1) ^ flip;
+        let u = k >> 1;
+        let (di, dj) = ((self.i1 - self.i0) as u32, (self.j1 - self.j0) as u32);
+        FarVertex {
+            at: [
+                (self.i0 as u32 + e * di) as i32,
+                (self.j0 as u32 + if wall { e } else { u } * dj) as i32,
+            ],
+            dir: self.dir,
+            corner: (e | u << 1) as u8,
+            top: self.top,
+            rise: self.rise,
+            border: self.border,
+        }
+    }
+
+    /// The face's four corners, in the order that draws it: with
+    /// [`QUAD_INDICES`], two triangles wound counter-clockwise as seen from
+    /// the side the face looks out of (the far pipeline culls the back).
+    pub fn corners(&self) -> [FarVertex; 4] {
+        let v = |at: [u8; 2], corner: u8| FarVertex {
+            at: [at[0] as i32, at[1] as i32],
+            dir: self.dir,
+            corner,
+            top: self.top,
+            rise: self.rise,
+            border: self.border,
+        };
+        let (i0, j0, i1, j1) = (self.i0, self.j0, self.i1, self.j1);
+        match self.dir {
+            FarDir::Top => [
+                v([i0, j0], 0),
+                v([i1, j0], 1),
+                v([i0, j1], 2),
+                v([i1, j1], 3),
+            ],
+            // A wall: low end and high end of its run, bottom then top --
+            // and the other way along the run for the two directions that
+            // would otherwise wind clockwise.
+            FarDir::PosX => [
+                v([i0, j0], 0),
+                v([i0, j1], 1),
+                v([i0, j0], 2),
+                v([i0, j1], 3),
+            ],
+            FarDir::NegX => [
+                v([i0, j1], 1),
+                v([i0, j0], 0),
+                v([i0, j1], 3),
+                v([i0, j0], 2),
+            ],
+            FarDir::PosZ => [
+                v([i1, j0], 1),
+                v([i0, j0], 0),
+                v([i1, j0], 3),
+                v([i0, j0], 2),
+            ],
+            FarDir::NegZ => [
+                v([i0, j0], 0),
+                v([i1, j0], 1),
+                v([i0, j0], 2),
+                v([i1, j0], 3),
+            ],
+        }
+    }
+}
+
+/// The indices that draw a face from its four [`corners`](FarFace::corners).
+pub const QUAD_INDICES: [u16; 6] = [0, 2, 1, 1, 2, 3];
+
+/// **The one place a face's colour is decided** (the seam issue #422 asks
+/// for; `far.wgsl`'s `face_colour` is this, and a golden test holds the two
+/// together): a top wears the top of the surface block, and a wall the mix
+/// of the surface block's side, soil and stone it carries -- which is what
+/// level 0's own risers facing that way are made of over the wall's quad
+/// (`cubara_world::far::QuadGround`, issue #423 decision 2), not what the
+/// wall's height would suggest.
+pub fn face_colour(materials: &Materials, face: &FarFace) -> Vec3 {
+    if face.dir == FarDir::Top {
+        return materials.top;
+    }
+    let surface = face.mix[0] as f32 / 255.0;
+    let soil = face.mix[1] as f32 / 255.0;
+    materials.side * surface + materials.soil * soil + materials.stone * (1.0 - surface - soil)
+}
+
+/// How much of its light a face keeps: `mesh.wgsl`'s ambient occlusion for
+/// a face as open to the sky as level 0's faces over the same ground are on
+/// average (`FarFace::open`), `ao_floor + (1 - ao_floor) * open`. The far
+/// terrain's twin of `aggregate::ao_fraction` at a width of one block, with
+/// the mean of the corners' levels in place of one corner's.
+pub fn face_open(face: &FarFace, ao_floor: f32) -> f32 {
+    ao_floor + (1.0 - ao_floor) * (face.open as f32 / 255.0)
+}
 
 /// One patch, as the renderer needs it: where it is, how coarse, and its
-/// heights row by row (`z` outer, `x` inner), [`FAR_VERTS`] a side.
+/// faces.
 #[derive(Clone, Copy, Debug)]
 pub struct FarPatch<'a> {
     /// The lowest `(x, z)` corner, in blocks -- the integer it is
@@ -34,9 +285,10 @@ pub struct FarPatch<'a> {
     pub origin: [i64; 2],
     /// The width of one quad, in blocks.
     pub quad: f32,
-    pub heights: &'a [f32],
-    /// How far the skirt drops below the edge, in blocks: deep enough to
-    /// cover the gap to a coarser neighbour.
+    pub faces: &'a [FarFace],
+    /// How far the walls on the patch's edge hang below the step they show,
+    /// in blocks: deep enough to cover the gap to a neighbour of another
+    /// level.
     pub skirt: f32,
 }
 
@@ -44,7 +296,7 @@ pub struct FarPatch<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FarSlot(u32);
 
-/// What `far.wgsl` reads besides the heights.
+/// What `far.wgsl` reads besides the vertices.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarParams {
     /// The box the voxel rings draw themselves, `(min, max)` in blocks --
@@ -52,8 +304,8 @@ pub struct FarParams {
     /// Nothing of the far terrain is drawn inside it. `None`: no hole.
     pub hole: Option<([i32; 3], [i32; 3])>,
     /// What the ground is made of: the mean colours of its faces
-    /// ([`crate::materials::mean_color`]) and the soil's depth, for the
-    /// block-aggregate shading (`crate::aggregate`).
+    /// ([`crate::materials::mean_color`]) and the soil's depth, for
+    /// [`face_colour`].
     pub materials: Materials,
 }
 
@@ -132,69 +384,137 @@ impl ParamsGpu {
     }
 }
 
-/// The committed [`MaskingTable`] as the 3D texture `far.wgsl` samples: its
-/// first two axes as width and height, its last two stacked as depth
-/// (`axis 2 + 16 * axis 3`). That is exactly the table's own byte order, so
-/// the bytes go up as they are. Linear filtering interpolates the first three
-/// axes; the shader blends along the fourth itself, never across a stack's
-/// edge.
-fn masking_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> (wgpu::TextureView, wgpu::Sampler) {
-    let side = TABLE_SIZE as u32;
-    let size = wgpu::Extent3d {
-        width: side,
-        height: side,
-        depth_or_array_layers: side * side,
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("far-masking-table"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::R8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        MaskingTable::committed().bytes(),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(side),
-            rows_per_image: Some(side),
-        },
-        size,
-    );
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("far-masking-sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
-    (texture.create_view(&Default::default()), sampler)
+/// The order a patch's faces are stored in, by direction, so that the
+/// directions that can face one eye are next to each other: an eye sees at
+/// most one of `PosX`/`NegX` and one of `PosZ`/`NegZ` of a patch it is not
+/// over, and the tops. With this order that is one run of faces for two of
+/// the four quarters the eye can be in and two runs for the others.
+const GROUP_ORDER: [FarDir; 5] = [
+    FarDir::PosX,
+    FarDir::PosZ,
+    FarDir::Top,
+    FarDir::NegZ,
+    FarDir::NegX,
+];
+
+/// Which of a patch's face groups ([`GROUP_ORDER`]) an eye at `eye` can see
+/// the front of, for a patch whose box is `b` (both relative to the same
+/// anchor): a wall facing `+x` stands somewhere in the box's span of x and is
+/// seen only from further along `+x` than itself, so not at all from an eye
+/// at or before the box's low side -- and so on for the other three. The tops
+/// are always drawn: inside the voxels' box the join folds some of them into
+/// walls (`join`), which face wherever the box's side does.
+///
+/// What the voxel arena does per node (`arena::faces_facing`), and for the
+/// same reason: about two walls in five face away from any one eye, and a
+/// triangle that is not sent is cheaper than one the GPU culls.
+pub fn groups_facing(b: &Aabb, eye: Vec3) -> [bool; 5] {
+    GROUP_ORDER.map(|dir| match dir {
+        FarDir::Top => true,
+        FarDir::PosX => eye.x > b.min.x,
+        FarDir::NegX => eye.x < b.max.x,
+        FarDir::PosZ => eye.z > b.min.z,
+        FarDir::NegZ => eye.z < b.max.z,
+    })
 }
 
-/// The far terrain on the GPU: a fixed number of patch slots, and the list of
-/// them drawn this frame.
+/// A patch's faces in the order they are stored and drawn in: by direction
+/// ([`GROUP_ORDER`]), otherwise as they came.
+pub fn stored_order(faces: &[FarFace]) -> Vec<FarFace> {
+    let mut out = Vec::with_capacity(faces.len());
+    for dir in GROUP_ORDER {
+        out.extend(faces.iter().filter(|f| f.dir == dir));
+    }
+    out
+}
+
+/// How many of `faces` look each way, in [`GROUP_ORDER`].
+pub fn group_counts(faces: &[FarFace]) -> [u32; 5] {
+    GROUP_ORDER.map(|dir| faces.iter().filter(|f| f.dir == dir).count() as u32)
+}
+
+/// The runs of consecutive faces to draw, as `(first face, faces)`, for a
+/// patch whose groups hold `counts` faces each (in [`GROUP_ORDER`]) and of
+/// which `facing` are wanted. Empty groups neither start nor break a run.
+pub fn facing_runs(counts: [u32; 5], facing: [bool; 5], mut emit: impl FnMut(u32, u32)) {
+    let mut start = 0;
+    let mut run: Option<(u32, u32)> = None;
+    for (count, wanted) in counts.into_iter().zip(facing) {
+        if wanted && count > 0 {
+            run = Some(match run {
+                Some((first, n)) => (first, n + count),
+                None => (start, count),
+            });
+        } else if !wanted && count > 0 {
+            if let Some((first, n)) = run.take() {
+                emit(first, n);
+            }
+        }
+        start += count;
+    }
+    if let Some((first, n)) = run {
+        emit(first, n);
+    }
+}
+
+/// How many faces one draw's instances each hold: the far terrain's runs of
+/// faces are sorted into these classes, and each class with anything in it
+/// is one instanced draw, every instance padded to the class's size with
+/// zero-area faces.
+///
+/// **Why classes at all.** A run is some of one patch's faces, and runs
+/// differ in length; one draw needs one vertex count. A draw per run is
+/// hundreds of draws a frame, and draws are what the M3 is bound by
+/// (`PHASE1_ARCHITECTURE.md` §2) -- Metal has no multi-draw, so an indirect
+/// list would be the same hundreds of draws issued in a loop. Seventeen
+/// classes are at most seventeen draws, whatever is in view.
+///
+/// Each is `sqrt 2` times the last, rounded up, from 16 to the first one that
+/// holds a whole patch ([`FAR_MAX_FACES`]), so a run is padded by 41% at
+/// most and about a fifth on average. **Chosen, not derived**: a finer
+/// ladder pads less and draws more often.
+pub const CLASS_FACES: [u32; 17] = [
+    16, 23, 32, 46, 64, 91, 128, 182, 256, 363, 512, 725, 1024, 1449, 2048, 2897, 4096,
+];
+
+/// The class a run of `faces` faces is drawn in: the smallest that holds it.
+pub fn class_of(faces: u32) -> usize {
+    CLASS_FACES
+        .iter()
+        .position(|&room| faces <= room)
+        .expect("no run is longer than a patch, and the last class holds one")
+}
+
+/// One run of faces to draw, as `far.wgsl` reads it: the patch's slot, the
+/// run's first face in the shared buffer, and how many faces it is.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+struct RunGpu {
+    slot: u32,
+    first: u32,
+    count: u32,
+}
+
+/// The far terrain on the GPU: every held patch's faces in one storage
+/// buffer, and the runs of them drawn this frame.
+///
+/// There is no vertex buffer. A face is three packed words (12 bytes)
+/// ([`FarFace::pack`]); `far.wgsl` makes its four corners from the vertex
+/// index and finds its run -- and through it its patch -- by the instance
+/// index. Both are sound because every draw here is direct
+/// (`scripts/check-architecture.sh`, Rule 5).
 pub struct FarTerrain {
-    heights: wgpu::Buffer,
+    faces: wgpu::Buffer,
+    face_slab: SlabAllocator,
     patches: wgpu::Buffer,
-    draw_slots: wgpu::Buffer,
     params: wgpu::Buffer,
     indices: wgpu::Buffer,
-    index_count: u32,
-    bind_group: wgpu::BindGroup,
+    /// The runs drawn this frame, a region of [`runs_per_class`] for each
+    /// class.
+    runs: wgpu::Buffer,
+    /// One bind group a class: the same buffers, with that class's region of
+    /// `runs`.
+    bind_groups: Vec<wgpu::BindGroup>,
     capacity: u32,
     /// Slots not holding a patch, handed out last-freed first.
     free: Vec<u32>,
@@ -213,8 +533,12 @@ pub struct FarTerrain {
     /// The render anchor (`crate::anchor`) the GPU records, `hole` and
     /// `boxes` are relative to.
     anchor: Anchor,
+    /// This frame's runs by class, from the last [`prepare`](Self::prepare).
+    by_class: Vec<Vec<RunGpu>>,
     /// How many slots [`prepare`](Self::prepare) found in view.
     drawn: u32,
+    /// The triangles of this frame's runs: two a face.
+    drawn_triangles: u64,
     /// Whether the far terrain can be seen at all
     /// ([`set_shown`](Self::set_shown)).
     shown: bool,
@@ -224,28 +548,40 @@ pub struct FarTerrain {
     raised: bool,
 }
 
-/// A patch as it was inserted, minus its heights (which the anchor does not
-/// touch): enough to rewrite its `PatchGpu` record and its box.
+/// A patch as it was inserted, minus its faces (which the anchor does not
+/// touch): enough to rewrite its `PatchGpu` record and its box, and to draw
+/// it.
 #[derive(Clone, Copy, Debug)]
 struct PlacedPatch {
     origin: [i64; 2],
     quad: f32,
     skirt: f32,
-    /// Lowest and highest height.
+    /// Lowest and highest point of any face, skirt included.
     lo: f32,
     hi: f32,
+    /// Where its faces are in the shared buffer.
+    first_face: u32,
+    /// How many faces it has of each direction, in [`GROUP_ORDER`] -- the
+    /// order they are stored in.
+    groups: [u32; 5],
 }
 
 impl PlacedPatch {
     fn of(patch: &FarPatch<'_>) -> Self {
-        let (lo, hi) = min_max(patch.heights);
+        let (lo, hi) = min_max(patch);
         Self {
             origin: patch.origin,
             quad: patch.quad,
             skirt: patch.skirt,
             lo,
             hi,
+            first_face: 0,
+            groups: group_counts(patch.faces),
         }
+    }
+
+    fn face_len(&self) -> u32 {
+        self.groups.iter().sum()
     }
 
     /// The `(x, z)` origin relative to `anchor`: the one exact integer
@@ -264,24 +600,47 @@ impl PlacedPatch {
     }
 
     /// The patch's box relative to `anchor`: its square of ground, from the
-    /// bottom of its skirt to its highest vertex. The heights are absolute
-    /// (the `heights` buffer is untouched by a rebase), so the anchor's `y`
-    /// comes off here, as `far.wgsl` takes it off every vertex.
+    /// bottom of its lowest wall to its highest top. The heights are
+    /// absolute (a face carries its own, and a rebase leaves the faces
+    /// alone), so the anchor's `y` comes off here, as `far.wgsl` takes it
+    /// off every vertex.
     fn aabb(&self, anchor: Anchor) -> Aabb {
         let [ox, oz] = self.origin_relative(anchor);
         let size = self.quad * FAR_QUADS as f32;
         let dy = anchor[1] as f32;
         Aabb {
-            min: Vec3::new(ox, self.lo - self.skirt - dy, oz),
+            min: Vec3::new(ox, self.lo - dy, oz),
             max: Vec3::new(ox + size, self.hi - dy, oz + size),
         }
     }
 }
 
+/// A patch's faces as they go up: grouped by direction ([`GROUP_ORDER`]),
+/// three words each.
+fn pack_patch(faces: &[FarFace]) -> Vec<[u32; 3]> {
+    stored_order(faces).iter().map(FarFace::pack).collect()
+}
+
+/// Bytes a face takes: [`FarFace::pack`]'s three words.
+const FACE_BYTES: u64 = 12;
+
+/// How many runs one class has room for, for `capacity` patches: every
+/// patch's two runs at most ([`GROUP_ORDER`]), rounded up so that a class's
+/// region of the buffer starts on a multiple of 256 bytes, as a bound range
+/// of a storage buffer must.
+fn runs_per_class(capacity: u32) -> u32 {
+    (2 * capacity).next_multiple_of(64)
+}
+
 impl FarTerrain {
-    /// Room for `capacity` patches, placed against the render anchor
-    /// `anchor` until [`rebase`](Self::rebase) moves it.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32, anchor: Anchor) -> Self {
+    /// Room for `capacity` patches and `face_capacity` faces, placed against
+    /// the render anchor `anchor` until [`rebase`](Self::rebase) moves it.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        (capacity, face_capacity): (u32, u32),
+        anchor: Anchor,
+    ) -> Self {
         let storage = |label, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -290,13 +649,15 @@ impl FarTerrain {
                 mapped_at_creation: false,
             })
         };
-        let per_patch = (FAR_VERTS * FAR_VERTS * std::mem::size_of::<f32>()) as u64;
-        let heights = storage("far-heights", per_patch * capacity as u64);
+        let face_capacity = face_capacity.max(1);
+        let faces = storage("far-faces", face_capacity as u64 * FACE_BYTES);
         let patches = storage(
             "far-patches",
             std::mem::size_of::<PatchGpu>() as u64 * capacity as u64,
         );
-        let draw_slots = storage("far-draw-slots", 4 * capacity as u64);
+        let run_bytes = std::mem::size_of::<RunGpu>() as u64;
+        let region = runs_per_class(capacity) as u64 * run_bytes;
+        let runs = storage("far-runs", region * CLASS_FACES.len() as u64);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("far-params"),
             size: std::mem::size_of::<ParamsGpu>() as u64,
@@ -312,71 +673,87 @@ impl FarTerrain {
             0,
             bytemuck::bytes_of(&ParamsGpu::new(params_world, anchor, false)),
         );
-        let (masking, masking_sampler) = masking_texture(device, queue);
 
-        let grid = grid_indices();
+        let quads = quad_indices();
         let indices = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("far-grid-indices"),
-            // A multiple of 4, as a buffer write must be; the padding is
-            // never indexed.
-            size: (std::mem::size_of_val(grid.as_slice()) as u64).next_multiple_of(4),
+            label: Some("far-quad-indices"),
+            size: std::mem::size_of_val(quads.as_slice()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut bytes = bytemuck::cast_slice::<u16, u8>(&grid).to_vec();
-        bytes.resize(bytes.len().next_multiple_of(4), 0);
-        queue.write_buffer(&indices, 0, &bytes);
+        queue.write_buffer(&indices, 0, bytemuck::cast_slice(&quads));
 
         let layout = far_bind_group_layout(device);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("far-bind-group"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: heights.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: patches.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: draw_slots.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&masking),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&masking_sampler),
-                },
-            ],
-        });
+        let bind_groups = (0..CLASS_FACES.len() as u64)
+            .map(|class| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("far-bind-group"),
+                    layout: &layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: patches.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: params.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: faces.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &runs,
+                                offset: class * region,
+                                size: wgpu::BufferSize::new(region),
+                            }),
+                        },
+                    ],
+                })
+            })
+            .collect();
         Self {
-            heights,
+            faces,
+            face_slab: SlabAllocator::new(face_capacity),
             patches,
-            draw_slots,
             params,
             indices,
-            index_count: grid.len() as u32,
-            bind_group,
+            runs,
+            bind_groups,
             capacity,
             free: (0..capacity).rev().collect(),
             boxes: vec![None; capacity as usize],
             placed: vec![None; capacity as usize],
             params_world,
             anchor,
+            by_class: vec![Vec::new(); CLASS_FACES.len()],
             drawn: 0,
+            drawn_triangles: 0,
             shown: true,
             raised: false,
             hole: None,
         }
+    }
+
+    /// A far terrain holding exactly `patches`, sized for them: what a
+    /// one-shot caller wants (a screenshot, the bench, a golden test).
+    pub fn holding(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        patches: &[FarPatch<'_>],
+        anchor: Anchor,
+    ) -> Self {
+        let faces: usize = patches.iter().map(|p| p.faces.len()).sum();
+        let room = (patches.len().max(1) as u32, faces as u32);
+        let mut terrain = Self::new(device, queue, room, anchor);
+        for patch in patches {
+            terrain
+                .insert(queue, *patch)
+                .expect("sized for these patches");
+        }
+        terrain
     }
 
     /// Whether any of the far terrain can be seen from where the eye is --
@@ -395,18 +772,19 @@ impl FarTerrain {
     }
 
     /// Re-express every patch, the hole and their boxes against `anchor`
-    /// (issue #379 decision 2). The heights are untouched -- they stay
-    /// absolute, and `far.wgsl` subtracts `Frame.anchor.y` from each; what
-    /// is rewritten is one 16-byte record per slot -- all of them, in **one**
-    /// `write_buffer` of `capacity * 16` bytes (64 KiB at the window's
-    /// `FAR_PATCH_CAPACITY`), which costs less than a frame's own indirect
-    /// upload. Not spread over frames: a patch drawn against the old anchor
-    /// while the eye is measured from the new one would be 4,096 blocks
-    /// off, the very thing the anchor exists to prevent; and not deferred to
-    /// each patch's next upload, because a patch at the horizon may not be
-    /// re-uploaded for minutes. The bounded single write is the cheapest
-    /// form that is also correct on the rebase frame itself. A no-op for
-    /// the anchor already in use.
+    /// (issue #379 decision 2). The faces are untouched -- they are whole
+    /// quads from their patch's corner and absolute heights, and `far.wgsl`
+    /// subtracts `Frame.anchor.y` from each; what is rewritten is one
+    /// 16-byte record per slot -- all of them, in **one** `write_buffer` of
+    /// `capacity * 16` bytes (64 KiB at the window's `FAR_PATCH_CAPACITY`),
+    /// which costs less than a frame's own indirect upload. Not spread over
+    /// frames: a patch drawn against the old anchor while the eye is
+    /// measured from the new one would be 4,096 blocks off, the very thing
+    /// the anchor exists to prevent; and not deferred to each patch's next
+    /// upload, because a patch at the horizon may not be re-uploaded for
+    /// minutes. The bounded single write is the cheapest form that is also
+    /// correct on the rebase frame itself. A no-op for the anchor already in
+    /// use.
     pub fn rebase(&mut self, queue: &wgpu::Queue, anchor: Anchor) {
         if anchor == self.anchor {
             return;
@@ -432,22 +810,29 @@ impl FarTerrain {
         );
     }
 
-    /// Upload a patch. `None` when every slot is taken -- the caller decides
-    /// what gives way, since it is the one that knows which patches matter.
+    /// Upload a patch. `None` when every slot is taken or its faces do not
+    /// fit -- the caller decides what gives way, since it is the one that
+    /// knows which patches matter.
     pub fn insert(&mut self, queue: &wgpu::Queue, patch: FarPatch<'_>) -> Option<FarSlot> {
-        assert_eq!(
-            patch.heights.len(),
-            FAR_VERTS * FAR_VERTS,
-            "a patch's heights"
+        assert!(
+            patch.faces.len() <= FAR_MAX_FACES,
+            "a patch of {} faces",
+            patch.faces.len()
         );
-        let slot = self.free.pop()?;
-        let per_patch = (FAR_VERTS * FAR_VERTS * std::mem::size_of::<f32>()) as u64;
-        queue.write_buffer(
-            &self.heights,
-            per_patch * slot as u64,
-            bytemuck::cast_slice(patch.heights),
-        );
-        let placed = PlacedPatch::of(&patch);
+        let slot = *self.free.last()?;
+        let first_face = self.face_slab.alloc(patch.faces.len() as u32)?;
+        self.free.pop();
+        if !patch.faces.is_empty() {
+            queue.write_buffer(
+                &self.faces,
+                first_face as u64 * FACE_BYTES,
+                bytemuck::cast_slice(&pack_patch(patch.faces)),
+            );
+        }
+        let placed = PlacedPatch {
+            first_face,
+            ..PlacedPatch::of(&patch)
+        };
         queue.write_buffer(
             &self.patches,
             std::mem::size_of::<PatchGpu>() as u64 * slot as u64,
@@ -462,7 +847,9 @@ impl FarTerrain {
     /// [`prepare`](Self::prepare).
     pub fn remove(&mut self, slot: FarSlot) {
         if self.boxes[slot.0 as usize].take().is_some() {
-            self.placed[slot.0 as usize] = None;
+            if let Some(placed) = self.placed[slot.0 as usize].take() {
+                self.face_slab.free(placed.first_face, placed.face_len());
+            }
             self.free.push(slot.0);
         }
     }
@@ -481,8 +868,9 @@ impl FarTerrain {
 
     /// Decide what is drawn this frame: every occupied slot whose box the
     /// frustum can see, nearest to `eye` first -- so near ground fills the
-    /// depth buffer before the distant ground it hides is drawn. Returns how
-    /// many. `frustum` and `eye` are anchor-relative, like the boxes
+    /// depth buffer before the distant ground it hides is drawn -- and of
+    /// each, the faces that can face the eye ([`groups_facing`]). Returns how
+    /// many patches. `frustum` and `eye` are anchor-relative, like the boxes
     /// (issue #379 decision 5).
     /// Patches wholly inside the voxels' hole are not drawn at all.
     pub fn prepare(&mut self, queue: &wgpu::Queue, frustum: &Frustum, eye: Vec3) -> u32 {
@@ -503,8 +891,36 @@ impl FarTerrain {
             }
         }
         let order = slots_to_draw(self.shown, &self.boxes, frustum, self.hole.as_ref(), eye);
-        if !order.is_empty() {
-            queue.write_buffer(&self.draw_slots, 0, bytemuck::cast_slice(&order));
+        for class in &mut self.by_class {
+            class.clear();
+        }
+        self.drawn_triangles = 0;
+        for &slot in &order {
+            let (Some(placed), Some(aabb)) =
+                (&self.placed[slot as usize], &self.boxes[slot as usize])
+            else {
+                continue;
+            };
+            let by_class = &mut self.by_class;
+            let triangles = &mut self.drawn_triangles;
+            facing_runs(placed.groups, groups_facing(aabb, eye), |first, count| {
+                by_class[class_of(count)].push(RunGpu {
+                    slot,
+                    first: placed.first_face + first,
+                    count,
+                });
+                *triangles += count as u64 * 2;
+            });
+        }
+        let region = runs_per_class(self.capacity) as u64 * std::mem::size_of::<RunGpu>() as u64;
+        for (class, runs) in self.by_class.iter().enumerate() {
+            if !runs.is_empty() {
+                queue.write_buffer(
+                    &self.runs,
+                    class as u64 * region,
+                    bytemuck::cast_slice(runs),
+                );
+            }
         }
         self.drawn = order.len() as u32;
         self.drawn
@@ -523,26 +939,134 @@ impl FarTerrain {
         self.capacity
     }
 
+    /// Faces held, and room for.
+    pub fn face_usage(&self) -> (u32, u32) {
+        let held = self.placed.iter().flatten().map(|p| p.face_len()).sum();
+        (held, self.face_slab.capacity())
+    }
+
     /// Patches drawn this frame, from the last [`prepare`](Self::prepare).
     pub fn drawn(&self) -> u32 {
         self.drawn
     }
 
-    /// Triangles drawn this frame, skirts included.
+    /// Triangles drawn this frame: the faces of the patches in view that
+    /// can face the eye, two each. Not the padding ([`drawn_cost`]).
+    ///
+    /// [`drawn_cost`]: Self::drawn_cost
     pub fn drawn_triangles(&self) -> u64 {
-        self.drawn as u64 * (self.index_count / 3) as u64
+        self.drawn_triangles
     }
 
-    /// Draw this frame's patches. The pipeline and bind group 0 (the camera)
+    /// What this frame's far terrain costs to issue: `(draws, vertices)` --
+    /// one draw a class with anything in it, and four vertices for every
+    /// face of every run's class, padding included ([`CLASS_FACES`]).
+    pub fn drawn_cost(&self) -> (u32, u64) {
+        issued(&self.by_class.iter().map(Vec::len).collect::<Vec<_>>())
+    }
+
+    /// Draw this frame's runs. The pipeline and bind group 0 (the camera)
     /// are the caller's to set.
     pub(crate) fn encode(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.drawn == 0 {
+        if self.drawn_triangles == 0 {
             return;
         }
-        pass.set_bind_group(1, &self.bind_group, &[]);
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
-        pass.draw_indexed(0..self.index_count, 0, 0..self.drawn);
+        for (class, runs) in self.by_class.iter().enumerate() {
+            if runs.is_empty() {
+                continue;
+            }
+            pass.set_bind_group(1, &self.bind_groups[class], &[]);
+            pass.draw_indexed(0..CLASS_FACES[class] * 6, 0, 0..runs.len() as u32);
+        }
     }
+}
+
+/// `(draws, vertices)` for `runs[class]` runs in each class.
+pub fn issued(runs: &[usize]) -> (u32, u64) {
+    let draws = runs.iter().filter(|&&n| n > 0).count() as u32;
+    let vertices = runs
+        .iter()
+        .zip(CLASS_FACES)
+        .map(|(&n, room)| n as u64 * room as u64 * 4)
+        .sum();
+    (draws, vertices)
+}
+
+/// The index list every run is drawn with: [`QUAD_INDICES`] for face after
+/// face, as many as the largest class holds. A draw takes a prefix of it.
+fn quad_indices() -> Vec<u16> {
+    let most = *CLASS_FACES.last().expect("there are classes") as u16;
+    (0..most)
+        .flat_map(|face| QUAD_INDICES.map(|i| face * 4 + i))
+        .collect()
+}
+
+/// `far.wgsl`'s `vs_main`, as far as a vertex's position before the crack
+/// seal: where the corner `v` of a patch at `origin` with `quad`-wide quads
+/// and a skirt `skirt` deep is put, given the voxels' box `hole` (`None`:
+/// no box) and the height hidden vertices go to ([`hidden_height`]). In world
+/// blocks; the shader does the same with the render anchor taken off
+/// everything.
+pub fn place(
+    v: &FarVertex,
+    (origin, quad, skirt): ([f32; 2], f32, f32),
+    hole: Option<(Vec3, Vec3)>,
+    hidden: f32,
+) -> Vec3 {
+    let at = |g: [i32; 2]| {
+        [
+            origin[0] + g[0] as f32 * quad,
+            origin[1] + g[1] as f32 * quad,
+        ]
+    };
+    let [x, z] = at(v.at);
+    let y = v.y(skirt);
+    let mut world = Vec3::new(x, y, z);
+    let Some((min, max)) = hole else {
+        return world;
+    };
+    if v.dir != FarDir::Top {
+        if wall_in_hole(v, world, quad, (min, max)) {
+            world.y = world.y.min(min.y);
+        }
+    } else if world.cmpgt(min).all() && world.cmplt(max).all() {
+        let lo = [(x - min.x) / quad, (z - min.z) / quad];
+        let hi = [(max.x - x) / quad, (max.z - z) / quad];
+        match join(v.at, lo, hi) {
+            Join::Skirt(to) => {
+                let [x, z] = at(to);
+                world = Vec3::new(x, y - skirt, z);
+            }
+            Join::Hidden => world.y = hidden,
+        }
+    }
+    world
+}
+
+/// Whether the wall whose corner `v` stands at `world` is the voxels' to
+/// draw: in their box as a whole, by a point half a quad along it from this
+/// corner and by its top. No wall crosses a side of the box
+/// (`cubara_world::far::JOIN_GRID`), so that point is on the same side of
+/// every one of them for all four corners, and the four agree.
+///
+/// **Why a wall does not go through [`join`]**, as a top's corners do: a wall
+/// with two corners snapped to the box's side and two sent to the hidden
+/// height is a vertical sliver a thousand blocks tall, and it faces sideways
+/// -- at an eye inside the box, where nothing would cull it. That is the
+/// curtain of issue #424 again, a block wide. A wall in the box is cut off at
+/// the box's floor instead: all of it above the floor is gone, wherever the
+/// eye is, and what stands under the floor -- ground the far terrain still
+/// draws -- keeps its wall.
+pub fn wall_in_hole(v: &FarVertex, world: Vec3, quad: f32, (min, max): (Vec3, Vec3)) -> bool {
+    let inward = if v.corner & 1 != 0 { -0.5 } else { 0.5 } * quad;
+    let (x, z) = if v.dir.faces_x() {
+        (world.x, world.z + inward)
+    } else {
+        (world.x + inward, world.z)
+    };
+    let top = v.top as f32;
+    x > min.x && x < max.x && z > min.z && z < max.z && top > min.y && top < max.y
 }
 
 /// Where `far.wgsl` puts a vertex that lies strictly inside the voxels' box
@@ -616,11 +1140,16 @@ pub fn hidden_height(hole_min: Vec3, hole_max: Vec3, eye: Vec3, lowest: f32) -> 
     }
 }
 
-fn min_max(heights: &[f32]) -> (f32, f32) {
-    heights
+/// The lowest and highest point of a patch's faces: the bottom of its
+/// deepest wall, skirt included, and its highest top.
+fn min_max(patch: &FarPatch<'_>) -> (f32, f32) {
+    patch
+        .faces
         .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &h| {
-            (lo.min(h), hi.max(h))
+        .flat_map(|f| f.corners())
+        .map(|v| v.y(patch.skirt))
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), y| {
+            (lo.min(y), hi.max(y))
         })
 }
 
@@ -717,59 +1246,341 @@ fn contains(outer: &Aabb, inner: &Aabb) -> bool {
     outer.min.cmple(inner.min).all() && inner.max.cmple(outer.max).all()
 }
 
-/// The index list for one patch's [`GRID`] x [`GRID`] vertices: two triangles
-/// per cell, every cell -- including the skirt ring's.
-fn grid_indices() -> Vec<u16> {
-    let mut out = Vec::with_capacity(((GRID - 1) * (GRID - 1) * 6) as usize);
-    for z in 0..GRID - 1 {
-        for x in 0..GRID - 1 {
-            let a = (z * GRID + x) as u16;
-            let b = a + 1;
-            let c = a + GRID as u16;
-            let d = c + 1;
-            out.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_grid_covers_every_cell_with_two_triangles() {
-        let idx = grid_indices();
-        let cells = (GRID - 1) * (GRID - 1);
-        assert_eq!(idx.len() as u32, cells * 6);
-        assert!(idx.iter().all(|&i| (i as u32) < GRID * GRID));
-        // Every vertex is used: none of the skirt ring is left out.
-        let mut used = vec![false; (GRID * GRID) as usize];
-        for &i in &idx {
-            used[i as usize] = true;
+    /// The vertex grid the far terrain was drawn with while it was a smooth
+    /// surface: a patch's 33 x 33 corners and a ring around them dropped into
+    /// the skirt. Issue #424's tests of [`join`] and [`hidden_height`] below
+    /// are written on it and are kept as they were: for a patch of unmerged
+    /// tops it is still what a top's corners do.
+    const GRID: u32 = FAR_QUADS as u32 + 3;
+
+    /// Two triangles per cell of [`GRID`], wound as [`QUAD_INDICES`] is.
+    fn grid_indices() -> Vec<u16> {
+        let mut out = Vec::with_capacity(((GRID - 1) * (GRID - 1) * 6) as usize);
+        for z in 0..GRID - 1 {
+            for x in 0..GRID - 1 {
+                let a = (z * GRID + x) as u16;
+                let b = a + 1;
+                let c = a + GRID as u16;
+                let d = c + 1;
+                out.extend_from_slice(&[a, c, b, b, c, d]);
+            }
         }
-        assert!(used.iter().all(|u| *u));
+        out
     }
 
-    /// The shader's `VERTS`/`GRID` and this module's must agree, or every
-    /// patch reads its neighbour's heights.
+    /// A cheap, fixed stream of numbers for the property tests.
+    fn stream(seed: u64) -> impl FnMut(u32) -> u32 {
+        let mut s = seed | 1;
+        move |below: u32| {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            ((s.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) % below as u64) as u32
+        }
+    }
+
+    /// A face of each kind somewhere in a patch, from `next`.
+    fn some_face(next: &mut impl FnMut(u32) -> u32) -> FarFace {
+        let dir = FarDir::ALL[next(5) as usize];
+        let (i0, j0) = (next(32) as u8, next(32) as u8);
+        let (w, d) = (
+            1 + next(32 - i0 as u32) as u8,
+            1 + next(32 - j0 as u32) as u8,
+        );
+        let (i1, j1) = match dir {
+            FarDir::Top => (i0 + w, j0 + d),
+            FarDir::PosX | FarDir::NegX => (i0, j0 + d),
+            FarDir::PosZ | FarDir::NegZ => (i0 + w, j0),
+        };
+        let wall = dir != FarDir::Top;
+        let mix = if wall {
+            [next(128) as u8, next(128) as u8]
+        } else {
+            [0, 0]
+        };
+        FarFace {
+            dir,
+            i0,
+            j0,
+            i1,
+            j1,
+            top: next(600) as i32 - 100,
+            rise: if wall { 1 + next(40) } else { 0 },
+            border: wall && next(4) == 0,
+            mix,
+            open: next(256) as u8,
+        }
+    }
+
+    /// The shader's `QUADS` and this module's must agree, or the join steps
+    /// off the patch.
     #[test]
     fn the_shader_agrees_on_the_patch_size() {
         let wgsl = crate::haze::FAR_WGSL;
         assert!(wgsl.contains(&format!("const QUADS: i32 = {FAR_QUADS};")));
-        assert!(wgsl.contains(&format!("const VERTS: u32 = {FAR_VERTS}u;")));
-        assert!(wgsl.contains(&format!("const GRID: u32 = {GRID}u;")));
+    }
+
+    /// A face survives the three words it travels in, at the ends of every
+    /// field as well as in the middle.
+    #[test]
+    fn a_face_packs_into_three_words_and_back() {
+        let mut next = stream(0xFACE);
+        for _ in 0..2_000 {
+            let face = some_face(&mut next);
+            assert_eq!(FarFace::unpack(face.pack()), face);
+        }
+        let edge = FarFace {
+            dir: FarDir::NegZ,
+            i0: 0,
+            j0: 32,
+            i1: 32,
+            j1: 32,
+            top: *FAR_TOP_RANGE.end(),
+            rise: FAR_MAX_RISE,
+            border: true,
+            mix: [0, 0],
+            open: 255,
+        };
+        assert_eq!(FarFace::unpack(edge.pack()), edge);
+        let low = FarFace {
+            top: *FAR_TOP_RANGE.start(),
+            ..edge
+        };
+        assert_eq!(FarFace::unpack(low.pack()), low);
+        // Beyond what fits: clamped, not wrapped into its neighbour's bits.
+        let beyond = FarFace {
+            top: 1_000_000,
+            rise: 1_000_000,
+            ..edge
+        };
+        assert_eq!(FarFace::unpack(beyond.pack()), edge);
+    }
+
+    /// Every face is drawn counter-clockwise as seen from the side it looks
+    /// out of -- the side the pipeline does not cull -- and its corners are
+    /// where the face is: a top at its height over its rectangle, a wall
+    /// from its top down exactly its rise, and a skirt further on the edge.
+    #[test]
+    fn a_face_winds_towards_its_normal_and_spans_what_it_says() {
+        let mut next = stream(0x51DE);
+        let patch = ([64.0, -128.0], 4.0, 9.0);
+        for _ in 0..2_000 {
+            let face = some_face(&mut next);
+            let p = face.corners().map(|v| place(&v, patch, None, 0.0));
+            for [a, b, c] in [[0, 2, 1], [1, 2, 3]] {
+                let normal = (p[b] - p[a]).cross(p[c] - p[a]);
+                assert!(
+                    normal.normalize().distance(face.dir.normal()) < 1e-5,
+                    "{face:?}: triangle {a}{b}{c} looks along {normal}"
+                );
+            }
+            let (lo, hi) = p.iter().fold(
+                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                |(lo, hi), &v| (lo.min(v), hi.max(v)),
+            );
+            let x = |i: u8| 64.0 + i as f32 * 4.0;
+            let z = |j: u8| -128.0 + j as f32 * 4.0;
+            let depth = face.rise as f32 + if face.border { 9.0 } else { 0.0 };
+            assert_eq!(
+                lo,
+                Vec3::new(x(face.i0), face.top as f32 - depth, z(face.j0))
+            );
+            assert_eq!(hi, Vec3::new(x(face.i1), face.top as f32, z(face.j1)));
+            // And each corner is pushed out of the face, not into it.
+            let centre = (lo + hi) / 2.0;
+            for (v, at) in face.corners().iter().zip(p) {
+                let out = v.outward();
+                assert_eq!(out.dot(face.dir.normal()), 0.0, "{face:?}: out of plane");
+                for axis in 0..3 {
+                    if out[axis] != 0.0 {
+                        assert_eq!(out[axis], (at[axis] - centre[axis]).signum(), "{face:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `far.wgsl` makes a face's corners from the vertex index; that is
+    /// [`FarFace::shader_corner`], which must be [`FarFace::corners`] -- and
+    /// the shader must still say what `shader_corner` does.
+    #[test]
+    fn the_shader_makes_the_corners_this_module_does() {
+        let mut next = stream(0xC0FFEE);
+        for _ in 0..2_000 {
+            let face = some_face(&mut next);
+            let corners = face.corners();
+            for k in 0..4 {
+                assert_eq!(
+                    face.shader_corner(k),
+                    corners[k as usize],
+                    "{face:?} corner {k}"
+                );
+            }
+        }
+        let wgsl = crate::haze::FAR_WGSL;
+        for line in [
+            "let nth = vertex / 4u;",
+            "let face = faces[run.first + nth];",
+            "let k = vertex % 4u;",
+            "let flip = u32(dir == DIR_NEG_X || dir == DIR_POS_Z);",
+            "let e = (k & 1u) ^ flip;",
+            "let u = k >> 1u;",
+            "let corner = e | (u << 1u);",
+            "var i = i32(i0 + e * di);",
+            "var j = i32(j0 + select(u, e, wall) * dj);",
+            // `FarVertex::y`.
+            "y = top - rise - select(0.0, tile.skirt, border);",
+            // `FarVertex::outward`.
+            "var outward = vec3<f32>(su, 0.0, sv);",
+            "outward = select(vec3<f32>(su, sv, 0.0), vec3<f32>(0.0, sv, su), faces_x);",
+        ] {
+            assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
+        }
+        // `FarDir`'s order is the shader's.
+        for (dir, name) in [
+            (FarDir::Top, "DIR_TOP"),
+            (FarDir::PosX, "DIR_POS_X"),
+            (FarDir::NegX, "DIR_NEG_X"),
+            (FarDir::PosZ, "DIR_POS_Z"),
+        ] {
+            let line = format!("const {name}: u32 = {}u;", dir as u32);
+            assert!(wgsl.contains(&line), "far.wgsl no longer has: {line}");
+        }
+        let normals: String = FarDir::ALL
+            .iter()
+            .map(|d| {
+                let n = d.normal();
+                format!("    vec3<f32>({:.1}, {:.1}, {:.1}),\n", n.x, n.y, n.z)
+            })
+            .collect();
+        assert!(
+            wgsl.contains(&normals),
+            "FACE_NORMALS is not FarDir's order"
+        );
+    }
+
+    /// **The far terrain's face light is the voxels'** (issue #422 decision
+    /// 2): `mesh.wgsl` and `far.wgsl` are both built with `face.wgsl` in
+    /// front, both call its `face_brightness`, and neither has a diffuse or
+    /// ambient term of its own left to drift.
+    #[test]
+    fn the_far_terrain_and_the_voxels_are_lit_by_one_function() {
+        let face = crate::haze::FACE_WGSL;
+        assert!(face.contains("fn face_brightness("));
+        assert!(face.contains("let diffuse = max(dot(n, sun_dir), 0.0) * diffuse_weight;"));
+        assert!(face.contains("let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);"));
+        assert!(face.contains("return ambient + diffuse;"));
+        let own = |wgsl: &str| wgsl.replacen(face, "", 1);
+        for (name, wgsl) in [
+            ("mesh.wgsl", crate::haze::MESH_WGSL),
+            ("far.wgsl", crate::haze::FAR_WGSL),
+        ] {
+            assert!(wgsl.contains(face), "{name} is not built with face.wgsl");
+            let own = own(wgsl);
+            assert!(own.contains("face_brightness("), "{name} does not call it");
+            for term in ["max(dot(n", "n.y * 0.5 + 0.5", "CRACK_SEAL: f32"] {
+                assert!(!own.contains(term), "{name} has its own `{term}`");
+            }
+            assert!(
+                own.contains("CRACK_SEAL"),
+                "{name} does not seal its cracks"
+            );
+        }
+        // The terms: the voxels' are pipeline constants, the far terrain's
+        // the frame's -- the same `Lighting` fields, in the same places.
+        assert!(crate::haze::MESH_WGSL
+            .contains("face_brightness(n, sun_dir, ambient_low, ambient_high, diffuse_weight)"));
+        for term in [
+            "frame.sun_dir.xyz,",
+            "frame.ambient.x,",
+            "frame.ambient.y,",
+            "frame.sun_color.w,",
+        ] {
+            assert!(crate::haze::FAR_WGSL.contains(term), "far.wgsl: {term}");
+        }
+    }
+
+    /// A top is the surface block's top; a wall is the mix it carries, and
+    /// either keeps as much light as it is open.
+    #[test]
+    fn a_face_wears_the_mix_it_carries() {
+        let m = Materials {
+            top: Vec3::new(0.1, 0.8, 0.1),
+            side: Vec3::new(0.3, 0.5, 0.1),
+            soil: Vec3::new(0.4, 0.3, 0.2),
+            stone: Vec3::splat(0.5),
+            soil_depth: 3.0,
+        };
+        let top = unit_top(3, 4, 20);
+        assert_eq!(face_colour(&m, &top), m.top);
+        for dir in [FarDir::PosX, FarDir::NegX, FarDir::PosZ, FarDir::NegZ] {
+            let wall = |mix: [u8; 2]| FarFace {
+                dir,
+                rise: 9,
+                mix,
+                ..top
+            };
+            assert_eq!(face_colour(&m, &wall([255, 0])), m.side);
+            assert_eq!(face_colour(&m, &wall([0, 255])), m.soil);
+            assert_eq!(face_colour(&m, &wall([0, 0])), m.stone);
+            // A fifth surface, two fifths soil, the rest stone -- whatever
+            // the wall's own height.
+            let mixed = m.side * 0.2 + m.soil * 0.4 + m.stone * 0.4;
+            assert!(face_colour(&m, &wall([51, 102])).distance(mixed) < 1e-6);
+            let tall = FarFace {
+                rise: 900,
+                ..wall([51, 102])
+            };
+            assert!(face_colour(&m, &tall).distance(mixed) < 1e-6);
+        }
+        // Wide open keeps all its light; shut in keeps the floor.
+        assert_eq!(face_open(&top, 0.4), 1.0);
+        assert_eq!(face_open(&FarFace { open: 0, ..top }, 0.4), 0.4);
+        let half = face_open(&FarFace { open: 51, ..top }, 0.4);
+        assert!((half - 0.52).abs() < 1e-6, "{half}");
+    }
+
+    fn unit_top(i: u8, j: u8, top: i32) -> FarFace {
+        FarFace {
+            dir: FarDir::Top,
+            i0: i,
+            j0: j,
+            i1: i + 1,
+            j1: j + 1,
+            top,
+            rise: 0,
+            border: false,
+            mix: [0, 0],
+            open: 255,
+        }
     }
 
     #[test]
     fn a_patch_box_spans_its_ground_and_its_skirt() {
-        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
-            .map(|i| 10.0 + (i % 7) as f32)
-            .collect();
+        let faces = [
+            unit_top(0, 0, 10),
+            unit_top(5, 9, 16),
+            FarFace {
+                dir: FarDir::NegX,
+                i0: 0,
+                j0: 0,
+                i1: 0,
+                j1: 1,
+                top: 10,
+                rise: 0,
+                border: true,
+                mix: [0, 0],
+                open: 255,
+            },
+        ];
         let b = patch_box(&FarPatch {
             origin: [64, -128],
             quad: 4.0,
-            heights: &heights,
+            faces: &faces,
             skirt: 8.0,
         });
         assert_eq!(b.min, Vec3::new(64.0, 2.0, -128.0));
@@ -782,20 +1593,18 @@ mod tests {
     /// an `f32` origin would already have no fractional bits to spare.
     #[test]
     fn a_patch_against_the_shifted_anchor_is_the_patch_at_the_origin() {
-        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
-            .map(|i| 10.0 + (i % 7) as f32)
-            .collect();
+        let faces = [unit_top(0, 0, 10), unit_top(5, 9, 16)];
         let shift = 1_048_576i64;
         let here = PlacedPatch::of(&FarPatch {
             origin: [64, -128],
             quad: 4.0,
-            heights: &heights,
+            faces: &faces,
             skirt: 8.0,
         });
         let there = PlacedPatch::of(&FarPatch {
             origin: [64 + shift, -128 - shift],
             quad: 4.0,
-            heights: &heights,
+            faces: &faces,
             skirt: 8.0,
         });
         let anchor = [shift as i32, 0, -shift as i32];
@@ -815,17 +1624,283 @@ mod tests {
         // so a patch 4,096 blocks higher against an anchor 4,096 higher is
         // the same box -- the anchor's y comes off the heights, as it does
         // off the hole and, in `far.wgsl`, off every vertex.
-        let up: Vec<f32> = heights.iter().map(|h| h + 4096.0).collect();
+        let up = faces.map(|f| FarFace {
+            top: f.top + 4096,
+            ..f
+        });
         let high = PlacedPatch::of(&FarPatch {
             origin: [64 + shift, -128 - shift],
             quad: 4.0,
-            heights: &up,
+            faces: &up,
             skirt: 8.0,
         });
         let anchor_up = [shift as i32, 4096, -shift as i32];
         assert_eq!(high.gpu(anchor_up).origin, here.gpu(anchor::ORIGIN).origin);
         let c = high.aabb(anchor_up);
         assert_eq!((c.min, c.max), (b.min, b.max));
+    }
+
+    /// Every run fits its class, no class is smaller than the one before,
+    /// and the last holds a whole patch.
+    #[test]
+    fn every_run_has_a_class_that_holds_it() {
+        assert!(CLASS_FACES.windows(2).all(|w| w[0] < w[1]));
+        assert!(*CLASS_FACES.last().unwrap() as usize >= FAR_MAX_FACES);
+        // The index buffer reaches the largest class's last vertex.
+        assert!(*CLASS_FACES.last().unwrap() * 4 <= u16::MAX as u32 + 1);
+        assert_eq!(quad_indices().len() as u32, CLASS_FACES.last().unwrap() * 6);
+        for faces in 1..=FAR_MAX_FACES as u32 {
+            let class = class_of(faces);
+            assert!(faces <= CLASS_FACES[class], "{faces} in class {class}");
+            assert!(
+                class == 0 || faces > CLASS_FACES[class - 1],
+                "{faces} would fit the class below {class}"
+            );
+        }
+        // Three runs in class 0 and one in class 2: two draws, and every
+        // run's whole class in vertices.
+        let mut runs = [0usize; 17];
+        runs[0] = 3;
+        runs[2] = 1;
+        assert_eq!(issued(&runs), (2, (3 * 16 + 32) * 4));
+    }
+
+    /// **Direction culling never drops a face the eye could see** (issue
+    /// #422): over seeded eyes and faces, any face with a corner the eye is
+    /// in front of is in a group [`groups_facing`] keeps -- and the runs
+    /// [`facing_runs`] makes of the kept groups are exactly their faces.
+    #[test]
+    fn a_face_that_can_face_the_eye_is_always_drawn() {
+        let mut next = stream(0xD1EC);
+        let patch = ([64.0, -128.0], 4.0, 9.0);
+        let (mut kept, mut dropped) = (0, 0);
+        for _ in 0..400 {
+            let faces: Vec<FarFace> = (0..40).map(|_| some_face(&mut next)).collect();
+            let far_patch = FarPatch {
+                origin: [64, -128],
+                quad: 4.0,
+                faces: &faces,
+                skirt: 9.0,
+            };
+            let placed = PlacedPatch::of(&far_patch);
+            let aabb = placed.aabb(anchor::ORIGIN);
+            // Eyes around the patch, over it, and inside its box.
+            let eye = Vec3::new(
+                next(600) as f32 - 200.0,
+                next(1200) as f32 - 300.0,
+                next(600) as f32 - 400.0,
+            );
+            let facing = groups_facing(&aabb, eye);
+            for face in &faces {
+                let group = GROUP_ORDER.iter().position(|d| *d == face.dir).unwrap();
+                let seen = face
+                    .corners()
+                    .iter()
+                    .any(|v| face.dir.normal().dot(eye - place(v, patch, None, 0.0)) > 0.0);
+                assert!(
+                    !seen || facing[group],
+                    "eye {eye}: {face:?} faces it and its group is not drawn"
+                );
+                if facing[group] {
+                    kept += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+            // The runs: every face of a kept group once, none of a dropped.
+            let mut drawn = vec![0u32; faces.len()];
+            facing_runs(placed.groups, facing, |first, count| {
+                for face in first..first + count {
+                    drawn[face as usize] += 1;
+                }
+            });
+            let mut at = 0;
+            for (group, &count) in placed.groups.iter().enumerate() {
+                for face in at..at + count {
+                    assert_eq!(drawn[face as usize], facing[group] as u32, "group {group}");
+                }
+                at += count;
+            }
+        }
+        // And it does drop some: a rule that kept everything would pass the
+        // above and cull nothing.
+        assert!(
+            dropped * 4 > kept,
+            "only {dropped} of {} dropped",
+            kept + dropped
+        );
+    }
+
+    /// Faces go up grouped by direction, so a run is a direction or a few
+    /// neighbouring ones.
+    #[test]
+    fn a_patchs_faces_are_stored_by_direction() {
+        let mut next = stream(0x6E0);
+        let faces: Vec<FarFace> = (0..200).map(|_| some_face(&mut next)).collect();
+        let packed = pack_patch(&faces);
+        assert_eq!(packed.len(), faces.len());
+        let stored: Vec<FarFace> = packed.into_iter().map(FarFace::unpack).collect();
+        let mut at = 0;
+        for dir in GROUP_ORDER {
+            let of_dir: Vec<FarFace> = faces.iter().copied().filter(|f| f.dir == dir).collect();
+            assert_eq!(&stored[at..at + of_dir.len()], of_dir.as_slice(), "{dir:?}");
+            at += of_dir.len();
+        }
+    }
+
+    /// **A wall inside the voxels' box shows an eye inside it nothing**
+    /// (issue #424's curtain, for the walls issue #422 adds). A patch of
+    /// rolling ground straddling a side of the box, and one straddling a
+    /// corner: every wall is in or out as a whole, and of a wall that is in,
+    /// nothing is left above the box's floor.
+    #[test]
+    fn no_wall_stands_inside_the_box() {
+        let hole = (
+            Vec3::new(-1024.0, -1064.0, -1024.0),
+            Vec3::new(1024.0, 984.0, 1024.0),
+        );
+        let quad = 8.0;
+        let height = |i: i32, j: i32| 60 + 9 * ((i * 3 + j * 5) % 7);
+        let mut inside = 0;
+        for origin in [[896.0, -128.0], [896.0, 896.0], [-1152.0, 0.0]] {
+            for line in 0..=FAR_QUADS as u8 {
+                for k in 0..FAR_QUADS as u8 {
+                    for along_x in [true, false] {
+                        let (below, above) = if along_x {
+                            (
+                                height(line as i32 - 1, k as i32),
+                                height(line as i32, k as i32),
+                            )
+                        } else {
+                            (
+                                height(k as i32, line as i32 - 1),
+                                height(k as i32, line as i32),
+                            )
+                        };
+                        if below == above {
+                            continue;
+                        }
+                        let dir = match (along_x, below > above) {
+                            (true, true) => FarDir::PosX,
+                            (true, false) => FarDir::NegX,
+                            (false, true) => FarDir::PosZ,
+                            (false, false) => FarDir::NegZ,
+                        };
+                        let face = FarFace {
+                            dir,
+                            i0: if along_x { line } else { k },
+                            j0: if along_x { k } else { line },
+                            i1: if along_x { line } else { k + 1 },
+                            j1: if along_x { k + 1 } else { line },
+                            top: below.max(above),
+                            rise: (below - above).unsigned_abs(),
+                            border: false,
+                            mix: [0, 0],
+                            open: 255,
+                        };
+                        let corners = face.corners();
+                        let raw = corners.map(|v| place(&v, (origin, quad, 40.0), None, 0.0));
+                        let ins =
+                            [0, 1, 2, 3].map(|c| wall_in_hole(&corners[c], raw[c], quad, hole));
+                        assert!(
+                            ins.iter().all(|&b| b == ins[0]),
+                            "{face:?} at {origin:?}: its corners disagree, {ins:?}"
+                        );
+                        let p = corners.map(|v| place(&v, (origin, quad, 40.0), Some(hole), 0.0));
+                        let middle = (raw[0] + raw[3]) / 2.0;
+                        let strictly = middle.x > hole.0.x
+                            && middle.x < hole.1.x
+                            && middle.z > hole.0.z
+                            && middle.z < hole.1.z;
+                        assert_eq!(ins[0], strictly, "{face:?} at {origin:?}");
+                        if strictly {
+                            inside += 1;
+                            assert!(
+                                p.iter().all(|v| v.y <= hole.0.y),
+                                "{face:?} at {origin:?} still stands in the box: {p:?}"
+                            );
+                        } else {
+                            assert_eq!(p, raw, "a wall outside the box moved");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            inside > 500,
+            "only {inside} walls were inside, so this proves little"
+        );
+
+        // Ground under the box's floor is the far terrain's, wall and all:
+        // a wall from above the floor to below it keeps the part below.
+        let floor = (Vec3::new(-1024.0, 50.0, -1024.0), hole.1);
+        let face = FarFace {
+            dir: FarDir::PosX,
+            i0: 8,
+            j0: 4,
+            i1: 8,
+            j1: 5,
+            top: 70,
+            rise: 30,
+            border: false,
+            mix: [0, 0],
+            open: 255,
+        };
+        let p = face
+            .corners()
+            .map(|v| place(&v, ([0.0, 0.0], quad, 40.0), Some(floor), 0.0));
+        let ys: Vec<f32> = p.iter().map(|v| v.y).collect();
+        assert_eq!(ys, vec![40.0, 40.0, 50.0, 50.0]);
+    }
+
+    /// A top's corners through [`place`] are [`join`]'s rule, on the faces
+    /// the mesher makes against the box's side: the row of single quads
+    /// inside it folds down into a skirt on the side, and nothing else of a
+    /// top is left inside the box facing an eye inside it.
+    #[test]
+    fn the_first_row_of_tops_inside_the_box_folds_into_its_skirt() {
+        let hole = (
+            Vec3::new(-1024.0, -1064.0, -1024.0),
+            Vec3::new(1024.0, 984.0, 1024.0),
+        );
+        // Quads of 8 from x = 896: quad 16 starts on the box's side.
+        let patch = ([896.0, -128.0], 8.0, 40.0);
+        let eye = Vec3::new(8.0, 120.0, 8.0);
+        let hidden = hidden_height(hole.0, hole.1, eye, 20.0);
+        // Outside, against the side: untouched.
+        let outside = unit_top(16, 4, 70).corners();
+        for v in outside {
+            assert_eq!(
+                place(&v, patch, Some(hole), hidden),
+                place(&v, patch, None, 0.0)
+            );
+        }
+        // Quad 15 is the first inside: a strip of it, five quads long.
+        let strip = FarFace {
+            j1: 9,
+            ..unit_top(15, 4, 70)
+        };
+        let p = strip
+            .corners()
+            .map(|v| place(&v, patch, Some(hole), hidden));
+        // Its corners on the side stay; the two a quad inside drop under
+        // them: a wall on the side, from the top down a skirt's depth.
+        for v in p {
+            assert_eq!(v.x, 1024.0, "{p:?}");
+        }
+        let ys: Vec<f32> = p.iter().map(|v| v.y).collect();
+        assert_eq!(ys, vec![30.0, 70.0, 30.0, 70.0]);
+        let normal = (p[2] - p[0]).cross(p[1] - p[0]).normalize();
+        assert_eq!(normal, Vec3::NEG_X, "the skirt faces into the box");
+        // Deeper in: hidden, all four at the hidden height.
+        let deep = FarFace {
+            i0: 9,
+            i1: 13,
+            ..strip
+        };
+        for v in deep.corners() {
+            assert_eq!(place(&v, patch, Some(hole), hidden).y, hidden);
+        }
     }
 
     /// Patches wholly inside the voxels' hole are not drawn; the rest are,
@@ -1125,9 +2200,19 @@ mod tests {
             "if snap_x || snap_z {",
             "i = select(i, ti, snap_x);",
             "j = select(j, tj, snap_z);",
-            "height(base, i, j) - frame.anchor.y - tile.skirt,",
+            // A snapped corner hangs a skirt under its own face's height.
+            "y - tile.skirt,",
             // `hidden_height`, worked out on the CPU (`FarTerrain::prepare`).
             "world.y = params.hole_min.w;",
+            // `wall_in_hole`, and what `place` does with it.
+            "let inward = select(0.5, -0.5, (corner & 1u) != 0u) * tile.quad;",
+            "let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);",
+            "if all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)",
+            "&& top > params.hole_min.y && top < params.hole_max.y {",
+            "world.y = min(world.y, params.hole_min.y);",
+            // ...and a wall cut off there is not sealed back open.
+            "seal = 0.0;",
+            "let sealed = world + outward * (seal * distance(world, frame.eye.xyz));",
         ] {
             assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
         }

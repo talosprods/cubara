@@ -412,15 +412,17 @@ pub fn run(
                 patches.len(),
                 building.elapsed().as_secs_f64()
             );
-            let mut terrain = cubara_render::FarTerrain::new(
-                &device,
-                &queue,
-                patches.len().max(1) as u32,
-                anchor,
-            );
-            for p in &patches {
-                terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
-            }
+            let faces: Vec<_> = patches
+                .iter()
+                .map(crate::far_streaming::to_far_faces)
+                .collect();
+            let far_patches: Vec<_> = patches
+                .iter()
+                .zip(&faces)
+                .map(|(p, f)| crate::far_streaming::to_far_patch(p, f))
+                .collect();
+            let mut terrain =
+                cubara_render::FarTerrain::holding(&device, &queue, &far_patches, anchor);
             // As with the arena below: a far terrain with patches missing is
             // not the view that was asked for, and its frame rate means nothing.
             assert_eq!(

@@ -69,23 +69,25 @@
 //! multiple of [`FOOTPRINT`] blocks, which is a cell edge at every level, so
 //! the same planes are left out everywhere.
 //!
-//! **The far terrain** has no faces to walk -- it is a smooth surface shaded
-//! as the blocks it stands for (`far.wgsl`'s `shade`). It is measured from
-//! what that shading says is there: per unit of ground one unit of top, and
-//! `|g|` of riser along each axis for a surface of gradient `g`, coloured by
-//! [`riser_colour`]. The gradient is taken as `far.wgsl` takes it, across
-//! the two quads either side of a vertex.
+//! **The far terrain** is measured from the faces `far::mesh` makes -- the
+//! tops and walls the game draws -- lit as `far.wgsl` lights them
+//! ([`measure_far`]).
 
 use std::collections::HashMap;
 
-use cubara_render::aggregate::{ao_fraction, face_light, riser_colour, Materials};
+use cubara_render::aggregate::{ao_fraction, face_light, Materials};
+use cubara_render::far::{face_colour, face_open};
 use cubara_render::materials::mean_color;
-use cubara_render::Lighting;
+use cubara_render::{FarDir, Lighting};
 use cubara_voxel::{BlockRegistry, Face, MeshContext, NodeChunk};
-use cubara_world::far::{self, PatchHeights, PatchKey, PATCH_QUADS, PATCH_VERTS};
+use cubara_world::far::{self, PatchKey};
 use cubara_world::node::NodeKey;
 use cubara_world::{TerrainBlocks, World, WorldGen, SOIL_DEPTH};
 use glam::Vec3;
+
+#[path = "../common/far_faces.rs"]
+mod far_faces_of;
+use far_faces_of::far_faces;
 
 /// The side of a footprint, in blocks: eight level-3 cells, and one
 /// level-2 node. **Chosen, not derived**: large enough that a level-3
@@ -864,116 +866,123 @@ fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
 /// nothing drawn.
 const SURFACE_MARGIN: i32 = 12;
 
-/// The far terrain's patches of `level` (quads of `2^level` blocks) over
-/// `fp`, as `far.wgsl` shades them.
+/// The far terrain's patches of `level` (quads of `2^level` blocks, up to a
+/// footprint's width) over `fp`, **as it is drawn** (issue #422): the game's
+/// own patches (`far::generate`) and the faces its mesher made of them
+/// (`far::mesh`), face by face -- each lit as `far.wgsl` lights it, by the
+/// shader's CPU twins ([`face_colour`], [`face_open`], [`face_light`];
+/// `golden.rs`'s `far_shading_is_the_face_reference` holds the shader to
+/// them).
+///
+/// Counted as the voxels are: a top over each of its quads, a wall as tall
+/// as the step it shows (a patch's skirt hangs under its neighbour's ground
+/// and the sky never sees it), and only where the quad it belongs to and the
+/// quad it looks out over are both in the footprint. A quad over ground a
+/// cave has carved at level 0 goes to the cave term, and so does a wall of
+/// it or facing it: the far terrain draws no cave, and what it draws there
+/// is not the surface's.
 pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
     let q = 1i64 << level;
-    let mut patches: HashMap<PatchKey, PatchHeights> = HashMap::new();
-    fn patch_at<'a>(
-        patches: &'a mut HashMap<PatchKey, PatchHeights>,
-        gen: &WorldGen,
-        level: u32,
-        x: i64,
-        z: i64,
-    ) -> &'a PatchHeights {
-        let key = PatchKey::containing(level, x, z);
-        patches
-            .entry(key)
-            .or_insert_with(|| far::generate(gen, key))
-    }
-
-    // `riser_colour` with unit colours is the riser's make-up itself: how
-    // much of it is the surface block's side, soil, and stone.
-    let unit = Materials {
-        top: Vec3::ZERO,
-        side: Vec3::new(0.0, 0.0, 1.0),
-        soil: Vec3::new(0.0, 1.0, 0.0),
-        stone: Vec3::new(1.0, 0.0, 0.0),
-        soil_depth: setup.far_materials.soil_depth,
-    };
-    debug_assert_eq!((STONE, SOIL, SURFACE), (0, 1, 2));
-
+    assert!(
+        q <= FOOTPRINT as i64,
+        "a quad of {q} blocks is wider than a footprint"
+    );
     let carved = setup.carved(fp);
+    let holds = |(x, z): (i64, i64)| fp.holds(x as i32, z as i32);
+    let quad_carved = |(x, z): (i64, i64)| any_carved(&carved, fp, x as i32, z as i32, q as i32);
+
+    let mut keys = std::collections::BTreeSet::new();
+    for z in (fp.z0 as i64..(fp.z0 + FOOTPRINT) as i64).step_by(q as usize) {
+        for x in (fp.x0 as i64..(fp.x0 + FOOTPRINT) as i64).step_by(q as usize) {
+            keys.insert(PatchKey::containing(level, x, z));
+        }
+    }
     let mut faces = Faces::default();
     let mut cave = Faces::default();
-    let quads = (FOOTPRINT as i64 / q).max(1);
-    // A quad wider than the footprint is weighed by the footprint's share.
-    let ground = (FOOTPRINT as f64 / quads as f64).powi(2);
-    for b in 0..quads {
-        for a in 0..quads {
-            let (x, z) = (fp.x0 as i64 + a * q, fp.z0 as i64 + b * q);
-            let patch = patch_at(&mut patches, &setup.gen, level, x, z);
-            let [ox, oz] = patch.key.origin();
-            let (i, j) = (((x - ox) / q) as usize, ((z - oz) / q) as usize);
-            // A quad over ground a cave has carved at level 0 goes to the
-            // cave term, as a voxel cell over it does: the far terrain
-            // draws no cave, and what it draws there is not the surface's.
-            let faces = if any_carved(
-                &carved,
-                fp,
-                x as i32,
-                z as i32,
-                q.min(FOOTPRINT as i64) as i32,
-            ) {
-                &mut cave
-            } else {
-                &mut faces
+    let mut tops = vec![f64::NAN; (FOOTPRINT * FOOTPRINT) as usize];
+    for key in keys {
+        let patch = far::generate(&setup.gen, key);
+        let [ox, oz] = key.origin();
+        for face in far_faces(&patch.faces) {
+            // `FarDir` and `DIRECTIONS` are in one order.
+            let d = face.dir as usize;
+            let normal = face.dir.normal();
+            debug_assert_eq!(Vec3::from(DIRECTIONS[d].normal()), normal);
+            let lit = face_colour(&setup.far_materials, &face)
+                * face_open(&face, setup.lighting.ao_floor)
+                * face_light(normal, &setup.lighting);
+            // What the face is made of: stone, soil, the surface block.
+            let (surface, soil) = match face.dir {
+                FarDir::Top => (1.0, 0.0),
+                _ => (face.mix[0] as f64 / 255.0, face.mix[1] as f64 / 255.0),
             };
-            // A quad is drawn with its four vertices' colours blended, so it
-            // is weighed as their mean.
-            for (vi, vj) in [(i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)] {
-                let g = vertex_gradient(patch, vi, vj);
-                let share = ground / 4.0;
-                let top = setup.far_materials.top * face_light(Vec3::Y, &setup.lighting);
-                faces.area[0] += share;
-                faces.material[0][SURFACE] += share;
-                for c in 0..3 {
-                    faces.lit[0][c] += top[c] as f64 * share;
+            let made_of = [1.0 - surface - soil, soil, surface];
+            debug_assert_eq!((STONE, SOIL, SURFACE), (0, 1, 2));
+            // The area of this face the sky sees: on the surface, and on or
+            // beside carved ground.
+            let mut seen = [0f64; 2];
+            if face.dir == FarDir::Top {
+                for j in face.j0..face.j1 {
+                    for i in face.i0..face.i1 {
+                        let quad = (ox + i as i64 * q, oz + j as i64 * q);
+                        if !holds(quad) {
+                            continue;
+                        }
+                        seen[quad_carved(quad) as usize] += (q * q) as f64;
+                        for b in 0..q {
+                            for a in 0..q {
+                                let (ci, cj) =
+                                    (quad.0 + a - fp.x0 as i64, quad.1 + b - fp.z0 as i64);
+                                tops[(cj * FOOTPRINT as i64 + ci) as usize] = face.top as f64;
+                            }
+                        }
+                    }
                 }
-                // A riser faces down the slope.
-                for (slope, up, down) in [(g[0], 2, 1), (g[1], 4, 3)] {
-                    if slope == 0.0 {
+            } else {
+                // A wall stands on a quad line and runs along the other
+                // axis: the quad behind it is its own, the one in front is
+                // the lower ground it looks out over.
+                let along_x = face.i0 == face.i1;
+                let positive = matches!(face.dir, FarDir::PosX | FarDir::PosZ);
+                let (line, run) = if along_x {
+                    (ox + face.i0 as i64 * q, face.j0..face.j1)
+                } else {
+                    (oz + face.j0 as i64 * q, face.i0..face.i1)
+                };
+                let (own, front) = if positive {
+                    (line - q, line)
+                } else {
+                    (line, line - q)
+                };
+                for k in run {
+                    let (own, front) = if along_x {
+                        let z = oz + k as i64 * q;
+                        ((own, z), (front, z))
+                    } else {
+                        let x = ox + k as i64 * q;
+                        ((x, own), (x, front))
+                    };
+                    if !(holds(own) && holds(front)) {
                         continue;
                     }
-                    let d = if slope > 0.0 { up } else { down };
-                    let area = slope.abs() as f64 * share;
-                    let normal = Vec3::from(DIRECTIONS[d].normal());
-                    let lit = riser_colour(&setup.far_materials, slope)
-                        * face_light(normal, &setup.lighting);
-                    let made_of = riser_colour(&unit, slope);
-                    faces.area[d] += area;
-                    for c in 0..3 {
-                        faces.lit[d][c] += lit[c] as f64 * area;
-                        faces.material[d][c] += made_of[c] as f64 * area;
-                    }
+                    let beside_a_cave = quad_carved(own) || quad_carved(front);
+                    seen[beside_a_cave as usize] += (face.rise as i64 * q) as f64;
+                }
+            }
+            for (term, area) in [(&mut faces, seen[0]), (&mut cave, seen[1])] {
+                if area == 0.0 {
+                    continue;
+                }
+                term.area[d] += area;
+                term.open[d] += face.open as f64 / 255.0 * area;
+                for c in 0..3 {
+                    term.lit[d][c] += lit[c] as f64 * area;
+                    term.material[d][c] += made_of[c] * area;
                 }
             }
         }
     }
-
-    let tops = (0..FOOTPRINT)
-        .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
-        .map(|(i, j)| {
-            let (x, z) = (fp.x0 as i64 + i as i64, fp.z0 as i64 + j as i64);
-            // The surface over the middle of the column.
-            patch_at(&mut patches, &setup.gen, level, x, z)
-                .height_at(x as f64 + 0.5, z as f64 + 0.5)
-        })
-        .collect();
     Measure { faces, cave, tops }
-}
-
-/// The slope `far.wgsl`'s `vs_main` shades vertex `(i, j)` of a patch with:
-/// across the neighbouring heights, one-sided at the patch's edge.
-fn vertex_gradient(patch: &PatchHeights, i: usize, j: usize) -> [f32; 2] {
-    let q = patch.key.quad() as f32;
-    let h = |i: usize, j: usize| patch.heights[j * PATCH_VERTS + i];
-    let (il, ir) = (i.saturating_sub(1), (i + 1).min(PATCH_QUADS));
-    let (jl, jr) = (j.saturating_sub(1), (j + 1).min(PATCH_QUADS));
-    [
-        (h(ir, j) - h(il, j)) / ((ir - il) as f32 * q),
-        (h(i, jr) - h(i, jl)) / ((jr - jl) as f32 * q),
-    ]
 }
 
 /// How a stepped height field of `cell`-block squares takes each square's

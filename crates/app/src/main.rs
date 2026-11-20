@@ -1464,6 +1464,9 @@ fn main() {
                 size: value("--size")
                     .and_then(bench::parse_size)
                     .unwrap_or((1920, 1080)),
+                far_coarser: value("--far-coarser")
+                    .and_then(|f| f.parse().ok())
+                    .unwrap_or(1.0),
             });
         // Static overlay text -- the pause menu or console, for a review
         // screenshot of `Hud::menu` with no window (`--screenshot menu.png

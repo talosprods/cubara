@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
 use cubara_render::aggregate::Materials;
-use cubara_render::{FarParams, FarPatch, FarSlot, Renderer};
+use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
@@ -103,11 +103,24 @@ pub fn far_view(
     hole: Option<Hole>,
     quality: FarQuality,
 ) -> Option<FarView> {
+    far_view_scaled(eye, screen_height, hole, quality, 1.0)
+}
+
+/// [`far_view`] with every pixel size of the quality -- its quads, its error
+/// bound and its floor -- `coarser` times as large. The game draws at 1;
+/// `far_census` asks what the others would cost.
+pub fn far_view_scaled(
+    eye: [f64; 3],
+    screen_height: u32,
+    hole: Option<Hole>,
+    quality: FarQuality,
+    coarser: f64,
+) -> Option<FarView> {
     let d = quality.detail()?;
-    let pixel = FOV_Y / screen_height.max(1) as f64;
+    let pixel = FOV_Y / screen_height.max(1) as f64 * coarser;
     Some(FarView {
         eye,
-        split_ratio: far::split_ratio_for(d.quad_px, screen_height.max(1) as f64, FOV_Y),
+        split_ratio: far::split_ratio_for(d.quad_px * coarser, screen_height.max(1) as f64, FOV_Y),
         max_error: d.error_px * pixel,
         min_quad: d.floor_px * pixel,
         radius: FAR_VIEW_RADIUS,
@@ -136,15 +149,41 @@ pub fn voxel_hole(eye: [f32; 3]) -> Hole {
     ))
 }
 
-/// The renderer's form of a patch.
-pub fn to_far_patch(p: &PatchHeights) -> FarPatch<'_> {
+/// The renderer's form of a patch's faces: the same rectangles, field for
+/// field (the render crate does not know the world crate, Rule 3).
+pub fn to_far_faces(p: &PatchHeights) -> Vec<FarFace> {
+    p.faces
+        .iter()
+        .map(|f| FarFace {
+            dir: match f.dir {
+                far::FaceDir::Top => FarDir::Top,
+                far::FaceDir::PosX => FarDir::PosX,
+                far::FaceDir::NegX => FarDir::NegX,
+                far::FaceDir::PosZ => FarDir::PosZ,
+                far::FaceDir::NegZ => FarDir::NegZ,
+            },
+            i0: f.i0,
+            j0: f.j0,
+            i1: f.i1,
+            j1: f.j1,
+            top: f.top,
+            rise: f.rise,
+            border: f.border,
+            mix: f.mix,
+            open: f.open,
+        })
+        .collect()
+}
+
+/// The renderer's form of a patch, with its `faces` ([`to_far_faces`]).
+pub fn to_far_patch<'a>(p: &PatchHeights, faces: &'a [FarFace]) -> FarPatch<'a> {
     FarPatch {
         // The integer it is: the renderer subtracts its anchor from it
         // exactly (issue #379).
         origin: p.key.origin(),
         quad: p.key.quad() as f32,
-        heights: &p.heights,
-        skirt: p.skirt(),
+        faces,
+        skirt: p.skirt_blocks() as f32,
     }
 }
 
@@ -534,13 +573,13 @@ impl FarStreaming {
             let Some(patch) = self.plan.patch(key) else {
                 continue;
             };
-            match renderer.far_insert(to_far_patch(patch)) {
+            match renderer.far_insert(to_far_patch(patch, &to_far_faces(patch))) {
                 Some(slot) => {
                     self.slots.insert(key, slot);
                 }
                 None if !self.warned_full => {
                     log::warn!(
-                        "far terrain: every slot is taken -- some distant ground is not drawn"
+                        "far terrain: out of slots or vertices -- some distant ground is not drawn"
                     );
                     self.warned_full = true;
                 }
@@ -775,7 +814,44 @@ mod tests {
     #[test]
     fn the_renderer_and_the_world_agree_on_the_patch_size() {
         assert_eq!(cubara_render::FAR_QUADS, far::PATCH_QUADS);
-        assert_eq!(cubara_render::FAR_VERTS, far::PATCH_VERTS);
+        // A face travels in three words (`FarFace::pack`): every height the
+        // terrain can have, and the tallest step between two of them, must
+        // fit their fields, or a mountain is drawn clamped.
+        let (lo, hi) = far::surface_bounds();
+        assert!(cubara_render::FAR_TOP_RANGE.contains(&(lo.floor() as i32 - 1)));
+        assert!(cubara_render::FAR_TOP_RANGE.contains(&(hi.ceil() as i32 + 1)));
+        assert!((hi - lo).ceil() as u32 <= cubara_render::FAR_MAX_RISE);
+        // And the renderer's face is the world's, field for field.
+        let patch = far::generate(&WorldGen::new(7), PatchKey::new(5, -27, 151));
+        let faces = to_far_faces(&patch);
+        assert_eq!(faces.len(), patch.faces.len());
+        for (ours, theirs) in faces.iter().zip(&patch.faces) {
+            assert_eq!(ours.dir as usize, theirs.dir as usize);
+            assert_eq!(
+                (
+                    ours.i0,
+                    ours.j0,
+                    ours.i1,
+                    ours.j1,
+                    ours.top,
+                    ours.rise,
+                    ours.border
+                ),
+                (
+                    theirs.i0,
+                    theirs.j0,
+                    theirs.i1,
+                    theirs.j1,
+                    theirs.top,
+                    theirs.rise,
+                    theirs.border
+                )
+            );
+        }
+        assert!(faces.len() <= cubara_render::far::FAR_MAX_FACES);
+        for (ours, theirs) in faces.iter().zip(&patch.faces) {
+            assert_eq!((ours.mix, ours.open), (theirs.mix, theirs.open));
+        }
     }
 
     // --- The plan without a GPU (#398, rule 6) --------------------------

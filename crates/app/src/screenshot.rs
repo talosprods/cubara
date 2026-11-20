@@ -7,7 +7,8 @@
 //! anything.
 //!
 //! Run with: `cargo run --release -- --screenshot out.png`, or from a place:
-//! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]`.
+//! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]
+//! [--far-coarser F]`.
 
 use cubara_render::materials::TextureLayers;
 use cubara_render::{headless, load_registry, Lighting, Shot};
@@ -27,6 +28,11 @@ pub struct View {
     /// Render distance in chunks.
     pub radius: i32,
     pub size: (u32, u32),
+    /// The far terrain's quads, error bound and floor this many times as
+    /// wide on screen as this PC's quality sets them
+    /// (`far_streaming::far_view_scaled`): 1 is the game's. For comparing
+    /// what a coarser far terrain would look like (issue #422).
+    pub far_coarser: f64,
 }
 
 /// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_chunks()` (chunks; times 16 for blocks)
@@ -102,7 +108,13 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 .unwrap_or_default()
                 .far;
             let eye = v.eye.map(|c| c as f64);
-            if let Some(view) = crate::far_streaming::far_view(eye, v.size.1, Some(hole), quality) {
+            if let Some(view) = crate::far_streaming::far_view_scaled(
+                eye,
+                v.size.1,
+                Some(hole),
+                quality,
+                v.far_coarser,
+            ) {
                 far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
             }
             far_params = Some(crate::far_streaming::to_far_params(
@@ -125,7 +137,12 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
     };
     let shot = Shot { menu, ..shot };
     let meshed = built.into_iter().filter_map(to_meshed_node);
-    let patches: Vec<_> = far.iter().map(crate::far_streaming::to_far_patch).collect();
+    let faces: Vec<_> = far.iter().map(crate::far_streaming::to_far_faces).collect();
+    let patches: Vec<_> = far
+        .iter()
+        .zip(&faces)
+        .map(|(p, f)| crate::far_streaming::to_far_patch(p, f))
+        .collect();
     let Some(frame) = headless::render_with_far(meshed, &patches, far_params, shot) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
