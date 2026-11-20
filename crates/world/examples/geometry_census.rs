@@ -64,14 +64,27 @@ fn main() {
     };
 
     let schedule = schedule_for_radius(radius);
+    // `CENSUS_AT=cx,cz` centres the selection on that chunk column instead
+    // of the origin's: a mountain, say, where the ground is steepest.
+    let (cx, cz) = std::env::var("CENSUS_AT")
+        .ok()
+        .and_then(|at| {
+            let mut parts = at.split(',').map(|p| p.trim().parse::<i32>());
+            Some((parts.next()?.ok()?, parts.next()?.ok()?))
+        })
+        .unwrap_or((0, 0));
+    println!(
+        "centre chunk column ({cx}, {cz}), surface there at y {}",
+        world.surface_height(cx * 16 + 8, cz * 16 + 8)
+    );
     // `CENSUS_SQUASH=k` selects in 3D around chunk (0, ymin, 0) the way the
     // game does, instead of the band ymin..=ymax.
     let nodes = match std::env::var("CENSUS_SQUASH")
         .ok()
         .and_then(|k| k.parse().ok())
     {
-        Some(k) => desired_nodes_3d(ChunkCoord::new(0, ymin, 0), k, &schedule),
-        None => desired_nodes(ChunkCoord::new(0, 0, 0), ymin..=ymax, &schedule),
+        Some(k) => desired_nodes_3d(ChunkCoord::new(cx, ymin, cz), k, &schedule),
+        None => desired_nodes(ChunkCoord::new(cx, 0, cz), ymin..=ymax, &schedule),
     };
     let mut per_level = [Tally::default(); 8];
 
@@ -101,11 +114,12 @@ fn main() {
             };
             chunk.build_mesh(&ctx)
         };
-        // Blocks per lattice cell of this node's mesh, per axis (R1b: the
-        // vertical one, `cell_v`, no longer matches the horizontal one,
-        // `cell_h`, above level 0).
+        // Blocks per cell of the lattice this node's mesh is built on, per
+        // axis (R1b: the vertical one, `cell_v`, no longer matches the
+        // horizontal one, `cell_h`, above level 0 -- one block at every
+        // level since issue #423).
         let cell_h = node.extent_chunks();
-        let cell_v = node.cell_height_blocks();
+        let cell_v = node.drawn_row_blocks();
         let origin = node.world_origin();
         let tally = &mut per_level[node.level as usize];
 

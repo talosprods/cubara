@@ -469,10 +469,9 @@ pub fn face_light(n: Vec3, lighting: &Lighting) -> Vec3 {
 /// At a width of one block it is `mix(ao_floor, 1, ao_raw / 3)`; a wider
 /// cell's dark end moves toward 1 (R1c, issue #327 decision 5).
 ///
-/// The shader is the definition. This is its twin for the GPU-free checks
-/// that compare what a coarse node shows with what its blocks show
-/// (`tests/t3_coarse_ao.rs`, `tests/lod_consistency.rs`), as [`face_light`]
-/// is for the lighting.
+/// The shader is the definition. This is its twin for the GPU-free check
+/// that compares what a coarse node shows with what its blocks show
+/// (`tests/lod_consistency`), as [`face_light`] is for the lighting.
 pub fn ao_fraction(ao_raw: u32, log2_width: u32, ao_floor: f32) -> f32 {
     let ao_frac = ao_raw as f32 / 3.0;
     let width = (1u32 << log2_width) as f32;

@@ -41,6 +41,9 @@ struct MaskCell {
     sign: i8,
     /// Per-corner occlusion 0..=3 (3 = unoccluded/bright), in corner order c0..c3.
     ao: [u8; 4],
+    /// Per corner, log2 of how many times wider the cell is than the shade
+    /// at that corner ([`top_ao`]); all zero on a wall.
+    ao_width: [u8; 4],
     /// The solid block this face belongs to (meaningless when `sign == 0`).
     block: BlockId,
 }
@@ -48,6 +51,7 @@ struct MaskCell {
 const NO_CELL: MaskCell = MaskCell {
     sign: 0,
     ao: [0; 4],
+    ao_width: [0; 4],
     block: BlockId::AIR,
 };
 
@@ -421,9 +425,26 @@ pub(crate) fn greedy_mesh(
                         // is still the pre-advance boundary here.
                         let air_d = if sign == 1 { pos[d] + 1 } else { pos[d] };
                         let block = if sign == 1 { a_id } else { b_id };
+                        let ao = face_ao(&block_at, ctx.registry, d, u, v, air_d, uu, vv);
+                        let (ao, ao_width) = if d == 1 {
+                            top_ao(&block_at, ctx.registry, scale, air_d, sign, uu, vv, ao)
+                        } else {
+                            let ao = wall_ao(
+                                &block_at,
+                                ctx.registry,
+                                scale,
+                                (d, u, v),
+                                air_d,
+                                sign,
+                                (uu, vv),
+                                ao,
+                            );
+                            (ao, [0; 4])
+                        };
                         MaskCell {
                             sign,
-                            ao: face_ao(&block_at, ctx.registry, d, u, v, air_d, uu, vv),
+                            ao,
+                            ao_width,
                             block,
                         }
                     };
@@ -470,7 +491,8 @@ pub(crate) fn greedy_mesh(
                     }
 
                     push_quad(
-                        &mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, m.block, ctx, scale,
+                        &mut mesh, d, u, v, pos[d], i, j, w, h, m.sign, m.ao, m.ao_width, m.block,
+                        ctx, scale,
                     );
                     push_skirt(
                         &mut mesh,
@@ -511,14 +533,14 @@ pub(crate) fn greedy_mesh(
 /// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
 /// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
 ///
-/// `pub` (not just crate-internal): `cubara-render`'s T3
-/// (`a_coarse_node_averages_like_its_blocks`, issue #327 decision 5/R1c)
-/// computes a coarse cell's AO-lit colour against real level-0 blocks over
-/// the same footprint off the GPU, and must read the *same* AO this mesher
-/// bakes into a quad's corners (`ARCHITECTURE.md` Rule 5) rather than a
-/// second copy of this logic.
+/// On a coarse lattice this is where a corner's AO starts, not what is
+/// baked: [`top_ao`] and [`wall_ao`] take it from here (issue #423). What a
+/// node shows is measured from its mesh
+/// (`crates/render/tests/lod_consistency`), which is why this is no longer
+/// `pub`: the test that called it from outside re-implemented R1c's
+/// scaling on top of it, a second copy of a rule that has since changed.
 #[allow(clippy::too_many_arguments)]
-pub fn face_ao(
+fn face_ao(
     block_at: &impl Fn(i32, i32, i32) -> BlockId,
     registry: &BlockRegistry,
     d: usize,
@@ -569,6 +591,232 @@ pub fn face_ao_of(
     ao
 }
 
+/// For a top or bottom face cell at (`uu`, `vv`) = (z, x) whose empty side is
+/// the layer `air_d`: per corner (in [`face_ao`]'s order), its AO on a
+/// coarse lattice (`own` is what [`face_ao`] says of the cell), and log2 of
+/// how many times wider the cell is than the shade the corner's occluders
+/// cast on it. `mesh.wgsl` lightens the corner's AO by that factor.
+///
+/// **A level-0 block's shade is one block wide, and a slope has one per
+/// block.** A coarse cell `W` blocks wide stands for `W` columns. Beside a
+/// riser one block tall, level 0 has one shaded column of them, so the
+/// cell's shade is a `W`-th as strong: that was R1c's whole rule (issue #327
+/// decision 5), and it is right for a single step. But a coarse riser `k`
+/// blocks tall on a slope stands for a staircase of `k` level-0 steps, each
+/// shading the column at its foot: `min(k, W)` of the `W` columns are shaded,
+/// not one. Scaling every riser's shade down by `W` made every coarse slope
+/// lighter than its blocks -- 7 to 14/255 on the tops of a mountain face,
+/// the largest colour difference between the levels (issue #423, measured by
+/// `crates/render/tests/lod_consistency`). So the factor is `W / min(k, W)`,
+/// to a power of two (the vertex has two bits for it), with `k` the height
+/// of the corner's occluding columns, counted up from the air layer.
+///
+/// **Which column, which power of two, and which occluders** -- all three
+/// chosen from the same measurement, not derived (per footprint, forty
+/// footprints):
+/// - `k` is the taller of the two *side* neighbours when either occludes,
+///   and the diagonal neighbour's only when it occludes alone. At level 0
+///   the shade across a top's edge is cast by the column beside that edge;
+///   the diagonal one adds a corner to it and does not widen it. Taking the
+///   tallest of all three shaded diagonal slopes at full strength, where
+///   only some of level 0's columns have that corner: 1.9 to 2.4/255 too
+///   dark at level 1, against 1.1 to 1.4 this way.
+/// - a band between two powers of two goes to the nearer one, and **a tie
+///   goes down** (a riser of 3 beside a 4-block cell shades 2, not 4).
+///   Up left level 2's tops 2.6 to 3.4/255 too dark on every kind of slope;
+///   down, 1.3 to 2.2.
+/// - **an occluder darkens a corner's band only if it is at least half as
+///   tall as the riser that sets the band.** A corner between a riser of
+///   eight and one of two is, at level 0, eight columns each shaded by the
+///   first and two of them by the second as well; counted as two occluders
+///   over the whole band it came out as dark as a corner in a pit. Measured
+///   by riser height (`top_shade_by_riser_report`): under a riser as tall
+///   as the cell is wide the tops kept 0.72 to 0.75 of their light where
+///   level 0's keep 0.77 to 0.80, and the two worst level-3 footprints
+///   (4.4 and 4.1/255 too dark) were almost wholly such cells. Worst tops
+///   per level with every occluder counted, 1.44, 2.21, 4.38; this way,
+///   1.44, 1.93, 3.40. (Half, because the corner's shade comes in thirds:
+///   an occluder over under half the band is nearer to none than to one.)
+///
+/// An open corner keeps log2 of `W`, as before: its AO is full whatever the
+/// factor, and one value across open corners keeps the greedy merge whole.
+/// At `W = 1` (level 0) `own` -- [`face_ao`]'s corners -- comes back as it
+/// is, with every width zero.
+#[allow(clippy::too_many_arguments)]
+fn top_ao(
+    block_at: &impl Fn(i32, i32, i32) -> BlockId,
+    registry: &BlockRegistry,
+    scale: [i32; 3],
+    air_d: i32,
+    sign: i8,
+    uu: i32,
+    vv: i32,
+    own: [u8; 4],
+) -> ([u8; 4], [u8; 4]) {
+    let width = scale[0].max(scale[2]).max(1);
+    let full = (width as u32)
+        .trailing_zeros()
+        .min(crate::mesh::MAX_AO_WIDTH_LOG2);
+    let mut widths = [full as u8; 4];
+    if full == 0 {
+        return (own, widths);
+    }
+    let mut ao = own;
+    // How far the column at (z, x) stands past the air layer, in blocks,
+    // counted away from the face over the rows that cover the cell's width
+    // and no further: a riser taller than that shades the whole cell
+    // already.
+    let rise = |z: i32, x: i32| -> i32 {
+        let cells = (width + scale[1] - 1) / scale[1];
+        let mut n = 0;
+        while n < cells && registry.is_solid(block_at(x, air_d + n * sign as i32, z)) {
+            n += 1;
+        }
+        n * scale[1]
+    };
+    for (k, (cu, cv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].iter().enumerate() {
+        let su = if *cu == 1 { 1 } else { -1 };
+        let sv = if *cv == 1 { 1 } else { -1 };
+        let sides = [rise(uu + su, vv), rise(uu, vv + sv)];
+        let diagonal = rise(uu + su, vv + sv);
+        // The riser that casts this corner's shade: beside the edge if
+        // there is one, diagonal only if it stands alone.
+        let beside = sides[0].max(sides[1]);
+        let riser = if beside > 0 { beside } else { diagonal };
+        if riser == 0 {
+            continue;
+        }
+        // Which of the three darken the corner over that band.
+        let counts = |rise: i32| rise > 0 && 2 * rise >= riser;
+        ao[k] = vertex_ao(counts(sides[0]), counts(sides[1]), counts(diagonal));
+        // log2 of the band, to the nearer power of two: up only when the
+        // riser is past the middle of the two, so a tie goes down.
+        let mut band = 31 - (riser as u32).leading_zeros();
+        if 2 * riser as u32 > 3 << band {
+            band += 1;
+        }
+        widths[k] = full.saturating_sub(band) as u8;
+    }
+    (ao, widths)
+}
+
+/// The darkest a coarse wall's shade band is above its foot row
+/// ([`wall_ao`]): one occluder, `vertex_ao(true, false, false)`.
+const WALL_BAND_SHADE: u8 = 2;
+
+/// A wall face cell's corner AO on a coarse lattice: `own` -- what
+/// [`face_ao`] says of the cell itself -- with **the shade of the riser's
+/// foot carried up the wall, as many rows as the riser is tall and no
+/// further than the cell is wide** (issue #423).
+///
+/// At level 0 a riser is shaded along its foot, by the tread it stands on,
+/// and a slope is a staircase: every step has a foot. A coarse riser `k`
+/// blocks tall beside a cell `W` blocks wide stands for `min(k, W)` of those
+/// steps -- the same count [`top_ao`] shades the tread by -- so
+/// `min(k, W)` of its `k` rows are foot rows at level 0. Shaded along its one
+/// foot only, a coarse wall came out lighter than its blocks: it kept 0.87
+/// to 0.94 of its light where level 0's risers keep 0.80 to 0.84 (measured
+/// by `crates/render/tests/lod_consistency`, levels 2 and 3 on slopes).
+///
+/// So each of the first `min(k, W)` rows of a riser keeps its own upper two
+/// corners and takes for its lower two the foot row's, **no darker than one
+/// occluder** ([`WALL_BAND_SHADE`], the tread itself) -- the foot row
+/// included, when there is a row of band above it. Rows that agree merge,
+/// and the band is drawn as one quad, one ramp from that shade to the open
+/// top: the mean of one ramp over the band is the mean of a ramp on each of
+/// its rows, which is what level 0 draws. (The *pattern* differs -- one long
+/// ramp, not `min(k, W)` short ones -- as a coarse top's shade band does.) A
+/// riser one row tall is its foot and nothing else, shaded as level 0
+/// shades it.
+///
+/// **Chosen from measurement, not derived** (worst single footprint and
+/// side direction of forty, /255, at levels 1, 2, 3; then level 3's meshed
+/// triangles around the gate's ground eye, 325 thousand before issue #423):
+///
+/// | the band's lower corners | worst side, L1 / L2 / L3 | level 3 triangles |
+/// |---|---|---|
+/// | no band: the foot row alone | 1.13 / 1.71 / 3.05 | 641 k |
+/// | the foot's own corners, carried up as they are | 0.71 / 1.99 / 2.48 | -- |
+/// | no darker than the tread, the foot row apart | 0.89 / 1.58 / 2.11 | 620 k |
+/// | **no darker than the tread, the foot row with it** | 1.29 / 1.53 / 2.25 | 541 k |
+///
+/// The foot's own corners are a little too dark carried up: what else stands
+/// beside a foot's end shades one column of blocks, and a whole cell's width
+/// of a coarse wall. Keeping the foot row apart is a little closer to level
+/// 0 and one quad more on every riser; the lead chose the cheaper
+/// (2026-11-20), since level 3's exact tops already cost it two thirds more
+/// triangles.
+///
+/// A face above something other than its own riser -- an overhang, a cave
+/// under the wall, the node's floor -- keeps `own`.
+#[allow(clippy::too_many_arguments)]
+fn wall_ao(
+    block_at: &impl Fn(i32, i32, i32) -> BlockId,
+    registry: &BlockRegistry,
+    scale: [i32; 3],
+    (d, u, v): (usize, usize, usize),
+    air_d: i32,
+    sign: i8,
+    (uu, vv): (i32, i32),
+    own: [u8; 4],
+) -> [u8; 4] {
+    let width = scale[0].max(scale[2]);
+    if width <= 1 || d == 1 {
+        return own;
+    }
+    // The rows a band may reach above the foot, the foot's own included.
+    let rows = (width + scale[1] - 1) / scale[1];
+    // The sweep axis that is `y`, and the corners at the low end of it, in
+    // `face_ao`'s order (0,0), (1,0), (1,1), (0,1).
+    let (up, low) = if u == 1 {
+        ((1, 0), [0, 3])
+    } else {
+        ((0, 1), [0, 1])
+    };
+    let solid = |behind: bool, down: i32| {
+        let mut p = [0i32; 3];
+        p[d] = if behind { air_d - sign as i32 } else { air_d };
+        p[u] = uu - up.0 * down;
+        p[v] = vv - up.1 * down;
+        registry.is_solid(block_at(p[0], p[1], p[2]))
+    };
+    for down in 1..=rows {
+        if solid(false, down) {
+            // The tread: the foot is the row above it.
+            let foot = down - 1;
+            let at_foot = if foot == 0 {
+                // The foot row itself: with the band, if the riser goes on
+                // above it and the band has a second row to give it.
+                let goes_on = rows > 1 && solid(true, -1) && !solid(false, -1);
+                if !goes_on {
+                    return own;
+                }
+                own
+            } else {
+                face_ao(
+                    block_at,
+                    registry,
+                    d,
+                    u,
+                    v,
+                    air_d,
+                    uu - up.0 * foot,
+                    vv - up.1 * foot,
+                )
+            };
+            let mut ao = own;
+            for k in low {
+                ao[k] = at_foot[k].max(WALL_BAND_SHADE);
+            }
+            return ao;
+        }
+        if !solid(true, down) {
+            return own;
+        }
+    }
+    own
+}
+
 /// Emit one merged quad on the plane `plane` along axis `d`, spanning `w`×`h` cells
 /// in the (`u`,`v`) axes starting at (`i`,`j`), with orientation `sign` (±1), per-corner
 /// AO `ao` (levels 0..=3, corner order c0..c3), and the `block` the quad belongs to
@@ -588,6 +836,7 @@ fn push_quad(
     h: i32,
     sign: i8,
     ao: [u8; 4],
+    ao_width: [u8; 4],
     block: BlockId,
     ctx: &MeshContext,
     scale: [i32; 3],
@@ -617,8 +866,14 @@ fn push_quad(
     ];
     let c3 = [base[0] + dv[0], base[1] + dv[1], base[2] + dv[2]];
 
-    // Each corner's own texel-tile coordinate, one tile per grid cell, tiling
-    // the texture across the merged quad.
+    // Each corner's own texel-tile coordinate, **one tile per block**, tiling
+    // the texture across the merged quad: a cell `scale` blocks wide along an
+    // axis spans `scale` tiles along it, so a coarse face shows the tile at
+    // the size level 0 shows it, and the sampler picks the mip level 0 picks
+    // (`docs/PROPOSAL_LOD_TRANSITIONS.md` R4; issue #423 -- one tile per
+    // *cell* drew the pattern 2^level times too large, most of what changed
+    // on the ground when a node swapped levels, #380). A level-3 node's
+    // faces reach 128 tiles, which the 8-bit fields hold.
     //
     // Floors and ceilings take the sweep axes as they come. **Walls do not:**
     // the sweep axes are (y, z) for an x wall and (x, y) for a z wall, so
@@ -627,13 +882,14 @@ fn push_quad(
     // row 0 is its top, so v is measured down from the quad's top edge, and u
     // runs along the horizontal axis toward the right of someone looking at
     // the face from outside (so lettering on a furnace would read correctly).
+    let (su, sv) = (scale[u], scale[v]);
     let tile = |a: i32, b: i32| -> (i32, i32) {
         match d {
             // x wall: u axis is y, v axis is z. Right is -z for +x, +z for -x.
-            0 => (if sign == 1 { h - b } else { b }, w - a),
+            0 => ((if sign == 1 { h - b } else { b }) * sv, (w - a) * su),
             // z wall: u axis is x, v axis is y. Right is +x for +z, -x for -z.
-            2 => (if sign == 1 { a } else { w - a }, h - b),
-            _ => (a, b),
+            2 => ((if sign == 1 { a } else { w - a }) * su, (h - b) * sv),
+            _ => (a * su, b * sv),
         }
     };
     let uv0 = tile(0, 0);
@@ -645,11 +901,12 @@ fn push_quad(
     // faces to stay outward/CCW for back-face culling. AO and UV follow the same reorder.
     // Which side of the quad each corner is on, along the sweep axes u and v.
     let (k0, k1, k2, k3) = ((false, false), (true, false), (true, true), (false, true));
-    let (verts, uvs, vao, sides) = if sign == 1 {
+    let (verts, uvs, vao, widths, sides) = if sign == 1 {
         (
             [c0, c1, c2, c3],
             [uv0, uv1, uv2, uv3],
             [ao[0], ao[1], ao[2], ao[3]],
+            ao_width,
             [k0, k1, k2, k3],
         )
     } else {
@@ -657,32 +914,15 @@ fn push_quad(
             [c0, c3, c2, c1],
             [uv0, uv3, uv2, uv1],
             [ao[0], ao[3], ao[2], ao[1]],
+            [ao_width[0], ao_width[3], ao_width[2], ao_width[1]],
             [k0, k3, k2, k1],
         )
     };
 
-    // AO on a top/bottom face spans one of its own cells -- `scale[u]`/
-    // `scale[v]` blocks wide, equal on both for a `d == 1` sweep (`u`/`v` are
-    // x and z, R1b's horizontal cells). Without scaling it, a coarse node's
-    // AO gradient still darkens over one block regardless of how wide its
-    // cell actually is, so a riser's foot gets a band 2^level blocks wide and
-    // reads darker than the same riser's own blocks would
-    // (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1, issue #327 decision 5).
-    // Walls keep an unscaled gradient -- the proposal measures this problem
-    // only at top faces, and every wall's own material is already per-block
-    // (decision 3's UVs). `scale` is always a power of two (1 at level 0,
-    // 2^level for a coarse node's horizontal cells), so `trailing_zeros` is
-    // exactly log2.
-    let ao_width_log2 = if d == 1 {
-        (scale[u].max(scale[v]).max(1) as u32)
-            .trailing_zeros()
-            .min(crate::mesh::MAX_AO_WIDTH_LOG2)
-    } else {
-        0
-    };
-
     let start = mesh.vertices.len() as u32;
-    for (((c, (cu, cv)), a), (u_max, v_max)) in verts.iter().zip(uvs).zip(vao).zip(sides) {
+    for ((((c, (cu, cv)), a), width), (u_max, v_max)) in
+        verts.iter().zip(uvs).zip(vao).zip(widths).zip(sides)
+    {
         mesh.vertices.push(
             Vertex::new(
                 (c[0] * scale[0]) as u32,
@@ -695,7 +935,7 @@ fn push_quad(
                 cv as u32,
             )
             .with_corner(u_max, v_max)
-            .with_ao_width(ao_width_log2),
+            .with_ao_width(width as u32),
         );
     }
 
@@ -833,7 +1073,7 @@ fn push_skirt(
             (i + start, j - 1, run, 1)
         };
         push_quad(
-            mesh, d, u, v, plane, qi, qj, qw, qh, m.sign, m.ao, m.block, ctx, scale,
+            mesh, d, u, v, plane, qi, qj, qw, qh, m.sign, m.ao, m.ao_width, m.block, ctx, scale,
         );
     }
 }
@@ -886,6 +1126,14 @@ mod tests {
     /// today) is proven to leave every public entry point's output
     /// byte-for-byte unchanged, per `ARCHITECTURE.md` Rule 6 -- without
     /// keeping a second "reference" mesher around (Rule 5) to compare against.
+    ///
+    /// **The three scaled fixtures were re-pinned for issue #423** (the two
+    /// `build_mesh_lod` hashes and the staircase at LOD 1), on purpose: a face
+    /// of a cell wider than a block now tiles its texture per block and
+    /// shades its top by the height of the riser beside it, so a scaled
+    /// mesh's UVs and AO-width bits changed. Every `scale = 1` hash here is
+    /// untouched, which is what says level 0's mesh is still byte for byte
+    /// what it was.
     #[test]
     fn r1a_refactor_is_byte_identical_to_pre_refactor_main() {
         let registry = registry();
@@ -908,12 +1156,12 @@ mod tests {
         );
         assert_eq!(
             mesh_hash(&diagonal.build_mesh_lod(&c, 1)),
-            0x1eee232b476b7f52,
+            0x694b48d581d285d2,
             "build_mesh_lod(1) on the same chunk"
         );
         assert_eq!(
             mesh_hash(&diagonal.build_mesh_lod(&c, 2)),
-            0xe41a17fe04bdd845,
+            0x19bef5a34d9cdfe5,
             "build_mesh_lod(2) on the same chunk"
         );
 
@@ -997,7 +1245,7 @@ mod tests {
         );
         assert_eq!(
             mesh_hash(&staircase.build_mesh_lod(&c, 1)),
-            0xef035cf0b527f325,
+            0x6f0b304194a67a25,
             "the staircase at LOD 1"
         );
     }
@@ -1724,6 +1972,375 @@ mod tests {
         let registry = registry();
         let mesh = chunk.build_mesh(&ctx(&registry));
         assert_eq!(mesh.triangle_count(), 12, "6 faces, no skirts");
+    }
+
+    /// Issue #423: a coarse top's shade is as wide as the riser beside it is
+    /// tall (a riser of `k` blocks stands for `k` level-0 steps, each shading
+    /// the column at its foot), capped at the cell's width and rounded to the
+    /// nearer power of two, a tie down. A slab of cells with one column
+    /// standing `k` rows above it: the slab tops' corners that the column
+    /// occludes carry `log2(width / band)`, the open ones `log2(width)` as
+    /// before. For cells of 4 blocks, of 2 (level 1) and of 8 with rows of 4
+    /// (level 3) -- and for the slab's underside with the column hanging
+    /// from it, where the corners are wound the other way.
+    #[test]
+    fn a_coarse_top_is_shaded_as_wide_as_the_riser_is_tall() {
+        let registry = registry();
+        let c = ctx(&registry);
+        // The cell, then: k rows -> log2(cell width / the shade band).
+        type Risers = &'static [(i32, u32)];
+        let cases: [([i32; 3], Risers); 3] = [
+            // bands of 1, 2, 2 (3 is a tie between 2 and 4: down), 4, 4.
+            ([4, 1, 4], &[(1, 2), (2, 1), (3, 1), (4, 0), (6, 0)]),
+            // bands of 1, 2, 2: the cap is the cell's own width.
+            ([2, 1, 2], &[(1, 1), (2, 0), (3, 0)]),
+            // rows of four blocks: bands of 4, 8, 8.
+            ([8, 4, 8], &[(1, 1), (2, 0), (3, 0)]),
+        ];
+        for (scale, risers) in cases {
+            let full = (scale[0] as u32).trailing_zeros();
+            for &(k, expected) in risers {
+                for ceiling in [false, true] {
+                    // Twelve rows: the slab is the bottom one, or the top one
+                    // with the column hanging under it.
+                    let (slab, column) = if ceiling {
+                        (11, 11 - k..=10)
+                    } else {
+                        (0, 1..=k)
+                    };
+                    let mesh = greedy_mesh(
+                        [4, 12, 4],
+                        scale,
+                        |x, y, z| {
+                            let solid = (0..4).contains(&x)
+                                && (0..4).contains(&z)
+                                && (y == slab || ((x, z) == (2, 2) && column.contains(&y)));
+                            if solid {
+                                BlockId::STONE
+                            } else {
+                                BlockId::AIR
+                            }
+                        },
+                        |_, _, _| false,
+                        |_, _, _| false,
+                        &c,
+                    );
+                    // The slab's faces toward the column: its tops, or its
+                    // underside.
+                    let (face, plane) = if ceiling {
+                        (Face::NegY, 11 * scale[1])
+                    } else {
+                        (Face::PosY, scale[1])
+                    };
+                    let at = format!("cells {scale:?}, a riser of {k} rows, ceiling {ceiling}");
+                    let (mut shaded, mut open) = (0, 0);
+                    for v in &mesh.vertices {
+                        if v.face() != face || v.y() != plane as u32 {
+                            continue;
+                        }
+                        if v.ao() < 3 {
+                            shaded += 1;
+                            assert_eq!(v.ao_width_log2(), expected, "{at}");
+                        } else {
+                            open += 1;
+                            assert_eq!(v.ao_width_log2(), full, "{at}: an open corner");
+                        }
+                    }
+                    assert!(
+                        shaded >= 8 && open >= 8,
+                        "{at}: {shaded} shaded, {open} open"
+                    );
+                    // Walls carry no width.
+                    for v in &mesh.vertices {
+                        if v.face() != Face::PosY && v.face() != Face::NegY {
+                            assert_eq!(v.ao_width_log2(), 0, "{at}: {:?}", v.face());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #423: the riser that sets a corner's shade band is the one
+    /// *beside* the top's edge; a taller diagonal neighbour adds to the
+    /// corner's occlusion and does not widen the band, and sets it only
+    /// where it occludes alone. A slab of 4-block cells with a column of 2
+    /// rows at cell (2, 1) and one of 4 rows at cell (2, 2):
+    ///
+    /// - cell (1, 1)'s corner toward them has the 2-row column beside it and
+    ///   the 4-row one diagonal: band 2, `log2(4 / 2) = 1` (the taller of
+    ///   the three would say band 4, 0);
+    /// - cell (1, 3)'s corner toward the 4-row column has it diagonal and
+    ///   nothing beside: band 4, 0.
+    #[test]
+    fn a_coarse_tops_shade_band_is_set_by_the_riser_beside_it() {
+        let registry = registry();
+        let c = ctx(&registry);
+        let mesh = greedy_mesh(
+            [4, 12, 4],
+            [4, 1, 4],
+            |x, y, z| {
+                let solid = (0..4).contains(&x)
+                    && (0..4).contains(&z)
+                    && (y == 0
+                        || ((x, z) == (2, 1) && (1..=2).contains(&y))
+                        || ((x, z) == (2, 2) && (1..=4).contains(&y)));
+                if solid {
+                    BlockId::STONE
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| false,
+            &c,
+        );
+        // The corner at block (x, z) of the slab-top quad whose opposite
+        // corner is at (ox, oz).
+        let corner = |x: u32, z: u32, ox: u32, oz: u32| -> Vertex {
+            let quads: Vec<&[Vertex; 4]> = mesh
+                .vertices
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|q| q[0].face() == Face::PosY && q[0].y() == 1)
+                .filter(|q| {
+                    let has = |x: u32, z: u32| q.iter().any(|v| (v.x(), v.z()) == (x, z));
+                    has(x, z) && has(ox, oz)
+                })
+                .collect();
+            assert_eq!(
+                quads.len(),
+                1,
+                "one slab-top quad from ({ox}, {oz}) to ({x}, {z})"
+            );
+            *quads[0]
+                .iter()
+                .find(|v| (v.x(), v.z()) == (x, z))
+                .expect("the corner")
+        };
+        // Cell (1, 1) is blocks 4..8 x 4..8; its corner at (8, 8).
+        let beside = corner(8, 8, 4, 4);
+        assert!(beside.ao() < 3, "occluded");
+        assert_eq!(beside.ao_width_log2(), 1, "the 2-row column beside it");
+        // Cell (1, 3) is blocks 4..8 x 12..16; its corner at (8, 12).
+        let diagonal = corner(8, 12, 4, 16);
+        assert_eq!(diagonal.ao(), 2, "one diagonal occluder");
+        assert_eq!(diagonal.ao_width_log2(), 0, "the 4-row column, alone");
+    }
+
+    /// Issue #423: an occluder darkens a coarse top's corner, over the band,
+    /// only if it is at least half as tall as the riser that sets the band.
+    /// A slab of 8-block cells; beside cell (1, 1) a column 8 rows tall on
+    /// one side and a `short` one on the other. At the corner between them
+    /// the tall one sets the band (the whole cell) and the short one counts
+    /// from four rows up: under that the corner is shaded by one occluder,
+    /// from there by two. At the short column's own far corner its shade is
+    /// its own band's, whatever it is beside.
+    #[test]
+    fn an_occluder_under_half_the_band_does_not_darken_the_corner() {
+        let registry = registry();
+        let c = ctx(&registry);
+        // Rows of the short column; AO at the corner between the two; log2
+        // of (cell width / the short column's own band).
+        for (short, between, own_width) in [(2, 2u32, 2u32), (3, 2, 2), (4, 0, 1), (8, 0, 0)] {
+            let mesh = greedy_mesh(
+                [4, 12, 4],
+                [8, 1, 8],
+                |x, y, z| {
+                    let solid = (0..4).contains(&x)
+                        && (0..4).contains(&z)
+                        && (y == 0
+                            || ((x, z) == (2, 1) && (1..=8).contains(&y))
+                            || ((x, z) == (1, 2) && (1..=short).contains(&y)));
+                    if solid {
+                        BlockId::STONE
+                    } else {
+                        BlockId::AIR
+                    }
+                },
+                |_, _, _| false,
+                |_, _, _| false,
+                &c,
+            );
+            // Cell (1, 1) is blocks 8..16 x 8..16; its top is one quad.
+            let quads: Vec<&[Vertex; 4]> = mesh
+                .vertices
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|q| q[0].face() == Face::PosY && q[0].y() == 1)
+                .filter(|q| {
+                    let has = |x: u32, z: u32| q.iter().any(|v| (v.x(), v.z()) == (x, z));
+                    has(8, 8) && has(16, 16)
+                })
+                .collect();
+            assert_eq!(quads.len(), 1, "a short column of {short} rows");
+            let corner = |x: u32, z: u32| -> Vertex {
+                *quads[0]
+                    .iter()
+                    .find(|v| (v.x(), v.z()) == (x, z))
+                    .expect("the corner")
+            };
+            let at = format!("a column of 8 rows and one of {short}");
+            let both = corner(16, 16);
+            assert_eq!(both.ao(), between, "{at}: the corner between them");
+            assert_eq!(both.ao_width_log2(), 0, "{at}: the tall one's band");
+            let tall = corner(16, 8);
+            assert_eq!(
+                (tall.ao(), tall.ao_width_log2()),
+                (2, 0),
+                "{at}: the tall one alone"
+            );
+            let low = corner(8, 16);
+            assert_eq!(
+                (low.ao(), low.ao_width_log2()),
+                (2, own_width),
+                "{at}: the short one alone"
+            );
+        }
+    }
+
+    /// Issue #423: a coarse riser's foot shade is carried up the wall, as
+    /// many rows as the riser is tall and no further than the cell is wide,
+    /// no darker than one occluder. A column `k` rows tall on a slab: each
+    /// of its four walls is one band from its foot up to the cell's width
+    /// (level 2 at its lower edge, open at its upper), and what is left
+    /// above it, unshaded. A column one row tall is a foot and nothing else:
+    /// shaded by the tread and the tread beside it (level 1), as at level 0.
+    ///
+    /// Level 0's cells (one block wide) keep the foot row alone; rows of
+    /// four under cells of eight make a band of two rows (eight blocks); and
+    /// a column hanging from a ceiling, or floating above the slab, has no
+    /// foot, so nothing is carried.
+    #[test]
+    fn a_coarse_risers_foot_shade_is_carried_up_the_wall() {
+        assert_eq!(WALL_BAND_SHADE, vertex_ao(true, false, false));
+        let registry = registry();
+        let c = ctx(&registry);
+        // (bottom, top, AO at the lower corners, AO at the upper corners),
+        // in rows of the lattice, bottom up.
+        type Bands = &'static [(i32, i32, u8, u8)];
+        const STANDING: u8 = 0;
+        const HANGING: u8 = 1;
+        const FLOATING: u8 = 2;
+        let cases: [([i32; 3], i32, u8, Bands); 10] = [
+            ([4, 1, 4], 1, STANDING, &[(1, 2, 1, 3)]),
+            ([4, 1, 4], 2, STANDING, &[(1, 3, 2, 3)]),
+            ([4, 1, 4], 3, STANDING, &[(1, 4, 2, 3)]),
+            ([4, 1, 4], 4, STANDING, &[(1, 5, 2, 3)]),
+            // Taller than the cell is wide: four rows of band, then none.
+            ([4, 1, 4], 6, STANDING, &[(1, 5, 2, 3), (5, 7, 3, 3)]),
+            // A cell two blocks wide: a band of two rows.
+            ([2, 1, 2], 4, STANDING, &[(1, 3, 2, 3), (3, 5, 3, 3)]),
+            // Level 0: the foot row and nothing else.
+            ([1, 1, 1], 3, STANDING, &[(1, 2, 1, 3), (2, 4, 3, 3)]),
+            // Rows of four under a cell of eight: two rows are eight blocks.
+            ([8, 4, 8], 3, STANDING, &[(1, 3, 2, 3), (3, 4, 3, 3)]),
+            // Hanging from a ceiling: shaded where it meets it, as any wall.
+            ([4, 1, 4], 3, HANGING, &[(8, 10, 3, 3), (10, 11, 3, 1)]),
+            // Floating two rows above the slab: the slab is no tread of
+            // this wall, and nothing is carried up across the gap.
+            ([4, 1, 4], 2, FLOATING, &[(3, 5, 3, 3)]),
+        ];
+        for (scale, k, how, expected) in cases {
+            let (slab, column) = match how {
+                HANGING => (11, 11 - k..=10),
+                FLOATING => (0, 3..=k + 2),
+                _ => (0, 1..=k),
+            };
+            let mesh = greedy_mesh(
+                [4, 12, 4],
+                scale,
+                |x, y, z| {
+                    let solid = (0..4).contains(&x)
+                        && (0..4).contains(&z)
+                        && (y == slab || ((x, z) == (2, 2) && column.contains(&y)));
+                    if solid {
+                        BlockId::STONE
+                    } else {
+                        BlockId::AIR
+                    }
+                },
+                |_, _, _| false,
+                |_, _, _| false,
+                &c,
+            );
+            let at =
+                format!("cells {scale:?}, a column of {k} rows, standing/hanging/floating {how}");
+            let (w, v) = (scale[0] as u32, scale[1]);
+            let mut walls = 0;
+            for face in [Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
+                // The column's wall that way: inside its own footprint, not
+                // the slab's rim.
+                let mut bands: Vec<(i32, i32, u8, u8)> = mesh
+                    .vertices
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|q| q[0].face() == face)
+                    .filter(|q| {
+                        q.iter().all(|p| {
+                            (2 * w..=3 * w).contains(&p.x()) && (2 * w..=3 * w).contains(&p.z())
+                        })
+                    })
+                    .map(|q| {
+                        let low = q.iter().map(|p| p.y()).min().unwrap();
+                        let high = q.iter().map(|p| p.y()).max().unwrap();
+                        let ao = |y: u32| -> u8 {
+                            let at_y: Vec<u8> = q
+                                .iter()
+                                .filter(|p| p.y() == y)
+                                .map(|p| p.ao() as u8)
+                                .collect();
+                            assert_eq!(at_y.len(), 2, "{at}: {face:?}");
+                            assert_eq!(at_y[0], at_y[1], "{at}: {face:?}, corners at {y}");
+                            at_y[0]
+                        };
+                        (low as i32 / v, high as i32 / v, ao(low), ao(high))
+                    })
+                    .collect();
+                bands.sort();
+                assert_eq!(bands, expected, "{at}: {face:?}");
+                walls += 1;
+            }
+            assert_eq!(walls, 4);
+        }
+    }
+
+    /// Issue #423 (`docs/PROPOSAL_LOD_TRANSITIONS.md` R4): a face of a cell
+    /// wider than a block shows one tile per *block*, as level 0 does, not
+    /// one tile stretched over the cell. One cell of 4 x 2 x 4 blocks: its
+    /// top spans 4 x 4 tiles and each wall 4 across by 2 down.
+    #[test]
+    fn a_coarse_face_tiles_once_per_block() {
+        let registry = registry();
+        let c = ctx(&registry);
+        let mesh = greedy_mesh(
+            [3, 3, 3],
+            [4, 2, 4],
+            |x, y, z| {
+                if (x, y, z) == (1, 1, 1) {
+                    BlockId::STONE
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| false,
+            &c,
+        );
+        assert_eq!(mesh.triangle_count(), 12);
+        for quad in mesh.vertices.as_chunks::<4>().0 {
+            let span = |f: fn(&Vertex) -> u32| {
+                quad.iter().map(f).max().unwrap() - quad.iter().map(f).min().unwrap()
+            };
+            let (u, v) = (span(|v| v.u()), span(|v| v.v()));
+            match quad[0].face() {
+                Face::PosY | Face::NegY => assert_eq!((u, v), (4, 4), "top or bottom"),
+                face => assert_eq!((u, v), (4, 2), "{face:?}: across by down"),
+            }
+        }
     }
 
     #[test]

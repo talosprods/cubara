@@ -499,6 +499,10 @@ impl WorldSnapshot {
     /// path; `cell_height_blocks(0)` is 1 but is never consulted here) and
     /// diverge above it, where a coarse node's actual lattice is this
     /// function's vertical window, not `1 << level`.
+    ///
+    /// `(x, z)` is the cell's corner and `y` **a block row**: what the node
+    /// draws at that block, its top row cut off at `surface`, the exact top
+    /// (issue #423; [`WorldGen::solid_at_v_on`]).
     pub fn certainly_solid_at_v(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
         if level == 0 {
             return self.certainly_solid_at(x, y, z, 0, surface);
@@ -1341,44 +1345,34 @@ mod tests {
 
     /// **T2** `coarse_tops_are_the_surface` (issue #327's Done-when, and
     /// R1b's own scope: "T2 goes green"): a coarse column's drawn top is the
-    /// surface block, within 0.5 block of `surface_height + 1`, over sampled
-    /// columns in every ring (levels 1-3).
+    /// surface block, **exactly at `surface + 1`**, over sampled columns in
+    /// every ring (levels 1-3) -- `surface` being the highest of the columns
+    /// the cell covers (issue #423 decision 1).
+    ///
+    /// Exactly, at level 3 too, since #423: its rows are four blocks tall,
+    /// and the one that holds the surface is cut off at it as the node is
+    /// drawn (`NodeChunk::drawn`). Until then this test allowed level 3 half
+    /// a cell (two blocks), which is the step the 512-block ring showed.
     ///
     /// Follows `worldgen::tests::a_coarse_columns_top_is_the_surface_block`'s
-    /// own method (that test pins the same claim for the old isotropic
-    /// `WorldGen::generate`): for each sampled column, work out *which* cell
-    /// the generator's own `surface < y + v + (v - 1) / 2 && surface >= y +
-    /// (v - 1) / 2` rule says is the top one, and check its content -- rather
-    /// than scanning for "the highest solid cell", which a cave can lower by
-    /// many blocks with no bearing on whether R1b placed the *surface* cell
-    /// correctly. Skipping a cave-carved column (the predicted cell reads
-    /// air) is what the sibling test does for exactly this reason: a cave
-    /// there proves nothing about surface placement, in either direction.
+    /// own method: for each sampled column, work out *which* cell the
+    /// generator's own rule says is the top one -- the row that holds the
+    /// surface -- and check its content, rather than scanning for "the
+    /// highest solid cell", which a cave can lower by many blocks with no
+    /// bearing on whether the *surface* cell is placed correctly. Skipping
+    /// a cave-carved column (the predicted cell reads air) is what the
+    /// sibling test does for exactly this reason.
     #[test]
     fn coarse_tops_are_the_surface() {
         let world = World::new();
         let blocks = layered_blocks();
         for level in [1u32, 2, 3] {
             let v = NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
-            // The exact worst case `density_at_v`'s own "solid while this
-            // cell's quantized middle is at or under the surface" rule can
-            // produce, derived from its `(v - 1) / 2` (floor) midpoint: the
-            // predicted top cell's drawn face can land up to this many
-            // blocks away from `surface + 1`, never more. At `v = 1` (rings
-            // 1-2) that is exactly 0 -- a coarse column's top is then the
-            // real level-0 surface, no quantization at all, well inside "0.5
-            // block". At `v = 4` (ring 3), it is `v - (v-1)/2 - 1 = 2`: half
-            // the *cell*, which §1.1/§3 of the proposal already documents as
-            // the coarse-cell height-error bound ring 3 accepts (its v = 4
-            // cells are, deliberately, a cheap approximation -- M4 may later
-            // replace them with candidate (ii)).
-            let m = (v - 1) / 2;
-            let max_err = (v - m - 1).max(m);
-            let (mut sampled, mut within_bound, mut tops_are_grass) = (0u32, 0u32, 0u32);
+            let (mut sampled, mut at_the_surface, mut tops_are_grass) = (0u32, 0u32, 0u32);
             for nx in -4..=4i32 {
                 for nz in -4..=4i32 {
                     let node = NodeKey::new(level, [nx, 0, nz]);
-                    let Some(NodeChunk::Aniso(chunk)) = world.node_at(node, blocks) else {
+                    let Some(chunk @ NodeChunk::Aniso(_)) = world.node_at(node, blocks) else {
                         continue;
                     };
                     let dims = chunk.dims();
@@ -1393,7 +1387,7 @@ mod tests {
                             // the top, if this node's y-range holds it.
                             let Some(ly) = (0..dims[1]).rev().find(|&ly| {
                                 let y = origin[1] + ly as i32 * v;
-                                surface < y + v + (v - 1) / 2 && surface >= y + (v - 1) / 2
+                                (y..y + v).contains(&surface)
                             }) else {
                                 continue;
                             };
@@ -1402,9 +1396,15 @@ mod tests {
                                 continue; // a cave carved the predicted top away
                             }
                             sampled += 1;
-                            let drawn_top = origin[1] + (ly as i32 + 1) * v;
-                            if (drawn_top - (surface + 1)).abs() <= max_err {
-                                within_bound += 1;
+                            // What is drawn of that cell: its block rows, on
+                            // the lattice the node is meshed on.
+                            let rows = chunk.mesh_scale()[1];
+                            let drawn_top = (0..chunk.mesh_dims()[1])
+                                .rev()
+                                .find(|&row| chunk.drawn(lx, row, lz) != BlockId::AIR)
+                                .map(|row| origin[1] + (row as i32 + 1) * rows);
+                            if drawn_top == Some(surface + 1) {
+                                at_the_surface += 1;
                             }
                             if block == blocks.grass {
                                 tops_are_grass += 1;
@@ -1418,15 +1418,69 @@ mod tests {
                 "level {level}: only {sampled} columns sampled, too few to mean anything"
             );
             assert_eq!(
-                within_bound, sampled,
-                "level {level} (v={v}): {} of {sampled} predicted tops are more than {max_err} block(s) off surface + 1",
-                sampled - within_bound
+                at_the_surface,
+                sampled,
+                "level {level} (rows of {v}): {} of {sampled} tops are not drawn at surface + 1",
+                sampled - at_the_surface
             );
             assert_eq!(
                 tops_are_grass,
                 sampled,
                 "level {level}: {} of {sampled} predicted tops are not grass",
                 sampled - tops_are_grass
+            );
+        }
+    }
+
+    /// **`certainly_solid_at_v` is what a coarse node draws, block by
+    /// block.** `border_samples` asks it what a neighbour shows at a block
+    /// on the other side of a border, so it is held here to the neighbour
+    /// itself: every block of every column of generated nodes at levels 1,
+    /// 2 and 3 against `NodeChunk::drawn` -- level 3's top row cut off at
+    /// its column's exact top included, which is where the two could part
+    /// (a block above the top, in the row that holds it).
+    #[test]
+    fn certainly_solid_is_what_a_coarse_node_draws() {
+        let world = World::new();
+        let blocks = layered_blocks();
+        for level in [1u32, 2, 3] {
+            let (mut checked, mut above_the_top) = (0u32, 0u32);
+            for (nx, nz) in [(0, 0), (-3, 2), (5, -4)] {
+                for ny in -1..=1 {
+                    let node = NodeKey::new(level, [nx, ny, nz]);
+                    let Some(chunk) = world.node_at(node, blocks) else {
+                        continue;
+                    };
+                    let (w, v) = (node.extent_chunks(), node.cell_height_blocks());
+                    let origin = node.world_origin();
+                    let dims = chunk.mesh_dims();
+                    assert_eq!(chunk.mesh_scale(), [w, 1, w], "level {level}");
+                    for lz in 0..dims[2] {
+                        for lx in 0..dims[0] {
+                            let x = origin[0] + lx as i32 * w;
+                            let z = origin[2] + lz as i32 * w;
+                            let surface = world.cell_surface_height(x, z, w);
+                            for row in 0..dims[1] {
+                                let y = origin[1] + row as i32;
+                                assert_eq!(
+                                    world.certainly_solid_at_v(x, y, z, level, surface),
+                                    chunk.drawn(lx, row, lz) != BlockId::AIR,
+                                    "level {level}, block ({x}, {y}, {z}), its cell's top at {surface}"
+                                );
+                                checked += 1;
+                                // In the row that holds the top, above it.
+                                if y > surface && y.div_euclid(v) == surface.div_euclid(v) {
+                                    above_the_top += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(checked >= 40_000, "level {level}: {checked} blocks");
+            assert!(
+                level < 3 || above_the_top > 1000,
+                "level 3: only {above_the_top} blocks above a top in its own row"
             );
         }
     }

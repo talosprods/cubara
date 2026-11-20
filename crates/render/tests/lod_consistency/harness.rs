@@ -298,7 +298,7 @@ impl Faces {
 }
 
 /// The largest channel difference between two colours, on the 0-255 scale
-/// (linear light, as T3 has always been measured: `t3_coarse_ao.rs`).
+/// (linear light, as T3 has been measured since R1c, issue #327).
 pub fn colour_delta(a: [f64; 3], b: [f64; 3]) -> f64 {
     (0..3)
         .map(|c| (a[c] - b[c]).abs() * 255.0)
@@ -449,9 +449,9 @@ pub fn measure_voxels_from(
 /// [`Drawn::measure`] counts, as often as there are masks to count it by.
 pub struct Drawn {
     fp: Footprint,
-    /// A cell's width and height, in blocks.
+    /// A cell's width, in blocks. (Its faces are walked in block rows: a
+    /// mesh's positions are in blocks whatever rows the node stores.)
     pub w: i32,
-    pub v: i32,
     /// Each lattice column's drawn top: one above its highest solid cell.
     top: Vec<Option<i32>>,
     /// Every node's mesh, with the node's origin.
@@ -461,8 +461,7 @@ pub struct Drawn {
 /// Generate and mesh the voxels of `level` over `fp`, the nodes' cells from
 /// `source`.
 pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource) -> Drawn {
-    let probe = NodeKey::new(level, [0, 0, 0]);
-    let (w, v) = (probe.extent_chunks(), probe.cell_height_blocks());
+    let w = NodeKey::new(level, [0, 0, 0]).extent_chunks();
     let node_size = 16 * w;
     let cells = FOOTPRINT / w;
     let mut top: Vec<Option<i32>> = vec![None; (cells * cells) as usize];
@@ -501,7 +500,9 @@ pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource)
                     continue;
                 };
                 let origin = node.world_origin();
-                let dims = chunk.dims();
+                // What the node draws, on the lattice it is drawn on: level
+                // 3's rows of four are cut off at its exact tops.
+                let (dims, rows) = (chunk.mesh_dims(), chunk.mesh_scale()[1]);
                 for lz in 0..dims[2] {
                     for lx in 0..dims[0] {
                         let (x, z) = (origin[0] + lx as i32 * w, origin[2] + lz as i32 * w);
@@ -510,9 +511,9 @@ pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource)
                         };
                         let solid = (0..dims[1])
                             .rev()
-                            .find(|&ly| setup.registry.is_solid(chunk.get(lx, ly, lz)));
+                            .find(|&ly| setup.registry.is_solid(chunk.drawn(lx, ly, lz)));
                         if let Some(ly) = solid {
-                            let face = origin[1] + (ly as i32 + 1) * v;
+                            let face = origin[1] + (ly as i32 + 1) * rows;
                             top[c] = Some(top[c].map_or(face, |t| t.max(face)));
                         }
                     }
@@ -553,13 +554,7 @@ pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource)
             .entry((fp.x0, fp.z0))
             .or_insert_with(|| std::rc::Rc::new(mask));
     }
-    Drawn {
-        fp,
-        w,
-        v,
-        top,
-        meshes,
-    }
+    Drawn { fp, w, top, meshes }
 }
 
 /// [`measure_voxels_from`], counting only the faces of columns at least
@@ -587,7 +582,7 @@ impl Drawn {
     /// with for level 0**, so that the reference and the level it is held
     /// against leave out exactly the same ground.
     pub fn measure(&self, setup: &Setup, inner: i32, mask: i32) -> Measure {
-        let (fp, w, v) = (self.fp, self.w, self.v);
+        let (fp, w) = (self.fp, self.w);
         assert!(
             mask >= w && mask % w == 0,
             "a mask of {mask} blocks cannot split cells of {w}"
@@ -688,13 +683,15 @@ impl Drawn {
                             if !counted(own[0], own[2]) {
                                 continue;
                             }
-                            for y in (min[1]..max[1]).step_by(v as usize) {
+                            for y in min[1]..max[1] {
                                 // Open sky in front: the column there is drawn no
-                                // higher than this cell's foot (or not at all).
+                                // higher than this block row's foot (or not at
+                                // all). Row by row of blocks -- a top is at any
+                                // block, whatever rows the node stores.
                                 if top[f].is_none_or(|t| t <= y) {
                                     let beside_a_cave = cell_carved(own[0], own[2])
                                         || cell_carved(front[0], front[2]);
-                                    seen[beside_a_cave as usize] += (w * v) as f64;
+                                    seen[beside_a_cave as usize] += w as f64;
                                 }
                             }
                         }
@@ -729,6 +726,57 @@ impl Drawn {
     }
 }
 
+impl Drawn {
+    /// Per level-0 column (row by row, `z` outer): how much of its light the
+    /// baked ambient occlusion leaves the sky-visible top face over it --
+    /// the mean over the quad that covers it, as [`Drawn::measure`] takes
+    /// it. `NaN` where the sky sees no top. For taking a level's shade apart
+    /// (`top_shade_by_riser_report`), not for a tolerance.
+    pub fn top_light(&self, setup: &Setup) -> Vec<f64> {
+        let (fp, w) = (self.fp, self.w);
+        let cells = FOOTPRINT / w;
+        let mut out = vec![f64::NAN; (FOOTPRINT * FOOTPRINT) as usize];
+        for (origin, mesh) in &self.meshes {
+            for quad in mesh.indices.chunks(6) {
+                let base = *quad.iter().min().expect("six indices") as usize;
+                let corners = &mesh.vertices[base..base + 4];
+                if corners[0].face() != Face::PosY {
+                    continue;
+                }
+                let ao: Vec<f64> = corners
+                    .iter()
+                    .map(|c| ao_fraction(c.ao(), c.ao_width_log2(), setup.lighting.ao_floor) as f64)
+                    .collect();
+                let light = if quad[0] as usize == base {
+                    (2.0 * (ao[0] + ao[2]) + ao[1] + ao[3]) / 6.0
+                } else {
+                    (2.0 * (ao[1] + ao[3]) + ao[0] + ao[2]) / 6.0
+                };
+                // Back out the floor: 1 is unshaded, 0 as dark as it gets.
+                let lo = |f: fn(&cubara_voxel::Vertex) -> u32, o: i32| {
+                    o + corners.iter().map(f).min().expect("four") as i32
+                };
+                let hi = |f: fn(&cubara_voxel::Vertex) -> u32, o: i32| {
+                    o + corners.iter().map(f).max().expect("four") as i32
+                };
+                let y = lo(|c| c.y(), origin[1]);
+                for z in lo(|c| c.z(), origin[2])..hi(|c| c.z(), origin[2]) {
+                    for x in lo(|c| c.x(), origin[0])..hi(|c| c.x(), origin[0]) {
+                        if !fp.holds(x, z) {
+                            continue;
+                        }
+                        let cell = (((z - fp.z0) / w) * cells + (x - fp.x0) / w) as usize;
+                        if self.top[cell] == Some(y) {
+                            out[((z - fp.z0) * FOOTPRINT + (x - fp.x0)) as usize] = light;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Whether a cave has carved any level-0 column under the `w`-block cell at
 /// `(x, z)` (clipped to the footprint; a cell outside it is not).
 fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
@@ -739,10 +787,10 @@ fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
 }
 
 /// How far above and below a node column's level-0 surface its nodes are
-/// generated, in blocks. **Chosen, not derived**: above, a level-3 row
-/// rounds a top up by at most two blocks and a max over a cell can only
-/// reach the footprint's own highest column; below, a cave mouth can lower a
-/// column's top, and one deeper than this is counted as nothing drawn.
+/// generated, in blocks. **Chosen, not derived**: above, a max over a cell
+/// can only reach the footprint's own highest column, so any margin does;
+/// below, a cave mouth can lower a column's top, and one deeper than this is
+/// counted as nothing drawn.
 const SURFACE_MARGIN: i32 = 12;
 
 /// The far terrain's patches of `level` (quads of `2^level` blocks) over
@@ -887,8 +935,8 @@ pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) 
             };
             let (x0, z0) = (fp.x0 + ci, fp.z0 + cj);
             let top = match rule {
-                TopRule::Max => gen.cell_top(x0, z0, cell, 1),
-                TopRule::SampledMax(n) => gen.cell_top_sampled(x0, z0, cell, 1, n),
+                TopRule::Max => gen.cell_top(x0, z0, cell),
+                TopRule::SampledMax(n) => gen.cell_top_sampled(x0, z0, cell, n),
                 TopRule::Mean => {
                     let sum: i64 = columns(cell).map(|(a, b)| h(ci + a, cj + b) as i64).sum();
                     (sum as f64 / (cell * cell) as f64).round() as i32
