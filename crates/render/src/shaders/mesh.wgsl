@@ -168,7 +168,7 @@ fn vs_main(in: VsIn) -> VsOut {
     let z = f32((in.packed0 >> 20u) & 0x3FFu);
     let ao_raw = (in.packed0 >> 30u) & 0x3u;
 
-    // word 1: tex_layer:12 face:3 u:8 v:8 (1 spare)
+    // word 1: tex_layer:12 face:3 u:8 v:8 latent:1
     let tex_layer = in.packed1 & 0xFFFu;
     let face = (in.packed1 >> 12u) & 0x7u;
     let u = f32((in.packed1 >> 15u) & 0xFFu);
@@ -219,7 +219,13 @@ fn vs_main(in: VsIn) -> VsOut {
         select(0.0, su, ua == 1u) + select(0.0, sv, va == 1u),
         select(0.0, su, ua == 2u) + select(0.0, sv, va == 2u),
     );
-    let world_pos = on_grid + outward * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
+    // A latent riser (word 1's top bit, `Vertex::with_latent`) has no
+    // height until the morph opens it: its vertical seal grows with the
+    // morph, so unmorphed it stays flat and morphed it overlaps the top face
+    // beside it like any riser.
+    let latent = (in.packed1 >> 31u) == 1u;
+    let seal = outward * vec3<f32>(1.0, select(1.0, morph, latent), 1.0);
+    let world_pos = on_grid + seal * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
 
     // AO (R1c, issue #327 decision 5): a coarse top face's corners carry
     // `ao_width_log2`, log2 of the cell's own width in blocks (`Vertex::

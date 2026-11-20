@@ -252,6 +252,10 @@ mod tests {
     /// The terrain's three materials by name (`TerrainBlocks::from_registry`),
     /// no trees: what `node_columns` asks `is_solid_at` about.
     fn blocks() -> TerrainBlocks {
+        TerrainBlocks::from_registry(&registry())
+    }
+
+    fn registry() -> BlockRegistry {
         let material = |name: &str| {
             (
                 std::path::PathBuf::from("test-fixture.ron"),
@@ -267,13 +271,191 @@ mod tests {
                 },
             )
         };
-        let registry = BlockRegistry::from_materials(vec![
+        BlockRegistry::from_materials(vec![
             material("cubara:grass"),
             material("cubara:soil"),
             material("cubara:stone"),
         ])
-        .expect("fixture registry is valid");
-        TerrainBlocks::from_registry(&registry)
+        .expect("fixture registry is valid")
+    }
+
+    /// The nodes of a morphing `level` around the steep mountain of #432
+    /// (chunk column (336, 213)): the one holding the surface there and its
+    /// eight neighbours on the same row.
+    fn mountain_nodes(snapshot: &WorldSnapshot, level: u32) -> Vec<NodeKey> {
+        let (px, pz) = (336 * 16, 213 * 16);
+        let extent = 16 << level;
+        let mut nodes = Vec::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let (x, z) = (px + dx * extent, pz + dz * extent);
+                let y = snapshot.surface_height(x, z);
+                nodes.push(NodeKey::new(
+                    level,
+                    [x.div_euclid(extent), y.div_euclid(extent), z.div_euclid(extent)],
+                ));
+            }
+        }
+        nodes
+    }
+
+    /// **The mesh the game draws is closed at every factor, and at full
+    /// morph it is the parent's** -- the mesher's own output, not the rule:
+    /// real nodes of every morphing level on the steep mountain are meshed,
+    /// every vertex is moved by one factor `f` as `mesh.wgsl` moves it, and
+    /// then, for every column whose riser rows lie inside the node:
+    ///
+    /// - its top face stands at `lerp(top, target)`;
+    /// - on every boundary with a neighbour whose morphed top is lower, the
+    ///   column's riser quads facing that neighbour cover the whole height
+    ///   between the two morphed tops, with no gap.
+    ///
+    /// Goes red when the mesher keys a riser's rows wrongly, leaves out a
+    /// latent riser, bakes a delta from the wrong row, or merges faces that
+    /// move differently.
+    #[test]
+    fn a_morphed_node_is_closed_and_stands_on_its_parent() {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        let (mut tops, mut risers, mut skipped) = (0, 0, 0);
+        for level in MORPH_LEVELS {
+            let w = 1i32 << level;
+            for node in mountain_nodes(&snapshot, level) {
+                let Some(geometry) =
+                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                else {
+                    continue;
+                };
+                let columns = node_columns(&snapshot, node, blocks).expect("a morphing level");
+                let chunk = snapshot.node_at(node, blocks).expect("a drawn node");
+                let ny = 16 * w; // rows of one block
+                // Whether column (cx, cz) is drawn as the height field says
+                // over rows `from..to`: solid under `top`, air from it -- no
+                // cave or pit there (a tree's leaves above `to` are not
+                // asked). The closure is held on that ground; where a column
+                // is not, the morph must leave it still (below).
+                let height_field = |cx: i32, cz: i32, from: i32, top: i32, to: i32| {
+                    (from.max(0)..to.min(ny)).all(|y| {
+                        let solid = chunk.drawn(cx as usize, y as usize, cz as usize)
+                            != cubara_voxel::BlockId::AIR;
+                        solid == (y < top)
+                    })
+                };
+                let quads: Vec<[cubara_voxel::Vertex; 4]> = geometry
+                    .mesh
+                    .vertices
+                    .chunks(4)
+                    .map(|q| [q[0], q[1], q[2], q[3]])
+                    .collect();
+                for f in [0.0f32, 0.25, 0.5, 1.0] {
+                    let y = |v: cubara_voxel::Vertex| v.y() as f32 + v.morph_delta() * f;
+                    let lerp = |s: i32, t: i32| s as f32 + (t - s) as f32 * f;
+                    for cz in 0..16 {
+                        for cx in 0..16 {
+                            let [top, target, _, _] = columns.at(cx, cz);
+                            // Tops: one face over the column's square, at
+                            // the morphed top.
+                            if (1..=ny).contains(&top) && height_field(cx, cz, top - 1, top, top + 1) {
+                                let (x0, z0) = (cx * w, cz * w);
+                                let found = quads.iter().any(|q| {
+                                    q[0].face() == cubara_voxel::Face::PosY
+                                        && q[0].y() as i32 == top
+                                        && q.iter().all(|v| (y(*v) - lerp(top, target)).abs() < 1e-3)
+                                        && q.iter().map(|v| v.x() as i32).min() <= Some(x0)
+                                        && q.iter().map(|v| v.x() as i32).max() >= Some(x0 + w)
+                                        && q.iter().map(|v| v.z() as i32).min() <= Some(z0)
+                                        && q.iter().map(|v| v.z() as i32).max() >= Some(z0 + w)
+                                });
+                                assert!(
+                                    found,
+                                    "level {level} {node:?} column ({cx}, {cz}): no top face at \
+                                     {} (top {top}, target {target}, f {f})",
+                                    lerp(top, target)
+                                );
+                                tops += 1;
+                            }
+                            // Risers toward the +x and +z neighbours, both ways.
+                            for (dx, dz) in [(1, 0), (0, 1)] {
+                                let (nx, nz) = (cx + dx, cz + dz);
+                                if nx >= 16 || nz >= 16 {
+                                    continue;
+                                }
+                                let a = columns.at(cx, cz);
+                                let b = columns.at(nx, nz);
+                                let (ta, tb) = (lerp(a[0], a[1]), lerp(b[0], b[1]));
+                                if (ta - tb).abs() < 1e-3 {
+                                    continue;
+                                }
+                                // The higher one's riser, facing the lower.
+                                let (high, low, sign) = if ta > tb { (a, b, 1) } else { (b, a, -1) };
+                                let span = [high[0], high[1], low[0], low[1]];
+                                if span.iter().any(|&r| !(1..=ny).contains(&r)) {
+                                    continue; // crosses into the node above or below
+                                }
+                                let (from, to) = (a[0].min(b[0]) - 1, a[0].max(b[0]) + 1);
+                                if !height_field(cx, cz, from, a[0], to)
+                                    || !height_field(nx, nz, from, b[0], to)
+                                {
+                                    // A cave, a pit or an overhang the world's
+                                    // purity rule must have seen too: neither
+                                    // column moves.
+                                    assert!(
+                                        a[1] == a[0] && b[1] == b[0],
+                                        "level {level} {node:?} ({cx},{cz})/({nx},{nz}) is not a \
+                                         height field as drawn, yet morphs: {a:?} {b:?}"
+                                    );
+                                    skipped += 1;
+                                    continue;
+                                }
+                                let axis = if dx == 1 { 0 } else { 2 };
+                                let face = cubara_voxel::Face::from_axis_sign(axis, sign);
+                                let plane = if dx == 1 { (cx + 1) * w } else { (cz + 1) * w };
+                                let along = if dx == 1 { cz * w } else { cx * w };
+                                let mut cover: Vec<(f32, f32)> = quads
+                                    .iter()
+                                    .filter(|q| q[0].face() == face)
+                                    .filter(|q| {
+                                        let p = |v: &cubara_voxel::Vertex| {
+                                            (if axis == 0 { v.x() } else { v.z() }) as i32
+                                        };
+                                        let s = |v: &cubara_voxel::Vertex| {
+                                            (if axis == 0 { v.z() } else { v.x() }) as i32
+                                        };
+                                        q.iter().all(|v| p(v) == plane)
+                                            && q.iter().map(s).min().unwrap() <= along
+                                            && q.iter().map(s).max().unwrap() >= along + w
+                                    })
+                                    .map(|q| {
+                                        let ys = q.iter().map(|v| y(*v));
+                                        (ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max))
+                                    })
+                                    .collect();
+                                cover.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+                                let (lo, hi) = (ta.min(tb), ta.max(tb));
+                                let mut reached = lo;
+                                for (bottom, top) in cover {
+                                    if bottom <= reached + 1e-3 {
+                                        reached = reached.max(top);
+                                    }
+                                }
+                                assert!(
+                                    reached >= hi - 1e-3,
+                                    "level {level} {node:?} ({cx},{cz})->({nx},{nz}) at f {f}: \
+                                     tops {ta}/{tb}, risers reach only {reached}"
+                                );
+                                risers += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("checked {tops} tops and {risers} risers; {skipped} pairs not a height field");
+        assert!(tops > 1000 && risers > 1000, "checked {tops} tops and {risers} risers");
+        assert!(skipped * 10 < risers, "{skipped} pairs skipped of {risers}");
     }
 
     #[test]
@@ -540,6 +722,101 @@ mod tests {
             }
         }
         assert!(pairs > 1000, "only {pairs} pairs were checked");
+    }
+
+    /// **What the morph costs in geometry** (issue #380's study): the
+    /// game's selection around an eye (radius 64, squash 2, the default
+    /// schedule, the real assets), meshed with and without the morph --
+    /// triangles and vertices per level, how many of the added quads are
+    /// latent risers, and the largest delta a vertex carries. Every node of
+    /// the selection, seen or not (as `geometry_census` and #432's tables).
+    /// `MORPH_CENSUS_AT=x,y,z` picks the eye (default: the gate's ground eye,
+    /// (8, 40, 8)).
+    #[test]
+    #[ignore = "meshes a whole selection twice: cargo test -p cubara-world --release morph_cost_census -- --ignored --nocapture"]
+    fn morph_cost_census() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let registry = BlockRegistry::load(&root.join("assets/blocks")).expect("assets/blocks");
+        let structures = cubara_voxel::StructureRegistry::load(&root.join("assets/structures"))
+            .expect("assets/structures");
+        let ores = cubara_voxel::OreRegistry::load(&root.join("assets/ores")).expect("assets/ores");
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&structures, &registry)
+            .with_ores(&ores, &registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        let eye: [f32; 3] = std::env::var("MORPH_CENSUS_AT")
+            .ok()
+            .and_then(|t| {
+                let v: Vec<f32> = t.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                (v.len() == 3).then(|| [v[0], v[1], v[2]])
+            })
+            .unwrap_or([8.0, 40.0, 8.0]);
+        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye), SQUASH, DEFAULT_RING_SCHEDULE);
+        // Per level: [triangles, vertices] without and with the morph, latent
+        // quads, quads that move, the largest delta, nodes, milliseconds.
+        let mut rows = [[0u64; 9]; 4];
+        let mut largest = 0f32;
+        for &node in &nodes {
+            let l = node.level as usize;
+            let start = std::time::Instant::now();
+            let plain = crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, false);
+            let t_plain = start.elapsed();
+            let start = std::time::Instant::now();
+            let morphed = crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, true);
+            let t_morph = start.elapsed();
+            rows[l][7] += t_plain.as_micros() as u64;
+            rows[l][8] += t_morph.as_micros() as u64;
+            rows[l][6] += 1;
+            if let Some(g) = plain {
+                rows[l][0] += g.mesh.triangle_count() as u64;
+                rows[l][1] += g.mesh.vertices.len() as u64;
+            }
+            if let Some(g) = morphed {
+                rows[l][2] += g.mesh.triangle_count() as u64;
+                rows[l][3] += g.mesh.vertices.len() as u64;
+                for q in g.mesh.vertices.chunks(4) {
+                    if q[0].is_latent() {
+                        rows[l][4] += 1;
+                    }
+                    if q.iter().any(|v| v.morph_delta() != 0.0) {
+                        rows[l][5] += 1;
+                    }
+                    for v in q {
+                        largest = largest.max(v.morph_delta().abs());
+                    }
+                }
+            }
+        }
+        println!("morph cost census around {eye:?}: {} nodes, radius 64, squash {SQUASH}", nodes.len());
+        println!("| level | nodes | triangles, plain | triangles, morph | change | vertices, plain | vertices, morph | change | latent quads | quads that move | mesh ms plain / morph |");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|");
+        let mut total = [0u64; 4];
+        for (l, r) in rows.iter().enumerate() {
+            if r[6] == 0 {
+                continue;
+            }
+            for k in 0..4 {
+                total[k] += r[k];
+            }
+            let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
+            println!(
+                "| {l} | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | {} | {} | {:.0} / {:.0} |",
+                r[6], r[0], r[2], pct(r[0], r[2]), r[1], r[3], pct(r[1], r[3]), r[4], r[5],
+                r[7] as f64 / 1000.0, r[8] as f64 / 1000.0
+            );
+        }
+        let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
+        println!(
+            "| all | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | | | |",
+            nodes.len(), total[0], total[2], pct(total[0], total[2]), total[1], total[3], pct(total[1], total[3])
+        );
+        println!(
+            "largest delta a vertex carries: {largest} blocks (the format holds {})",
+            cubara_voxel::MAX_MORPH_DELTA
+        );
+        assert!(largest < cubara_voxel::MAX_MORPH_DELTA, "a delta was clamped");
     }
 
     #[test]

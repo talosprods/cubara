@@ -1404,10 +1404,13 @@ fn push_skirt(
 /// it covers nothing. The morph lifts its top edge to `l.t_top` and its foot
 /// to `l.t_bot`.
 ///
-/// Its corners are all marked as on the low side of the quad vertically, so
-/// `mesh.wgsl`'s crack seal (which pushes each corner a fraction of a pixel
-/// out of its quad) moves the whole edge down together instead of opening
-/// the riser into a sliver a tenth of a pixel tall.
+/// Its corners are marked latent (`Vertex::with_latent`): `mesh.wgsl`'s
+/// crack seal pushes each corner a fraction of a pixel out of its quad, and
+/// for these it scales the vertical push by the morph factor -- unmorphed the
+/// riser stays flat rather than a sliver a tenth of a pixel tall, and
+/// morphed its top edge overlaps the top face beside it as every riser's
+/// does. (Pushing it the other way left a gap under the top face that rays
+/// fell through: single pixels of sky in the first run of the study.)
 fn push_latent_riser(
     mesh: &mut Mesh,
     (d, u, v): (usize, usize, usize),
@@ -1442,16 +1445,10 @@ fn push_latent_riser(
     let y = (l.y * scale[1]) as u32;
     for vertex in &mut mesh.vertices[start..] {
         let top = vertex.y() == y;
-        let (u_max, v_max) = vertex.corner();
-        let corner = if d == 0 {
-            (false, v_max)
-        } else {
-            (u_max, false)
-        };
         let delta = if top { l.t_top } else { l.t_bot } as f32 - l.y as f32;
         *vertex = vertex
             .with_y(y)
-            .with_corner(corner.0, corner.1)
+            .with_latent(true)
             .with_morph(morph_level, delta);
     }
 }

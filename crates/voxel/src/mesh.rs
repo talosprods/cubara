@@ -130,6 +130,11 @@ const MORPH_DELTA_BITS: u32 = 32 - MORPH_DELTA_SHIFT;
 /// split into by material in between are rounded, and they stay inside the
 /// riser's plane. Chosen, not derived.
 pub const MORPH_DELTA_STEP: f32 = 0.25;
+/// Word 1's one spare bit: this vertex is a corner of a latent riser, one
+/// the distance morph opens from no height (`crate::voxel`). `mesh.wgsl`
+/// scales its vertical crack seal by the morph factor, so unmorphed it stays
+/// flat and morphed it seals like any riser.
+const LATENT_BIT: u32 = 1 << 31;
 /// The largest morph delta a vertex can carry, in blocks.
 pub const MAX_MORPH_DELTA: f32 =
     ((1i32 << (MORPH_DELTA_BITS - 1)) - 1) as f32 * MORPH_DELTA_STEP;
@@ -141,7 +146,7 @@ pub const MAX_MORPH_DELTA: f32 =
 ///
 /// ```text
 /// word 0:  x:10  y:10  z:10  ao:2
-/// word 1:  tex_layer:12  face:3  u:8  v:8  (1 spare)
+/// word 1:  tex_layer:12  face:3  u:8  v:8  latent:1
 /// word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  morph_level:2  morph_delta:10
 /// ```
 ///
@@ -273,6 +278,20 @@ impl Vertex {
                 | ((q as u32) << MORPH_DELTA_SHIFT),
             ..self
         }
+    }
+
+    /// Returns a copy of this vertex marked as a corner of a latent riser
+    /// (word 1's spare bit, [`LATENT_BIT`]).
+    pub fn with_latent(self, latent: bool) -> Self {
+        Self {
+            packed1: (self.packed1 & !LATENT_BIT) | if latent { LATENT_BIT } else { 0 },
+            ..self
+        }
+    }
+
+    /// Whether [`with_latent`](Self::with_latent) marked this vertex.
+    pub fn is_latent(self) -> bool {
+        self.packed1 & LATENT_BIT != 0
     }
 
     /// The morph band level [`with_morph`](Self::with_morph) set.

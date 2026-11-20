@@ -158,6 +158,26 @@ pub fn holes(morphed: &Frame, fixed: &Frame) -> u32 {
     count
 }
 
+/// Pixels of nothing in `frame` with land within two pixels above **and**
+/// below: a gap through the ground, whatever drew it -- the measure of a
+/// frame's own sparkles, which [`holes`] is compared against.
+pub fn isolated_nothing(frame: &Frame) -> u32 {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let land = |x: usize, y: usize| !nothing(&frame.pixels[(y * w + x) * 4..][..4]);
+    let mut count = 0;
+    for y in 2..h.saturating_sub(2) {
+        for x in 0..w {
+            if land(x, y) {
+                continue;
+            }
+            if (1..=2).any(|k| land(x, y - k)) && (1..=2).any(|k| land(x, y + k)) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// The swaps between two selections, per ring edge ([`EDGES`] order): the
 /// nodes that leave and the nodes that arrive. A node is part of a swap at
 /// edge `L` when it is a level-`L` node replaced by its children or the
@@ -313,18 +333,48 @@ struct Approach {
     peak: [f32; 3],
 }
 
+/// How high above the ground the walking eye is: a player's eye over the
+/// top face of the block they stand on (`cubara_sim`'s 1.62, rounded).
+const EYE_HEIGHT: f32 = 1.6;
+
+/// Which approach: the gate's toward-peak flight, level with the summit, or
+/// the same line walked on the ground (`CUBARA_STUDY_PATH=walk`) -- the eye
+/// a player's height over the ground under it, looking at the summit from
+/// where the walk starts. Both at the flight's 24 blocks a second (walking
+/// is about a sixth of that, which only the morph's per-frame step depends
+/// on: it scales with the speed).
 fn approach(gen: &WorldGen) -> Approach {
     let (start, look) = toward_peak(gen);
-    let frames = (SECONDS * FPS).round() as usize;
+    // `CUBARA_STUDY_SECONDS` shortens the approach for a quick look.
+    let seconds = std::env::var("CUBARA_STUDY_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(SECONDS);
+    let walk = std::env::var("CUBARA_STUDY_PATH").is_ok_and(|p| p == "walk");
+    let frames = (seconds * FPS).round() as usize;
     let step = FLY_SPEED / FPS;
-    let eyes = (0..=frames)
-        .map(|i| {
-            let t = i as f32 * step;
-            [start[0] + look[0] * t, start[1], start[2] + look[2] * t]
-        })
-        .collect();
     // `toward_peak` starts 900 blocks out, level with the summit (+3).
     let peak = [start[0] + look[0] * 900.0, start[1] - 3.0, start[2] + look[2] * 900.0];
+    let eyes: Vec<[f32; 3]> = (0..=frames)
+        .map(|i| {
+            let t = i as f32 * step;
+            let (x, z) = (start[0] + look[0] * t, start[2] + look[2] * t);
+            let y = if walk {
+                gen.surface_height(x.floor() as i32, z.floor() as i32) as f32 + 1.0 + EYE_HEIGHT
+            } else {
+                start[1]
+            };
+            [x, y, z]
+        })
+        .collect();
+    let look = if walk {
+        let e = eyes[0];
+        glam::Vec3::new(peak[0] - e[0], peak[1] - e[1], peak[2] - e[2])
+            .normalize()
+            .to_array()
+    } else {
+        look
+    };
     Approach { eyes, look, peak }
 }
 
@@ -369,16 +419,31 @@ struct Run {
     tallies: [EdgeTally; 3],
     /// The worst frame's pair per edge: (frame, pixels changed, before, after).
     kept: [Option<(usize, u32, Frame, Frame)>; 3],
-    /// Holes the morph opened: (frames checked, frames with any, most in one).
-    holes: (usize, usize, u32),
+    /// Holes the morph opened: (frames checked, frames with any, most in
+    /// one, isolated nothing in the morphed frames, in the same frames as
+    /// meshed -- summed over the frames checked).
+    holes: (usize, usize, u32, u64, u64),
     /// The approach strip: (frame, morphed, as meshed) at evenly spaced frames.
     strip: Vec<(usize, Frame, Frame)>,
     /// Swaps per edge with their eye, for the height-only numbers.
     swap_events: Vec<(u32, NodeKey, [f32; 3])>,
+    /// The pair at each `focus` frame asked for: (edge, frame, before, after).
+    focused: Vec<(usize, usize, Frame, Frame)>,
+    /// What the flight's own motion changes from one frame to the next
+    /// (pixels over the tolerance), every thirtieth frame: the scale the
+    /// level-of-detail changes are seen against.
+    motion: Vec<u32>,
 }
 
-/// Run the approach under `schedule`, morphing (`morph`) or not.
-fn run(scene: &mut Scene, viewer: &mut Viewer, schedule: &RingSchedule, morph: bool) -> Run {
+/// Run the approach under `schedule`, morphing (`morph`) or not, keeping
+/// each edge's pair at its `focus` frame as well as its worst.
+fn run(
+    scene: &mut Scene,
+    viewer: &mut Viewer,
+    schedule: &RingSchedule,
+    morph: bool,
+    focus: [Option<usize>; 3],
+) -> Run {
     let gen = WorldGen::new(World::new().seed());
     let path = approach(&gen);
     let params = if morph {
@@ -420,9 +485,12 @@ fn run(scene: &mut Scene, viewer: &mut Viewer, schedule: &RingSchedule, morph: b
 
     let mut tallies: [EdgeTally; 3] = Default::default();
     let mut kept: [Option<(usize, u32, Frame, Frame)>; 3] = [None, None, None];
-    let mut holes_seen = (0usize, 0usize, 0u32);
+    let mut holes_seen = (0usize, 0usize, 0u32, 0u64, 0u64);
     let mut strip = Vec::new();
     let mut swap_events = Vec::new();
+    let mut motion = Vec::new();
+    let mut focused = Vec::new();
+    let mut previous: Option<Frame> = None;
     let strip_at: Vec<usize> = (0..6).map(|k| k * (path.eyes.len() - 1) / 5).collect();
 
     let mut prev_sel = select(path.eyes[0]);
@@ -469,6 +537,9 @@ fn run(scene: &mut Scene, viewer: &mut Viewer, schedule: &RingSchedule, morph: b
             }
             let Some(b) = before[k].take() else { continue };
             let c = change(&b, &after);
+            if focus[k] == Some(i) {
+                focused.push((k, i, b.clone(), after.clone()));
+            }
             if c.changed > 0 || c.luminance > 0.0 {
                 tallies[k].frames.push((i, c));
             }
@@ -492,10 +563,18 @@ fn run(scene: &mut Scene, viewer: &mut Viewer, schedule: &RingSchedule, morph: b
                     holes_seen.1 += 1;
                 }
                 holes_seen.2 = holes_seen.2.max(h);
+                holes_seen.3 += isolated_nothing(&after) as u64;
+                holes_seen.4 += isolated_nothing(&fixed) as u64;
             }
             if in_strip {
                 strip.push((i, after.clone(), fixed));
             }
+        }
+        if let Some(p) = previous.take() {
+            motion.push(change(&p, &after).changed);
+        }
+        if i % 30 == 29 {
+            previous = Some(after);
         }
         prev_sel = sel;
         if i % 300 == 0 {
@@ -512,6 +591,8 @@ fn run(scene: &mut Scene, viewer: &mut Viewer, schedule: &RingSchedule, morph: b
         holes: holes_seen,
         strip,
         swap_events,
+        focused,
+        motion,
     }
 }
 
@@ -643,9 +724,16 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
     });
     let layers = assets.layers;
     let registry = Arc::new(assets.registry);
-    let blocks = TerrainBlocks::from_registry(&registry)
-        .with_oak(&crate::game::load_structure_registry(), &registry)
-        .with_ores(&crate::game::load_ore_registry(), &registry);
+    // `CUBARA_STUDY_NO_TREES` grows no trees at any level: what is left of
+    // a swap's change without them.
+    let trees = std::env::var_os("CUBARA_STUDY_NO_TREES").is_none();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let blocks = if trees {
+        blocks.with_oak(&crate::game::load_structure_registry(), &registry)
+    } else {
+        blocks
+    }
+    .with_ores(&crate::game::load_ore_registry(), &registry);
     let mut scene = Scene {
         snapshot: world.snapshot(),
         registry,
@@ -662,9 +750,10 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
     };
     let dir = out_dir().join(name);
 
-    let swap = run(&mut scene, &mut viewer, schedule, false);
+    let swap = run(&mut scene, &mut viewer, schedule, false, [None; 3]);
     viewer.show(&mut scene, &BTreeSet::new());
-    let morph = run(&mut scene, &mut viewer, schedule, true);
+    let focus = [0, 1, 2].map(|k| swap.kept[k].as_ref().map(|(i, _, _, _)| *i));
+    let morph = run(&mut scene, &mut viewer, schedule, true, focus);
 
     let bands = morph_bands(schedule, VERTICAL_LOD_SQUASH);
     let mut s = String::new();
@@ -675,8 +764,16 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
     );
     let _ = writeln!(
         s,
-        "approach: the toward-peak flight, peak at {:?}, {} frames at {FPS} fps, {} blocks a frame",
+        "approach: {}, peak at {:?}, from {:?} to {:?}, look {:?}, {} frames at {FPS} fps, {} blocks a frame",
+        if std::env::var("CUBARA_STUDY_PATH").is_ok_and(|p| p == "walk") {
+            "walked on the ground toward the summit"
+        } else {
+            "the toward-peak flight, level with the summit"
+        },
         path.peak,
+        path.eyes[0],
+        path.eyes[path.eyes.len() - 1],
+        path.look,
         path.eyes.len() - 1,
         FLY_SPEED / FPS
     );
@@ -723,9 +820,22 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
     }
     let _ = writeln!(
         s,
-        "\nholes the morph opened (a pixel of nothing with land above and below, where the same nodes unmorphed show land): {} frames checked, {} with any, at most {} pixels",
-        morph.holes.0, morph.holes.1, morph.holes.2
+        "\nholes the morph opened (a pixel of nothing with land above and below, where the same nodes unmorphed show land): {} frames checked, {} with any, at most {} pixels; isolated nothing over those frames: {} morphed, {} as meshed (the mesher's own sparkles)",
+        morph.holes.0, morph.holes.1, morph.holes.2, morph.holes.3, morph.holes.4
     );
+
+    if !swap.motion.is_empty() {
+        let mut m = swap.motion.clone();
+        m.sort_unstable();
+        let _ = writeln!(
+            s,
+            "\nthe flight's own motion, frame to frame (no level of detail changed, pixels over the tolerance): median {}, min {}, max {} of {} frames sampled",
+            m[m.len() / 2],
+            m[0],
+            m[m.len() - 1],
+            m.len()
+        );
+    }
 
     // Height-only, per swap in view (both runs saw the same swaps).
     let _ = writeln!(
@@ -797,6 +907,21 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
             save(&dir.join(format!("{tag}_morph_f{i:04}_after.png")), a);
             save(&dir.join(format!("{tag}_morph_f{i:04}_diff.png")), &diff_image(b, a));
         }
+    }
+    for (k, i, b, a) in &morph.focused {
+        let tag = format!("edge{}{}", EDGES[*k] - 1, EDGES[*k]);
+        let c = change(b, a);
+        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_before.png")), b);
+        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_after.png")), a);
+        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_diff.png")), &diff_image(b, a));
+        let _ = writeln!(
+            s,
+            "\nmorph at the swap's worst frame, edge {}: frame {i}, {} pixels over the tolerance ({} land<->nothing), largest step {}",
+            edge_name(EDGES[*k], schedule),
+            c.changed,
+            c.flips,
+            c.max_step
+        );
     }
     for (i, morphed, fixed) in &morph.strip {
         save(&dir.join(format!("strip_f{i:04}_morph.png")), morphed);
@@ -897,9 +1022,15 @@ mod tests {
     #[test]
     #[ignore = "GPU, minutes: cargo test -p cubara --bin cubara transition_study -- --ignored --nocapture"]
     fn transition_study_report() {
-        let mut report = study("default", DEFAULT_RING_SCHEDULE);
-        report.push('\n');
-        report.push_str(&study("half", HALF_SCHEDULE));
+        // `CUBARA_STUDY_SCHEDULES=default` (or `half`) runs one of the two.
+        let which = std::env::var("CUBARA_STUDY_SCHEDULES").unwrap_or_default();
+        let mut report = String::new();
+        for (name, schedule) in [("default", DEFAULT_RING_SCHEDULE), ("half", HALF_SCHEDULE)] {
+            if which.is_empty() || which.split(',').any(|w| w == name) {
+                report.push_str(&study(name, schedule));
+                report.push('\n');
+            }
+        }
         println!("{report}");
         let _ = std::fs::write(out_dir().join("report.md"), &report);
     }
