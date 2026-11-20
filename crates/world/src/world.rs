@@ -468,47 +468,51 @@ impl WorldSnapshot {
         }
     }
 
-    /// Whether a node of `level` *certainly* draws the cell at corner
-    /// `(x, y, z)` solid, given the column's `surface` height -- for deciding
-    /// what may be hidden, where "not sure" must come out as "no".
-    ///
-    /// Level 0 is the real world as far as edits go; coarser levels are the
-    /// generator sampled the way [`node_at`](Self::node_at) samples it.
-    /// **Without trees**: a
-    /// tree only ever makes a cell more solid, so leaving it out can only keep
-    /// a face that could have gone, never drop one that is needed. It is what
-    /// makes this cheap -- finding the trees near a block costs more than the
-    /// terrain. Edits do count: a dug-out block is air, and treating it as rock
-    /// would hide the hole.
-    pub fn certainly_solid_at(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
-        if level == 0 {
-            if let Some(&block) = self.edits.get(&[x, y, z]) {
-                return block != BlockId::AIR;
-            }
-        }
-        self.worldgen.solid_at_step_on(x, y, z, 1 << level, surface)
+    /// [`WorldGen::cell_ground`]: the level-0 columns a coarse cell covers and
+    /// the top it draws -- what [`certainly_solid_at_v`](Self::certainly_solid_at_v)
+    /// judges a cell of a coarse neighbour by.
+    pub fn cell_ground(&self, x: i32, z: i32, step: i32) -> crate::worldgen::CellGround {
+        self.worldgen.cell_ground(x, z, step)
     }
 
-    /// [`certainly_solid_at`](Self::certainly_solid_at), for R1b's anisotropic
-    /// coarse nodes: `level`'s cell is `2^level` blocks wide but only
-    /// [`NodeKey::cell_height_blocks`](crate::node::NodeKey::cell_height_blocks)
-    /// tall, so this is what `border_samples`
-    /// (`cubara_world::mesh`) must ask instead of
-    /// [`certainly_solid_at`](Self::certainly_solid_at) once R1b lands --
-    /// the two agree exactly at level 0 (always the exact, never-approximated
-    /// path; `cell_height_blocks(0)` is 1 but is never consulted here) and
-    /// diverge above it, where a coarse node's actual lattice is this
-    /// function's vertical window, not `1 << level`.
+    /// Whether level 0 *certainly* draws the block at `(x, y, z)` solid,
+    /// given its column's `surface` height -- for deciding what may be
+    /// hidden, where "not sure" must come out as "no".
     ///
-    /// `(x, z)` is the cell's corner and `y` **a block row**: what the node
-    /// draws at that block, its top row cut off at `surface`, the exact top
-    /// (issue #423; [`WorldGen::solid_at_v_on`]).
-    pub fn certainly_solid_at_v(&self, x: i32, y: i32, z: i32, level: u32, surface: i32) -> bool {
-        if level == 0 {
-            return self.certainly_solid_at(x, y, z, 0, surface);
+    /// Level 0 is the real world as far as edits go: a dug-out block is air,
+    /// and treating it as rock would hide the hole. **Without trees**: a
+    /// tree only ever makes a block more solid, so leaving it out can only
+    /// keep a face that could have gone, never drop one that is needed. It
+    /// is what makes this cheap -- finding the trees near a block costs more
+    /// than the terrain.
+    pub fn certainly_solid_at(&self, x: i32, y: i32, z: i32, surface: i32) -> bool {
+        if let Some(&block) = self.edits.get(&[x, y, z]) {
+            return block != BlockId::AIR;
         }
+        self.worldgen.solid_on(x, y, z, surface)
+    }
+
+    /// Whether a node of the coarse `level` draws block row `y` of `cell`
+    /// solid -- what `border_samples` (`cubara_world::mesh`) asks of a
+    /// coarse neighbour. The generator alone, as [`node_at`](Self::node_at)
+    /// builds a coarse node: an edit is not in it.
+    ///
+    /// `y` is **a block row**: the node is drawn cut off at the cell's top,
+    /// whatever rows it stores (issue #423;
+    /// [`WorldGen::cell_draws_solid`]). `cell` is the cell of `level` that
+    /// holds the block ([`cell_ground`](Self::cell_ground)).
+    pub fn certainly_solid_at_v(
+        &self,
+        y: i32,
+        level: u32,
+        cell: &crate::worldgen::CellGround,
+    ) -> bool {
+        debug_assert!(
+            level >= 1 && cell.w == 1 << level,
+            "a cell of level {level}"
+        );
         let v = crate::node::NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
-        self.worldgen.solid_at_v_on(x, y, z, v, surface)
+        self.worldgen.cell_draws_solid(cell, y, v)
     }
 
     /// Cast a ray through the world (terrain + edits) and return the first solid
@@ -1346,8 +1350,8 @@ mod tests {
     /// **T2** `coarse_tops_are_the_surface` (issue #327's Done-when, and
     /// R1b's own scope: "T2 goes green"): a coarse column's drawn top is the
     /// surface block, **exactly at `surface + 1`**, over sampled columns in
-    /// every ring (levels 1-3) -- `surface` being the highest of the columns
-    /// the cell covers (issue #423 decision 1).
+    /// every ring (levels 1-3) -- `surface` being the cell's top, the mean
+    /// of the columns it covers or its summit (issue #423).
     ///
     /// Exactly, at level 3 too, since #423: its rows are four blocks tall,
     /// and the one that holds the surface is cut off at it as the node is
@@ -1459,11 +1463,13 @@ mod tests {
                         for lx in 0..dims[0] {
                             let x = origin[0] + lx as i32 * w;
                             let z = origin[2] + lz as i32 * w;
-                            let surface = world.cell_surface_height(x, z, w);
+                            let cell = world.cell_ground(x, z, w);
+                            let surface = cell.top;
+                            assert_eq!(surface, world.cell_surface_height(x, z, w));
                             for row in 0..dims[1] {
                                 let y = origin[1] + row as i32;
                                 assert_eq!(
-                                    world.certainly_solid_at_v(x, y, z, level, surface),
+                                    world.certainly_solid_at_v(y, level, &cell),
                                     chunk.drawn(lx, row, lz) != BlockId::AIR,
                                     "level {level}, block ({x}, {y}, {z}), its cell's top at {surface}"
                                 );
@@ -1733,16 +1739,17 @@ mod tests {
         let surface = world.surface_height(16, 16);
         let deep = [16, surface - 30, 16];
         assert!(
-            world.certainly_solid_at(deep[0], deep[1], deep[2], 0, surface),
+            world.certainly_solid_at(deep[0], deep[1], deep[2], surface),
             "deep rock is solid before the edit"
         );
         world.set_block(deep[0], deep[1], deep[2], BlockId::AIR);
         assert!(
-            !world.certainly_solid_at(deep[0], deep[1], deep[2], 0, surface),
+            !world.certainly_solid_at(deep[0], deep[1], deep[2], surface),
             "level 0 sees the dug-out block"
         );
+        let cell = world.cell_ground(16, 16, 2);
         assert!(
-            world.certainly_solid_at(deep[0], deep[1], deep[2], 1, surface),
+            world.certainly_solid_at_v(deep[1], 1, &cell),
             "level 1 is the generator alone: the hole is not in it"
         );
     }

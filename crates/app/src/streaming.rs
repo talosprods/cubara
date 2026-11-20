@@ -937,6 +937,18 @@ mod tests {
     /// the default world, and meshed as a mesh job meshes it. Vertices and
     /// indices are what the arena counts.
     ///
+    /// **Every node of the selection is counted, seen or not.** The game
+    /// uploads only the nodes its visibility search reaches, so this is
+    /// more than is resident: from the ground at the worst column here 58%
+    /// of it. It is an upper bound for an eye on the ground. It is **not**
+    /// one by construction for an eye raised above the mountain, where
+    /// nearly everything selected is in sight -- but the selection is
+    /// smaller there, and of eleven eyes tried (up to seventeen chunks above
+    /// three mountains) the most resident was 3,462,428 vertices against
+    /// this test's 4,280,540. So the number held here is above everything
+    /// found resident; a test that searched from raised eyes as well would
+    /// cost several times this one's minute.
+    ///
     /// **[`SWAP_OVERLAP`] is chosen, not derived**: while the player moves,
     /// a node and the nodes replacing it are resident together until the
     /// swap is done, so the peak is above any steady state. A quarter more

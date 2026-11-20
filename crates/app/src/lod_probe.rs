@@ -768,10 +768,11 @@ mod m4 {
     }
 
     /// The drawn top of a coarse ring node's cell over `(x, z)`:
-    /// [`WorldGen::cell_surface_height`] itself -- the highest column the
-    /// cell covers, which is what the game draws at every level (issue #423:
-    /// level 3's stored rows of four are cut off at it) and what R2's trees
-    /// stand on. `step_h` is the node's horizontal cell width (`2^level`).
+    /// [`WorldGen::cell_surface_height`] itself -- the mean of the columns
+    /// the cell covers, or its summit, which is what the game draws at every
+    /// level (issue #423: level 3's stored rows of four are cut off at it)
+    /// and what R2's trees stand on. `step_h` is the node's horizontal cell
+    /// width (`2^level`).
     ///
     /// `v` is the height of the rows the top is **drawn** in. The game's is
     /// one block at every level ([`production_cell_height`]), and then this

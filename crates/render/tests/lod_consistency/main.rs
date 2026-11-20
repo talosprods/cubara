@@ -24,6 +24,7 @@
 //! ```
 
 mod harness;
+mod study;
 
 use cubara_render::aggregate::face_light;
 use glam::Vec3;
@@ -67,6 +68,18 @@ enum Ranked {
     /// [`Rep::min_area`] of them): **a failure**, not a direction to pass
     /// over -- a level that draws no risers on a hillside is not showing the
     /// same ground (second review of #428, point 3).
+    ///
+    /// **Two thresholds a factor of two apart decide this**, and a direction
+    /// can sit on them for a reason that is not that one (third review of
+    /// #428, S4): a direction made of single steps facing *away* from the
+    /// slope keeps well under half its area at levels 2 and 3 as a matter of
+    /// course, since such steps vanish inside a coarse cell, and the side
+    /// split's own bias (`harness.rs`'s module doc) takes a little more. On
+    /// main's rule three cliff directions were `Missing` this way (129
+    /// against 60 square blocks, where the cut-offs are 128 and 64). No
+    /// footprint-level is missing a direction on this seed today; one that
+    /// turns up on another seed should be read against its area before it
+    /// is read as a level that lost its risers.
     Missing { level0: f64, area: f64 },
     /// T3: the difference of the two lit colours, /255.
     Delta(f64),
@@ -95,6 +108,16 @@ struct Compared {
 /// same footprint **split on `rep`'s cells** ([`Rep::mask`]), so that both
 /// cover the same ground.
 fn compare(setup: &Setup, fp: Footprint, rep: Rep, level0: &Measure, other: &Measure) -> Compared {
+    // The same ground on both sides is the same count of tops: one per
+    // column of the cells no cave has carved. A reference split on other
+    // cells than `rep`'s -- its own columns, say -- has more.
+    if matches!(rep, Rep::Voxel(_) | Rep::Far(_)) {
+        assert_eq!(
+            level0.faces.area[0], other.faces.area[0],
+            "{rep} over {fp:?}: level 0's surface term has {} tops and the representation's {}; they do not cover the same ground",
+            level0.faces.area[0], other.faces.area[0]
+        );
+    }
     let mut delta = [Ranked::Unranked; 5];
     let min_area = rep.min_area();
     for (d, slot) in delta.iter_mut().enumerate() {
@@ -247,7 +270,7 @@ fn measure_all(setup: &Setup, footprints: &[(Terrain, Footprint)], reps: &[Rep])
             };
             let level0 = split
                 .entry(rep.mask())
-                .or_insert_with(|| level0.measure(setup, 0, rep.mask()));
+                .or_insert_with(|| reference_for(setup, &level0, rep));
             pools
                 .entry((kind, rep))
                 .or_default()
@@ -267,6 +290,16 @@ fn reference(setup: &Setup, fp: Footprint) -> Drawn {
     draw_voxels(setup, fp, 0, &|node| {
         setup.world.node_at(node, setup.blocks)
     })
+}
+
+/// **Level 0 over the ground `rep`'s surface term covers**: `level0` (a
+/// [`reference`]) split on `rep`'s cells. The one place that step is taken
+/// -- the report's pooled numbers and every asserted comparison go through
+/// here, so a reference split on the wrong cells cannot be right in the
+/// tests and wrong in the tables (third review of #428, S2). [`compare`]
+/// then holds the two sides to the same count of tops.
+fn reference_for(setup: &Setup, level0: &Drawn, rep: Rep) -> Measure {
+    level0.measure(setup, 0, rep.mask())
 }
 
 fn percent(v: Option<f64>) -> String {
@@ -407,9 +440,9 @@ fn far_quad_tops() -> impl Iterator<Item = Rep> {
         Rep::Stepped(
             quad,
             if quad <= 8 {
-                TopRule::Max
+                TopRule::Exact
             } else {
-                TopRule::SampledMax(FAR_SAMPLES)
+                TopRule::Sampled(FAR_SAMPLES)
             },
         )
     })
@@ -452,10 +485,13 @@ fn consistency_report() {
     println!("{}", report(&pools));
 }
 
-/// **For the far terrain's decision** (#423, #422): what a stepped height
-/// field would draw under each rule for a quad's top, per quad width. The
-/// max keeps every peak and can only raise the ground; the mean moves it
-/// both ways and lowers the ridges. Measured, so the choice is not a guess.
+/// **For the far terrain** (#423, #422): what a stepped height field draws
+/// under the rule for a cell's top (`WorldGen::cell_top`, and its sampled
+/// form for quads too wide to visit every column of), per quad width, with
+/// the highest column -- the first version of #423 -- beside it. The mean
+/// keeps the ground where it is and a summit keeps its height; the highest
+/// column can only raise the ground. Measured, so the choice is not a
+/// guess; `height_rule_study_report` is the study the rule was chosen by.
 #[test]
 #[ignore]
 fn stepped_top_rule_report() {
@@ -464,12 +500,12 @@ fn stepped_top_rule_report() {
     let reps: Vec<Rep> = [2, 4, 8, 16, 32, 64]
         .into_iter()
         .flat_map(|cell| {
-            let mut rules = vec![TopRule::Max, TopRule::Mean];
+            let mut rules = vec![TopRule::Exact, TopRule::Max];
             if cell > 8 {
-                rules.push(TopRule::SampledMax(8));
+                rules.push(TopRule::Sampled(8));
             }
             if cell > 4 {
-                rules.push(TopRule::SampledMax(FAR_SAMPLES));
+                rules.push(TopRule::Sampled(FAR_SAMPLES));
             }
             rules.into_iter().map(move |rule| Rep::Stepped(cell, rule))
         })
@@ -520,6 +556,7 @@ fn level_0_draws_its_surface() {
         "seed {FOOTPRINT_SEED:#x}"
     );
     let mut grassy = 0;
+    let (mut worst_side_shade, mut shaded_sides) = (0f64, 0usize);
     for (kind, fp) in footprints {
         // Through `reference`, the function every comparison takes level 0
         // from: this test is what says that reference IS level 0.
@@ -692,19 +729,31 @@ fn level_0_draws_its_surface() {
                 setup.far_materials.soil,
                 setup.far_materials.side,
             ];
+            // Held to their openness as the tops are: `ao_floor + (1 -
+            // ao_floor) * open` of the unshaded colour. Not exactly, since
+            // a riser's layers are not shaded alike (its foot is darker
+            // than its top row, and the foot is soil): `SIDE_SHADE` of the
+            // unshaded colour, chosen just over the 0.011 measured. With
+            // the ambient occlusion left out of the sides they are 0.16 to
+            // 0.24 off (third review of #428, S1).
+            const SIDE_SHADE: f64 = 0.02;
+            let open = f.open[d] / f.area[d];
             for c in 0..3 {
                 let unshaded: f64 = [STONE, SOIL, SURFACE]
                     .iter()
                     .map(|&m| f.material[d][m] * (colours[m][c] * light[c]) as f64)
                     .sum();
                 let floor = setup.lighting.ao_floor as f64;
+                let expected = unshaded * (floor + (1.0 - floor) * open);
+                worst_side_shade = worst_side_shade.max((f.lit[d][c] - expected).abs() / unshaded);
                 assert!(
-                    f.lit[d][c] <= unshaded * 1.001 && f.lit[d][c] >= unshaded * floor,
-                    "{kind:?} {fp:?}: {} faces lit {} against {unshaded} unshaded",
+                    (f.lit[d][c] - expected).abs() <= SIDE_SHADE * unshaded,
+                    "{kind:?} {fp:?}: {} faces lit {} against {expected} (openness {open:.3}, {unshaded} unshaded)",
                     direction_name(d),
                     f.lit[d][c]
                 );
             }
+            shaded_sides += (open < 0.95) as usize;
         }
         // The claim the split rests on: a steep slope's *surface* is almost
         // stone-free, and its stone is in the cave mouths.
@@ -718,6 +767,11 @@ fn level_0_draws_its_surface() {
         }
     }
     assert!(grassy >= 2, "only {grassy} footprints with all-grass tops");
+    println!("level 0's sides: lit colour within {worst_side_shade:.4} of what their openness says; {shaded_sides} directions shaded");
+    assert!(
+        shaded_sides >= 8,
+        "only {shaded_sides} side directions are shaded at all: the sides' shade is not being tested"
+    );
 }
 
 /// The measurement moves when the ground is wrong: a level-1 node whose soil
@@ -1015,7 +1069,7 @@ fn level_1_matches_level_0_on_the_rolling_hills() {
     let (mut worst, mut checked) = (0f64, 0);
     for &(_, fp) in &footprints {
         let rep = Rep::Voxel(1);
-        let level0 = reference(&setup, fp).measure(&setup, 0, rep.mask());
+        let level0 = reference_for(&setup, &reference(&setup, fp), rep);
         let one = compare(&setup, fp, rep, &level0, &measure_voxels(&setup, fp, 1));
         for (d, ranked) in one.delta.iter().enumerate() {
             // A direction level 0 has and level 1 lacks is infinitely off.
@@ -1069,10 +1123,10 @@ fn the_far_rows_follow_the_ground() {
         .filter(|(k, _)| *k == Terrain::Steep)
         .collect();
     assert_eq!(footprints.len(), PER_KIND, "seed {FOOTPRINT_SEED:#x}");
-    let (mut worst_top, mut axes, mut top_gap) = (0f64, 0, 0f64);
+    let (mut worst_top, mut axes, mut top_gap, mut lit_sides) = (0f64, 0, 0f64, 0usize);
     for &(_, fp) in &footprints {
         let rep = Rep::Far(2);
-        let level0 = reference(&setup, fp).measure(&setup, 0, rep.mask());
+        let level0 = reference_for(&setup, &reference(&setup, fp), rep);
         let far = measure_far(&setup, fp, 2);
         let one = compare(&setup, fp, rep, &level0, &far);
         let (mean, ..) = spread(&one.shape.column);
@@ -1098,7 +1152,37 @@ fn the_far_rows_follow_the_ground() {
         if let Ranked::Delta(delta) = one.delta[0] {
             top_gap = top_gap.max(delta);
         }
+        // A far riser is lit as a side: what it is made of, under the light
+        // of the way it faces, and nothing else (the far terrain has no
+        // ambient occlusion). Lit as a top it would be 1.8 to 3 times this.
+        for (d, face) in DIRECTIONS.iter().enumerate().skip(1) {
+            let f = &far.faces;
+            if f.area[d] < MIN_AREA {
+                continue;
+            }
+            let light = face_light(Vec3::from(face.normal()), &setup.lighting);
+            let m = &setup.far_materials;
+            for c in 0..3 {
+                let expected: f64 = [(STONE, m.stone), (SOIL, m.soil), (SURFACE, m.side)]
+                    .iter()
+                    .map(|&(material, colour)| {
+                        f.material[d][material] * (colour[c] * light[c]) as f64
+                    })
+                    .sum();
+                assert!(
+                    (f.lit[d][c] - expected).abs() <= 1e-3 * expected,
+                    "{fp:?}: the far terrain's {} risers are lit {} against {expected}",
+                    direction_name(d),
+                    f.lit[d][c]
+                );
+                lit_sides += 1;
+            }
+        }
     }
+    assert!(
+        lit_sides >= 3 * PER_KIND,
+        "only {lit_sides} far riser colours were held"
+    );
     println!("far, quads of 4: worst mean top {worst_top:.2} blocks; {axes} axes checked; tops up to {top_gap:.1}/255 off level 0's");
     assert!(
         axes >= PER_KIND,
@@ -1291,7 +1375,7 @@ fn generation_cost_report() {
     let setup = Setup::new();
     let footprints = draw_footprints(&setup.gen, FOOTPRINT_SEED, 3);
     let snapshot = setup.world.snapshot();
-    println!("level  nodes  generate us/node  build us/node");
+    println!("level  nodes  generate us/node  links us/node  build us/node");
     for level in 0..=3u32 {
         let size = 16 * (1 << level);
         let mut nodes = std::collections::BTreeSet::new();
@@ -1309,13 +1393,24 @@ fn generation_cost_report() {
         }
         // Three passes, the fastest kept: the first warms the caches, and a
         // neighbour's build landing in one pass should not decide the row.
-        let (mut generate, mut build) = (f64::INFINITY, f64::INFINITY);
+        let (mut generate, mut links, mut build) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
         for _ in 0..3 {
             let start = Instant::now();
-            for &node in &nodes {
-                std::hint::black_box(setup.world.node_at(node, setup.blocks));
-            }
+            let generated: Vec<_> = nodes
+                .iter()
+                .map(|&node| setup.world.node_at(node, setup.blocks))
+                .collect();
             generate = generate.min(start.elapsed().as_secs_f64());
+            // The visibility links alone, of the nodes just generated: part
+            // of `build` below.
+            let start = Instant::now();
+            for chunk in &generated {
+                std::hint::black_box(cubara_world::visibility::node_links(
+                    chunk.as_ref(),
+                    &setup.registry,
+                ));
+            }
+            links = links.min(start.elapsed().as_secs_f64());
             let start = Instant::now();
             for &node in &nodes {
                 std::hint::black_box(cubara_world::mesh::build_node(
@@ -1330,9 +1425,10 @@ fn generation_cost_report() {
         }
         let n = nodes.len() as f64;
         println!(
-            "L{level}     {:5}  {:16.1}  {:13.1}",
+            "L{level}     {:5}  {:16.1}  {:13.1}  {:13.1}",
             nodes.len(),
             generate * 1e6 / n,
+            links * 1e6 / n,
             build * 1e6 / n
         );
     }
@@ -1360,6 +1456,13 @@ struct One {
     /// The shape on the surface: over the columns whose cell stands on
     /// ground no cave has carved.
     shape: Shape,
+    /// Columns of the surface term the level draws under its own cell's top:
+    /// a pit, the level's own cave.
+    pits: usize,
+    /// Whether the footprint's highest column is a summit as the height rule
+    /// has it (the level-3 cell that holds it stands at its height, and so
+    /// every finer cell that holds it): `shape.peak` is then held to zero.
+    summit: bool,
 }
 
 impl One {
@@ -1404,6 +1507,38 @@ fn unshaded(setup: &Setup, f: &Faces, d: usize) -> Option<[f64; 3]> {
     Some(out)
 }
 
+/// Whether the highest of `fp`'s `counted` columns (the first, `z` then
+/// `x`) is a summit as `WorldGen::cell_top` has it at level 3: the first
+/// highest column of the nine level-3 cells around it -- and then, the rule
+/// says, of every finer cell's nine as well, so every level stands at its
+/// height there. A footprint cut out of a slope has its highest column at
+/// its edge, with higher ground beyond: no summit, and no level owes it a
+/// peak.
+fn holds_a_summit(setup: &Setup, fp: Footprint, counted: &[bool]) -> bool {
+    let (mut high, mut at) = (i32::MIN, (0, 0));
+    for j in 0..FOOTPRINT {
+        for i in 0..FOOTPRINT {
+            let h = setup.gen.surface_height(fp.x0 + i, fp.z0 + j);
+            if counted[(j * FOOTPRINT + i) as usize] && h > high {
+                (high, at) = (h, (fp.x0 + i, fp.z0 + j));
+            }
+        }
+    }
+    // The first highest column of the nine level-3 cells around: the rule's
+    // own words, from the height field alone.
+    let (cx, cz) = (at.0.div_euclid(8) * 8, at.1.div_euclid(8) * 8);
+    let (mut first, mut first_at) = (i32::MIN, (0, 0));
+    for z in cz - 8..cz + 16 {
+        for x in cx - 8..cx + 16 {
+            let h = setup.gen.surface_height(x, z);
+            if h > first {
+                (first, first_at) = (h, (x, z));
+            }
+        }
+    }
+    first_at == at
+}
+
 /// Every footprint at every coarse voxel level, measured once for the tests
 /// below.
 fn coarse_footprints() -> &'static [One] {
@@ -1421,7 +1556,7 @@ fn coarse_footprints() -> &'static [One] {
             let drawn = reference(&setup, fp);
             for level in VOXEL_LEVELS {
                 let rep = Rep::Voxel(level);
-                let level0 = drawn.measure(&setup, 0, rep.mask());
+                let level0 = reference_for(&setup, &drawn, rep);
                 let other = measure_voxels(&setup, fp, level);
                 let Compared { delta, shape } = compare(&setup, fp, rep, &level0, &other);
                 let (mut mix, mut shade) = ([None; 5], [None; 5]);
@@ -1439,6 +1574,19 @@ fn coarse_footprints() -> &'static [One] {
                     };
                     shade[d] = Some((kept(&level0.faces, a), kept(&other.faces, b)));
                 }
+                // A pit: a column on the surface drawn under its own cell's
+                // top.
+                let w = rep.mask();
+                let on = setup.on_the_surface(fp, w);
+                let mut pits = 0;
+                for j in 0..FOOTPRINT {
+                    for i in 0..FOOTPRINT {
+                        let top = setup.gen.cell_top(fp.x0 + i / w * w, fp.z0 + j / w * w, w);
+                        pits += (on[(j * FOOTPRINT + i) as usize]
+                            && other.top(i, j) < (top + 1) as f64)
+                            as usize;
+                    }
+                }
                 all.push(One {
                     kind,
                     fp,
@@ -1449,6 +1597,8 @@ fn coarse_footprints() -> &'static [One] {
                     mix,
                     shade,
                     shape,
+                    pits,
+                    summit: holds_a_summit(&setup, fp, &on),
                 });
             }
         }
@@ -1530,7 +1680,7 @@ fn per_footprint_report() {
                         direction_name(d),
                         o.fp.x0,
                         o.fp.z0,
-                        o.shape.column.iter().filter(|d| **d < 0.0).count(),
+                        o.pits,
                         o.mix[d].unwrap_or(f64::NAN),
                         o.shade[d].map_or(f64::NAN, |s| s.0),
                         o.shade[d].map_or(f64::NAN, |s| s.1),
@@ -1591,15 +1741,31 @@ fn per_footprint_report() {
                 "  shape, peak: {}",
                 each(&|o| spread(&o.shape.peak).0, true)
             );
-            // A coarse top is the highest column under it, so on the surface
-            // term nothing is drawn below level 0 -- but where the level's
-            // own cave rule opens a pit under ground level 0 leaves whole.
-            let below = |o: &One| o.shape.column.iter().filter(|d| **d < 0.0).count();
             println!(
-                "  columns drawn below level 0 (a pit: the level's own cave under an intact surface), of {}: {}",
+                "  shape, peak of the footprints that hold a summit: {}",
+                sorted(
+                    ones.iter()
+                        .filter(|o| o.summit)
+                        .map(|o| spread(&o.shape.peak).0)
+                        .collect(),
+                    true
+                )
+            );
+            println!(
+                "  shape, columns standing under level 0, %: {}",
+                each(
+                    &|o| o.shape.column.iter().filter(|d| **d < 0.0).count() as f64 * 100.0
+                        / o.shape.column.len().max(1) as f64,
+                    false
+                )
+            );
+            // A pit: a column drawn under its own cell's top, on ground
+            // level 0 leaves whole.
+            println!(
+                "  columns in a pit (drawn under their own cell's top), of {}: {}",
                 ones.iter().map(|o| o.shape.column.len()).sum::<usize>(),
                 ones.iter()
-                    .map(|o| below(o).to_string())
+                    .map(|o| o.pits.to_string())
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -1755,22 +1921,24 @@ fn top_shade_by_riser_report() {
 ///
 /// | level | tops: worst, bound | sides: worst, bound |
 /// |---|---|---|
-/// | 1 | 1.44, 2.0 | 1.29, 2.0 |
-/// | 2 | 1.93, 2.0 | 1.53, 2.0 |
-/// | 3 | 3.40, 3.5 (nine of forty footprints are over 2.0) | 2.25, 2.5 (two of 63 ranked directions are over 2.0) |
+/// | 1 | 1.50, 2.0 | 1.51, 2.0 |
+/// | 2 | 1.66, 2.0 | 1.62, 2.0 |
+/// | 3 | 2.88, 3.0 (nine of forty footprints are over 2.0) | 3.18, 3.25 (two of 63 ranked directions are over 2.0: 3.18 and 2.21) |
 ///
 /// What is left at level 3 is stated in `docs/PHASE3_ARCHITECTURE.md` §9.4,
 /// and `top_shade_by_riser_report` takes it apart: a coarse top knows the
 /// risers beside it and nothing of the steps *inside* its 8 x 8 columns, so
 /// a cell with no riser beside it is lighter than its blocks and one under a
-/// tall riser darker, and a footprint is off by whichever it has more of; a
-/// cell below the top one is one material over four rows; and level 3 opens
-/// a pit where most of a cell is cave under a surface level 0 leaves whole.
+/// tall riser darker, and a footprint is off by whichever it has more of;
+/// and a cell is one material over four rows, the one that holds the top
+/// the surface block over as many of them as are drawn, so a direction with
+/// a few dozen faces is a sample of level 0's mix (the 3.18: a cliff's +X,
+/// 2.45 of it the materials alone).
 /// Tightening these numbers is tightening those.
 const T3_ALLOWED: [(u32, f64, f64); 3] = [
     (1, T3_TOLERANCE, T3_TOLERANCE),
     (2, T3_TOLERANCE, T3_TOLERANCE),
-    (3, 3.5, 2.5),
+    (3, 3.0, 3.25),
 ];
 
 /// **T3** (`docs/PROPOSAL_LOD_TRANSITIONS.md` §6, #423 decision 3): *a
@@ -1826,22 +1994,24 @@ fn a_coarse_level_shows_level_0s_colours() {
 ///   version of #423's rule left 1 to 19%: all grass side from afar.
 ///
 /// **Both bounds are chosen, not derived**, just over the measured worst:
-/// stone 0.9 point (one cliff footprint at level 3); soil 5.0, 4.9 and 6.9
-/// points under level 0's at levels 1, 2 and 3 on steep ground. The soil
-/// that is missing is the foot of level 0's risers, which the wider cells'
-/// higher tops cover, and at level 3 the surface block a column's top cell
-/// wears over as many of its four rows as are drawn.
+/// stone 1.1 points (one cliff footprint at level 1, 2.4% at level 0; two
+/// at level 3 are a point over); soil 3.7, 0.7 and 5.6 points under level
+/// 0's at levels 1, 2 and 3. The soil that is missing at level 3 is under
+/// the surface block that the cell holding a column's top wears over as
+/// many of its four rows as are drawn.
 #[test]
 fn a_mountain_is_made_of_the_same_from_afar() {
-    const STONE_POINTS: f64 = 0.01;
-    const SOIL_POINTS: [f64; 3] = [0.06, 0.06, 0.08];
+    const STONE_POINTS: f64 = 0.0125;
+    const SOIL_POINTS: [f64; 3] = [0.045, 0.02, 0.065];
     let all = coarse_footprints();
     let mut held = 0;
+    let mut worst_stone = 0f64;
     for one in all {
         let Some((near, far)) = one.stone() else {
             continue;
         };
         held += 1;
+        worst_stone = worst_stone.max((far - near).abs());
         assert!(
             (far - near).abs() <= STONE_POINTS,
             "{}: {:.1}% of the side faces are stone, level 0 has {:.1}%",
@@ -1851,6 +2021,10 @@ fn a_mountain_is_made_of_the_same_from_afar() {
         );
     }
     assert!(held >= 100, "only {held} footprints had the side faces");
+    println!(
+        "stone share of the sides: at most {:.2} points off level 0's",
+        worst_stone * 100.0
+    );
     for kind in TERRAINS {
         for (level, allowed) in VOXEL_LEVELS.into_iter().zip(SOIL_POINTS) {
             let share = |f: fn(&One) -> &Faces| {
@@ -1863,6 +2037,11 @@ fn a_mountain_is_made_of_the_same_from_afar() {
                 soil / area
             };
             let (near, far) = (share(|o| &o.level0), share(|o| &o.faces));
+            println!(
+                "{kind:?}, level {level}: soil {:.1}% of the sides, level 0 {:.1}%",
+                far * 100.0,
+                near * 100.0
+            );
             assert!(
                 (far - near).abs() <= allowed,
                 "{kind:?}, level {level}: {:.1}% of the side faces are soil, level 0 has {:.1}% (seed {FOOTPRINT_SEED:#x})",
@@ -1877,68 +2056,149 @@ fn a_mountain_is_made_of_the_same_from_afar() {
 /// the level-0 height field over the columns of the level's surface term:
 ///
 /// - **every column is drawn**;
-/// - **the peak keeps its height, exactly, at every level**: it is the max
-///   of the same columns, and level 3's row of four that holds it is cut
-///   off at it -- but for a peak over a pit (below), which one gentle
-///   footprint has at level 3, a block down;
-/// - **the ground is never lower in the bulk**, and not higher than the max
-///   makes it: the mean over the columns of drawn minus level 0 is between
-///   zero and `SHAPE`'s bound;
-/// - **the skyline** -- the ridge line of every row and line of columns --
-///   stays within a mean distance that starts near one block at level 1 and
-///   scales with the cell;
-/// - **pits are few**: a coarse top is the highest column under it, so on
-///   the surface term nothing is drawn below level 0 except where the
-///   level's own cave rule (a cell is cave where most of it is) opens a pit
-///   under ground level 0 leaves whole. Counted in level-0 columns per
-///   footprint, of some 3,700.
+/// - **the ground leans neither up nor down**: the mean over the columns of
+///   drawn minus level 0 is within `SHAPE`'s first bound of zero. A cell's
+///   top is the mean of its columns, so as many stand above the coarser
+///   cell as below it and a swap has no direction. With the highest column
+///   (the first version of #423) the same number was +1.8, +5.3 and +12.0
+///   blocks on the worst footprint, and that is what sank at every ring;
+/// - **a summit keeps its height, exactly, at every level**: where the
+///   footprint's highest column is a summit (`holds_a_summit`), the level's
+///   highest top is level 0's. Enough footprints must hold one;
+/// - **the skyline** -- the highest top along every row and line of columns
+///   -- stays within a mean distance that starts near one block at level 1
+///   and scales with the cell;
+/// - **no pit**: no column is drawn under its own cell's top. A coarse cell
+///   is cave only where all of its ground is, so on ground level 0 leaves
+///   whole no level opens one (`coarse_caves_nest` is the rule itself; the
+///   voting rule before it left up to 10, 39 and 267 columns of a footprint
+///   in a pit at levels 1, 2 and 3).
 ///
 /// **The bounds are chosen, not derived**, just over the worst footprint
-/// measured (the first two on cliffs): mean column +1.77, +5.30, +12.01
-/// blocks, skyline 1.08, 3.23, 7.27 blocks and 10, 39, 267 columns in a pit
-/// at levels 1, 2, 3. #423 starts the skyline at 1 block for level 1: that
-/// holds on the hills, the gentle and the steep slopes (worst 0.90) and on
-/// eight of ten cliff footprints (the other two are 1.04 and 1.08). The
-/// ground standing higher is the max of decision 1 -- about half a cell
-/// width times the slope -- and is the owner's to judge from the mountain
-/// images; it is bounded here so that it cannot grow unseen.
+/// measured: mean column 0.03, 0.06 and 0.26 blocks off, skyline 1.31, 3.26
+/// and 7.18 blocks at levels 1, 2, 3 (all three on cliffs). #423 starts the
+/// skyline at 1 block for level 1: that holds on the hills and the gentle
+/// slopes (worst 0.70) and on all but one steep and three cliff footprints.
+/// The skyline here is a *distance*, and a cell's flat top stands off a
+/// slope's outline by a quarter of its width times the slope whichever rule
+/// sets it; what the rule decides is which way, and that is the first bound.
 #[test]
 fn a_coarse_level_keeps_level_0s_shape() {
-    /// Per level: the most the mean column may stand above level 0, the
-    /// most the skyline's mean distance may be, the peak's range, and the
-    /// most columns in a pit.
-    const SHAPE: [(f64, f64, (f64, f64), usize); 3] = [
-        (2.0, 1.25, (0.0, 0.0), 16),
-        (5.5, 3.5, (0.0, 0.0), 48),
-        (12.5, 7.5, (-1.0, 0.0), 288),
-    ];
+    /// Per level: the most the mean column may stand off level 0, and the
+    /// most the skyline's mean distance may be.
+    const SHAPE: [(f64, f64); 3] = [(0.1, 1.5), (0.1, 3.5), (0.3, 7.5)];
+    let mut summits = [0usize; 3];
     for one in coarse_footprints() {
-        let (bulk_bound, skyline_bound, (peak_low, peak_high), pit_bound) =
-            SHAPE[one.level as usize - 1];
+        let (lean_bound, skyline_bound) = SHAPE[one.level as usize - 1];
         let at = one.at();
         assert_eq!(
             one.shape.undrawn, 0,
             "{at}: columns of the surface not drawn"
         );
         let (peak, ..) = spread(&one.shape.peak);
+        if one.summit {
+            summits[one.level as usize - 1] += 1;
+            assert_eq!(
+                peak, 0.0,
+                "{at}: the summit stands {peak:+.2} blocks off level 0's"
+            );
+        }
+        let (lean, ..) = spread(&one.shape.column);
         assert!(
-            (peak_low..=peak_high).contains(&peak),
-            "{at}: the peak is {peak:+.2} blocks off level 0's"
-        );
-        let (bulk, ..) = spread(&one.shape.column);
-        assert!(
-            (0.0..=bulk_bound).contains(&bulk),
-            "{at}: the ground stands {bulk:+.2} blocks off level 0's on average, allowed 0..={bulk_bound}"
+            lean.abs() <= lean_bound,
+            "{at}: the ground stands {lean:+.2} blocks off level 0's on average, allowed {lean_bound} either way"
         );
         let (_, skyline, ..) = spread(&one.shape.skyline);
         assert!(
             skyline <= skyline_bound,
             "{at}: the skyline is {skyline:.2} blocks off, allowed {skyline_bound}"
         );
-        let pit = one.shape.column.iter().filter(|d| **d < 0.0).count();
-        assert!(
-            pit <= pit_bound,
-            "{at}: {pit} columns are drawn below level 0, allowed {pit_bound}"
+        assert_eq!(
+            one.pits, 0,
+            "{at}: {} columns are drawn under their own cell's top, over ground level 0 leaves whole",
+            one.pits
         );
     }
+    assert!(
+        summits.iter().all(|&n| n >= 8),
+        "footprints that hold a summit, per level: {summits:?}"
+    );
+}
+
+/// **Coarse caves nest: a pit only ever opens on approach** (issue #423,
+/// second round). In every seeded footprint, every block that a level draws
+/// as cave -- air at or under the top of its own cell -- is air at the next
+/// finer level too, down to level 0, the world's own blocks. So nothing a
+/// coarse level shows open closes as the player comes nearer.
+///
+/// Under the rule before this one (a cell was cave where the noise at its
+/// corner was, or where most of eight samples in it were) level 3 drew
+/// 8 x 8 pits up to 12 blocks deep over ground level 2 drew whole, and this
+/// test is red on it.
+///
+/// Every level must show caves somewhere in these footprints, or there
+/// would be nothing to nest.
+#[test]
+fn coarse_caves_nest() {
+    /// Rows under a footprint's lowest column that are looked at. **Chosen,
+    /// not derived**: past the 24 blocks distant caves reach.
+    const DEPTH: i32 = 32;
+    let setup = Setup::new();
+    let footprints = draw_footprints(&setup.gen, FOOTPRINT_SEED, PER_KIND);
+    let mut carved = [0usize; 4];
+    let mut failures = Vec::new();
+    for (kind, fp) in footprints {
+        let heights: Vec<i32> = (0..FOOTPRINT * FOOTPRINT)
+            .map(|k| {
+                setup
+                    .gen
+                    .surface_height(fp.x0 + k % FOOTPRINT, fp.z0 + k / FOOTPRINT)
+            })
+            .collect();
+        let rows = heights.iter().min().unwrap() - DEPTH..heights.iter().max().unwrap() + 1;
+        let height = rows.len();
+        let air: Vec<Vec<bool>> = (0..=3)
+            .map(|level| drawn_air(&setup, fp, level, rows.clone()))
+            .collect();
+        for level in 0..=3u32 {
+            let w = 1 << level;
+            for j in 0..FOOTPRINT {
+                for i in 0..FOOTPRINT {
+                    let top = setup.gen.cell_top(fp.x0 + i / w * w, fp.z0 + j / w * w, w);
+                    let column = (j * FOOTPRINT + i) as usize * height;
+                    for y in rows.start..=top.min(rows.end - 1) {
+                        let at = column + (y - rows.start) as usize;
+                        if !air[level as usize][at] {
+                            continue;
+                        }
+                        carved[level as usize] += 1;
+                        if level > 0 && !air[level as usize - 1][at] && failures.len() < 12 {
+                            failures.push(format!(
+                                "{kind:?} at ({}, {}): level {level} draws a cave at ({}, {y}, {}) where level {} draws ground",
+                                fp.x0,
+                                fp.z0,
+                                fp.x0 + i,
+                                fp.z0 + j,
+                                level - 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("blocks drawn as cave, levels 0 to 3: {carved:?}");
+    assert!(
+        failures.is_empty(),
+        "a coarse level opens what a finer one draws whole (seed {FOOTPRINT_SEED:#x}):\n  {}",
+        failures.join("\n  ")
+    );
+    assert!(
+        carved.iter().all(|&n| n > 0),
+        "blocks drawn as cave per level: {carved:?} -- a level with none has nothing to nest"
+    );
+    assert!(
+        carved.windows(2).all(|pair| pair[0] >= pair[1]),
+        "a coarser level draws more cave than a finer one: {carved:?}"
+    );
 }

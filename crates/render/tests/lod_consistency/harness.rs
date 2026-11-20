@@ -25,10 +25,10 @@
 //!   under which a cave has carved some level-0 column's top away -- the
 //!   floor of a cave mouth and the walls it bares. Reported, never asserted.
 //!   A cave mouth is detail: level 0 draws every one, a coarse cell is cave
-//!   where most of it is (`WorldGen::cave_at`) and only near the surface, the
-//!   far terrain draws none. Counted in with the surface, level 0's pits
-//!   made a steep slope look 4% stone where its surface is 0.1%, and every
-//!   coarse level was being compared with that.
+//!   only where all of its ground is (`WorldGen::row_is_cave`) and only near
+//!   the surface, the far terrain draws none. Counted in with the surface,
+//!   level 0's pits made a steep slope look 4% stone where its surface is
+//!   0.1%, and every coarse level was being compared with that.
 //!
 //! The split is made on level 0's columns for every representation alike
 //! ([`Setup::carved`]), cell by cell: a cell (or a far quad) with one carved
@@ -36,8 +36,27 @@
 //! leaves more ground out -- on a steep slope 6% of level 0's sky-visible
 //! area is cave term, 23% of level 3's -- so **level 0 is measured again for
 //! every comparison, split on the cells of the level it is compared with**
-//! ([`Drawn::measure`]'s `mask`): both sides of a comparison then cover
-//! exactly the same ground (second review of #428, point 1).
+//! ([`Drawn::measure`]'s `mask`): both sides of a comparison then cover the
+//! same ground (second review of #428, point 1).
+//!
+//! **Exactly the same ground for the tops; not quite for the sides** (third
+//! review of #428, S3). A side face goes to the cave term when the mask cell
+//! of its own column *or of the column in front* is carved. A coarse level's
+//! riser always stands between two cells, so it needs both whole. Level 0,
+//! split on the same mask, keeps every riser between two columns of *one*
+//! whole cell, whatever the cells around it are. So where a whole cell has
+//! a carved neighbour, level 0 keeps the staircase inside it and the level
+//! loses the one riser that stands for that staircase. The tops are not
+//! touched by this (`compare` holds the two sides to the same count of
+//! them). The side *area* is: on steep ground a level-3 node shows x0.75 of
+//! level 0's side area on the surface term where over every face it shows
+//! x0.81 (level 2: x0.89 against x0.92; cliffs at level 3: x0.83 against
+//! x0.88 -- measured on the first version of #423, a throwaway probe). So
+//! the report's `area / level 0's` column understates a level's risers by
+//! six to eight percent at level 3 and three to four at level 2. T3 is a
+//! mean colour and hardly moves with it. **Nothing may bound riser area
+//! with the surface term's ratio as it stands**; it is reported, not
+//! asserted.
 //!
 //! A column is *carved* where level 0 is not the height field: its drawn
 //! top is not `surface_height + 1`, or a block of its side that a lower
@@ -777,6 +796,58 @@ impl Drawn {
     }
 }
 
+/// What `level` draws of `fp` block by block, as the game generates it: for
+/// every column of the footprint (row by row, `z` outer) and every block row
+/// of `rows`, whether the level draws air there. A coarse level's cell
+/// speaks for every column it covers; level 0 is the world's own blocks.
+pub fn drawn_air(
+    setup: &Setup,
+    fp: Footprint,
+    level: u32,
+    rows: std::ops::Range<i32>,
+) -> Vec<bool> {
+    let w = NodeKey::new(level, [0, 0, 0]).extent_chunks();
+    let node_size = 16 * w;
+    let height = rows.len();
+    let mut air = vec![true; (FOOTPRINT * FOOTPRINT) as usize * height];
+    let node_range =
+        |lo: i32, len: i32| lo.div_euclid(node_size)..=(lo + len - 1).div_euclid(node_size);
+    for nz in node_range(fp.z0, FOOTPRINT) {
+        for nx in node_range(fp.x0, FOOTPRINT) {
+            for ny in node_range(rows.start, height as i32) {
+                let node = NodeKey::new(level, [nx, ny, nz]);
+                // Nothing generated is nothing drawn: air.
+                let Some(chunk) = setup.world.node_at(node, setup.blocks) else {
+                    continue;
+                };
+                let origin = node.world_origin();
+                let (dims, scale) = (chunk.mesh_dims(), chunk.mesh_scale());
+                assert_eq!(scale, [w, 1, w], "level {level} is drawn in block rows");
+                for lz in 0..dims[2] {
+                    for lx in 0..dims[0] {
+                        let (x, z) = (origin[0] + lx as i32 * w, origin[2] + lz as i32 * w);
+                        for ly in 0..dims[1] {
+                            let y = origin[1] + ly as i32;
+                            if !rows.contains(&y)
+                                || !setup.registry.is_solid(chunk.drawn(lx, ly, lz))
+                            {
+                                continue;
+                            }
+                            for cz in z.max(fp.z0)..(z + w).min(fp.z0 + FOOTPRINT) {
+                                for cx in x.max(fp.x0)..(x + w).min(fp.x0 + FOOTPRINT) {
+                                    let column = ((cz - fp.z0) * FOOTPRINT + cx - fp.x0) as usize;
+                                    air[column * height + (y - rows.start) as usize] = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    air
+}
+
 /// Whether a cave has carved any level-0 column under the `w`-block cell at
 /// `(x, z)` (clipped to the footprint; a cell outside it is not).
 fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
@@ -787,10 +858,10 @@ fn any_carved(carved: &[bool], fp: Footprint, x: i32, z: i32, w: i32) -> bool {
 }
 
 /// How far above and below a node column's level-0 surface its nodes are
-/// generated, in blocks. **Chosen, not derived**: above, a max over a cell
-/// can only reach the footprint's own highest column, so any margin does;
-/// below, a cave mouth can lower a column's top, and one deeper than this is
-/// counted as nothing drawn.
+/// generated, in blocks. **Chosen, not derived**: above, a cell's top is no
+/// higher than its own highest column, so any margin does; below, a cave
+/// mouth can lower a column's top, and one deeper than this is counted as
+/// nothing drawn.
 const SURFACE_MARGIN: i32 = 12;
 
 /// The far terrain's patches of `level` (quads of `2^level` blocks) over
@@ -909,14 +980,15 @@ fn vertex_gradient(patch: &PatchHeights, i: usize, j: usize) -> [f32; 2] {
 /// top from the level-0 columns it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TopRule {
-    /// `WorldGen::cell_top`: the highest covered column (#423 decision 1).
-    Max,
+    /// `WorldGen::cell_top`: the mean of the covered columns, and the
+    /// highest of them where the square holds a summit (#423).
+    Exact,
     /// `WorldGen::cell_top_sampled` over an `n` x `n` grid of the covered
     /// columns: what a quad too large to visit every column of affords.
-    SampledMax(i32),
-    /// For comparison only, and not in `WorldGen`: the mean of the covered
-    /// columns, rounded to the nearest block.
-    Mean,
+    Sampled(i32),
+    /// For comparison only, and not in `WorldGen`: the highest covered
+    /// column (the first version of #423).
+    Max,
 }
 
 /// The tops a stepped height field of `cell`-block squares would draw over
@@ -935,12 +1007,12 @@ pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) 
             };
             let (x0, z0) = (fp.x0 + ci, fp.z0 + cj);
             let top = match rule {
-                TopRule::Max => gen.cell_top(x0, z0, cell),
-                TopRule::SampledMax(n) => gen.cell_top_sampled(x0, z0, cell, n),
-                TopRule::Mean => {
-                    let sum: i64 = columns(cell).map(|(a, b)| h(ci + a, cj + b) as i64).sum();
-                    (sum as f64 / (cell * cell) as f64).round() as i32
-                }
+                TopRule::Exact => gen.cell_top(x0, z0, cell),
+                TopRule::Sampled(n) => gen.cell_top_sampled(x0, z0, cell, n),
+                TopRule::Max => columns(cell)
+                    .map(|(a, b)| h(ci + a, cj + b))
+                    .max()
+                    .expect("a square covers a column"),
             };
             for b in 0..cell {
                 for a in 0..cell {
@@ -962,9 +1034,10 @@ pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) 
 /// **Level 0 here is the height field**: `surface_height + 1`, the top face
 /// of every column's surface block, which is what #423's decisions 1 and 4
 /// name. A cave mouth lowers a level-0 column's drawn top below that, and
-/// caves have their own rule for coarse cells (`WorldGen::cave_at`: most of
-/// the cell), so they are not what is compared -- `level_0_draws_its_surface`
-/// holds the drawn level 0 to the height field everywhere else.
+/// caves have their own rule for coarse cells (`WorldGen::row_is_cave`: all
+/// of the cell's ground), so they are not what is compared --
+/// `level_0_draws_its_surface` holds the drawn level 0 to the height field
+/// everywhere else.
 #[derive(Clone, Debug, Default)]
 pub struct Shape {
     /// `drawn - level 0`, per column, in blocks.

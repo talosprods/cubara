@@ -59,16 +59,26 @@ pub const OPEN: NodeLinks = [FaceLinks::ALL; GRAIN * GRAIN * GRAIN];
 /// Takes [`NodeChunk`] (R1b, issue #327 decision 6), not a plain [`Chunk`]:
 /// a coarse node's lattice has its own vertical cell count now, different
 /// from its horizontal one, so each of the `GRAIN`³ sub-blocks' own region
-/// size is per-axis -- `chunk.dims()[axis] / GRAIN` -- rather than one shared
-/// `Chunk::SIZE / GRAIN`. `GRAIN` divides every axis's cell count evenly for
-/// every level/`v` combination R1b produces (checked by
+/// size is per-axis -- `chunk.mesh_dims()[axis] / GRAIN` -- rather than one
+/// shared `Chunk::SIZE / GRAIN`. `GRAIN` divides every axis's cell count
+/// evenly for every level/`v` combination R1b produces (checked by
 /// `node_links_region_size_divides_every_level_evenly` below), so this never
 /// rounds.
+///
+/// **The links are those of the lattice the node is drawn on**
+/// ([`NodeChunk::mesh_dims`], [`NodeChunk::drawn`]), which for a level-3
+/// node is not the one it stores: its rows of four are cut off at each
+/// column's top (issue #423), and the blocks above a top are air. The rule
+/// in this module's header rests on the links describing that air; worked
+/// out on the stored rows they called it rock, and the search left out
+/// nodes that the drawn lattice keeps (14 distinct level-3 nodes over 48
+/// eye positions, review of #432). `the_links_of_a_node_are_those_of_what_it_draws`
+/// holds the two together.
 pub fn node_links(chunk: Option<&NodeChunk>, registry: &BlockRegistry) -> NodeLinks {
     let Some(chunk) = chunk else {
         return OPEN;
     };
-    let dims = chunk.dims();
+    let dims = chunk.mesh_dims();
     let size = [dims[0] / GRAIN, dims[1] / GRAIN, dims[2] / GRAIN];
     std::array::from_fn(|i| {
         let (x, y, z) = (i % GRAIN, i / GRAIN % GRAIN, i / GRAIN / GRAIN);
@@ -491,6 +501,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The links of a node are those of what it draws** (review of #432,
+    /// B2). A level-3 node stores rows of four blocks and is drawn cut off
+    /// at each column's top, so the lattice it stores is not the one the
+    /// camera sees. Every generated level-3 node around the default seed's
+    /// mountains, three ways:
+    ///
+    /// - as it is: `node_links` of the node the game makes;
+    /// - **as drawn**: a lattice of block rows built from `NodeChunk::drawn`,
+    ///   with nothing left to cut;
+    /// - as stored: its rows of four, drawn whole.
+    ///
+    /// The first must be the second, node for node. And the third must
+    /// differ from them somewhere, and only ever by calling air rock -- or
+    /// this could not tell which lattice `node_links` reads. (It read the
+    /// stored one until the review: the search then left out nodes the
+    /// drawn lattice keeps.)
+    #[test]
+    fn the_links_of_a_node_are_those_of_what_it_draws() {
+        use cubara_voxel::AnisoChunk;
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = World::new();
+        let (mut nodes, mut differ) = (0, 0);
+        // The mountain the golden images frame: chunk column (-56, 304).
+        for nx in -11..-3 {
+            for nz in 34..42 {
+                for ny in 0..3 {
+                    let node = NodeKey::new(3, [nx, ny, nz]);
+                    let Some(chunk) = world.node_at(node, blocks) else {
+                        continue;
+                    };
+                    let NodeChunk::Aniso(lattice) = &chunk else {
+                        panic!("a level-3 node is an anisotropic lattice");
+                    };
+                    assert_eq!(lattice.scale()[1], 4, "level 3 stores rows of four");
+                    let as_drawn = NodeChunk::Aniso(AnisoChunk::from_fn(
+                        chunk.mesh_dims(),
+                        chunk.mesh_scale(),
+                        |x, y, z| chunk.drawn(x, y, z),
+                    ));
+                    let as_stored = NodeChunk::Aniso(AnisoChunk::from_fn(
+                        lattice.dims(),
+                        lattice.scale(),
+                        |x, y, z| lattice.get(x, y, z),
+                    ));
+                    let links = node_links(Some(&chunk), &registry);
+                    let drawn = node_links(Some(&as_drawn), &registry);
+                    let stored = node_links(Some(&as_stored), &registry);
+                    assert_eq!(links, drawn, "{node:?}: the links are not what it draws");
+                    nodes += 1;
+                    if stored != drawn {
+                        differ += 1;
+                        // A stored row is solid wherever a drawn one is: it
+                        // can only join less.
+                        for (s, d) in stored.iter().zip(&drawn) {
+                            for a in FACES {
+                                for b in FACES {
+                                    assert!(
+                                        !s.joins(a, b) || d.joins(a, b),
+                                        "{node:?}: the stored rows join {a:?} to {b:?} and the drawn ones do not"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{nodes} level-3 nodes, {differ} whose stored rows join less than what they draw");
+        assert!(
+            nodes >= 60 && differ >= 3,
+            "{nodes} nodes, {differ} of them told apart: not enough to say which lattice the links read"
+        );
     }
 
     fn registry() -> BlockRegistry {

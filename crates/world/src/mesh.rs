@@ -163,11 +163,11 @@ fn mesh_chunk(
     let ctx = MeshContext { registry, layer_of };
     let origin = node.world_origin();
     let scale = 1.0f32;
-    let surfaces = std::cell::RefCell::new(HashMap::new());
+    let ground = std::cell::RefCell::new(BorderGround::default());
     let covered =
-        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
+        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
     let may_be_solid =
-        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::Any);
+        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
     let (mesh, local_aabb) = build_mesh_bounded_occluded_node(chunk, &ctx, covered, may_be_solid)?;
     Some(NodeGeometry {
         mesh,
@@ -203,6 +203,15 @@ pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
         out.push(ChunkCoord::new(c[0], c[1], c[2]));
     }
     out
+}
+
+/// The ground [`border_samples`] has asked about while one node is meshed:
+/// level 0's columns by `(x, z)`, and the cells of coarser neighbours by
+/// corner and width.
+#[derive(Default)]
+struct BorderGround {
+    columns: HashMap<(i32, i32), i32>,
+    cells: HashMap<(i32, i32, i32), crate::worldgen::CellGround>,
 }
 
 /// Which answer [`border_samples`] gives over the cells it looks at.
@@ -248,7 +257,7 @@ fn border_samples(
     world: &WorldSnapshot,
     node: NodeKey,
     blocks: TerrainBlocks,
-    surfaces: &std::cell::RefCell<HashMap<(i32, i32, i32), i32>>,
+    ground: &std::cell::RefCell<BorderGround>,
     g: [i32; 3],
     want: Want,
 ) -> bool {
@@ -269,26 +278,35 @@ fn border_samples(
         origin[2] + g[2] * step[2],
     ];
     // Whether the cell of level `at` that holds block `q` is drawn solid
-    // there: its column's exact top and its own rows
-    // (`World::certainly_solid_at_v`). Surface heights are the expensive
-    // part of a sample, and one node's border touches few columns, so each
-    // is computed once per node.
+    // there: its top and its own rows (`World::certainly_solid_at_v`).
+    // Surface heights are the expensive part of a sample, and one node's
+    // border touches few columns, so each cell's are computed once per node.
     let solid = |q: [i32; 3], at: u32| {
-        if want == Want::Any && at == 0 {
-            // Trees count here: leaving one out could drop a skirt a trunk at
-            // the border needs, where for covering it can only keep a face.
-            return world.is_solid_at(q[0], q[1], q[2], blocks);
+        if at == 0 {
+            if want == Want::Any {
+                // Trees count here: leaving one out could drop a skirt a
+                // trunk at the border needs, where for covering it can only
+                // keep a face.
+                return world.is_solid_at(q[0], q[1], q[2], blocks);
+            }
+            let surface = *ground
+                .borrow_mut()
+                .columns
+                .entry((q[0], q[2]))
+                .or_insert_with(|| world.surface_height(q[0], q[2]));
+            return world.certainly_solid_at(q[0], q[1], q[2], surface);
         }
         let step_h = 1 << at;
         let (x, z) = (
             q[0].div_euclid(step_h) * step_h,
             q[2].div_euclid(step_h) * step_h,
         );
-        let surface = *surfaces
-            .borrow_mut()
+        let mut ground = ground.borrow_mut();
+        let cell = ground
+            .cells
             .entry((x, z, step_h))
-            .or_insert_with(|| world.cell_surface_height(x, z, step_h));
-        world.certainly_solid_at_v(x, q[1], z, at, surface)
+            .or_insert_with(|| world.cell_ground(x, z, step_h));
+        world.certainly_solid_at_v(q[1], at, cell)
     };
     // `All` stops at the first air, `Any` at the first solid.
     let decided = |is_solid: bool| match want {
@@ -750,7 +768,7 @@ mod tests {
     /// two blocks above level 2, a wall ringing the player 512 blocks out.
     #[test]
     fn a_flat_field_is_drawn_at_its_surface_at_every_level() {
-        use crate::worldgen::Covered;
+        use crate::worldgen::NodeGround;
         let registry = test_registry();
         let layer_of = |_: &str| 0;
         let ctx = MeshContext {
@@ -764,13 +782,7 @@ mod tests {
             for level in 1..=3u32 {
                 let node = NodeKey::new(level, [0, 0, 0]);
                 let (w, v) = (node.extent_chunks(), node.cell_height_blocks());
-                let flat = vec![
-                    Covered {
-                        surface: t,
-                        around: [t; 4],
-                    };
-                    (16 * 16 * w * w) as usize
-                ];
+                let flat = NodeGround::over(w, |_, _| t);
                 // The node that holds the surface.
                 let oy = t.div_euclid(16 * w) * 16 * w;
                 let chunk = gen.generate_aniso_over([0, oy, 0], w, v, blocks, &flat);
