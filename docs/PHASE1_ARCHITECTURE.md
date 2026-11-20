@@ -739,6 +739,22 @@ exists to answer, checked on every push rather than assumed.
 > player comes close. `a_coarse_cell_is_what_most_of_its_blocks_are` holds both
 > halves: shallow cells follow their blocks, deeper coarse cells are rock.
 >
+> **Amended (2026-11-20, issue #423) -- all of a coarse cell's ground, not
+> most of it.** The vote let a coarse cell open over ground the next finer
+> level drew whole: level 3 drew pits 8 x 8 blocks wide and up to 12 deep
+> that closed again as the player came nearer, and the owner's requirement
+> is that approaching a mountain changes nothing but detail. A coarse cell
+> is now cave only where **every block of ground in it** is cave at level 0
+> (`WorldGen::row_is_cave`), still within `DISTANT_CAVE_DEPTH` of the
+> surface. So caves nest: whatever a level draws open, every finer level
+> draws open too, and a pit only ever opens on approach. A cave at least a
+> cell wide is still a cave from a kilometre away; a narrower one is detail
+> and shows when the level that can hold it is drawn. The contract "a
+> coarse cell is what most of its blocks are" is given up for caves;
+> `a_coarse_cell_is_cave_only_where_all_its_ground_is` holds the new one,
+> and `coarse_caves_nest` (`crates/render/tests/lod_consistency`) the
+> nesting. `PHASE3_ARCHITECTURE.md` §9.4 has the numbers.
+>
 > The text below is kept as the reasoning it was.
 
 

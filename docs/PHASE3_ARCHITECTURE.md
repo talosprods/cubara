@@ -361,9 +361,12 @@ Every divergence that follows from that table:
    colour is the same; the pattern is 2^L times larger (#380 found this and
    the AO to be most of what changes land-to-land at a swap).
 7. **Caves.** Level 0 carves them at every depth and through the surface; a
-   coarse cell is cave where most of it is and only within
-   `DISTANT_CAVE_DEPTH` of the surface; the far terrain has none. Left as it
-   is (PHASE1 §8.6); the harness counts it and keeps it apart from the rest.
+   coarse cell was cave by a vote -- at levels 1 and 2 the noise at one of
+   its blocks, at level 3 most of eight samples near its middle -- and only
+   within `DISTANT_CAVE_DEPTH` of the surface; the far terrain has none. So
+   a level could open a pit over ground the next finer level drew whole.
+   PR 1 left it as it was (PHASE1 §8.6) and the harness counts it apart from
+   the rest; PR 2 makes coarse caves nest (§9.4).
 8. **Trees** stand on `drawn_top` of their own column, not on the cell that
    draws the ground under them (R2's recorded risk).
 
@@ -399,7 +402,8 @@ case), steep mountain faces and cliffs, drawn by a printed seed, not picked:
   a cave mouth and the walls it bares). **Every level is held to the
   surface term, and only to it.** The cave term is reported and never
   asserted, because the levels differ there by design: level 0 draws every
-  cave mouth, a coarse cell is cave where most of it is and only within
+  cave mouth, a coarse cell is cave only where all of its ground is
+  (§9.4; by a vote, when this was first written) and only within
   `DISTANT_CAVE_DEPTH` of the surface, the far terrain draws none. A cave
   mouth is detail. It is 4 to 12% of level 0's sky-visible area and about
   half stone, so counted in with the surface it made a steep slope look
@@ -421,6 +425,21 @@ case), steep mountain faces and cliffs, drawn by a printed seed, not picked:
   the same count of columns. It moved the pooled numbers by at most 0.1/255
   and 0.1 point of stone share; the shape rows moved more (a cave under a
   footprint's peak had been read as a lost peak, at level 0 too).
+- **Exactly the same ground for the tops; not quite for the sides** (third
+  review of #428, S3). A side face goes to the cave term when the mask cell
+  of its own column *or of the column in front* is carved. A level's riser
+  always stands between two cells, so it needs both whole; level 0, split
+  on the same mask, keeps every riser between two columns of *one* whole
+  cell. Where a whole cell has a carved neighbour, level 0 keeps the
+  staircase inside it and the level loses the one riser that stands for
+  it. The tops are not touched (`compare` holds the two sides to the same
+  count of them). The side *area* is: on steep ground level 3 showed x0.75
+  of level 0's side area on the surface term where over every face it
+  showed x0.81 (level 2: x0.89 against x0.92; measured on the first version
+  of PR 2). So the report's `area / level 0's` column understates a level's
+  risers by six to eight percent at level 3 and three to four at level 2.
+  T3 is a mean colour and hardly moves with it. **Riser area is reported
+  and not bounded, and must not be bounded with that ratio as it stands.**
 - **Per footprint, not only pooled** (finding B3): every comparison is made
   footprint by footprint, the report prints the worst single footprint
   beside each pooled number, and the assertions hold the worst footprint.
@@ -485,11 +504,15 @@ pub fn surface_height(&self, x: i32, z: i32) -> i32;
 /// What a column is made of `depth` blocks below ITS OWN surface.
 pub fn ground_layer(depth: i32) -> GroundLayer; // Surface | Soil | Stone
 
-/// A cell's drawn top block: the MAX of surface_height over the columns
-/// [x0, x0 + w) x [z0, z0 + w). cell_top(x, z, 1) is surface_height(x, z).
+/// A cell's drawn top block over the columns [x0, x0 + w) x [z0, z0 + w):
+/// the MEAN of their surface_height, rounded to the nearest block (a half
+/// to the even one) -- and the HIGHEST of them where the cell holds a
+/// summit: where the first highest column of the nine cells around it is
+/// one of its own. cell_top(x, z, 1) is surface_height(x, z).
 pub fn cell_top(&self, x0: i32, z0: i32, w: i32) -> i32;
 
-/// The same over an n x n grid of the cell's columns: the single
+/// The same over an n x n grid of the cell's columns, centred in the cell,
+/// the nine cells around each sampled on its own grid: the single
 /// implementation (cell_top is this at n = w).
 pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, n: i32) -> i32;
 
@@ -498,25 +521,51 @@ pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, n: i32) -> i32;
 pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
 ```
 
-- **Height: the max, to the block, at every level.** A coarse cell's top, a
-  far quad's top and a level-0 column's top are `cell_top` at three widths.
-  A peak keeps its height exactly, and a parent cell's top is the highest of
-  its children's (`exact_tops_nest`), so a coarser level never shows sky
-  where a finer one has land. **Level 3 stores rows of four blocks and is
-  drawn to the block all the same** (PR 2, §9.4): the row that holds a
-  column's top is cut off at it. PR 1 gave `cell_top` a row height and
-  rounded to it, because level 3 drew its rows whole: -1, +2, +1 or 0
-  blocks off by the top's height mod 4, so on a plain at 1 mod 4 level 3
-  stood two blocks above level 2, a wall ringing the player 512 blocks out
-  (the lead's audit, 2026-11-20). The parameter is gone with the rounding.
+- **Height: the mean of the covered columns, to the block, with summits
+  kept; at every level.** A coarse cell's top, a far quad's top and a
+  level-0 column's top are `cell_top` at three widths. The mean is rounded
+  to the nearest block, a half to the even one, so that rounding lifts
+  nothing. A cell that **holds a summit** -- the first highest column (`z`,
+  then `x`) of the nine cells around it is one of its own -- stands at
+  that column instead. The reasons, in §9.4's study:
+  - a swap replaces a cell by the four finer cells under it, so what
+    changes on screen is the coarser top minus the finer ones. Under the
+    mean that difference has no direction: as many columns stand above
+    the coarser cell as below it, and a slope neither sinks nor rises as a
+    ring edge passes over it;
+  - the mean alone lowers what stands out, and a peak would grow back
+    edge by edge. A summit is kept exactly, **and it nests**: the finer
+    cell that holds the same column holds a summit too (its nine cells lie
+    inside the coarser cell's nine), down to the column itself
+    (`a_summit_stands_at_every_finer_level`).
+
+  **Decision 1 of #423 named the max.** PR 2 was first built on it and its
+  review measured what it does: every slope stands higher the coarser the
+  level and sinks 7 to 9 pixels at each ring edge on the way in. The max is
+  not what is built; the study and the reason are in §9.4, and the lead
+  asked for the rule to be chosen by that measurement (2026-11-20).
+
+  **The tops do not nest as the max's did.** Nothing may assume a coarser
+  level stands at or above a finer one: `border_samples` asks every
+  neighbour it could have what it draws, and that is what keeps the seams
+  closed.
+
+  **Level 3 stores rows of four blocks and is drawn to the block all the
+  same** (PR 2, §9.4): the row that holds a column's top is cut off at it.
+  PR 1 gave `cell_top` a row height and rounded to it, because level 3 drew
+  its rows whole: -1, +2, +1 or 0 blocks off by the top's height mod 4, so
+  on a plain at 1 mod 4 level 3 stood two blocks above level 2, a wall
+  ringing the player 512 blocks out (the lead's audit, 2026-11-20). The
+  parameter is gone with the rounding.
 - **Material: by depth below each column's own surface.** `ground_layer` is
-  the only depth rule; `material_at` reads it. A coarse riser's row at
-  height `y` wears `ground_layer(s - y)`, where `s` is the lowest covered
-  surface that is at or above `y` -- level 0's staircase projected onto the
-  riser, so a gentle slope's coarse riser is grass side row after row, and
-  stone shows where a covered column really stands more than `1 +
-  SOIL_DEPTH` blocks proud (PR 2). A far wall, which cannot band, takes the
-  mix `ground_faces(..).sides[d]` gives for its quad's footprint (#422).
+  the only depth rule; `material_at` reads it. A coarse cell wears the
+  layer of one of the level-0 side faces its columns show at its rows --
+  each made of `ground_layer` at its depth below its **own** column's
+  surface -- picked by a hash of the cell's position, so a gentle slope's
+  coarse riser is grass side nearly row after row, and stone shows where a
+  covered column really stands more than `1 + SOIL_DEPTH` blocks proud
+  (PR 2, §9.4). A far wall, which cannot band, takes the mix
+  `ground_faces(..).sides[d]` gives for its quad's footprint (#422).
 - **Light: level 0's openness.** `ground_faces` carries how open level 0's
   tops and risers are, from the mesher's own corner rule
   (`cubara_voxel::face_ao_of`, which `face_ao` now delegates to), so a
@@ -544,56 +593,82 @@ quad's height or a far face's colour):
   so the 1,024 m join is exact (both are on the 8-block grid) -- and there
   is no row height left to get wrong: until PR 2 the join needed the far
   quad to round to level 3's rows of four as well.
-- above 8 blocks the exact max costs `q^2` heights a quad, so the far
-  terrain calls `cell_top_sampled` with `n = 4`. It can only be lower than
-  the exact top, and it does not nest (a child can stand above its parent);
-  the harness's `stepped` rows measure it per quad width.
+- above 8 blocks the exact form costs `q^2` heights a quad (and a look at
+  the quads around one that might hold a summit), so the far terrain calls
+  `cell_top_sampled` with `n = 4`: the same rule over 4 x 4 columns centred
+  in the quad. Its mean is a sample of the quad's, it can miss a peak
+  narrower than the spacing, and its summits do not nest (a quad half as
+  wide looks at columns its parent skips); the harness's `stepped` rows
+  measure it per quad width, below.
 - wall colour facing direction `d` = the `Materials` mixed by
   `ground_faces(x0, z0, q, n).sides[d]`, times the openness; top colour =
   `Materials.top` times `top_open`. Not `riser_colour` of the wall's own
   height, which is divergence 2 again.
 
-**What the max costs in shape** -- measured, not guessed
-(`stepped_top_rule_report`; drawn minus level 0, mean over columns, with the
-skyline's mean in brackets and the peak last):
+**What the rule does to the shape, per cell width** -- measured, not guessed
+(`stepped_top_rule_report`; drawn minus level 0 on steep ground, mean over
+columns, with the highest column -- the first version of #423 -- beside it):
 
-| steep mountain, cell width | max (#423 d1) | mean of the columns, for comparison |
-|---|---|---|
-| 2 (level 1) | +1.2 (+0.6), peak 0 | 0.0 (-0.3), peak -0.7 |
-| 4 (level 2) | +3.5 (+1.8), peak 0 | 0.0 (-1.4), peak -1.8 |
-| 8 (level 3, far join) | +8.0 (+3.9), peak 0 | 0.0 (-3.5), peak -5.5 |
-| 16 | +16.5 (+7.9), peak 0 | 0.0 (-7.6), peak -13 |
-| 32 | +31 (+15), peak 0 | 0.0 (-15), peak -27 |
-| 64 | +50 (+23), peak 0 | 0.0 (-27), peak -50 |
+| cell width | `cell_top` | `cell_top_sampled`, `n = 4` | the highest column |
+|---|---|---|---|
+| 2 (level 1) | +0.01 | | +1.2 |
+| 4 (level 2) | +0.02 | | +3.5 |
+| 8 (level 3, far join) | +0.09 | +0.13 | +8.0 |
+| 16 | +0.6 | +0.6 | +16.6 |
+| 32 | +3.8 | +2.4 | +30.9 |
+| 64 | +24.7 | +16.0 | +50.1 |
 
-The max keeps every peak and raises slopes by about half a cell width times
-the slope; a mean keeps the bulk and lowers every peak and ridge by as much.
-On screen either is about half a cell, since cells are sized in pixels. The
-max is the decision (#423 d1, confirmed by the lead on 2026-11-15: a top
-never below level 0 never shows sky where level 0 has land). That distant
-mountains come out slightly fuller is the owner's to look at, with PR 2's
-images; changing it is one aggregator in `cell_top_sampled`.
+Up to 8 blocks the ground stands where level 0's does, to a tenth of a
+block. **Past 16 blocks the summits take over**: one cell in nine is the
+highest of its nine at any width, and a cell 64 blocks wide that holds a
+summit stands tens of blocks above its own mean. That is the max's
+swelling again, in fewer cells. Whether a far quad that wide should keep
+its summit, or stand at its mean, is #422's to measure with these rows; the
+voxel levels stop at 8.
 
 ### 9.4 The voxels on the rule (PR 2)
 
+Built in two rounds. The first put the coarse levels on #423's decisions as
+written -- a cell's top at its highest column -- and fixed colour, material,
+shade, peaks and the step at the 512-block ring. Its review measured what
+was left: the *shape* of a slope still moved at every ring, by as many
+pixels as before and now always the same way. The second round chose the
+height rule by that measurement, made coarse caves nest, and closed the
+review's findings. What follows is the tree as built.
+
 What changed, all of it behind the functions of §9.3:
 
-- **Height.** `cell_surface_height` is `cell_top`: the highest covered
-  column. `generate_aniso` (and `generate` at a step above one, which is the
-  same rule at `v = step`) asks every column of the node's footprint once
-  (`covered_surfaces`) and keeps each cell's heights sorted.
+- **Height.** `cell_surface_height` is `cell_top`: the mean of the covered
+  columns, or the cell's summit. `generate_aniso` (and `generate` at a step
+  above one, which is the same rule at `v = step`, drawn whole, and built
+  only by tests) asks every column of the node's footprint once
+  (`node_ground`), keeps each cell's columns sorted, and works each cell's
+  top out with the one body the standalone functions use (`top_over`). A
+  cell at the node's edge that might hold a summit asks the cells beyond it
+  as well.
 - **Level 3's top is cut off at the exact top.** It still stores rows of
-  four blocks (`NodeKey::cell_height_blocks`, #327 decision 1: generation,
-  caves and the visibility links are per row of four, as before). A row is
-  now solid while it holds any ground, and the one that holds a column's top
-  is drawn only up to it: the node carries its columns' exact tops
-  (`AnisoChunk::with_tops`) and its mesh is built on block rows
-  (`mesh_dims`, `NodeKey::drawn_row_blocks`). So every level's top face is
-  `cell_top + 1`, a riser between two level-3 cells is as tall as their tops
-  differ, and level 3 nests in level 2 and joins the far terrain exactly.
+  four blocks (`NodeKey::cell_height_blocks`, #327 decision 1: generation
+  and caves are per row of four). A row is solid while it holds any ground,
+  and the one that holds a column's top is drawn only up to it: the node
+  carries its columns' exact tops (`AnisoChunk::with_tops`) and its mesh is
+  built on block rows (`mesh_dims`, `NodeKey::drawn_row_blocks`). So every
+  level's top face is `cell_top + 1`, a riser between two level-3 cells is
+  as tall as their tops differ, and level 3 joins the far terrain exactly.
   `border_samples` asks every level about the block, not the row: a
   neighbour's cell is solid at a block when the block is at or under its
-  exact top and its row is not cave.
+  top and its row is not cave (`WorldGen::cell_draws_solid`, held to the
+  generated node block by block).
+- **Caves nest.** A coarse cell-row is cave only where **every block of
+  ground in it is cave at level 0** (`WorldGen::row_is_cave`): every block
+  of the cell's columns, in those rows, that is at or under its own
+  column's surface and the cell's top. One block of rock and the cell stays
+  whole. A finer cell inside it covers some of the same blocks, so whatever
+  a level draws open every finer level draws open too, and **a pit only
+  ever opens on approach**. The depth limit nests as well: a row is carved
+  only if its lowest block is within `DISTANT_CAVE_DEPTH` of the cell's
+  highest column. It replaces a vote (§9.1 item 7; PHASE1 §8.6 is amended).
+  The first block of rock ends the count, so a cell still costs one noise
+  sample nearly always.
 - **Material.** `coarse_block` replaces `block_at_on_surface_v`, `top_cell`
   and `probe`. At level 0 a column shows a side face at every row above a
   neighbour's surface and at or under its own, made of `ground_layer` at
@@ -602,10 +677,14 @@ What changed, all of it behind the functions of §9.3:
   a hash of the cell's position**, so over many cells every layer shows in
   the share it has at level 0. (Two rules came before and each was a
   measured error: depth below the cell's own top, which is main's stone;
-  and the lowest covered surface at or above the row, the first version of
-  this PR, which never showed stone and hardly any soil either.) A level-3
-  cell is one block id over four rows: its face is picked among all four
-  rows' faces, and the topmost cell wears the surface block.
+  and the lowest covered surface at or above the row, which never showed
+  stone and hardly any soil either.) The cell that holds the top wears the
+  surface block. **A mean top's riser reaches below every column the cell
+  covers**, down to the top of the next cell: rows level 0 shows from that
+  cell's columns. Such a row wears one of *all* the cell's level-0 faces, by
+  the same hash; by depth alone those rows came out as bands of soil and
+  stone along the foot of every riser. Under the riser's foot a row is the
+  inside of the ground and wears its depth.
 - **Top-face AO.** The shade a riser casts on the coarse top at its foot is
   `min(riser height, cell width)` blocks wide, not always one (`top_ao` in
   `cubara_voxel`): a riser `k` blocks tall on a slope stands for `k` level-0
@@ -627,6 +706,97 @@ What changed, all of it behind the functions of §9.3:
   at level 0's size and picks level 0's mip (R4).
 - **Trees** stand on the top of the cell that draws the ground under them
   (`node_trees` calls `cell_top` for the node's cell). `drawn_top` is gone.
+- **Visibility links are those of what is drawn.** `node_links` floods the
+  lattice a node is drawn on (`NodeChunk::drawn` over `mesh_dims`). A
+  level-3 node's stored rows of four are solid in the one to three blocks
+  of air above every top; worked out on those, the links called air rock,
+  which is the unsafe direction for a search that must never leave out
+  what a line of sight reaches (review of #432, B2: the search left out
+  nodes the drawn lattice keeps from 20 of 48 eye positions; no hole was
+  found). `the_links_of_a_node_are_those_of_what_it_draws` compares the
+  two on 109 generated level-3 nodes, 28 of which the stored rows get
+  wrong.
+
+**The height rule was chosen by what a swap changes on screen**
+(`height_rule_study_report`, `crates/render/tests/lod_consistency/study.rs`).
+The owner's requirement, 2026-11-20: approaching a mountain, it must not be
+seen to shift or change at all; only detail may appear. A swap replaces a
+coarse cell by the finer cells under it, so per level-0 column what changes
+at a ring edge is the coarser level's top minus the finer one's. Each
+candidate rule is worked out from the height field alone over the harness's
+forty seeded footprints, and judged in pixels at the distance of the edge
+(60 degrees of vertical field of view; one block is 6.4, 3.6 and 2.0 pixels
+at 160, 288 and 512 blocks on 1080 rows, and 1.33 and 1.54 times that on
+the 1440 and 1664 rows the owner plays at):
+
+- **the surface**: the difference over every column. Its mean is the
+  systematic part -- the whole slope sinking (+) or rising (-) as the edge
+  passes over it; its 95th percentile is the size of what changes at all;
+- **the outline**: the same for the skyline, the highest top along a line
+  of sight (along x, along z and both diagonals, in a window of 192 blocks),
+  on lines where level 0 has a crest inside the window;
+- **the summit**: a level's highest top against level 0's, where a
+  footprint holds one.
+
+Steep mountain, pixels at 1080 rows, at the 160 / 288 / 512-block edges:
+
+| rule | surface: mean | surface: 95th pct | outline: mean | outline: 95th pct | summit, blocks, L1 / L2 / L3 |
+|---|---|---|---|---|---|
+| highest column (the first version) | +7.5 / +8.3 / +9.0 | 19.3 / 25.1 / 26.2 | +5.3 / +5.5 / +5.5 | 19.3 / 17.9 / 20.1 | 0 / 0 / 0 |
+| mean, rounded down (as main, of all columns) | -2.2 / -0.4 / 0.0 | 12.9 / 14.3 / 14.1 | -3.9 / -2.1 / -2.3 | 12.9 / 10.7 / 12.1 | -1.2 / -2.2 / -6.2 |
+| mean, a half rounded up | +1.1 / -0.4 / -0.1 | 12.9 / 14.3 / 14.1 | -0.5 / -2.2 / -2.3 | 12.9 / 10.7 / 12.1 | -0.8 / -2.0 / -6.0 |
+| mean, a half to the even block | 0.0 / 0.0 / 0.0 | 12.9 / 14.3 / 14.1 | -1.6 / -1.7 / -2.3 | 12.9 / 10.7 / 12.1 | -0.8 / -2.0 / -6.0 |
+| median | -3.0 / +0.6 / +0.4 | 19.3 / 14.3 / 14.1 | -3.8 / -0.9 / -1.7 | 12.9 / 10.7 / 12.1 | -0.8 / -2.0 / -5.4 |
+| 75th percentile | +3.0 / +3.1 / +3.5 | 19.3 / 14.3 / 18.1 | +1.0 / +1.4 / +0.9 | 12.9 / 10.7 / 12.1 | -0.6 / -1.0 / -2.6 |
+| midrange | +1.7 / 0.0 / 0.0 | 12.9 / 14.3 / 14.1 | +0.2 / -2.4 / -3.2 | 12.9 / 10.7 / 12.1 | -0.4 / -2.0 / -6.8 |
+| highest column where the cell's is above both neighbours' along a line, else mean | +1.7 / +1.4 / +3.6 | 12.9 / 17.9 / 26.2 | +4.8 / +5.4 / +5.3 | 19.3 / 17.9 / 20.1 | 0 / 0 / 0 |
+| highest column once the cell's own slope is taken out | +2.2 / +1.0 / +2.0 | 12.9 / 14.3 / 16.1 | +0.9 / +0.8 / +1.0 | 12.9 / 10.7 / 12.1 | -0.2 / -0.4 / -2.8 |
+| the same, with summits kept | +0.6 / +1.9 / +2.2 | 12.9 / 14.3 / 16.1 | -0.1 / +2.0 / +1.7 | 12.9 / 14.3 / 14.1 | 0 / 0 / 0 |
+| **mean, a half to even, with summits kept (chosen)** | **0.0 / +0.1 / +0.1** | 12.9 / 14.3 / 14.1 | **-0.9 / -0.8 / -0.8** | 12.9 / 10.7 / 14.1 | **0 / 0 / 0** |
+
+The chosen rule on the other kinds of ground, surface mean then outline
+mean: cliffs 0.0 / +0.1 / +0.2 and -1.0 / -1.0 / -0.7 (the highest column:
++7.8 / +8.7 / +9.8 and +5.8 / +6.2 / +6.5); gentle slopes 0.0 / +0.1 / 0.0
+and +0.1 / +0.2 / +0.2 (+2.9 / +3.3 / +3.6 and +3.5 / +3.7 / +4.0); rolling
+hills 0.0 / 0.0 / +0.1 and +0.2 / +0.1 / 0.0 (+1.1 / +1.2 / +1.3 and +0.8 /
++0.9 / +0.8).
+
+What the table says:
+
+- **The systematic part is what a rule decides.** With the highest column a
+  slope sank 7.5 to 9 pixels at every edge, its outline 5.5. With the
+  chosen rule the surface does not move in the mean (at most 0.2 pixel on
+  any kind of ground) and the outline by under a pixel, the other way.
+- **The mean alone gives up the peaks**: six blocks at level 3, growing
+  back edge by edge. Keeping the summit costs nothing on the surface and
+  halves the outline's mean (-1.6 / -1.7 / -2.3 to -0.9 / -0.8 / -0.8).
+- **Deciding "ridge or slope" cell by cell does not work.** The rule that
+  takes the highest column wherever a cell stands above both neighbours
+  along some line keeps every peak and leaves the outline as swollen as
+  the max did: on a slope the height field's own roughness makes a cell a
+  crest along the contour as often as not.
+- **No rule gets the 95th percentile near 2 pixels.** It is 13 to 14 pixels
+  at every edge on steep ground whatever the rule (19 to 26 with the
+  highest column), 6 to 7 on a gentle slope, and on the rolling hills one
+  block, which at 160 blocks is 6.4 pixels by itself. That is the size of
+  a cell: a flat top a cell wide stands off a slope by a quarter of its
+  width times the slope, and cells are sized in pixels (a level-1 cell at
+  160 blocks is 13 pixels wide, a level-3 cell at 512 is 16). **What is
+  left is detail arriving all at once, and only a blend between levels
+  over distance can spread it**; that is a later block, not this one.
+- **How each nests.** The highest column nests exactly and upward: a parent
+  is never below a child, so every swap is a drop. The mean nests in the
+  mean: a parent is the mean of its children up to rounding, so a swap has
+  no direction and about 33 / 39 / 45% of a steep slope's columns stand
+  above the coarser cell that covered them. A summit nests exactly.
+
+The four mountain images say the same (`mountain_level_0..3.png`; the
+outline is the first land pixel of each image column, against level 0's
+from the same eye): the level's outline stands +0.1 / +0.2 / +0.6 pixel
+from level 0's in the mean at levels 1 / 2 / 3, where the highest column
+stood +1.6 / +4.5 / +8.3 and main -0.9 / -1.2 / -2.2. The mean *distance* is
+1.0 / 2.4 / 5.3 pixels (the highest column 1.6 / 4.6 / 10.1, main 1.3 / 2.7 /
+5.4): the direction is gone, the size of a cell is not.
 
 **After** (same forty footprints, the surface term, pooled over ten
 footprints a kind with the worst single footprint in brackets; §9.2's
@@ -634,156 +804,180 @@ footprints a kind with the worst single footprint in brackets; §9.2's
 
 | steep mountain | L1 | L2 | L3 |
 |---|---|---|---|
-| stone share of side faces (level 0: 0.1%) | 0.1% (was 6.6) | 0.1% (30.3) | 0.0% (39.8) |
-| T3, tops (+Y), /255 | 1.02 (1.41), was 6.9 (7.9) | 0.12 (0.89), was 11.3 (12.6) | 1.26 (3.40), was 14.1 (15.1) |
-| T3, worst side direction, /255 | 0.93 (1.29), was 2.0 (4.3) | 0.85 (1.42), was 8.1 (13.9) | 1.21 (2.25), was 10.4 (15.7) |
-| peak, blocks | 0.0 (was -1.1) | 0.0 (-3.0) | 0.0 (-6.1) |
-| skyline, mean, blocks | +0.6 (was -0.9) | +1.7 (-2.0) | +3.6 (-3.8) |
-| mean column, drawn - level 0, blocks | +1.2 | +3.5 | +7.8 |
+| stone share of side faces (level 0: 0.1%) | 0.1% (was 6.6) | 0.1% (30.3) | 0.1% (39.8) |
+| T3, tops (+Y), /255 | 1.09 (1.50), was 6.9 (7.9) | 0.33 (0.86), was 11.3 (12.6) | 0.68 (2.88), was 14.1 (15.1) |
+| T3, worst side direction, /255 | 0.85 (1.14), was 2.0 (4.3) | 0.74 (1.18), was 8.1 (13.9) | 1.08 (2.21), was 10.4 (15.7) |
+| mean column, drawn - level 0, blocks | +0.01 | +0.02 | +0.07 |
+| summit, blocks | 0 | 0 | 0 |
 
 | | L1 | L2 | L3 |
 |---|---|---|---|
-| stone share of sides, cliffs (level 0: 0.7%) | 0.5% (was 11.2) | 0.6% (37.7) | 0.6% (47.1) |
+| stone share of sides, cliffs (level 0: 0.7%, 0.6%, 0.6%) | 0.9% (was 11.2) | 0.8% (37.7) | 0.8% (47.1) |
 | stone share of sides, gentle slope (level 0: 0.0%) | 0.0% (0.0) | 0.0% (4.0) | 0.0% (9.5) |
-| T3 tops, gentle slope | 0.37 (1.13), was 2.5 (4.5) | 0.85 (1.93), was 5.3 (8.2) | 0.49 (3.19), was 8.0 (10.7) |
-| T3 tops, rolling hills | 0.11 (0.31), was 0.26 (0.4) | 0.46 (0.62), was 1.2 (1.5) | 0.99 (1.55), was 3.6 (4.0) |
+| soil share of sides, steep (level 0: 33.5%, 33.2%, 32.2%) | 30.2% | 32.5% | 26.6% |
+| T3 tops, gentle slope | 0.31 (0.88), was 2.5 (4.5) | 0.86 (1.66), was 5.3 (8.2) | 1.05 (2.30), was 8.0 (10.7) |
+| T3 tops, rolling hills | 0.08 (0.14), was 0.26 (0.4) | 0.40 (0.56), was 1.2 (1.5) | 0.96 (1.36), was 3.6 (4.0) |
 
-Soil is the other half of "made of the same": on steep ground a third of
-level 0's side faces are soil (33%), and the levels show 28%, 28% and 25%
-(asserted within 6, 6 and 8 points; the first version of the rule showed 1
-to 19%). Riser *area* is 0.96 to 0.99 of level 0's at level 1, 0.87 to 0.95
-at level 2 and 0.71 to 0.88 at level 3 on slopes: bumps inside a cell have
-no riser. It is reported and not bounded (§9.1 item 3).
+(§9.2's "peak" and "skyline" rows are not repeated: a footprint cut out of
+a slope has its highest column at its cut edge, with higher ground beyond,
+so those rows read -0.6 / -1.4 / -3.6 and -0.5 / -1.5 / -3.6 blocks for a
+rule that is at level 0's height wherever there is a summit. The study's
+outline, taken on real crests in a wider window, is -0.1 / -0.3 / -0.7
+blocks against level 0 on steep ground; the highest column's was +0.8 /
++2.4 / +5.1.)
+
+Riser *area* is 0.96 to 1.00 of level 0's at level 1, 0.86 to 0.93 at level
+2 and 0.67 to 0.81 at level 3 on the surface term, which understates it
+(§9.2): bumps inside a cell have no riser. It is reported and not bounded
+(§9.1 item 3).
 
 **#423 decision 3's 2/255 holds at levels 1 and 2, in every direction of
 every single footprint, and not at level 3.** Worst footprint and direction
-measured, tops then sides: level 1 1.44 and 1.29; level 2 1.93 and 1.53;
-level 3 **3.40** (nine of forty footprints are over 2.0) and **2.25** (two
-of 63 ranked directions). The harness asserts 2.0 and 2.0, 2.0 and 2.0, 3.5
-and 2.5 (`T3_ALLOWED`; level 3's are chosen, just over the measured worst).
-What is left at level 3, in order (`top_shade_by_riser_report` takes the
-first apart):
+measured, tops then sides: level 1 1.50 and 1.51; level 2 1.66 and 1.62;
+level 3 **2.88** (nine of forty footprints are over 2.0) and **3.18** (two
+of 63 ranked directions: 3.18 and 2.21). The harness asserts 2.0 and 2.0,
+2.0 and 2.0, 3.0 and 3.25 (`T3_ALLOWED`; level 3's are chosen, just over
+the measured worst). The stone share of the sides is within 1.15 points of
+level 0's in every footprint (asserted at 1.25), the soil share within 3.7,
+0.7 and 5.6 points per kind (asserted at 4.5, 2 and 6.5). What is left at
+level 3, in order (`top_shade_by_riser_report` takes the first apart):
 
 1. **A coarse top knows the risers beside it and nothing of the steps
    inside it.** Its shade is cast by its neighbours' heights; level 0's, by
-   every step among the 64 columns under it. A cell with no riser beside it
-   keeps 0.96 to 0.99 of its light where its blocks keep 0.80 to 0.94, and
-   one under a riser as tall as the cell is wide keeps 0.77 where they keep
-   0.79 to 0.83: a footprint is off by whichever it has more of (the worst
-   one too light, the next too dark).
+   every step among the 64 columns under it. A footprint is off by
+   whichever it has more of.
    **The lever:** shade a coarse top by level 0's openness over its own
    columns -- `ground_faces(..).top_open`, the number the far terrain is to
    use (§9.3) -- carried per column the way the exact tops are. Not built.
-2. **A cell below the top one is one material over four rows**, where level
-   0 changes layer row by row: 1.3 to 2.1/255 of the worst side directions
-   is material alone.
-3. **Pits.** A coarse cell is cave where most of it is (§9.1 item 7), so
-   level 3 opens a pit under ground that level 0 leaves whole: up to 267 of
-   a footprint's 3,700 columns (39 at level 2, 10 at level 1), bounded by
-   `a_coarse_level_keeps_level_0s_shape`.
-4. **Level 0's own chunk-edge AO blindness** (§9.3), which is about 2/255 on
-   steep tops by itself and is in the reference every level is held to.
+2. **A cell is one material over four rows**, and the one that holds the
+   top is the surface block over as many of them as are drawn, where level
+   0 shows one row of it and soil under it: that is the soil level 3 is
+   short of, and a direction with a few dozen faces is a sample of level
+   0's mix (the 3.18 is one cliff's +X, 2.45 of it the materials alone).
+   **The lever:** let the cut-off row wear the surface block and the rest
+   of its cell what the hash picks. Not built.
+3. **Level 0's own chunk-edge AO blindness** (§9.3, #430), which is about
+   2/255 on steep tops by itself and is in the reference every level is
+   held to.
 
-**The shape, and what the max costs.** Peaks keep their height exactly at
-every level (asserted; one gentle footprint's peak stands over a level-3
-pit, a block down). The ground is never lower in the bulk. Slopes swell, as
-§9.3's table said they would: the worst footprint's mean column stands
-+1.77, +5.30 and +12.01 blocks above level 0 at levels 1, 2 and 3, and its
-skyline 1.08, 3.23 and 7.27 blocks off (both on cliffs; asserted at 2.0,
-5.5, 12.5 and 1.25, 3.5, 7.5). That a distant mountain is slightly fuller,
-rather than lower and stonier, is the owner's to judge from
-`crates/render/tests/golden/mountain_level_0..3.png` against
-`docs/images/423/mountain_level_0..3_before.png`.
+(Pits were item 3 of this list: up to 267 columns of a footprint at level
+3. There are none left on the surface term at any level, and
+`a_coarse_level_keeps_level_0s_shape` holds it at none.)
+
+**The shape, asserted** (`a_coarse_level_keeps_level_0s_shape`, every
+footprint): the mean column stands within 0.1, 0.1 and 0.3 blocks of level
+0 at levels 1, 2 and 3 (measured: 0.03, 0.06 and 0.26, the last on cliffs,
+where a summit cell at a cliff's edge stands over its foot); where a
+footprint's highest column is a summit every level's highest top is level
+0's, exactly; the skyline's mean distance is within 1.5, 3.5 and 7.5 blocks
+(measured 1.31, 3.26, 7.18, on cliffs); no column is drawn under its own
+cell's top. `coarse_caves_nest` holds the cave rule itself: in every
+footprint every block a level draws as cave is air at the next finer level,
+down to the world's own blocks (475,297 / 145,592 / 100,112 / 29,632 blocks
+drawn as cave at levels 0 to 3).
 
 **What level 0 itself changed by.** A level-0 node leaves out a border face
 only where every neighbour it could have draws solid there, the level-1
-cell beside it included (`border_samples`). That cell is now solid up to
-the highest of its four columns, where it was solid up to their mean, so a
-few more border faces are left out. In the game the level-1 cell stands
-there. In a scene drawn at level 0 alone it shows at the outer edge of what
-is drawn: strips of wall at the edge that were kept are gone. That is all
-of what moved in the four HUD goldens and in `mountain_level_0` (with
-`cell_surface_height` alone put back on the mean, they render the same
-pixels as before).
+cell beside it included (`border_samples`). What that cell draws changed
+twice over: its top is the mean of all four columns with a half to the even
+block, where main took the mean rounded down, and it is cave only where all
+four of its blocks are, where main asked one of them. In the game the
+level-1 cell stands there. In a scene drawn at level 0 alone it shows at the
+outer edge of what is drawn, as strips of wall one block tall that are kept
+or left out. That is all of what moved in the level-0 scenes among the
+golden images (`hearts`, `crosshair`, `hotbar`, `item_icons`, `cave_mouth`
+and `mountain_level_0`), 0.3 to 0.45% of their pixels.
 
 **Triangles** (`geometry_census`: meshed triangles per level in the game's
 own selection around each gate eye -- radius 64, squash 2 -- deterministic;
-resident, not what a frame draws):
+every node of the selection, not what a frame draws):
 
-| ground eye (8, 40, 8) | main | no cut (rows of four) | **cut, as built** | cut, foot row apart |
-|---|---|---|---|---|
-| level 0 | 390,624 | 387,756 | 387,756 | 387,756 |
-| level 1 | 270,072 | 268,740 | 265,902 | 269,614 |
-| level 2 | 332,042 | 327,454 | 306,506 | 323,098 |
-| level 3 | 325,368 | 323,584 (-0.5%) | **541,754 (+66.5%)** | 619,834 (+90.5%) |
-| all | 1,318,106 | 1,307,534 (-0.8%) | **1,501,918 (+13.9%)** | 1,600,302 (+21.4%) |
+| ground eye (8, 40, 8) | main | the first version (highest column) | **as built** |
+|---|---|---|---|
+| level 0 | 390,624 | 387,756 | 387,742 |
+| level 1 | 270,072 | 265,902 | 259,124 |
+| level 2 | 332,042 | 306,506 | 287,264 |
+| level 3 | 325,368 | 541,754 (+66.5%) | **448,390 (+37.8%)** |
+| all | 1,318,106 | 1,501,918 (+13.9%) | **1,382,520 (+4.9%)** |
 
-| hill eye (8, 300, 8) | main | no cut | **cut, as built** | cut, foot row apart |
-|---|---|---|---|---|
-| level 2 | 445,828 | 442,074 | 416,796 | 436,816 |
-| level 3 | 330,822 | 327,480 (-1.0%) | **547,056 (+65.4%)** | 626,892 (+89.5%) |
-| all | 776,650 | 769,554 (-0.9%) | **963,852 (+24.1%)** | 1,063,708 (+37.0%) |
+| hill eye (8, 300, 8) | main | the first version | **as built** |
+|---|---|---|---|
+| level 2 | 445,828 | 416,796 | 394,714 |
+| level 3 | 330,822 | 547,056 (+65.4%) | **449,276 (+35.8%)** |
+| all | 776,650 | 963,852 (+24.1%) | **843,990 (+8.7%)** |
 
-(The flight eye at 3,000 blocks has no voxel node in its selection. The
-two columns that were not built were counted at the commits where they
-existed; the top shade's corner rule, added after them, moves a level's
-count by under 0.1%.)
+(The flight eye at 3,000 blocks has no voxel node in its selection.)
 
-Level 3 grows by two thirds, and all of it is the cut: an exact top means
-two neighbouring 8-block cells differ by a block or three almost
-everywhere, so tops that merged into terraces of four no longer do and
-every cell edge has a riser. Flat ground costs nothing more.
+Level 3's rise is the cut: an exact top means two neighbouring 8-block
+cells differ by a block or three almost everywhere, so tops that merged
+into terraces of four no longer do and every cell edge has a riser. Flat
+ground costs nothing more. It is a sixth less than with the highest column;
+part of that is caves, of which fewer are drawn at a distance (7% of level
+3's triangles are underground where 15% were).
 
 **Decided by the lead, 2026-11-20: the cut, with a riser's foot row merged
-into its shade band** (the bold column). The requirement it rests on, as the
-lead put the owner's: approaching a mountain, it must not shift or change at
-all, and that must hold on a weak PC too, where an automatic quality setting
-chooses distance and detail. Rounding between levels is therefore not
-acceptable at any quality; exact heights make "no shift" true by
-construction, and what they cost is to be recovered elsewhere (per-PC
-quality, engine optimisations), not by rounding. What the count does to a
-frame is the gate benchmark's to say (rows in `BENCHMARKS.md`, taken by the
-lead on a quiet machine).
+into its shade band.** The requirement it rests on, as the lead put the
+owner's: approaching a mountain, it must not shift or change at all, and
+that must hold on a weak PC too, where an automatic quality setting chooses
+distance and detail. Rounding between levels is therefore not acceptable at
+any quality, and what exact heights cost is to be recovered elsewhere
+(per-PC quality, engine optimisations), not by rounding. The same
+requirement is what the height rule was then chosen by. What the count does
+to a frame is the gate benchmark's to say (rows in `BENCHMARKS.md`, taken by
+the lead on a quiet machine).
 
 **Generation and build cost** (`generation_cost_report`; microseconds per
 node, fastest of three passes, test profile with `cubara-world` optimised
-and the mesher not, on a shared machine -- good for the ratio and nothing
-finer):
+and the mesher and the link flood not, on a shared machine -- good for the
+ratio and nothing finer):
 
 | | L0 | L1 | L2 | L3 |
 |---|---|---|---|---|
-| generate, before | 373 | 285 | 675 | 398 |
-| generate, after | 377 | 328 | 999 | 1,583 |
-| | 1.0x | 1.2x | 1.5x | 4.0x |
-| build (generate, mesh, links, trees), before | 1,098 | 2,146 | 5,757 | 3,634 |
-| build, after | 1,100 | 2,512 | 7,333 | 12,908 |
-| | 1.0x | 1.2x | 1.3x | 3.6x |
+| generate, main | 373 | 285 | 675 | 398 |
+| generate, as built | 342 | 351 | 1,073 | 1,725 |
+| | 0.9x (the same code: this is the measurement's noise) | 1.2x | 1.6x | 4.3x |
+| build (generate, mesh, links, trees), main | 1,098 | 2,146 | 5,757 | 3,634 |
+| build, as built | 1,028 | 2,409 | 7,266 | 14,964 |
+| | 0.9x | 1.1x | 1.3x | 4.1x |
 
 A level-3 node asks 16,900 surface heights where it asked 1,024, counts
-level 0's faces for its cells near the surface (a cell at or under its
-columns' lowest neighbour shows none and is spared the count: 2,113 without
-that), and its mesh is swept, and its border sampled, on four times the
-rows. It is worker time, not frame time. The exact max is what makes peaks,
-the nesting of level 2 inside level 3 and the 8-block far join exact, and
-was accepted at 3.3 times (lead, 2026-11-16); **at 4.0 times for generation
-it is a known cost, to be judged against the flight benchmark's swap lag**
-(lead, 2026-11-20). **The levers:** cache a node column's height grid across
-its vertical stack of nodes -- an accelerator only, by §3 -- which roughly
-halves generation; and sample a level-3 border per stored row of four
-wherever the block is not in the row that holds the neighbour's top. Neither
-is built.
+level 0's faces for its cells near the surface, and its mesh is swept, its
+border sampled and its links flooded on four times the rows. It is worker
+time, not frame time. The first version was 4.0 and 3.6 times main; the
+summit test and the nested cave rule add 0.3 to generation, and flooding
+the links on the drawn lattice most of the rest of the build (2.6 ms of the
+15 in this unoptimised profile, where the stored rows took a quarter of
+that). **It is a known cost, to be judged against the flight benchmark's
+swap lag** (lead, 2026-11-20). **The levers:** cache a node column's height
+grid across its vertical stack of nodes -- an accelerator only, by §3 --
+which roughly halves generation; and sample a level-3 border per stored
+row of four wherever the block is not in the row that holds the
+neighbour's top. Neither is built.
 
 **The chunk arena.** Every resident node's mesh lives in one vertex and one
 index buffer of fixed capacity (`cubara_render`'s `ChunkArena`), and a node
 that does not fit is skipped: a hole. It held 4.0 million vertices, sized
-from the scene around the origin when the node tree landed (#111). Standing
-on a mountain the game's selection is larger than that **on main already**:
-4,233,148 vertices around chunk column (336, 213) of the default seed,
-steady state, before the nodes a swap keeps resident twice. With level 3's
-exact tops the same selection is 4,583,520. So PR 2 raises the arena to 8
-million vertices and 12 million indices (lead, 2026-11-20; 96 + 48 MB of
-buffers, from 48 + 24), and
-`streaming::tests::the_arena_holds_the_selection_around_a_mountain` holds
-the worst of three seeded mountains, times 1.25 for a swap (chosen, not
-derived), under it. A capacity derived from the selection, instead of a
+from the scene around the origin when the node tree landed (#111). PR 2
+raises it to 8 million vertices and 12 million indices (lead, 2026-11-20;
+96 + 48 MB of buffers, from 48 + 24). Two numbers stand behind that, and
+they are not the same thing:
+
+- **every node of the game's selection**, seen or not: 4,280,540 vertices
+  standing on a mountain (chunk column (336, 213) of the default seed), and
+  2,765,040 around the origin;
+- **what is resident**: the game meshes and uploads only the nodes its
+  visibility search reaches. On the ground at that column that is 2,474,840
+  (58%). The most found from any eye tried is **3,462,428**, nine chunks
+  above the same mountain, where nearly all of a smaller selection is in
+  sight (eleven eyes over three mountains and the origin).
+
+So what is shown is that 4.0 million had no margin left: 3.46 million
+resident before any swap is 87% of it, and over it with a quarter more for
+the nodes a swap keeps resident twice. **What is not shown is that main
+overflowed**: main's whole selection at that column is 4,233,148 vertices,
+which counts nodes it never uploads, and what main keeps resident there was
+not measured. `streaming::tests::the_arena_holds_the_selection_around_a_mountain`
+holds the first number -- above everything found resident -- at the three
+steepest of 64 seeded columns, times 1.25 for a swap (chosen, not derived),
+under the capacity. A capacity derived from the selection, instead of a
 constant held to it, is the lead's follow-up.
