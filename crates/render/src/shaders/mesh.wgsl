@@ -34,6 +34,15 @@ struct Frame {
     // The render anchor (issue #379): every position in this shader, `eye`
     // included, is relative to it; only the height haze wants it back.
     anchor: vec4<f32>,
+    // The distance morph (issue #380's study; CDLOD geomorphing,
+    // `cubara_world::morph`): per level, the band of the morph metric over
+    // which that level's vertices move to their parent's height -- (start,
+    // end) of levels 0 and 1 in [0], of 2 and 3 in [1]; a level that does
+    // not morph has a band no metric reaches -- and the eye each level's
+    // metric is measured from (the camera's but in a measurement), relative
+    // to the anchor. morph_eye[0].w is the metric's vertical squash.
+    morph_band: array<vec4<f32>, 2>,
+    morph_eye: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -165,14 +174,31 @@ fn vs_main(in: VsIn) -> VsOut {
     let u = f32((in.packed1 >> 15u) & 0xFFu);
     let v = f32((in.packed1 >> 23u) & 0xFFu);
 
-    // word 2: node_index:16 corner_u:1 corner_v:1 ao_width_log2:2 (12 spare)
+    // word 2: node_index:16 corner_u:1 corner_v:1 ao_width_log2:2
+    //         morph_level:2 morph_delta:10 (read below)
     let node_index = in.packed2 & 0xFFFFu;
     let corner = (in.packed2 >> 16u) & 3u;
     let ao_width_log2 = (in.packed2 >> 18u) & 3u;
 
     let local_pos = vec3<f32>(x, y, z);
     let node_origin = node_origins[node_index];
-    let on_grid = node_origin.xyz + local_pos * node_origin.w;
+    let on_lattice = node_origin.xyz + local_pos * node_origin.w;
+
+    // The distance morph (issue #380's study): word 2's bits 20-21 are the
+    // level whose band moves this vertex, bits 22-31 how far up it moves at
+    // full morph, signed, in quarter blocks (`Vertex::with_morph`) -- to its
+    // parent cell's height. The factor is `cubara_world::morph::morph_factor`
+    // of the selection's own distance (`morph_metric`), taken where the
+    // vertex was meshed, so every vertex at one place moves alike and no
+    // seam opens between the faces that share it.
+    let morph_level = (in.packed2 >> 20u) & 3u;
+    let morph_delta = f32(bitcast<i32>(in.packed2) >> 22u) * 0.25;
+    let band_pair = frame.morph_band[morph_level >> 1u];
+    let band = select(band_pair.xy, band_pair.zw, (morph_level & 1u) == 1u);
+    let morph_rel = on_lattice - frame.morph_eye[morph_level].xyz;
+    let morph_metric = max(length(morph_rel.xz), frame.morph_eye[0].w * abs(morph_rel.y));
+    let morph = clamp((morph_metric - band.x) / max(band.y - band.x, 1e-6), 0.0, 1.0);
+    let on_grid = on_lattice + vec3<f32>(0.0, morph_delta * morph, 0.0);
     // Seal the cracks a greedy mesh's T-junctions leave: where a long quad's
     // edge passes a corner of the shorter quads beside it, the corner lands a
     // rounding error off the projected edge, and now and then a pixel centre

@@ -27,7 +27,7 @@
 use crate::block::BlockId;
 use crate::mesh::Mesh;
 use crate::storage::ChunkStorage;
-use crate::voxel::{greedy_mesh, Chunk, MeshContext};
+use crate::voxel::{greedy_mesh_morph, Chunk, MeshContext, MorphColumns};
 
 /// A rectangular node lattice with independent per-axis cell counts and a
 /// fixed per-axis vertex-position scale (R1b). Never used for level 0, which
@@ -205,14 +205,30 @@ impl AnisoChunk {
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
+        self.build_mesh_morph(ctx, occluded, may_be_solid, None)
+    }
+
+    /// [`build_mesh_with_neighbours`](Self::build_mesh_with_neighbours),
+    /// with the distance morph baked in where `morph` is given (issue #380's
+    /// study, [`MorphColumns`]). Only a lattice drawn on block rows can
+    /// morph: `None` is used for any other.
+    pub fn build_mesh_morph(
+        &self,
+        ctx: &MeshContext,
+        occluded: impl Fn(i32, i32, i32) -> bool,
+        may_be_solid: impl Fn(i32, i32, i32) -> bool,
+        morph: Option<&MorphColumns>,
+    ) -> Mesh {
         let dims = self.mesh_dims().map(|n| n as i32);
-        greedy_mesh(
+        let scale = self.mesh_scale();
+        greedy_mesh_morph(
             dims,
-            self.mesh_scale(),
+            scale,
             |x, y, z| self.block_at(x, y, z),
             occluded,
             may_be_solid,
             ctx,
+            morph.filter(|_| scale[1] == 1),
         )
     }
 
@@ -301,9 +317,22 @@ impl NodeChunk {
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
+        self.build_mesh_morph(ctx, occluded, may_be_solid, None)
+    }
+
+    /// [`build_mesh_with_neighbours`](Self::build_mesh_with_neighbours),
+    /// with the distance morph baked in where `morph` is given (issue #380's
+    /// study, [`MorphColumns`]).
+    pub fn build_mesh_morph(
+        &self,
+        ctx: &MeshContext,
+        occluded: impl Fn(i32, i32, i32) -> bool,
+        may_be_solid: impl Fn(i32, i32, i32) -> bool,
+        morph: Option<&MorphColumns>,
+    ) -> Mesh {
         match self {
-            NodeChunk::Uniform(c) => c.build_mesh_with_neighbours(ctx, occluded, may_be_solid),
-            NodeChunk::Aniso(a) => a.build_mesh_with_neighbours(ctx, occluded, may_be_solid),
+            NodeChunk::Uniform(c) => c.build_mesh_morph(ctx, occluded, may_be_solid, morph),
+            NodeChunk::Aniso(a) => a.build_mesh_morph(ctx, occluded, may_be_solid, morph),
         }
     }
 

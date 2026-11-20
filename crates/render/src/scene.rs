@@ -598,8 +598,12 @@ impl SceneRenderer {
         eye: glam::Vec3,
         anchor: Anchor,
         lighting: Lighting,
+        morph: Option<(crate::render::MorphParams, [glam::Vec3; 4])>,
     ) {
-        let uniform = FrameUniform::new(view_proj, eye, anchor, lighting);
+        let mut uniform = FrameUniform::new(view_proj, eye, anchor, lighting);
+        if let Some((params, eyes)) = morph {
+            uniform = uniform.with_morph(&params, eyes);
+        }
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         self.set_lighting(device, lighting);
     }

@@ -126,7 +126,20 @@ pub fn build_mesh_bounded_occluded_node(
     occluded: impl Fn(i32, i32, i32) -> bool,
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
 ) -> Option<(Mesh, Aabb)> {
-    let mesh = chunk.build_mesh_with_neighbours(ctx, occluded, may_be_solid);
+    build_mesh_bounded_occluded_node_morph(chunk, ctx, occluded, may_be_solid, None)
+}
+
+/// [`build_mesh_bounded_occluded_node`] with the distance morph baked in
+/// where `morph` is given (issue #380's study): the bounds then hold every
+/// vertex both where it is built and where the morph can take it.
+pub fn build_mesh_bounded_occluded_node_morph(
+    chunk: &NodeChunk,
+    ctx: &MeshContext,
+    occluded: impl Fn(i32, i32, i32) -> bool,
+    may_be_solid: impl Fn(i32, i32, i32) -> bool,
+    morph: Option<&crate::voxel::MorphColumns>,
+) -> Option<(Mesh, Aabb)> {
+    let mesh = chunk.build_mesh_morph(ctx, occluded, may_be_solid, morph);
     if mesh.indices.is_empty() {
         return None;
     }
@@ -145,8 +158,11 @@ fn mesh_aabb(mesh: &Mesh, scale: Vec3) -> Aabb {
     let mut max = Vec3::splat(f32::MIN);
     for v in &mesh.vertices {
         let p = Vec3::new(v.x() as f32, v.y() as f32, v.z() as f32);
-        min = min.min(p);
-        max = max.max(p);
+        // Where the distance morph can take it, too (issue #380's study): a
+        // box that left that out could be culled while what it draws shows.
+        let moved = p + Vec3::new(0.0, v.morph_delta() / scale.y, 0.0);
+        min = min.min(p).min(moved);
+        max = max.max(p).max(moved);
     }
     Aabb::new(min * scale, max * scale)
 }

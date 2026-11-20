@@ -48,7 +48,7 @@ pub use profiling::Profiler;
 pub use render::{
     camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
     load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose, CameraUniform,
-    FrameUniform, Lighting, Presented, RebaseReport, Renderer,
+    FrameUniform, Lighting, MorphParams, Presented, RebaseReport, Renderer,
 };
 pub use scene::HealthView;
 pub use scene::{

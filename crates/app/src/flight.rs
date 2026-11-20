@@ -1176,6 +1176,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     use crate::game::{load_item_registry, load_recipe_book, Game};
     let mut game = Game::new();
     let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
+    renderer.set_morph(crate::streaming::morph_params());
     let layers = assets.layers;
     let registry = Arc::new(assets.registry);
     let items = load_item_registry();
@@ -1284,6 +1285,7 @@ impl Streamed {
         if !sky {
             renderer.set_clear_color(NOTHING);
         }
+        renderer.set_morph(crate::streaming::morph_params());
         let layers = assets.layers;
         let registry = Arc::new(assets.registry);
         let nodes = NodeStreaming::new(

@@ -35,6 +35,25 @@ use cubara_world::World;
 /// the bottom of a shaft you look into turns to solid rock. `2` keeps 80.
 pub(crate) const VERTICAL_LOD_SQUASH: i32 = 2;
 
+/// The distance morph's bands for the game's ring schedule and squash
+/// (issue #380's study; `cubara_world::morph`): what the renderer moves
+/// each level's vertices to their parent's height over.
+pub(crate) fn morph_params() -> cubara_render::MorphParams {
+    morph_params_for(node::DEFAULT_RING_SCHEDULE, VERTICAL_LOD_SQUASH)
+}
+
+/// [`morph_params`] for any ring schedule.
+pub(crate) fn morph_params_for(
+    schedule: &node::RingSchedule,
+    squash: i32,
+) -> cubara_render::MorphParams {
+    cubara_render::MorphParams {
+        bands: cubara_world::morph::morph_bands(schedule, squash)
+            .map(|band| band.map(|b| (b.start, b.end))),
+        squash: squash as f32,
+    }
+}
+
 /// How far the voxel nodes reach, in chunks: the outer edge of
 /// [`node::DEFAULT_RING_SCHEDULE`]'s last (coarsest) ring. Beyond it the far
 /// terrain takes over (`crate::far_streaming`).
