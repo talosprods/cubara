@@ -273,6 +273,22 @@ pub fn render_with_far(
     far_params: Option<crate::far::FarParams>,
     shot: Shot,
 ) -> Option<Frame> {
+    render_with_far_cleared(meshed, far, far_params, shot, None)
+}
+
+/// [`render_with_far`], clearing the frame to `clear` instead of the sky.
+/// **Measurement only** ([`crate::SceneRenderer::set_clear_color`]): a colour
+/// the land never takes shows exactly where nothing was drawn, which the
+/// consistency probe (`crates/app/src/consistency_probe.rs`) reads as "sky"
+/// per pixel. A function rather than a [`Shot`] field because `Shot` is built
+/// as a struct literal in every golden test.
+pub fn render_with_far_cleared(
+    meshed: impl IntoIterator<Item = MeshedNode>,
+    far: &[crate::far::FarPatch<'_>],
+    far_params: Option<crate::far::FarParams>,
+    shot: Shot,
+    clear: Option<wgpu::Color>,
+) -> Option<Frame> {
     // Collected rather than left as the iterator `ChunkArena::from_meshed`
     // wants: trees (issue #332, R2) are a *second* GPU-side arena
     // (`TreeArena`), built from the same nodes before they are moved into
@@ -282,6 +298,7 @@ pub fn render_with_far(
     let tree_data: Vec<NodeTrees> = nodes.iter().map(NodeTrees::of).collect();
     render_arena(
         shot,
+        clear,
         (far, far_params),
         tree_data,
         |device, queue, multi_draw, anchor, _ctx| {
@@ -299,6 +316,7 @@ pub fn render_with_far(
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
     render_arena(
         shot,
+        None,
         (&[], None),
         Vec::new(),
         |device, queue, multi_draw, anchor, ctx| {
@@ -364,6 +382,7 @@ impl NodeTrees {
 /// `cubara_world::mesh::BuiltNode`s to have carried any.
 fn render_arena(
     shot: Shot,
+    clear: Option<wgpu::Color>,
     (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
     tree_data: Vec<NodeTrees>,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, Anchor, &MeshContext) -> ChunkArena,
@@ -497,6 +516,9 @@ fn render_arena(
     // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
     // see it either).
     scene.set_camera(&device, &queue, vp, eye_rel, anchor, lighting);
+    if let Some(color) = clear {
+        scene.set_clear_color(color);
+    }
     // A one-shot capture (headless render/golden/`--screenshot`): the mesh
     // pipeline must match `lighting` in this exact frame, not a frame or two
     // later once a background rebuild lands.

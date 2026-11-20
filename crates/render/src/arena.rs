@@ -59,6 +59,10 @@ pub(crate) const VERTEX_CAPACITY: u32 = 4_000_000;
 /// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
 /// 6,000,000 is ~2.4× headroom, unchanged from #89.
 const INDEX_CAPACITY: u32 = 6_000_000;
+/// The arena's capacity as `(vertices, indices, nodes)`: what a one-shot
+/// caller (the consistency probe) checks its scene against, because a
+/// scene over it drops nodes silently (issue #89) and reads as a hole.
+pub const CAPACITY: (u32, u32, u32) = (VERTEX_CAPACITY, INDEX_CAPACITY, MAX_NODES);
 /// Max nodes the indirect-args buffer can hold (upper bound on *visible*
 /// nodes in one frame). Node-based streaming (§6.1) is what finally lets
 /// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585

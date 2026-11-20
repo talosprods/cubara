@@ -32,7 +32,7 @@ pub const FLY_SPEED: f32 = 24.0;
 /// What frames clear to while measuring: magenta, a colour the land never
 /// takes (the fog fades it into the sky's own colour), so a pixel showing it
 /// is a pixel nothing was drawn on.
-const NOTHING: wgpu::Color = wgpu::Color {
+pub(crate) const NOTHING: wgpu::Color = wgpu::Color {
     r: 1.0,
     g: 0.0,
     b: 1.0,
@@ -40,7 +40,7 @@ const NOTHING: wgpu::Color = wgpu::Color {
 };
 
 /// Whether an RGBA pixel shows [`NOTHING`].
-fn shows_nothing(p: &[u8]) -> bool {
+pub(crate) fn shows_nothing(p: &[u8]) -> bool {
     p[0] >= 250 && p[1] <= 5 && p[2] >= 250
 }
 
@@ -468,11 +468,10 @@ const PEAK_SEARCH: i32 = 4096;
 /// far terrain, so the flight crosses the voxel rings' edges on the way in.
 const PEAK_APPROACH: f32 = 900.0;
 
-/// The owner's flight toward a mountain: the tallest surface within
-/// [`PEAK_SEARCH`] of spawn, approached level at its summit's height from
-/// [`PEAK_APPROACH`] away on the side facing spawn. Returns the start and the
-/// direction. Deterministic for a seed: a 32-block grid, ties to the first.
-pub fn toward_peak(gen: &cubara_world::WorldGen) -> ([f32; 3], [f32; 3]) {
+/// The tallest surface within [`PEAK_SEARCH`] of spawn, as `(height, x, z)`:
+/// a 32-block grid, ties to the first. One search for the flight and for the
+/// consistency probe's mountain (Rule 5).
+pub fn tallest_surface(gen: &cubara_world::WorldGen) -> (i32, i32, i32) {
     let mut best = (i32::MIN, 0, 0);
     for x in (-PEAK_SEARCH..=PEAK_SEARCH).step_by(32) {
         for z in (-PEAK_SEARCH..=PEAK_SEARCH).step_by(32) {
@@ -482,7 +481,15 @@ pub fn toward_peak(gen: &cubara_world::WorldGen) -> ([f32; 3], [f32; 3]) {
             }
         }
     }
-    let (h, px, pz) = best;
+    best
+}
+
+/// The owner's flight toward a mountain: the tallest surface within
+/// [`PEAK_SEARCH`] of spawn, approached level at its summit's height from
+/// [`PEAK_APPROACH`] away on the side facing spawn. Returns the start and the
+/// direction. Deterministic for a seed: a 32-block grid, ties to the first.
+pub fn toward_peak(gen: &cubara_world::WorldGen) -> ([f32; 3], [f32; 3]) {
+    let (h, px, pz) = tallest_surface(gen);
     let peak = glam::vec2(px as f32, pz as f32);
     let away = (-peak).normalize_or(glam::Vec2::X);
     let start = peak + away * PEAK_APPROACH;
