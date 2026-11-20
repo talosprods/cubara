@@ -772,3 +772,18 @@ its vertical stack of nodes -- an accelerator only, by §3 -- which roughly
 halves generation; and sample a level-3 border per stored row of four
 wherever the block is not in the row that holds the neighbour's top. Neither
 is built.
+
+**The chunk arena.** Every resident node's mesh lives in one vertex and one
+index buffer of fixed capacity (`cubara_render`'s `ChunkArena`), and a node
+that does not fit is skipped: a hole. It held 4.0 million vertices, sized
+from the scene around the origin when the node tree landed (#111). Standing
+on a mountain the game's selection is larger than that **on main already**:
+4,233,148 vertices around chunk column (336, 213) of the default seed,
+steady state, before the nodes a swap keeps resident twice. With level 3's
+exact tops the same selection is 4,583,520. So PR 2 raises the arena to 8
+million vertices and 12 million indices (lead, 2026-11-20; 96 + 48 MB of
+buffers, from 48 + 24), and
+`streaming::tests::the_arena_holds_the_selection_around_a_mountain` holds
+the worst of three seeded mountains, times 1.25 for a swap (chosen, not
+derived), under it. A capacity derived from the selection, instead of a
+constant held to it, is the lead's follow-up.

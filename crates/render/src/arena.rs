@@ -45,20 +45,32 @@ pub struct NodeId {
 }
 
 /// Vertex-arena capacity, in vertices (12 bytes/vertex, the packed format
-/// since #43 -- not the 28-byte figure an earlier version of this comment
-/// quoted, from before that landed). Re-derived (issue #38's tracking arc,
-/// sub-issue #111) against the real post-node-tree radius-64 peak: 1,659,216
-/// vertices used (`BENCHMARKS.md`, footnote 29), so 4,000,000 is ~2.4×
-/// headroom -- **unchanged from the #89-era value**, because that number was
-/// never really "sized for radius 12" in any binding sense, just generously
-/// picked early and left to absorb terrain growth since; measured against
-/// the real worst case for the first time here, it's still comfortably
-/// covered without needing to move.
-pub(crate) const VERTEX_CAPACITY: u32 = 4_000_000;
+/// since #43): what every resident node's mesh has to fit in together. Past
+/// it [`ChunkArena::insert`] skips the node -- a hole in the world -- so it
+/// is sized from the game's own selection where that is largest, not from
+/// the scene around the origin.
+///
+/// **Measured** (issue #423; `geometry_census` with the game's selection,
+/// radius 64 and squash 2, steady state): 3,003,836 vertices around the
+/// origin, and 4,583,520 standing on a mountain (chunk column (336, 213) of
+/// the default seed, the steepest of a seeded set). 8,000,000 is 1.7 times
+/// the mountain, which leaves room for the nodes that are resident twice
+/// while levels swap and for a mountain steeper than the ones measured.
+/// `streaming::tests::the_arena_holds_the_selection_around_a_mountain`
+/// (`cubara-app`) holds the worst of that seeded set, with a swap
+/// allowance, under this number.
+///
+/// It was 4,000,000 until then, "about 2.4 times" a radius-64 peak of
+/// 1,659,216 vertices measured for #111 around the origin. By issue #423
+/// the same selection was 2,636,212 around the origin and **4,233,148 on
+/// that mountain: over the arena in steady state**, before any swap, so
+/// nodes were being skipped there; coarse level 3's exact tops add another
+/// 350,000.
+pub(crate) const VERTEX_CAPACITY: u32 = 8_000_000;
 /// Index-arena capacity, in indices (4 bytes/index). Same story as
-/// `VERTEX_CAPACITY`: measured radius-64 peak is 2,488,824 indices used, so
-/// 6,000,000 is ~2.4× headroom, unchanged from #89.
-const INDEX_CAPACITY: u32 = 6_000_000;
+/// `VERTEX_CAPACITY`, and the same ratio: a mesh of quads has six indices
+/// to four vertices. 6,875,280 on the mountain; it was 6,000,000.
+const INDEX_CAPACITY: u32 = 12_000_000;
 /// Max nodes the indirect-args buffer can hold (upper bound on *visible*
 /// nodes in one frame). Node-based streaming (§6.1) is what finally lets
 /// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585
@@ -412,6 +424,12 @@ pub struct ChunkArena {
 }
 
 impl ChunkArena {
+    /// How many vertices every resident node's mesh may hold together, and
+    /// how many indices: readable without a device, so that what the game
+    /// selects can be held against them GPU-free.
+    pub const VERTEX_CAPACITY: u32 = VERTEX_CAPACITY;
+    pub const INDEX_CAPACITY: u32 = INDEX_CAPACITY;
+
     /// Create the arena and its GPU buffers. `multi_draw` selects the fast indirect
     /// path; when false, drawing falls back to a per-chunk `draw_indexed` loop over
     /// the same shared buffers. `anchor` is the render anchor the first
