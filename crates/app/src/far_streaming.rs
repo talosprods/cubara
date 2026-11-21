@@ -116,13 +116,16 @@ const RESELECT_BLOCKS: f64 = 1.0;
 ///
 /// Above 1 because the far terrain is blocks now (issue #422): a block
 /// surface costs about nine vertices a quad where the smooth one shared one
-/// among four, and the M3 shades the far terrain's vertices at about 0.4 ns
-/// each whatever the shader does (`docs/PHASE3_ARCHITECTURE.md` §9.8), so at
-/// 1 the gate is not met at any quality. **Chosen, not derived**: 2.5 is the
-/// first size measured to hold 1,000 FPS at Medium on the M3; the owner left
-/// the size to the engine ("as long as it is good", 2026-11-21), and the
-/// candidates' numbers are in §9.8.
-pub const FAR_QUAD_SCALE: f64 = 2.5;
+/// among four, and the M3 spends about 0.4 ns on each of them whatever the
+/// shader does. That cost follows the triangles: a mesh with fewer vertices
+/// but more triangles was slower (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1
+/// the gate is not met at any quality. **Chosen, not derived**: 3 is the
+/// smallest size measured on a quiet M3 to hold 1,000 FPS at Medium with room
+/// to spare (hill eye 1,121 / 1,130 FPS against main's 1,049 / 1,055; 2.5
+/// held by 3.5% and stood below main there, `BENCHMARKS.md` footnote 96). The
+/// owner left the size to the engine ("as long as it is good", 2026-11-21);
+/// the candidates' numbers are in §9.8.
+pub const FAR_QUAD_SCALE: f64 = 3.0;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
 /// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from
@@ -829,16 +832,21 @@ mod tests {
     /// The cache also holds everything generated around a second eye far
     /// away, as it would after the player moved: that is what the rule has
     /// to drop, and what it must not drop with it.
+    ///
+    /// At the quality's own sizes ([`SIM_QUAD_SCALE`]): at the game's wider
+    /// quads (3) no ancestor's split reaches this eye's selection, so keeping
+    /// less moves nothing and the test would test nothing (its last assert).
     #[test]
     fn keeping_the_ancestors_keeps_the_selection_still() {
         let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
         let view_at = |eye: [f64; 3]| FarView {
             radius: 20_000.0,
-            ..far_view(
+            ..far_view_scaled(
                 eye,
                 720,
                 Some(voxel_hole(eye.map(|v| v as f32))),
                 FarQuality::High,
+                SIM_QUAD_SCALE,
             )
             .unwrap()
         };

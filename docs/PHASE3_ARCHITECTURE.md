@@ -1469,7 +1469,7 @@ pointed 16 faces back costs next to nothing, 32 faces back half again).
 The owner left the size of a far quad to the engine (2026-11-21: "as long
 as it is good"). The constant multiplies every pixel size a quality names
 -- its quads, its error bound and its floor -- so Medium's quads of 16
-pixels are quads of 40 at 2.5; `--far-quad-scale F` overrides it for the
+pixels are quads of 48 at 3; `--far-quad-scale F` overrides it for the
 window, `--bench`, a flight and `--screenshot`, which is how the sizes below
 were measured. It is the only lever of the three found that both holds the
 gate and is watertight:
@@ -1477,15 +1477,28 @@ gate and is watertight:
 | scale | Medium, ground / hill FPS | High, ground / hill FPS | the gate | patches selected / in view (Medium, ground eye) | far triangles | far vertices issued | holes, low flight / toward the mountain |
 |---|--:|--:|---|--:|--:|--:|---|
 | x1 (the quality's own sizes; as first built) | 636 / 577 | | not met at any quality | | | 1.96 M | |
-| **x2.5 (the default)** | 1,080 / 1,035 | 988 / 944 | met at Medium | 163 / 56 | 244,604 | 591,064 | 0 of 1,195 / 0 of 1,798 |
-| x3 | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
+| x2.5 | 1,080 / 1,035 | 988 / 944 | met at Medium | 163 / 56 | 244,604 | 591,064 | 0 of 1,195 / 0 of 1,798 |
+| **x3 (the default)** | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
 | x3.5 | not run: the gate stops at High | 1,059 / 1,013 | met at High | 181 / 61 at High | 263,342 at High | 637,284 at High | 0 of 1,195 / 0 of 1,799 |
 
 (M3 on battery, the machine in use and other sessions running: **not
 quiet**, single runs, so the patch, triangle and vertex counts are exact and
 the frame rates are not `BENCHMARKS.md` rows. The flights fly High. At 2.5
-the hill eye holds the gate by 3.5%; the choice between 2.5 and 3 waits for
-a quiet bench.)
+the hill eye held the gate by 3.5% there.)
+
+**The quiet bench chose 3** (`BENCHMARKS.md` footnote 96: AC power, no
+agents, five quiet minutes, two runs of each, alternating; Medium, ground /
+hill FPS). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
+1,036 / 1,034 -- it holds, by 3.5% at the hill eye, and stands below main
+there. At 3: 1,153 / 1,161 and 1,121 / 1,130, 7% over main at the hill eye.
+Both fly with no hole and with 1 or 2 stale frames where main has 16.
+
+A shared-vertex mesh (`feat/422-far-mesh-cost`, not landed) issued fewer
+vertices at 1.5 than this mesh at 2.5 (488,357 against 595,612 at the hill
+eye, Medium) but twice the indices (1.88 million against 0.89), and measured
+860 / 860 FPS at the hill eye against 1,036 / 1,034 in the same quiet window:
+the far pass's cost follows the triangles it draws, not the vertices it
+shades. A finer far terrain needs fewer triangles.
 
 - **Shared corners** (four vertices a quad in one fixed index list, each
   face's colour carried flat from a corner of its own) were built on a
