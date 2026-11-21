@@ -135,19 +135,44 @@ pub const MORPH_DELTA_STEP: f32 = 0.25;
 /// scales its vertical crack seal by the morph factor, so unmorphed it stays
 /// flat and morphed it seals like any riser.
 const LATENT_BIT: u32 = 1 << 31;
+/// Word 3, the colour morph ([`Vertex::with_parent`]): the parent level's
+/// texture layer (as wide as the vertex's own), its openness in
+/// [`PARENT_OPEN_STEPS`] steps, and whether the vertex has a parent at all.
+const PARENT_LAYER_MASK: u32 = TEX_LAYER_MASK;
+const PARENT_OPEN_SHIFT: u32 = TEX_LAYER_BITS;
+const PARENT_OPEN_MASK: u32 = 0xFF;
+const HAS_PARENT_BIT: u32 = 1 << (PARENT_OPEN_SHIFT + 8);
+/// What a parent's openness is stored in: 255 steps of `0..=1`, so a
+/// stored openness is within 1/510 of the true one -- under a tenth of one
+/// /255 of colour at `mesh.wgsl`'s AO floor. Chosen, not derived.
+pub const PARENT_OPEN_STEPS: f32 = 255.0;
+
 /// The largest morph delta a vertex can carry, in blocks.
 pub const MAX_MORPH_DELTA: f32 = ((1i32 << (MORPH_DELTA_BITS - 1)) - 1) as f32 * MORPH_DELTA_STEP;
 
-/// A single mesh vertex, packed into 12 bytes: node-local lattice position,
+/// A single mesh vertex, packed into 16 bytes: node-local lattice position,
 /// baked ambient occlusion, texture-array layer, face direction, this
-/// vertex's own texel-tile coordinate, and the arena node it belongs to
+/// vertex's own texel-tile coordinate, the arena node it belongs to, and
+/// what the next coarser level shows where the distance morph takes it
 /// (`docs/PHASE1_ARCHITECTURE.md` §5.2/§5.3).
 ///
 /// ```text
 /// word 0:  x:10  y:10  z:10  ao:2
 /// word 1:  tex_layer:12  face:3  u:8  v:8  latent:1
 /// word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  morph_level:2  morph_delta:10
+/// word 3:  parent_layer:12  parent_open:8  has_parent:1  (11 spare)
 /// ```
+///
+/// Word 3 is the colour morph ([`Vertex::with_parent`]): the texture layer
+/// and the openness ([`Vertex::openness`]) the parent level draws at this
+/// vertex's fully morphed position. `mesh.wgsl` blends toward them by the
+/// same factor that moves the vertex, so at the end of its band a node shows
+/// its parent's colours as well as its parent's shape. It is a fourth word
+/// rather than bits found in the other three because none are left there,
+/// and because the fourth word measured free on the M3 (an A/B of a padded
+/// 16-byte vertex against the 12-byte one, `--bench gate`, two rounds each:
+/// ground 1,125 and 1,128 FPS against 1,130 and 1,125; hill 1,082 and 1,079
+/// against 1,089 and 1,082).
 ///
 /// `u`/`v` are *this vertex's* coordinate -- 0 or the greedy quad's extent,
 /// depending on which of the four corners it is -- not a value shared by the
@@ -171,6 +196,7 @@ pub struct Vertex {
     packed0: u32,
     packed1: u32,
     packed2: u32,
+    packed3: u32,
 }
 
 impl Vertex {
@@ -201,6 +227,7 @@ impl Vertex {
             packed0,
             packed1,
             packed2: 0,
+            packed3: 0,
         }
     }
 
@@ -316,6 +343,43 @@ impl Vertex {
         }
     }
 
+    /// How open this vertex is, `0..=1`: what `mesh.wgsl` lights it by,
+    /// `mix(ao_floor, 1, openness)`. Its baked AO ([`ao`](Self::ao), in
+    /// thirds) scaled toward open by its cell width
+    /// ([`ao_width_log2`](Self::ao_width_log2)): `1 - (1 - ao/3) / 2^width`,
+    /// which is `mesh.wgsl`'s `mix(ao_floor_scaled, 1, ao/3)` written without
+    /// the floor. The one place that number is written on the CPU.
+    pub fn openness(self) -> f32 {
+        let shade = 1.0 - self.ao() as f32 / 3.0;
+        1.0 - shade / (1u32 << self.ao_width_log2()) as f32
+    }
+
+    /// Returns a copy of this vertex carrying what the parent level draws
+    /// where the distance morph takes it (word 3): that face's texture
+    /// `layer` and its `openness` (`0..=1`, [`openness`](Self::openness)),
+    /// stored to [`PARENT_OPEN_STEPS`]. `mesh.wgsl` blends this vertex's
+    /// colour and light toward them by its morph factor.
+    pub fn with_parent(self, layer: u32, openness: f32) -> Self {
+        debug_assert!(layer <= PARENT_LAYER_MASK, "parent layer out of range");
+        let open = (openness.clamp(0.0, 1.0) * PARENT_OPEN_STEPS).round() as u32;
+        Self {
+            packed3: layer | (open << PARENT_OPEN_SHIFT) | HAS_PARENT_BIT,
+            ..self
+        }
+    }
+
+    /// What [`with_parent`](Self::with_parent) set: `(layer, openness)`,
+    /// the openness as stored; `None` for a vertex with no parent.
+    pub fn parent(self) -> Option<(u32, f32)> {
+        (self.packed3 & HAS_PARENT_BIT != 0).then(|| {
+            (
+                self.packed3 & PARENT_LAYER_MASK,
+                ((self.packed3 >> PARENT_OPEN_SHIFT) & PARENT_OPEN_MASK) as f32
+                    / PARENT_OPEN_STEPS,
+            )
+        })
+    }
+
     pub fn node_index(self) -> u32 {
         self.packed2 & NODE_INDEX_MASK
     }
@@ -405,8 +469,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vertex_is_twelve_bytes() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 12);
+    fn vertex_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<Vertex>(), 16);
     }
 
     /// The distance morph's bits (issue #380's study) round-trip -- a
