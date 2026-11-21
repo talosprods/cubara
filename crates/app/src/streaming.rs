@@ -1215,8 +1215,38 @@ mod tests {
         )
     }
 
-    /// Issue #332 decision 3: the real oak at levels 1-2, boxes from level 3
-    /// up -- the line `lod_probe.rs`'s M6 table's "instanced" column
+    /// **A node's trees reach the renderer with their own height, foot and
+    /// morph** (#433 item 2): the conversion the live path, `--bench` and
+    /// the transition study share. Distinct values in every field, so that
+    /// a field read from the wrong place (or a constant) is seen.
+    #[test]
+    fn a_trees_placement_carries_its_own_height_foot_and_morph() {
+        use cubara_world::mesh::NodeTree;
+        use cubara_world::TreeSite;
+        let tree = |x, z, base, height, morph| NodeTree {
+            site: TreeSite {
+                x,
+                z,
+                base,
+                height,
+                canopy_radius: 2,
+            },
+            morph,
+        };
+        let placed = tree_placements(&[tree(10, -20, 31, 4, -2), tree(-7, 3, 55, 6, 3)]);
+        assert_eq!(placed.len(), 2);
+        assert_eq!(
+            (placed[0].base, placed[0].height, placed[0].morph),
+            ([10, 31, -20], 4, -2)
+        );
+        assert_eq!(
+            (placed[1].base, placed[1].height, placed[1].morph),
+            ([-7, 55, 3], 6, 3)
+        );
+    }
+
+    /// Issue #332 decision 3 (#433: the silhouette): the real oak at levels
+    /// 1-2, its silhouette from level 3 up -- the line `lod_probe.rs`'s M6 table's "instanced" column
     /// describes in prose rather than asserting against directly.
     #[test]
     fn tree_model_for_splits_at_level_three() {
