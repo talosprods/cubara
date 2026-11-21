@@ -443,6 +443,7 @@ impl EdgeTally {
 }
 
 /// One run's results.
+#[derive(Default)]
 struct Run {
     tallies: [EdgeTally; 3],
     /// The worst frame's pair per edge: (frame, pixels changed, before, after).
@@ -789,7 +790,12 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
     };
     let dir = out_dir().join(name);
 
-    let swap = run(&mut scene, &mut viewer, schedule, false, [None; 3]);
+    // `CUBARA_STUDY_VARIANTS=morph` measures the morph alone (no swap run).
+    let swap = if std::env::var("CUBARA_STUDY_VARIANTS").is_ok_and(|v| v == "morph") {
+        Run::default()
+    } else {
+        run(&mut scene, &mut viewer, schedule, false, [None; 3])
+    };
     viewer.show(&mut scene, &BTreeSet::new());
     let focus = [0, 1, 2].map(|k| swap.kept[k].as_ref().map(|(i, _, _, _)| *i));
     let morph = run(&mut scene, &mut viewer, schedule, true, focus);

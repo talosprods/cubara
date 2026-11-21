@@ -1740,6 +1740,14 @@ pub fn mesh_pipeline_constants(
         ("viewport_width", width as f64),
         ("viewport_height", height as f64),
         ("aspect", width as f64 / height as f64),
+        // DBG (temporary, colour-LOD study).
+        (
+            "dbg_mode",
+            std::env::var("CUBARA_DBG_MODE")
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0.0),
+        ),
     ]
 }
 
