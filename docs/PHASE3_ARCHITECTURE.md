@@ -1459,13 +1459,13 @@ eye (M6, `lod_probe`) 247 level-3 trees are in view on average, so 27,200
 triangles (54,300 vertices) where the boxes were 5,900 (11,900), and at the
 hill eye 264 of them. Levels 1 and 2 draw 20 and 46 trees in view there,
 about 12,000 triangles, as before (the same oak, one model per height now:
-four draws where there was one). Six draws where there were two. CPU: one
+three draws where there was one). Six draws where there were two. CPU: one
 `MorphColumns` lookup per tree when a node is built (the columns were
-already worked out for the mesh); the instance stays 16 bytes. FPS, **not
-quiet** (the machine was in use, on battery, other agents running): no
-difference was measured that stands out from the run-to-run noise at the
-gate's ground eye, where the extra triangles are about 1% of the frame's;
-the gate and flight rows are the lead's, on a quiet machine.
+already worked out for the mesh); the instance stays 16 bytes. No FPS
+number is given here: the gate and flight rows are the lead's, on a quiet
+machine on AC power (`--bench gate` and `--bench flight`); the counts above
+are what they will show, and the direction to expect is a small cost at
+level 3.
 
 **Tests.** `a_tree_is_the_same_tree_at_every_distance` (the check over the
 48 trees, bounds in `trees.rs`'s `bounds`, each chosen) and
