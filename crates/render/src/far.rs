@@ -422,12 +422,18 @@ pub fn dense_patch(faces: &[FarFace]) -> Vec<u32> {
             };
             let w = cell_at(i, j);
             let byte = 3 * (face.dir as usize - 1);
-            for (n, value) in [face.mix[0], face.mix[1], face.open].into_iter().enumerate() {
+            for (n, value) in [face.mix[0], face.mix[1], face.open]
+                .into_iter()
+                .enumerate()
+            {
                 let at = w + 1 + (byte + n) / 4;
                 words[at] |= (value as u32) << (((byte + n) % 4) * 8);
             }
             if face.border {
-                let edge = EDGE_DIRS.iter().position(|&d| d == face.dir).expect("a wall");
+                let edge = EDGE_DIRS
+                    .iter()
+                    .position(|&d| d == face.dir)
+                    .expect("a wall");
                 let n = edge * FAR_QUADS + k;
                 // `rise + 1`: nothing is zero.
                 let drop = face.rise.min(FAR_MAX_RISE) + 1;
@@ -490,9 +496,17 @@ impl PatchVertex {
         let (edge, along, end) = (n / (2 * q), (n / 2) % q, n % 2);
         let (cell, at, corner) = match edge {
             0 => (along * q, [0, (along + end) as i32], (end << 1) as u8),
-            1 => (along * q + q - 1, [q as i32, (along + end) as i32], 1 | (end << 1) as u8),
+            1 => (
+                along * q + q - 1,
+                [q as i32, (along + end) as i32],
+                1 | (end << 1) as u8,
+            ),
             2 => (along, [(along + end) as i32, 0], end as u8),
-            _ => ((q - 1) * q + along, [(along + end) as i32, q as i32], 2 | end as u8),
+            _ => (
+                (q - 1) * q + along,
+                [(along + end) as i32, q as i32],
+                2 | end as u8,
+            ),
         };
         Self {
             at,
@@ -1365,7 +1379,8 @@ mod tests {
         let words = dense_patch(&faces);
         assert_eq!(words.len(), FAR_SLOT_WORDS);
         for f in &faces {
-            let cells = |i: usize, j: usize| (j * FAR_QUADS + i, (j * FAR_QUADS + i) * FAR_CELL_WORDS);
+            let cells =
+                |i: usize, j: usize| (j * FAR_QUADS + i, (j * FAR_QUADS + i) * FAR_CELL_WORDS);
             match f.dir {
                 FarDir::Top => {
                     let (cell, w) = cells(f.i0 as usize, f.j0 as usize);
@@ -1429,7 +1444,14 @@ mod tests {
         let positions: Vec<Vec3> = (0..FAR_PATCH_VERTICES)
             .map(|v| {
                 let pv = PatchVertex::of(v);
-                place(pv.at, pv.corner, pv.y(words, skirt), ([0.0, 0.0], quad, skirt), None, 0.0)
+                place(
+                    pv.at,
+                    pv.corner,
+                    pv.y(words, skirt),
+                    ([0.0, 0.0], quad, skirt),
+                    None,
+                    0.0,
+                )
             })
             .collect();
         let mut pieces = std::collections::BTreeMap::new();
@@ -1490,9 +1512,7 @@ mod tests {
             } else {
                 quad * height as f32
             };
-            *expected
-                .entry((dir, gx, gz, f.top, height))
-                .or_insert(0.0) += area;
+            *expected.entry((dir, gx, gz, f.top, height)).or_insert(0.0) += area;
         }
         let missing: Vec<_> = expected.keys().filter(|k| !drawn.contains_key(k)).collect();
         let extra: Vec<_> = drawn.keys().filter(|k| !expected.contains_key(k)).collect();
@@ -1511,7 +1531,11 @@ mod tests {
                 drawn[k]
             );
         }
-        assert!(expected.len() > 3000, "{} faces proves little", expected.len());
+        assert!(
+            expected.len() > 3000,
+            "{} faces proves little",
+            expected.len()
+        );
     }
 
     /// The owner a triangle's material is read from: the shader's rule
@@ -1543,7 +1567,14 @@ mod tests {
         let positions: Vec<Vec3> = (0..FAR_PATCH_VERTICES)
             .map(|v| {
                 let pv = PatchVertex::of(v);
-                place(pv.at, pv.corner, pv.y(&words, skirt), ([0.0, 0.0], quad, skirt), None, 0.0)
+                place(
+                    pv.at,
+                    pv.corner,
+                    pv.y(&words, skirt),
+                    ([0.0, 0.0], quad, skirt),
+                    None,
+                    0.0,
+                )
             })
             .collect();
         let mut checked = 0;
@@ -2014,7 +2045,13 @@ mod tests {
         // Ground well above the floor: what an eye inside the box has
         // raised out of sight, unless the old rule's height is asked for.
         let hidden = hidden.unwrap_or_else(|| hidden_height(hole.0, hole.1, eye, 20.0));
-        let p = placed_patch(&words, (origin, quad, skirt_depth - 0.0), hole, hidden, sink);
+        let p = placed_patch(
+            &words,
+            (origin, quad, skirt_depth - 0.0),
+            hole,
+            hidden,
+            sink,
+        );
         let strictly_inside =
             |p: Vec3| p.x > hole.0.x && p.x < hole.1.x && p.z > hole.0.z && p.z < hole.1.z;
         let mut seen = Vec::new();
@@ -2181,9 +2218,8 @@ mod tests {
         let patch = ([896.0, -128.0], 8.0, 40.0);
         let eye = Vec3::new(8.0, 120.0, 8.0);
         let hidden = hidden_height(hole.0, hole.1, eye, 20.0);
-        let corners = |i: i32, j: i32| {
-            [(i, j, 0u8), (i + 1, j, 1), (i, j + 1, 2), (i + 1, j + 1, 3)]
-        };
+        let corners =
+            |i: i32, j: i32| [(i, j, 0u8), (i + 1, j, 1), (i, j + 1, 2), (i + 1, j + 1, 3)];
         // Outside, against the side: untouched.
         for (i, j, k) in corners(16, 4) {
             assert_eq!(

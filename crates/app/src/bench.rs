@@ -77,7 +77,7 @@ const GPU_TIMER_DEPTH: usize = 1024;
 /// `schedule_for_radius`), so a larger radius shows how far render distance
 /// can grow without the draw/triangle cost exploding.
 /// Where the camera is, for [`run`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct View {
     /// A first-person camera at this eye position, turning slowly on the spot
     /// and looking a little down. `None` is the orbit above the whole region
@@ -92,6 +92,11 @@ pub struct View {
     /// game does (`docs/PROPOSAL_FAR_VIEW.md`). Only with an `eye`: the orbit
     /// frames the voxel region from outside, which no player's view does.
     pub far: Option<crate::far_streaming::FarQuality>,
+    /// The far terrain's quads, error bound and floor this many times as
+    /// wide on screen as `far`'s quality sets them (`--far-quad-scale`;
+    /// [`DEFAULT_QUAD_SCALE`](crate::far_streaming::DEFAULT_QUAD_SCALE) is the
+    /// game's).
+    pub far_quad_scale: f64,
 }
 
 /// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
@@ -396,8 +401,13 @@ pub fn run(
                 min: min.map(|c| (c * 16) as f64),
                 max: max.map(|c| (c * 16) as f64),
             };
-            let far_view =
-                crate::far_streaming::far_view(eye.map(|v| v as f64), height, Some(hole), quality);
+            let far_view = crate::far_streaming::far_view_scaled(
+                eye.map(|v| v as f64),
+                height,
+                Some(hole),
+                quality,
+                view.far_quad_scale,
+            );
             (Some(hole), far_view)
         }
         _ => (None, None),
@@ -830,6 +840,7 @@ pub fn try_qualities(
     overlay: bool,
     gpu_timing: GpuTimingMode,
     fog: bool,
+    far_quad_scale: f64,
 ) -> Vec<(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)> {
     let view_radius = crate::streaming::render_radius_chunks();
     let mut tries = Vec::new();
@@ -847,6 +858,7 @@ pub fn try_qualities(
                     eye: Some(gate_eye.eye),
                     squash: Some(crate::streaming::VERTICAL_LOD_SQUASH),
                     far: Some(quality),
+                    far_quad_scale,
                 };
                 (
                     *gate_eye,

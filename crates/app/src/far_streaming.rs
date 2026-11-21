@@ -97,6 +97,7 @@ const RESELECT_BLOCKS: f64 = 32.0;
 /// The view the far terrain is selected for at `quality`, scaled to a screen
 /// `screen_height` pixels tall, leaving `hole` to the voxels. `None` when the
 /// quality is `Off`.
+#[cfg(test)]
 pub fn far_view(
     eye: [f64; 3],
     screen_height: u32,
@@ -106,9 +107,22 @@ pub fn far_view(
     far_view_scaled(eye, screen_height, hole, quality, 1.0)
 }
 
+/// The far quad scale the game draws at: the quality's own quads, error bound
+/// and floor.
+pub const DEFAULT_QUAD_SCALE: f64 = 1.0;
+
+/// `--far-quad-scale F`: a factor for [`far_view_scaled`]'s `coarser`. Only a
+/// finite number from 0.5 to 8 -- a typo is refused, not measured as the
+/// scale that was asked for.
+pub fn parse_quad_scale(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && (0.5..=8.0).contains(f))
+}
+
 /// [`far_view`] with every pixel size of the quality -- its quads, its error
 /// bound and its floor -- `coarser` times as large. The game draws at 1;
-/// `far_census` asks what the others would cost.
+/// `--far-quad-scale` (and `far_census`) ask what the others would cost.
 pub fn far_view_scaled(
     eye: [f64; 3],
     screen_height: u32,
@@ -338,6 +352,9 @@ struct FarPlan {
     quality: FarQuality,
     /// [`FAR_VIEW_RADIUS`] in the game; tests use less.
     radius: f64,
+    /// The quality's pixel sizes times this ([`far_view_scaled`]):
+    /// [`DEFAULT_QUAD_SCALE`] unless `--far-quad-scale` says otherwise.
+    quad_scale: f64,
     /// Every patch generated and still of use: the ones drawn, and the ones
     /// whose error decides whether their area is split.
     heights: HashMap<PatchKey, PatchHeights>,
@@ -360,6 +377,7 @@ impl FarPlan {
         Self {
             quality,
             radius,
+            quad_scale: DEFAULT_QUAD_SCALE,
             heights: HashMap::new(),
             in_flight: HashSet::new(),
             selected_at: None,
@@ -432,7 +450,13 @@ impl FarPlan {
         self.arrived = false;
         let drawn = drawn();
 
-        let Some(view) = far_view(eye, screen_height, Some(hole), self.quality) else {
+        let Some(view) = far_view_scaled(
+            eye,
+            screen_height,
+            Some(hole),
+            self.quality,
+            self.quad_scale,
+        ) else {
             // Off: nothing beyond the voxels.
             let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
             leave.sort();
@@ -500,6 +524,14 @@ impl FarStreaming {
             materials: far_materials(),
             warned_full: false,
         }
+    }
+
+    /// Draw with the quality's quads, error bound and floor `scale` times as
+    /// wide on screen ([`far_view_scaled`]; `--far-quad-scale`). Before the
+    /// first frame: patches already drawn are not redrawn.
+    pub fn with_quad_scale(mut self, scale: f64) -> Self {
+        self.plan.quad_scale = scale;
+        self
     }
 
     /// The seed the far terrain is generated from.
@@ -814,9 +846,10 @@ mod tests {
     #[test]
     fn the_renderer_and_the_world_agree_on_the_patch_size() {
         assert_eq!(cubara_render::FAR_QUADS, far::PATCH_QUADS);
-        // A face travels in three words (`FarFace::pack`): every height the
-        // terrain can have, and the tallest step between two of them, must
-        // fit their fields, or a mountain is drawn clamped.
+        // A quad travels as a height of 18 bits and an edge wall's step in 14
+        // (`far::dense_patch`): every height the terrain can have, and the
+        // tallest step between two of them, must fit their fields, or a
+        // mountain is drawn clamped.
         let (lo, hi) = far::surface_bounds();
         assert!(cubara_render::FAR_TOP_RANGE.contains(&(lo.floor() as i32 - 1)));
         assert!(cubara_render::FAR_TOP_RANGE.contains(&(hi.ceil() as i32 + 1)));

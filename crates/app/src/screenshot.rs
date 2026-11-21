@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run --release -- --screenshot out.png`, or from a place:
 //! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]
-//! [--far-coarser F]`.
+//! [--far-quad-scale F]`.
 
 use cubara_render::materials::TextureLayers;
 use cubara_render::{headless, load_registry, Lighting, Shot};
@@ -32,7 +32,7 @@ pub struct View {
     /// wide on screen as this PC's quality sets them
     /// (`far_streaming::far_view_scaled`): 1 is the game's. For comparing
     /// what a coarser far terrain would look like (issue #422).
-    pub far_coarser: f64,
+    pub far_quad_scale: f64,
 }
 
 /// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_chunks()` (chunks; times 16 for blocks)
@@ -113,7 +113,7 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 v.size.1,
                 Some(hole),
                 quality,
-                v.far_coarser,
+                v.far_quad_scale,
             ) {
                 far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
             }

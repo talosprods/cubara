@@ -879,12 +879,7 @@ impl Renderer {
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect, anchor));
 
         let arena = ChunkArena::new(&device, multi_draw, anchor);
-        let far = crate::far::FarTerrain::new(
-            &device,
-            &queue,
-            FAR_PATCH_CAPACITY,
-            anchor,
-        );
+        let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY, anchor);
 
         // GPU work for F3, only where it was asked for (the game's window).
         let gpu_timing = wants_gpu_timing(
