@@ -1413,7 +1413,9 @@ mod tests {
                             // Grass, or the floor of a pit under one of its
                             // columns (`WorldGen::top_block`).
                             if block == blocks.grass
-                                || world.worldgen.a_pit_under_shows(x, z, step_h, block, blocks)
+                                || world
+                                    .worldgen
+                                    .a_pit_under_shows(x, z, step_h, block, blocks)
                             {
                                 tops_are_grass += 1;
                             }

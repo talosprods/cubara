@@ -190,7 +190,15 @@ pub fn mesh_node_with(
     let chunk = world.node_at(node, blocks)?;
     let parents = |parent| parent_faces(world, registry, layer_of, parent, blocks);
     let parents: &Parents = &parents;
-    mesh_chunk_with(world, registry, layer_of, node, blocks, &chunk, morph.then_some(parents))
+    mesh_chunk_with(
+        world,
+        registry,
+        layer_of,
+        node,
+        blocks,
+        &chunk,
+        morph.then_some(parents),
+    )
 }
 
 /// Mesh `node` from its already generated blocks.
@@ -625,14 +633,8 @@ impl MeshPool {
                                 Err(_) => break,
                             }
                         };
-                        let built = build_node_shared(
-                            &world,
-                            &registry,
-                            &*layer_of,
-                            node,
-                            blocks,
-                            &cache,
-                        );
+                        let built =
+                            build_node_shared(&world, &registry, &*layer_of, node, blocks, &cache);
                         if results.send((ticket, built)).is_err() {
                             break; // caller gone
                         }

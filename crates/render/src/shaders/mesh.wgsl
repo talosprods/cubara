@@ -252,6 +252,8 @@ fn vs_main(in: VsIn) -> VsOut {
     // morph. Its light and its colour blend toward them by the same factor
     // that moves it, so at the end of its band a node shows its parent's
     // colours as well as its parent's shape, and the swap changes neither.
+    // Bits as `Vertex::with_parent` packs them: layer 0-11, openness 12-19
+    // (in 255ths), has-parent 20.
     let has_parent = (in.packed3 & (1u << 20u)) != 0u;
     let parent_layer = select(tex_layer, in.packed3 & 0xFFFu, has_parent);
     let parent_open = f32((in.packed3 >> 12u) & 0xFFu) / 255.0;
@@ -259,8 +261,8 @@ fn vs_main(in: VsIn) -> VsOut {
     let lit_ao = mix(ao, mix(ao_floor, 1.0, parent_open), colour_morph);
     // The texture blends over the second half of the band only: its cost is
     // a second sample, and the first half is the near ground, most of the
-    // frame's pixels (BENCHMARKS / §9.6). The light needs no sample and
-    // blends over the whole band.
+    // frame's pixels (`docs/PHASE3_ARCHITECTURE.md` §9.6). The light needs
+    // no sample and blends over the whole band.
     let blend = select(0.0, clamp(2.0 * colour_morph - 1.0, 0.0, 1.0), parent_layer != tex_layer);
 
     var out: VsOut;

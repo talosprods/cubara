@@ -1461,5 +1461,3 @@ mod tests {
         let _ = std::fs::write(out_dir().join("report.md"), &report);
     }
 }
-
-

@@ -183,7 +183,10 @@ impl Morph {
             Morph::Static => y,
             Morph::Top { target, .. } => target,
             Morph::Riser {
-                s_top, t_bot, t_top, ..
+                s_top,
+                t_bot,
+                t_top,
+                ..
             } => (y + t_top - s_top).max(t_bot),
         }
     }
@@ -834,7 +837,13 @@ struct LatentRiser {
 /// blocks: lattice cell `(i, j)` of a slice along `d` on lattice plane
 /// `plane`, with the cell's rows at full morph `[y0, y1]` on a wall (a top's
 /// row is its plane). What [`ParentView::look_up`] is asked.
-fn cell_centre(d: usize, plane: i32, horizontal: i32, (y0, y1): (i32, i32), scale: [i32; 3]) -> [f32; 3] {
+fn cell_centre(
+    d: usize,
+    plane: i32,
+    horizontal: i32,
+    (y0, y1): (i32, i32),
+    scale: [i32; 3],
+) -> [f32; 3] {
     let mid = (y0 + y1) as f32 / 2.0;
     let h = (horizontal as f32 + 0.5) * scale[if d == 0 { 2 } else { 0 }] as f32;
     match d {
@@ -1681,9 +1690,9 @@ fn push_latent_riser(
                 [vx.x() as f32, t as f32, vx.z() as f32]
             })
             .collect();
-        let centre = corners
-            .iter()
-            .fold([0.0f32; 3], |a, c| [a[0] + c[0] / 4.0, a[1] + c[1] / 4.0, a[2] + c[2] / 4.0]);
+        let centre = corners.iter().fold([0.0f32; 3], |a, c| {
+            [a[0] + c[0] / 4.0, a[1] + c[1] / 4.0, a[2] + c[2] / 4.0]
+        });
         for (vertex, at) in mesh.vertices[start..].iter_mut().zip(&corners) {
             let is_top = vertex.y() == upper;
             let delta = if is_top { top } else { bot } as f32 - l.y as f32;
@@ -2441,9 +2450,7 @@ mod tests {
             // x = -1 and x = 2 stand as the column beside them.
             columns.extend([entry(a), entry(a), entry(b), entry(b)]);
         }
-        let morphs = (0..columns.len())
-            .map(|k| a_morphs || k % 4 >= 2)
-            .collect();
+        let morphs = (0..columns.len()).map(|k| a_morphs || k % 4 >= 2).collect();
         let morph = MorphColumns {
             n: 2,
             level: 1,
@@ -2616,7 +2623,12 @@ mod tests {
     /// morphing (a pit beside it, say) neither does `a`.
     #[test]
     fn a_morphing_columns_faces_carry_what_the_parent_draws() {
-        let corners = [([0, 5, 0], 0), ([0, 5, 2], 3), ([2, 5, 2], 3), ([2, 5, 0], 3)];
+        let corners = [
+            ([0, 5, 0], 0),
+            ([0, 5, 2], 3),
+            ([2, 5, 2], 3),
+            ([2, 5, 0], 3),
+        ];
         let vertices = corners
             .iter()
             .map(|&([x, y, z], ao)| Vertex::new(x, y, z, ao, Face::PosY, 9, 0, 0))

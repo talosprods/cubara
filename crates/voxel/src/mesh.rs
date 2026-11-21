@@ -380,8 +380,7 @@ impl Vertex {
         (self.packed3 & HAS_PARENT_BIT != 0).then(|| {
             (
                 self.packed3 & PARENT_LAYER_MASK,
-                ((self.packed3 >> PARENT_OPEN_SHIFT) & PARENT_OPEN_MASK) as f32
-                    / PARENT_OPEN_STEPS,
+                ((self.packed3 >> PARENT_OPEN_SHIFT) & PARENT_OPEN_MASK) as f32 / PARENT_OPEN_STEPS,
             )
         })
     }
@@ -516,8 +515,14 @@ mod tests {
             let v = base.with_parent(layer, open);
             let (l, o) = v.parent().expect("a parent");
             assert_eq!(l, layer);
-            assert!((o - open).abs() <= 0.5 / PARENT_OPEN_STEPS + 1e-6, "{o} for {open}");
-            assert_eq!((v.packed0, v.packed1, v.packed2), (base.packed0, base.packed1, base.packed2));
+            assert!(
+                (o - open).abs() <= 0.5 / PARENT_OPEN_STEPS + 1e-6,
+                "{o} for {open}"
+            );
+            assert_eq!(
+                (v.packed0, v.packed1, v.packed2),
+                (base.packed0, base.packed1, base.packed2)
+            );
         }
     }
 

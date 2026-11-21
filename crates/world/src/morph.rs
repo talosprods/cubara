@@ -1326,17 +1326,19 @@ mod tests {
     /// same way, in that face's texture layer, and each of its corners
     /// carries the openness the parent's triangle has there. Found here by
     /// a brute-force search of the parent's triangles -- not by
-    /// `ParentFaces`, whose answer this checks. And most of what moves does
-    /// carry a parent: of the moving tops, at least [`MIN_PARENTED`].
+    /// `ParentFaces`, whose answer this checks. And most of the ground that
+    /// morphs does carry a parent: of the tops of morphing columns, moving
+    /// or not, at least [`MIN_PARENTED`].
     ///
     /// Goes red when the parent is read in the wrong frame (offset, axis),
     /// a face is given the wrong layer or corner, a riser row is mapped
     /// stretched rather than whole, or the keying leaves faces out.
     #[test]
     fn a_fully_morphed_node_wears_what_its_parent_draws() {
-        /// The least share of moving tops that must carry a parent. Chosen,
-        /// not derived: what does not is beside a cave or across a node's
-        /// floor, a few percent on this mountain.
+        /// The least share of morphing columns' tops that must carry a
+        /// parent. Chosen, not derived: what does not is where the parent
+        /// draws no top over the column at full morph (beside a pit the
+        /// parent shows, under a node's floor), a few percent here.
         const MIN_PARENTED: f64 = 0.9;
         let registry = registry();
         let blocks = TerrainBlocks::from_registry(&registry);
@@ -1350,26 +1352,32 @@ mod tests {
             _ => 0,
         };
         type Tri = [([f32; 3], f32); 3];
-        let (mut checked, mut moving_tops, mut parented_tops) = (0usize, 0usize, 0usize);
+        let (mut checked, mut morphing_tops, mut parented_tops) = (0usize, 0usize, 0usize);
         for level in MORPH_LEVELS {
             for node in mountain_nodes(&snapshot, level) {
-                let Some(child) = crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                let Some(child) =
+                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
                 else {
                     continue;
                 };
                 let parent = node.parent();
-                let Some(drawn) =
-                    crate::mesh::mesh_node_with(&snapshot, &registry, &layer, parent, blocks, false)
-                else {
+                let Some(drawn) = crate::mesh::mesh_node_with(
+                    &snapshot, &registry, &layer, parent, blocks, false,
+                ) else {
                     continue;
                 };
+                let columns = node_columns(&snapshot, node, blocks).expect("a morphing level");
+                let w = 1i32 << level;
                 let (po, co) = (parent.world_origin(), node.world_origin());
                 let offset = [po[0] - co[0], po[1] - co[1], po[2] - co[2]];
                 // The parent's triangles by (face, plane), in the child's frame.
                 let mut tris: std::collections::HashMap<(u8, i32), Vec<(u32, Tri)>> =
                     std::collections::HashMap::new();
                 for quad in drawn.mesh.indices.chunks(6) {
-                    let vs: Vec<_> = quad.iter().map(|&i| drawn.mesh.vertices[i as usize]).collect();
+                    let vs: Vec<_> = quad
+                        .iter()
+                        .map(|&i| drawn.mesh.vertices[i as usize])
+                        .collect();
                     let face = vs[0].face();
                     let d = face as usize / 2;
                     let at = |v: cubara_voxel::Vertex| {
@@ -1400,12 +1408,17 @@ mod tests {
                     let candidates = tris.get(&(face as u8, plane))?;
                     let bary = |t: &Tri, q: [f32; 3]| {
                         let (a, b, c) = (t[0].0, t[1].0, t[2].0);
-                        let det = (b[va] - c[va]) * (a[ua] - c[ua]) + (c[ua] - b[ua]) * (a[va] - c[va]);
+                        let det =
+                            (b[va] - c[va]) * (a[ua] - c[ua]) + (c[ua] - b[ua]) * (a[va] - c[va]);
                         if det.abs() < 1e-9 {
                             return None;
                         }
-                        let w0 = ((b[va] - c[va]) * (q[ua] - c[ua]) + (c[ua] - b[ua]) * (q[va] - c[va])) / det;
-                        let w1 = ((c[va] - a[va]) * (q[ua] - c[ua]) + (a[ua] - c[ua]) * (q[va] - c[va])) / det;
+                        let w0 = ((b[va] - c[va]) * (q[ua] - c[ua])
+                            + (c[ua] - b[ua]) * (q[va] - c[va]))
+                            / det;
+                        let w1 = ((c[va] - a[va]) * (q[ua] - c[ua])
+                            + (a[ua] - c[ua]) * (q[va] - c[va]))
+                            / det;
                         Some([w0, w1, 1.0 - w0 - w1])
                     };
                     candidates.iter().find_map(|(layer, t)| {
@@ -1427,9 +1440,14 @@ mod tests {
                         [a[0] + c[0] / 4.0, a[1] + c[1] / 4.0, a[2] + c[2] / 4.0]
                     });
                     let face = q[0].face();
-                    if face == cubara_voxel::Face::PosY && q[0].morph_delta() != 0.0 {
-                        moving_tops += 1;
-                        parented_tops += q[0].parent().is_some() as usize;
+                    if face == cubara_voxel::Face::PosY {
+                        let cx = q.iter().map(|v| v.x() as i32).min().unwrap() / w;
+                        let cz = q.iter().map(|v| v.z() as i32).min().unwrap() / w;
+                        let [top, ..] = columns.at(cx, cz);
+                        if columns.morphs_at(cx, cz) && q[0].y() as i32 == top {
+                            morphing_tops += 1;
+                            parented_tops += q[0].parent().is_some() as usize;
+                        }
                     }
                     for (v, p) in q.iter().zip(&full) {
                         let Some((layer, open)) = v.parent() else {
@@ -1442,7 +1460,10 @@ mod tests {
                                  parent, and the parent draws no such face there"
                             );
                         };
-                        assert_eq!(layer, drawn_layer, "level {level} {node:?} {face:?} at {p:?}");
+                        assert_eq!(
+                            layer, drawn_layer,
+                            "level {level} {node:?} {face:?} at {p:?}"
+                        );
                         assert!(
                             (open - drawn_open).abs() <= 1.0 / 255.0 + 1e-4,
                             "level {level} {node:?} {face:?} at {p:?}: carries {open}, the \
@@ -1454,8 +1475,14 @@ mod tests {
             }
         }
         assert!(checked > 10_000, "only {checked} corners checked");
-        let share = parented_tops as f64 / moving_tops as f64;
-        println!("{checked} corners checked; {parented_tops} of {moving_tops} moving tops carry a parent");
-        assert!(share >= MIN_PARENTED, "{share:.3} of moving tops carry a parent");
+        let share = parented_tops as f64 / morphing_tops as f64;
+        println!(
+            "{checked} corners checked; {parented_tops} of {morphing_tops} tops of morphing columns \
+             carry a parent"
+        );
+        assert!(
+            share >= MIN_PARENTED,
+            "{share:.3} of morphing columns' tops carry a parent"
+        );
     }
 }

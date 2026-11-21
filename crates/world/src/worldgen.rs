@@ -959,8 +959,16 @@ impl WorldGen {
     /// share its columns are pit.
     ///
     /// [`from_above`]: Self::from_above
-    fn top_block(&self, x: i32, z: i32, top: i32, covered: &[Covered], blocks: TerrainBlocks) -> BlockId {
-        let k = crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % covered.len() as u64;
+    fn top_block(
+        &self,
+        x: i32,
+        z: i32,
+        top: i32,
+        covered: &[Covered],
+        blocks: TerrainBlocks,
+    ) -> BlockId {
+        let k =
+            crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % covered.len() as u64;
         let c = covered[k as usize];
         match self.from_above(x + c.at[0] as i32, z + c.at[1] as i32, c.surface, blocks) {
             Some(floor) => floor,
@@ -977,7 +985,13 @@ impl WorldGen {
     ///
     /// The one rule a coarser representation reads a column's top colour
     /// from; the far terrain is to read the same (#422).
-    pub fn from_above(&self, x: i32, z: i32, surface: i32, blocks: TerrainBlocks) -> Option<BlockId> {
+    pub fn from_above(
+        &self,
+        x: i32,
+        z: i32,
+        surface: i32,
+        blocks: TerrainBlocks,
+    ) -> Option<BlockId> {
         if !self.cave_at(x, surface, z) {
             return None;
         }
@@ -994,7 +1008,14 @@ impl WorldGen {
     ///
     /// [`from_above`]: Self::from_above
     #[cfg(test)]
-    pub(crate) fn a_pit_under_shows(&self, x0: i32, z0: i32, w: i32, block: BlockId, blocks: TerrainBlocks) -> bool {
+    pub(crate) fn a_pit_under_shows(
+        &self,
+        x0: i32,
+        z0: i32,
+        w: i32,
+        block: BlockId,
+        blocks: TerrainBlocks,
+    ) -> bool {
         (0..w * w).any(|k| {
             let (x, z) = (x0 + k % w, z0 + k / w);
             self.from_above(x, z, self.surface_height(x, z), blocks) == Some(block)
@@ -2980,7 +3001,9 @@ mod tests {
                             continue;
                         }
                         tops += 1;
-                        if block != blocks.grass && !gen.a_pit_under_shows(x, z, step, block, blocks) {
+                        if block != blocks.grass
+                            && !gen.a_pit_under_shows(x, z, step, block, blocks)
+                        {
                             soil += 1;
                         }
                     }
@@ -3037,15 +3060,18 @@ mod tests {
             let mut nodes = std::collections::BTreeMap::new();
             for nz in -2..2 {
                 for nx in -2..2 {
-                    let (ox, oz) = (mx.div_euclid(size) * size + nx * size, mz.div_euclid(size) * size + nz * size);
+                    let (ox, oz) = (
+                        mx.div_euclid(size) * size + nx * size,
+                        mz.div_euclid(size) * size + nz * size,
+                    );
                     for lz in 0..Chunk::SIZE as i32 {
                         for lx in 0..Chunk::SIZE as i32 {
                             let (x0, z0) = (ox + lx * step, oz + lz * step);
                             let top = gen.cell_surface_height(x0, z0, step);
                             let oy = top.div_euclid(size) * size;
-                            let node = nodes
-                                .entry((ox, oy, oz))
-                                .or_insert_with(|| gen.generate_aniso([ox, oy, oz], step, v, blocks));
+                            let node = nodes.entry((ox, oy, oz)).or_insert_with(|| {
+                                gen.generate_aniso([ox, oy, oz], step, v, blocks)
+                            });
                             let ly = ((top - oy) / v) as usize;
                             let block = node.get(lx as usize, ly, lz as usize);
                             if block == BlockId::AIR {
@@ -3055,7 +3081,8 @@ mod tests {
                             let pit = (0..step * step)
                                 .filter(|k| {
                                     let (x, z) = (x0 + k % step, z0 + k / step);
-                                    gen.from_above(x, z, gen.surface_height(x, z), blocks).is_some()
+                                    gen.from_above(x, z, gen.surface_height(x, z), blocks)
+                                        .is_some()
                                 })
                                 .count();
                             expected += pit as f64 / (step * step) as f64;
@@ -3066,8 +3093,13 @@ mod tests {
                     }
                 }
             }
-            println!("width {step}: {shown} of {tops} tops show a pit's floor, {expected:.1} expected");
-            assert!(expected > 30.0, "width {step}: too few pits to measure ({expected:.1})");
+            println!(
+                "width {step}: {shown} of {tops} tops show a pit's floor, {expected:.1} expected"
+            );
+            assert!(
+                expected > 30.0,
+                "width {step}: too few pits to measure ({expected:.1})"
+            );
             assert!(
                 (shown as f64 - expected).abs() <= PIT_SHARE * expected,
                 "width {step}: {shown} tops show a pit's floor, {expected:.1} expected"

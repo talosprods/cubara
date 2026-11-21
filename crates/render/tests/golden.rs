@@ -601,7 +601,10 @@ fn the_ao_floor_reaches_the_vertex_stage() {
         .iter()
         .filter(|p| p.delta > TOLERANCE)
         .count();
-    assert!(changed > 10_000, "an AO floor of 1 changed only {changed} pixels");
+    assert!(
+        changed > 10_000,
+        "an AO floor of 1 changed only {changed} pixels"
+    );
 }
 
 #[test]

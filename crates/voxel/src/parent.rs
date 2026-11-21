@@ -131,10 +131,7 @@ impl ParentFaces {
                 continue;
             }
             let opens: Vec<f32> = (0..6).map(|k| verts[k].openness()).collect();
-            let uniform = opens
-                .iter()
-                .all(|&o| o == opens[0])
-                .then_some(opens[0]);
+            let uniform = opens.iter().all(|&o| o == opens[0]).then_some(opens[0]);
             let id = out.quads.len() as u32;
             out.quads.push(ParentQuad {
                 layer: verts[0].tex_layer(),
@@ -271,11 +268,18 @@ mod tests {
         // Top faces sweep (u, v) = (z, x).
         let mesh = one_quad(
             Face::PosY,
-            [([0, 8, 0], 0), ([0, 8, 4], 3), ([4, 8, 4], 3), ([4, 8, 0], 3)],
+            [
+                ([0, 8, 0], 0),
+                ([0, 8, 4], 3),
+                ([4, 8, 4], 3),
+                ([4, 8, 0], 3),
+            ],
             7,
         );
         let faces = ParentFaces::from_mesh(&mesh, BLOCK);
-        let look = faces.look_up(Face::PosY, [1.5, 8.0, 2.5]).expect("under the quad");
+        let look = faces
+            .look_up(Face::PosY, [1.5, 8.0, 2.5])
+            .expect("under the quad");
         assert_eq!(look, ParentLook::Quad(7, 0));
         assert_eq!(look.layer(), 7);
         let at = |p: [f32; 3], toward: [f32; 3]| faces.openness_at(look, Face::PosY, p, toward);
@@ -296,7 +300,12 @@ mod tests {
     fn the_triangle_that_holds_the_child_face_is_the_one_read() {
         let mesh = one_quad(
             Face::PosY,
-            [([0, 8, 0], 3), ([0, 8, 4], 0), ([4, 8, 4], 3), ([4, 8, 0], 0)],
+            [
+                ([0, 8, 0], 3),
+                ([0, 8, 4], 0),
+                ([4, 8, 4], 3),
+                ([4, 8, 0], 0),
+            ],
             1,
         );
         let faces = ParentFaces::from_mesh(&mesh, BLOCK);
@@ -319,7 +328,12 @@ mod tests {
         // A wall on the plane x = 16, rows 4 to 6, z 0 to 8.
         let mesh = one_quad(
             Face::PosX,
-            [([16, 4, 0], 3), ([16, 6, 0], 3), ([16, 6, 8], 3), ([16, 4, 8], 3)],
+            [
+                ([16, 4, 0], 3),
+                ([16, 6, 0], 3),
+                ([16, 6, 8], 3),
+                ([16, 4, 8], 3),
+            ],
             3,
         );
         let faces = Arc::new(ParentFaces::from_mesh(&mesh, [8, 1, 8]));
@@ -327,8 +341,16 @@ mod tests {
             faces.look_up(Face::PosX, [16.0, 5.5, 7.5]),
             Some(ParentLook::Uniform(3, 255))
         );
-        assert_eq!(faces.look_up(Face::PosX, [16.0, 5.5, 8.5]), None, "z 8 is past it");
-        assert_eq!(faces.look_up(Face::PosX, [16.0, 6.5, 1.5]), None, "row 6 is past it");
+        assert_eq!(
+            faces.look_up(Face::PosX, [16.0, 5.5, 8.5]),
+            None,
+            "z 8 is past it"
+        );
+        assert_eq!(
+            faces.look_up(Face::PosX, [16.0, 6.5, 1.5]),
+            None,
+            "row 6 is past it"
+        );
         // A child whose origin is 16 blocks along x from the parent's.
         let view = ParentView::new(faces, [16, 0, 0]);
         assert!(view.look_up(Face::PosX, [0.0, 4.5, 0.5]).is_some());
