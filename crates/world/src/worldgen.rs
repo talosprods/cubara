@@ -967,24 +967,61 @@ impl WorldGen {
         covered: &[Covered],
         blocks: TerrainBlocks,
     ) -> BlockId {
-        let k =
-            crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % covered.len() as u64;
-        let c = covered[k as usize];
+        let c = covered[self.top_pick(x, z, top, covered.len())];
         match self.from_above(x + c.at[0] as i32, z + c.at[1] as i32, c.surface, blocks) {
             Some(floor) => floor,
             None => self.material_at(x, top, z, top, blocks),
         }
     }
 
+    /// Which of the `columns` level-0 columns of the cell at `(x, z)`, its
+    /// top block at `top`, the cell's top shows from above: an index into
+    /// them **sorted by surface, then `z`, then `x`** (the order a
+    /// [`NodeGround`] keeps a cell's columns in), by a hash of the cell.
+    /// The one pick: a voxel cell's top block ([`top_block`](Self::top_block))
+    /// and a far quad's top ([`top_layer`](Self::top_layer)) both ask it, so
+    /// a far quad over the columns of a voxel cell shows the same column.
+    fn top_pick(&self, x: i32, z: i32, top: i32, columns: usize) -> usize {
+        (crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % columns as u64) as usize
+    }
+
+    /// [`top_block`](Self::top_block) for a representation that has no
+    /// blocks -- the far terrain (#422): **the layer the top of the cell
+    /// `[x0, x0 + w) x [z0, z0 + w)` wears**, its top block at `top`
+    /// ([`cell_top_sampled`](Self::cell_top_sampled) with the same `n`).
+    /// The surface block, or the layer of the pit floor level 0 shows from
+    /// above one of its columns ([`pit_floor`](Self::pit_floor)), the column
+    /// picked by the cell's hash ([`top_pick`](Self::top_pick)).
+    ///
+    /// The columns are the `n` x `n` grid `cell_top_sampled` visits, all of
+    /// them when `n >= w`: there this is the layer of the block
+    /// `generate_aniso` gives the same cell's top, column for column
+    /// (`a_far_top_wears_what_the_voxel_cell_wears` holds the two together;
+    /// an ore is stone here, as it is to every far face). Wider cells are
+    /// sampled, as their tops are: over many cells a pit's floor still shows
+    /// in the share the sampled columns are pit.
+    pub fn top_layer(&self, x0: i32, z0: i32, w: i32, n: i32, top: i32) -> GroundLayer {
+        let mut columns: Vec<(i32, i32, i32)> = Self::sample_columns(x0, z0, w, n)
+            .map(|(x, z)| (self.surface_height(x, z), z, x))
+            .collect();
+        columns.sort_unstable();
+        let (surface, z, x) = columns[self.top_pick(x0, z0, top, columns.len())];
+        match self.pit_floor(x, z, surface) {
+            Some(floor) => Self::ground_layer(surface - floor),
+            None => GroundLayer::Surface,
+        }
+    }
+
     /// What level 0 shows from directly above the column `(x, z)` whose
     /// surface block is at `surface`, where that is not the surface block:
-    /// the floor of the pit a cave has opened there (the first block of
-    /// ground under the carved surface, within [`PIT_FLOOR_SEARCH`]), made of
-    /// what that depth is made of. `None` where the column's surface block
-    /// stands (no cave carves it): it shows the surface block.
+    /// the floor of the pit a cave has opened there
+    /// ([`pit_floor`](Self::pit_floor)), made of what that depth is made of.
+    /// `None` where the column's surface block stands (no cave carves it):
+    /// it shows the surface block.
     ///
     /// The one rule a coarser representation reads a column's top colour
-    /// from; the far terrain is to read the same (#422).
+    /// from: the voxel levels as a block (this), the far terrain as a layer
+    /// ([`top_layer`](Self::top_layer), #422), both off the same floor.
     pub fn from_above(
         &self,
         x: i32,
@@ -992,14 +1029,27 @@ impl WorldGen {
         surface: i32,
         blocks: TerrainBlocks,
     ) -> Option<BlockId> {
+        let floor = self.pit_floor(x, z, surface)?;
+        Some(self.material_at(x, floor, z, surface, blocks))
+    }
+
+    /// The `y` of the floor of the pit a cave has opened in the column
+    /// `(x, z)` whose surface block is at `surface`: the first block of
+    /// ground under the carved surface, within [`PIT_FLOOR_SEARCH`] (a
+    /// deeper pit shows the block the search stops at). `None` where no
+    /// cave carves the surface block. **The one place a pit's floor is
+    /// found** ([`from_above`](Self::from_above) and
+    /// [`top_layer`](Self::top_layer) read it).
+    pub fn pit_floor(&self, x: i32, z: i32, surface: i32) -> Option<i32> {
         if !self.cave_at(x, surface, z) {
             return None;
         }
-        let floor = (1..=PIT_FLOOR_SEARCH)
-            .map(|d| surface - d)
-            .find(|&y| !self.cave_at(x, y, z))
-            .unwrap_or(surface - PIT_FLOOR_SEARCH);
-        Some(self.material_at(x, floor, z, surface, blocks))
+        Some(
+            (1..=PIT_FLOOR_SEARCH)
+                .map(|d| surface - d)
+                .find(|&y| !self.cave_at(x, y, z))
+                .unwrap_or(surface - PIT_FLOOR_SEARCH),
+        )
     }
 
     /// Whether `block` is what level 0 shows from above one of the columns
