@@ -1365,6 +1365,7 @@ fn main() {
                     every: number("--every", 0.25),
                     size,
                     quality: far_streaming::FarQuality::High,
+                    morph: !args.iter().any(|a| a == "--no-morph"),
                 };
                 // `--frames-every N`: also write every Nth rendered frame to
                 // the `--frames` directory, numbered, for a video.

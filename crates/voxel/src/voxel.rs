@@ -104,19 +104,36 @@ impl MorphColumns {
 /// Where the distance morph moves a face's corners, in node-local block
 /// rows. Part of a [`MaskCell`]'s equality, so faces that move differently
 /// are never merged into one quad.
+///
+/// **A face that moves is never merged across cells either** (`cell`,
+/// `seg`): one quad per cell for a top, one per segment for a riser (its
+/// rows still merge, up the one cell's wall). The factor is not linear
+/// along an edge -- the metric is the larger of horizontal and twice the
+/// vertical distance, and where an edge crosses the line where the two are
+/// equal it bends to first order -- so a merged quad's edge leaves the
+/// corner of a smaller quad that sits on it (a T-junction) by up to half a
+/// pixel at the 288 m band, ten times the crack seal. The first flights
+/// with the morph showed exactly that: single pixels of sky, persistent in
+/// the settled frame, on the toward-peak flight and not without the morph.
+/// With no merging across cells every horizontal edge that moves is shared
+/// whole by the two faces on it; a T-junction along a vertical edge opens
+/// nothing, since the morph moves vertices only up and down it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Morph {
     /// The morph leaves it where it is.
     Static,
-    /// A column's top face, moving to row `target`.
-    Top { target: i32 },
+    /// A column's top face, moving to row `target`; `cell` keeps it apart
+    /// from its neighbours'.
+    Top { target: i32, cell: i32 },
     /// A riser: rows `[s_bot, s_top)` move onto `[t_bot, t_top]`, every
-    /// point on the straight line between the two.
+    /// point on the straight line between the two; `seg` keeps it apart
+    /// from the next segment's.
     Riser {
         s_bot: i32,
         s_top: i32,
         t_bot: i32,
         t_top: i32,
+        seg: i32,
     },
 }
 
@@ -126,12 +143,13 @@ impl Morph {
     fn target(self, y: i32) -> f32 {
         match self {
             Morph::Static => y as f32,
-            Morph::Top { target } => target as f32,
+            Morph::Top { target, .. } => target as f32,
             Morph::Riser {
                 s_bot,
                 s_top,
                 t_bot,
                 t_top,
+                ..
             } => {
                 if s_top == s_bot {
                     return if y >= s_top { t_top } else { t_bot } as f32;
@@ -480,10 +498,11 @@ pub(crate) fn greedy_mesh(
 
 /// [`greedy_mesh`], baking the distance morph into every vertex when
 /// `morph` is given (issue #380's study): each face is keyed by how the
-/// morph moves it ([`Morph`]) and only faces that move alike merge -- which
-/// cuts the greedy quads at the parent's cell boundaries -- and each riser
-/// that only the morph opens (none as built, some at full morph) is laid
-/// down with no height, a "latent" riser. `None` is today's mesh, exactly.
+/// morph moves it ([`Morph`]); a face that moves is not merged across cells
+/// at all (a riser's rows still merge up its own cell's wall), faces that
+/// stay merge as before, and each riser that only the morph opens (none as
+/// built, some at full morph) is laid down with no height, a "latent"
+/// riser. `None` is today's mesh, exactly.
 ///
 /// The morph data is in the lattice's own columns, and its rows are the
 /// lattice's rows: one block tall (`scale[1] == 1`), which every node mesh
@@ -756,7 +775,10 @@ fn key_morph(
                 }
                 let [top, target, _, _] = columns.at(x, z);
                 if top == plane && target != top {
-                    cell.morph = Morph::Top { target };
+                    cell.morph = Morph::Top {
+                        target,
+                        cell: x * columns.n + z,
+                    };
                 }
             }
         }
@@ -795,6 +817,7 @@ fn key_morph(
                 s_top,
                 t_bot,
                 t_top,
+                seg,
             };
             for y in s_bot.max(0)..s_top.min(ny) {
                 let idx = if d == 0 { seg * nu + y } else { y * nu + seg };
@@ -2166,6 +2189,101 @@ mod tests {
             }
         }
         assert_eq!(sides, 4, "expected one merged quad per side");
+    }
+
+    /// Two columns side by side on a two-by-two lattice: `a` (x = 0) one
+    /// block lower than `b` (x = 1) as built, but whose parent stands
+    /// higher. As built, `b`'s riser faces `a`; at full morph `a` must face
+    /// `b` -- a riser the mesh lays down with no height (issue #380's
+    /// study). Both rows of z are alike.
+    fn two_columns(a: [i32; 2], b: [i32; 2]) -> (Mesh, MorphColumns) {
+        let registry = registry();
+        let entry = |c: [i32; 2]| [c[0], c[1], c[0], c[1]];
+        let mut columns = Vec::new();
+        for _z in -1..=2 {
+            // x = -1 and x = 2 stand as the column beside them.
+            columns.extend([entry(a), entry(a), entry(b), entry(b)]);
+        }
+        let morph = MorphColumns {
+            n: 2,
+            level: 1,
+            columns,
+        };
+        let top = |x: i32| if x == 0 { a[0] } else { b[0] };
+        let mesh = greedy_mesh_morph(
+            [2, 8, 2],
+            [1, 1, 1],
+            |x, y, z| {
+                if (0..2).contains(&x) && (0..2).contains(&z) && y >= 0 && y < top(x) {
+                    BlockId(1)
+                } else {
+                    BlockId::AIR
+                }
+            },
+            |_, _, _| false,
+            |_, _, _| true,
+            &ctx(&registry),
+            Some(&morph),
+        );
+        (mesh, morph)
+    }
+
+    #[test]
+    fn a_riser_only_the_morph_opens_is_laid_flat_and_opens_to_the_parent() {
+        // a: top face row 2, parent's 4. b: 3, parent's 3.
+        let (mesh, _) = two_columns([2, 4], [3, 3]);
+        let quads: Vec<&[Vertex]> = mesh.vertices.chunks(4).collect();
+        // a's latent riser: facing +x on the plane x = 1, flat at row 2,
+        // its top edge to 4 and its foot to 3 (b's target) at full morph.
+        let latent: Vec<&&[Vertex]> = quads
+            .iter()
+            .filter(|q| q[0].face() == Face::PosX && q[0].x() == 1)
+            .collect();
+        assert_eq!(latent.len(), 2, "one per row of z: {latent:?}");
+        for q in latent {
+            assert!(q.iter().all(|v| v.is_latent() && v.y() == 2 && v.morph_level() == 1));
+            let mut deltas: Vec<f32> = q.iter().map(|v| v.morph_delta()).collect();
+            deltas.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            assert_eq!(deltas, vec![1.0, 1.0, 2.0, 2.0]);
+        }
+        // b's riser as built (row 2..3, facing -x) folds down onto 3: its
+        // foot rises one row, its top stays.
+        let built: Vec<&&[Vertex]> = quads
+            .iter()
+            .filter(|q| q[0].face() == Face::NegX && q[0].x() == 1)
+            .collect();
+        assert!(!built.is_empty());
+        for q in built {
+            assert!(!q.iter().any(|v| v.is_latent()));
+            for v in q.iter() {
+                let expected = if v.y() == 2 { 1.0 } else { 0.0 };
+                assert_eq!(v.morph_delta(), expected, "{v:?}");
+            }
+        }
+        // a's top moves to its parent's, b's not at all -- and a's, which
+        // moves, is one quad per cell (no T-junction on an edge that moves),
+        // where b's, which stays, merges over both rows of z as before.
+        let tops: Vec<&&[Vertex]> = quads.iter().filter(|q| q[0].face() == Face::PosY).collect();
+        let (moving, still): (Vec<&[Vertex]>, Vec<&[Vertex]>) =
+            tops.iter().map(|q| **q).partition(|q| q[0].y() == 2);
+        assert_eq!(moving.len(), 2, "a's top, one quad per cell: {moving:?}");
+        assert_eq!(still.len(), 1, "b's top, merged: {still:?}");
+        for q in moving {
+            assert!(q.iter().all(|v| v.morph_delta() == 2.0 && v.x() <= 1), "{q:?}");
+            let z: Vec<u32> = q.iter().map(|v| v.z()).collect();
+            assert_eq!(z.iter().max().unwrap() - z.iter().min().unwrap(), 1, "one cell");
+        }
+        assert!(still[0].iter().all(|v| v.morph_delta() == 0.0));
+    }
+
+    #[test]
+    fn no_morph_lays_no_latent_riser_and_moves_nothing() {
+        // The same ground with every target its own top: today's mesh.
+        let (mesh, _) = two_columns([2, 2], [3, 3]);
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.morph_delta() == 0.0 && !v.is_latent()));
     }
 
     #[test]

@@ -453,6 +453,10 @@ pub struct Flight {
     pub every: f32,
     pub size: (u32, u32),
     pub quality: FarQuality,
+    /// Whether the levels of detail morph into each other over distance
+    /// (issue #380's study, the game's default) or swap as before
+    /// (`--no-morph`), so one binary flies both.
+    pub morph: bool,
 }
 
 /// Where the eye is `t` seconds into `flight`.
@@ -1285,7 +1289,9 @@ impl Streamed {
         if !sky {
             renderer.set_clear_color(NOTHING);
         }
-        renderer.set_morph(crate::streaming::morph_params());
+        if flight.morph {
+            renderer.set_morph(crate::streaming::morph_params());
+        }
         let layers = assets.layers;
         let registry = Arc::new(assets.registry);
         let nodes = NodeStreaming::new(
@@ -2165,6 +2171,7 @@ mod tests {
             every: 0.5,
             size: (64, 32),
             quality: FarQuality::High,
+            morph: true,
         }
     }
 
@@ -2470,6 +2477,7 @@ mod tests {
             every: 1.0,
             size: (1920, 1080),
             quality: FarQuality::High,
+            morph: true,
         };
         let mut runs = Vec::new();
         for _ in 0..3 {

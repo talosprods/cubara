@@ -410,6 +410,35 @@ mod tests {
         assert_eq!(std::mem::size_of::<Vertex>(), 12);
     }
 
+    /// The distance morph's bits (issue #380's study) round-trip -- a
+    /// negative delta through the arithmetic shift, a too-large one clamped,
+    /// the latent flag -- and leave every other field as it was.
+    #[test]
+    fn a_vertex_carries_its_morph_and_keeps_the_rest() {
+        let base = Vertex::new(1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
+            .with_corner(true, false)
+            .with_ao_width(3)
+            .with_node_index(0xBEEF);
+        for (level, delta) in [(0, 0.0), (1, -3.25), (2, 17.5), (3, -128.0)] {
+            let v = base.with_morph(level, delta).with_latent(level % 2 == 1);
+            assert_eq!(v.morph_level(), level);
+            assert_eq!(v.morph_delta(), delta.max(-MAX_MORPH_DELTA));
+            assert_eq!(v.is_latent(), level % 2 == 1);
+            assert_eq!(
+                (v.x(), v.y(), v.z(), v.ao(), v.face(), v.tex_layer(), v.u(), v.v()),
+                (1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
+            );
+            assert_eq!(
+                (v.corner(), v.ao_width_log2(), v.node_index()),
+                ((true, false), 3, 0xBEEF)
+            );
+        }
+        assert_eq!(base.with_morph(1, 1000.0).morph_delta(), MAX_MORPH_DELTA);
+        assert_eq!(base.with_morph(1, 0.3).morph_delta(), 0.25, "quarter blocks");
+        assert_eq!(base.with_y(9).y(), 9);
+        assert_eq!(base.with_y(9).z(), 512);
+    }
+
     #[test]
     #[allow(clippy::type_complexity)]
     fn pack_unpack_round_trips_every_field_at_its_limits() {
