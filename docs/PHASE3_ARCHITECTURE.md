@@ -1474,7 +1474,18 @@ window, `--bench`, a flight and `--screenshot`, which is how the sizes below
 were measured. It is the only lever of the three found that both holds the
 gate and is watertight:
 
-@@CANDIDATES@@
+| scale | Medium, ground / hill FPS | High, ground / hill FPS | the gate | patches selected / in view (Medium, ground eye) | far triangles | far vertices issued | holes, low flight / toward the mountain |
+|---|--:|--:|---|--:|--:|--:|---|
+| x1 (the quality's own sizes; as first built) | 636 / 577 | | not met at any quality | | | 1.96 M | |
+| **x2.5 (the default)** | 1,080 / 1,035 | 988 / 944 | met at Medium | 163 / 56 | 244,604 | 591,064 | 0 of 1,195 / 0 of 1,798 |
+| x3 | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
+| x3.5 | not run: the gate stops at High | 1,059 / 1,013 | met at High | 181 / 61 at High | 263,342 at High | 637,284 at High | 0 of 1,195 / 0 of 1,799 |
+
+(M3 on battery, the machine in use and other sessions running: **not
+quiet**, single runs, so the patch, triangle and vertex counts are exact and
+the frame rates are not `BENCHMARKS.md` rows. The flights fly High. At 2.5
+the hill eye holds the gate by 3.5%; the choice between 2.5 and 3 waits for
+a quiet bench.)
 
 - **Shared corners** (four vertices a quad in one fixed index list, each
   face's colour carried flat from a corner of its own) were built on a
@@ -1524,14 +1535,24 @@ that was land shows sky until the finer patch comes: the flight's HOLES.
 Measured on the low flight (`--bench flight --eye 8,120,8 --look
 1,-0.15,0.3 --seconds 20`, M3, not quiet):
 
-@@RESELECT@@
+| far quad scale | every 32 blocks: frames with a hole / stale kept frames | every block |
+|---|---|---|
+| x2.5 | 26 of 1,194 / 8 | 0 of 1,195 / 1 |
+| x3 | 7 of 1,194 / 7 | 0 of 1,194 / 1 |
+| x3.5 | 0 of 1,194 / 5 | 0 of 1,195 / 2 |
+
+The 26 are one event of 0.4 s, a pixel or two at the foot of one mountain;
+the flight toward the mountain shows none at either distance.
 
 So `RESELECT_BLOCKS` is 1 (chosen, not derived: #398's "tiny" variant; the
 eye flies 0.4 block a frame). It is not #398's fix -- its plan replaces the
 constant with the slack `select` can report, and generates ahead -- and it
 does not make the live selection exact: a patch asked for still takes its
-frames to generate. What a step of the plan costs the main thread:
-@@PLANCOST@@
+frames to generate. What the plan costs the main thread
+(`far_plan_cost_report`, 600 frames of the low flight at the game's radius
+and quad scale, 232 patches shown): 200 selections where 32 blocks made 25,
+0.013 ms a frame in the mean, 0.041 ms at the 99th percentile and 0.046 at
+most. A standing eye selects nothing, as before.
 
 **What the zoom test found in the far terrain, and what became of it**
 (2026-11-21; `far_study.rs`'s `summit_lift_report` and

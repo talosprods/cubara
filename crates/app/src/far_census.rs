@@ -250,7 +250,8 @@ fn triangles(
 
 /// The far terrain's selection for `gate_eye` at `quality`, with every quad,
 /// error bound and floor `coarser` times as wide on screen as the quality
-/// sets them (1: the quality as the game draws it).
+/// names them (1: the sizes the smooth surface was drawn at; the game draws
+/// at `far_streaming::FAR_QUAD_SCALE`).
 fn select_at(
     gen: &WorldGen,
     gate_eye: &GateEye,
