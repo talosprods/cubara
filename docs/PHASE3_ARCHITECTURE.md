@@ -1196,3 +1196,116 @@ companions hold the second rule, and
 and `a_search_answer_holds_a_node_for_the_bare_node_it_sees_beside_it` hold
 it to the two places a node is let go (`release_held`, `leave_or_hold`: the
 streamer's bookkeeping, taken apart from the GPU for that).
+
+### 9.6 The colour morph: a ring edge swaps no colour either
+
+The distance morph (#380, #436) slides a node's heights to its parent's over
+a band before its ring edge, so that the swap moves nothing. What the swap
+still changed was **colour and shade**. The transition study
+(`crates/app/src/transition_study.rs`, the toward-peak flight, the worst
+single frame of each edge, pixels over the goldens' tolerance) put it at
+16,398, 12,933 and 21,080 pixels at the 160, 288 and 512 m edges on main
+(`b2fc847`), and took it apart with switches in the shader, each run on the
+same flight (study binary of this branch's first commit, since removed):
+
+| what was held equal at the swap | 160 m | 288 m | 512 m |
+|---|---|---|---|
+| nothing (main) | 16,398 | 12,933 | 21,080 |
+| a riser's texture laid by world height (no stretch) | 11,075 | 10,218 | 16,201 |
+| ... and every wall one texture | 8,286 | 6,987 | 12,346 |
+| ... and walls unshaded instead | 10,052 | 9,869 | 15,649 |
+| ... and tops unshaded instead | 8,788 | 7,743 | 14,049 |
+| ... walls one texture and unshaded | 4,994 | 4,868 | 8,163 |
+| ... one wall texture, no shade at all (**the floor**) | 3,027 | 3,657 | 6,594 |
+
+Four things, then, each worth a quarter to a third: a morphed riser's
+texture **stretched** with it (one tile over the three blocks a riser grew
+to); its **material** was its own where the parent's riser wears another
+(the hash of §9.4 picks per cell); and the **shade** of tops and of walls
+was its own -- most visibly the band a riser casts on the top at its foot,
+which a coarse cell draws as one ramp over the cell. What is left at the
+floor is ground that does not morph (beside a cave, a pit or a tree, across
+a node's floor) and, at 512 m, the trees' switch to boxes (#433).
+
+**The rule: at the end of its band a node draws its parent's colours as
+well as its parent's shape.** Three parts:
+
+- **A riser's rows move with its top, one for one** (`Morph::target`,
+  `cubara_voxel`). They used to move on the straight line from the rows as
+  built to the parent's, so a riser that grew was stretched. Moved whole,
+  every row lands on one of the parent's rows, tile on tile; a row that
+  would pass below the new foot stops there and closes up, and where the
+  riser grows the room left at its foot is laid as a latent riser, flat as
+  built, one piece per run of parent rows, its tile one per block at full
+  morph. The shape is the same at every instant -- only where rows lie
+  inside the riser's plane differs -- and the closure tests of #436 hold it.
+- **Every face of a morphing column carries what its parent draws where the
+  morph takes it**: the parent face's texture layer and its openness there
+  (word 3 of the vertex, `Vertex::with_parent`; `mesh.wgsl` lights a vertex
+  by `mix(ao_floor, 1, openness)`). It is **read off the parent's own
+  mesh** (`cubara_voxel::ParentFaces`, built by `cubara_world::mesh`'s
+  `parent_faces` from the parent node generated and meshed by the game's
+  own generator and mesher): which quad covers the face's middle at full
+  morph, and that quad's openness at each corner, interpolated over the
+  triangle that holds the face, as the rasterizer does. Worked out again
+  from the parent's cells it would be a second copy of the shade rules
+  (Rule 5), and a wrong one: a coarse wall's shade band is one ramp over
+  the quad the mesher *merges* (§9.4), a property of no single cell. A face
+  that moves nowhere still carries it (its column morphs; its colour does),
+  and cells merge only where they show the same of their parent -- the same
+  quad, or two quads equally open all over.
+- **`mesh.wgsl` blends by the morph factor**: the light toward the parent's
+  openness, and, where the parent's layer is another, the colour toward
+  that texture, sampled with the gradients of the fragment's own (so at
+  the same mip) under a branch nearly every fragment skips.
+
+**The fourth vertex word was measured before it was built.** No spare bits
+were left in three words (#436 took the last); a padded 16-byte vertex
+against the 12-byte one on the M3, `--bench gate` twice each, alternating:
+ground 1,125 and 1,128 FPS against 1,130 and 1,125, hill 1,082 and 1,079
+against 1,089 and 1,082 -- nothing to measure. The arena's 8 million
+vertices take 128 MB instead of 96.
+
+**A coarse top wears what level 0 shows from above one of its columns**
+(`WorldGen::top_block`, `from_above`), picked by a hash of the cell as its
+riser rows are: the surface block over a whole column, the floor of the pit
+over one a cave has opened. A coarse level shows a pit only where all of a
+cell is one (§9.4), so on the default seed's mountains the pits that open
+6.1% of level 0's columns were 3.4% of level 2's ground and 1.3% of level
+3's: the grey patches a mountain lost from afar in the zoom pairs. Partly
+pit cells now wear the floor in the share their columns are pit
+(`a_coarse_top_shows_pit_floors_in_the_share_level_0_does`: 58 and 156
+such tops against 61.6 and 150.2 expected at widths 4 and 8). `from_above`
+is the one rule for a column's colour from above; the far terrain is to
+read the same (#422). The surface term of the consistency harness does not
+move: a cell over a pit is in the cave term (§9.2).
+
+**The vertex stage had no pipeline constants.** `mesh.wgsl` has resolved AO
+in the vertex stage since R1c, with `ao_floor`, but the mesh pipeline passed
+its constants to the fragment stage only, so the vertex stage lit with the
+shader's default floor whatever `Lighting` said; it matched only because
+the two defaults agree. The colour morph lights by `ao_floor` there too; the
+vertex stage now gets the constants (`the_ao_floor_reaches_the_vertex_stage`).
+
+**Measured** (the transition study, the same flight and harness, main
+`b2fc847` against this rule; the morph's worst single frame per edge,
+pixels over the tolerance, and its luminance in pixel-equivalents):
+
+| edge | main | the colour morph | luminance, main -> colour |
+|---|---|---|---|
+| 0<->1 (160 m) | 16,398 | **4,959** (-70%) | 2,368 -> 786 |
+| 1<->2 (288 m) | 12,933 | **4,705** (-64%) | 2,020 -> 1,003 |
+| 2<->3 (512 m) | 21,080 | **9,208** (-56%) | 3,982 -> 1,596 |
+
+The floor of the table above is 3,027, 3,657 and 6,594: what is left is
+what does not morph. At 512 m a little of it is new -- a cell partly over a
+pit wears the floor now, and its children beside the pit do not morph, so
+they swap from the floor's colour rather than the surface's (9,208 against
+8,641 with the colour morph alone). The holes the morph opens are those of
+#436, unchanged (210 of 450 frames checked, at most 34 pixels; the same
+count as main's). `a_fully_morphed_level_draws_its_parents_colours` (GPU)
+draws a mountain at levels 0, 1 and 2 fully morphed against the level above
+unmorphed: 20,558, 22,204 and 21,383 pixels of 921,600 over the tolerance
+with the parent's colours, 52,043, 50,104 and 47,546 without -- what is left
+is ground beside caves and pits and along the node floors that cut a slope
+(#436's limit), which neither colour nor shape can morph.
