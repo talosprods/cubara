@@ -1511,6 +1511,28 @@ selection walks from (`far::root_level_for`);
 `a_plan_at_the_games_quad_scale_settles_on_the_exact_selection` was red
 with "the plan never settled".
 
+**Blocks turned the far selection's lag into holes, and the selection is
+now worked out every block.** The plan worked its selection out again only
+when the eye had moved `RESELECT_BLOCKS` = 32 blocks (1.3 s of flight), so
+for up to that long a far mountain could stand a level coarser than the
+selection at the eye asks for. That lag is #398's, measured there as STALE
+on main's smooth far terrain (10 to 13 kept frames on the low flight) and
+never as a hole: a smooth surface a level coarser moves its outline by less
+than the error bound. A block surface a level coarser has quads twice as
+wide, and where a far mountain's foot meets the ground behind it a pixel
+that was land shows sky until the finer patch comes: the flight's HOLES.
+Measured on the low flight (`--bench flight --eye 8,120,8 --look
+1,-0.15,0.3 --seconds 20`, M3, not quiet):
+
+@@RESELECT@@
+
+So `RESELECT_BLOCKS` is 1 (chosen, not derived: #398's "tiny" variant; the
+eye flies 0.4 block a frame). It is not #398's fix -- its plan replaces the
+constant with the slack `select` can report, and generates ahead -- and it
+does not make the live selection exact: a patch asked for still takes its
+frames to generate. What a step of the plan costs the main thread:
+@@PLANCOST@@
+
 **What the zoom test found in the far terrain, and what became of it**
 (2026-11-21; `far_study.rs`'s `summit_lift_report` and
 `pits_by_cell_width_report`):

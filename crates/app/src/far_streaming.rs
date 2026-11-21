@@ -90,9 +90,21 @@ impl FarQuality {
 const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 
 /// How far the eye moves before the selection is worked out again, in blocks.
-/// The finest far patches are a few hundred blocks wide, so this is well
-/// inside one of them.
-const RESELECT_BLOCKS: f64 = 32.0;
+///
+/// One block. It was 32 -- "well inside the finest patch" -- which let the
+/// drawn selection trail the eye's own by up to 1.3 s of flight: a far
+/// mountain stood a level coarser than it should for that long (#398's
+/// stale terrain). With the smooth far surface that moved an outline by
+/// less than the error bound; with blocks (#422) a level coarser is quads
+/// twice as wide, and at the foot of a far mountain a pixel of land turned
+/// to sky until the finer patch came: 26 frames of the low flight showed a
+/// hole at [`FAR_QUAD_SCALE`] 2.5 and 7 at 3, none at either with this.
+/// **Chosen, not derived**: #398's "tiny" variant, a third of a second of
+/// walking and two or three frames of flight. It is not that issue's fix --
+/// its plan replaces this constant by the slack `select` can report, and
+/// generates ahead -- and the cost is a `select` that often
+/// (`far_plan_cost_report`).
+const RESELECT_BLOCKS: f64 = 1.0;
 
 /// **How large the far terrain's quads are on screen**, as a factor on the
 /// pixel sizes a quality names ([`FarQuality::detail`]): its quads, its
@@ -1200,11 +1212,21 @@ mod tests {
         (Sim::new(TEST_RADIUS, hole, pool), start)
     }
 
-    /// Behaviour of today's `RESELECT_BLOCKS`, pinned so that the plan that
-    /// replaces it (#398 PR B) has something to differ from. Replaced by
-    /// `the_live_selection_is_the_exact_one_on_every_frame` there.
+    /// **Flying, what is shown is seldom behind the exact selection**: with
+    /// patches that arrive at once, the frames of three seconds of low
+    /// flight that show something other than the selection at their own eye
+    /// are few -- the plan works its selection out again every
+    /// [`RESELECT_BLOCKS`], and the eye flies 0.4 block a frame. Measured:
+    /// 21 of 180. At 32 blocks (what the constant was until blocks turned
+    /// the lag into holes, #422) it was 164, which this is red on. Not
+    /// none: #398's plan (the slack `select` can report) is what makes the
+    /// live selection the exact one on every frame, and
+    /// `the_live_selection_is_the_exact_one_on_every_frame` there replaces
+    /// this.
     #[test]
-    fn today_the_live_selection_trails_the_exact_one() {
+    fn the_live_selection_is_seldom_behind_the_exact_one() {
+        /// **Chosen, not derived**: the measured 21 with room.
+        const MOST: usize = 30;
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
         let eyes = low_flight(180);
@@ -1220,7 +1242,13 @@ mod tests {
         );
         assert!(
             behind > 0,
-            "the live selection never differed from the exact one in 3 s"
+            "the live selection never differed from the exact one in 3 s: \
+             this test no longer says what it was written to"
+        );
+        assert!(
+            behind <= MOST,
+            "{behind} of {} frames show something other than the exact selection, allowed {MOST}",
+            eyes.len()
         );
     }
 
@@ -1399,12 +1427,14 @@ mod tests {
         let eyes = low_flight(600);
         let start = eyes[0];
         let hole = voxel_hole(start.map(|v| v as f32));
-        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        // At the game's quad scale: what the game's own plan costs.
+        let game = |pool| Sim::at_scale(FAR_VIEW_RADIUS, hole, pool, FAR_QUAD_SCALE);
+        let mut sim = game(PoolModel::new(4, 2));
         sim.settle(start);
         sim.fly(&eyes);
         // The timed flight, from a fresh plan over the warm memo.
         let memo = std::mem::take(&mut sim.memo);
-        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        let mut sim = game(PoolModel::new(4, 2));
         sim.memo = memo;
         sim.settle(start);
         let selects_before = sim.plan.selects;
