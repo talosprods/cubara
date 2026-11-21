@@ -17,6 +17,15 @@
 //! this is the whole of what can be seen -- and unlike a cube-shaped LOD node,
 //! a height here is a number, not a cell boundary, so it does not flatten with
 //! distance (`PROPOSAL_FAR_VIEW.md` §2A, table B).
+//!
+//! **What is drawn is blocks** (issue #422). The height field stays the data;
+//! [`mesh`] turns it into what a voxel mesher would make of the same ground:
+//! every quad a flat top at a whole number of blocks ([`quad_top`], the one
+//! place that height is decided), a vertical wall wherever two neighbouring
+//! tops differ, exactly as tall as the step, and equal neighbours merged into
+//! one face. A quad of level `L` stands on the lattice of `2^L` blocks -- the
+//! lattice the voxel rings' coarse cells stand on -- so where the two meet
+//! their steps fall on the same lines.
 
 use crate::WorldGen;
 
@@ -73,6 +82,19 @@ impl PatchKey {
         ]
     }
 }
+
+/// **The finest level a far patch is ever drawn at**: the level of the voxel
+/// rings' coarsest cells, whose ground the far terrain meets at the join. A
+/// far quad finer than that cell would put a fine band between two coarse
+/// ones (level 3's cells of 8 blocks, the far terrain's quads of 4 or 2, then
+/// 16 and wider), which no screen size or quality asks for: the finest quad
+/// is the coarsest cell, at any screen height and any [`FarView`]. The same
+/// number for both sides of the join is what lets
+/// [`quad_top`] equal the voxel cell's top there ([`EXACT_TOP_QUAD`]).
+pub const FINEST_LEVEL: u32 = {
+    let schedule = crate::node::DEFAULT_RING_SCHEDULE;
+    schedule[schedule.len() - 1].0
+};
 
 /// A box the far terrain leaves to something else: the voxel rings, which
 /// draw everything inside it themselves. Axis-aligned, around the eye's chunk.
@@ -164,8 +186,9 @@ pub fn select(view: &FarView, error_of: impl Fn(PatchKey) -> Option<f32>) -> Vec
 }
 
 /// The coarsest level whose patches are at least `radius` wide, so a 3 x 3
-/// block of them always covers the view.
-fn root_level_for(radius: f64) -> u32 {
+/// block of them always covers the view: the level [`select`] starts its
+/// walk from, and so the coarsest patch whose error can decide a split.
+pub fn root_level_for(radius: f64) -> u32 {
     let mut level = 0;
     while ((PATCH_QUADS as i64) << level) < radius.ceil() as i64 {
         level += 1;
@@ -191,7 +214,7 @@ fn walk(
     let children_wide_enough = (key.quad() as f64 / 2.0) >= view.min_quad * d;
     let rough =
         children_wide_enough && error_of(key).is_some_and(|e| e as f64 > view.max_error * d);
-    if key.level > 0 && (near || rough) {
+    if key.level > FINEST_LEVEL && (near || rough) {
         for child in key.children() {
             walk(view, error_of, child, out);
         }
@@ -250,8 +273,170 @@ pub struct PatchHeights {
     pub error: f32,
     /// The worst of the same gaps.
     pub error_max: f32,
+    /// What every quad of the patch shows besides its height
+    /// ([`QuadGround::of`]), row by row, [`PATCH_QUADS`] on a side.
+    pub ground: Vec<QuadGround>,
+    /// The top of every quad, in whole blocks ([`quad_top`]), row by row,
+    /// [`TOPS_SIDE`] on a side: the patch's own quads and one ring of its
+    /// neighbours' around them (the *apron*), so a step on the patch's edge
+    /// is as exact as one inside it.
+    pub tops: Vec<i32>,
+    /// The patch as blocks: what [`mesh`] makes of `tops`.
+    pub faces: Vec<Face>,
 }
 
+/// Quads along one side of [`PatchHeights::tops`]: the patch's own and one
+/// more on either side.
+pub const TOPS_SIDE: usize = PATCH_QUADS + 2;
+
+/// Up to this width, in blocks, a quad's top is worked out from every one of
+/// its columns ([`WorldGen::cell_top`]); wider, from [`TOP_SAMPLES`] squared
+/// sample columns. Eight: the width of a cell of the voxel rings' coarsest
+/// level, so that where the far terrain meets them a quad and a cell over
+/// the same columns have the same top, exactly. **Chosen, not derived**
+/// beyond that: an exact top costs a surface height per column, 64 a quad
+/// here and four times that for every level above.
+pub const EXACT_TOP_QUAD: i64 = 8;
+
+/// Sample columns along a side of a quad wider than [`EXACT_TOP_QUAD`].
+/// **Chosen, not derived**: what the height field's own vertices are sampled
+/// with ([`FOOTPRINT_SAMPLES`]). A sampled top can miss a peak narrower than
+/// the spacing, and a quad's top can stand above its parent's
+/// (`measure::a_child_above_its_parent`).
+pub const TOP_SAMPLES: i32 = 4;
+
+/// Sample columns along a side of the quads of `key` for their top, and for
+/// what the top wears: every column up to [`EXACT_TOP_QUAD`],
+/// [`TOP_SAMPLES`] beyond.
+fn top_samples(key: PatchKey) -> i32 {
+    if key.quad() <= EXACT_TOP_QUAD {
+        key.quad() as i32
+    } else {
+        TOP_SAMPLES
+    }
+}
+
+/// Sample columns along a side of a quad for what its faces show
+/// ([`WorldGen::ground_faces`]): the wall mix and the ambient occlusion.
+/// Four up to twice [`EXACT_TOP_QUAD`] (16 blocks, where the far terrain
+/// takes over from the voxels' coarsest cells), where a difference in colour
+/// is seen side by side; two beyond. **Chosen, not derived**: each sample
+/// column costs nine surface heights. Measured by `far_rows_report` in
+/// `crates/render/tests/lod_consistency`: at quads of 16 two samples left
+/// the tops' colour 3.8/255 off level 0's and the stone share of the walls
+/// 2.5 points off on this seed's footprints (the voxel levels hold 3.0 and
+/// 1.25); four leave 2.6 and 1.1.
+fn face_samples(key: PatchKey) -> i32 {
+    if key.quad() <= 2 * EXACT_TOP_QUAD {
+        4
+    } else {
+        2
+    }
+}
+
+/// **The one place a quad's top is decided** (the seam issue #422 asks for):
+/// the height, in whole blocks, of the flat top the quad `(i, j)` of the
+/// patch `key` is drawn with -- `-1` and [`PATCH_QUADS`] being its
+/// neighbours' nearest quads.
+///
+/// It is the rule that one ground serves every level (issue #423,
+/// [`WorldGen::cell_top_sampled`]): the mean of the level-0 surfaces of the
+/// quad's columns, rounded to the block -- and, where the quad holds a
+/// summit, the highest mean of its four half-width cells (#437) -- plus one
+/// for the top face. So at level 0 a quad's top is its column's, and a
+/// level-3 quad's is the level-3 voxel cell's over the same 64 columns, to
+/// the block. Nothing here is the far terrain's own: a change to the
+/// voxels' rule is a change to this.
+pub fn quad_top(gen: &WorldGen, key: PatchKey, i: i32, j: i32) -> i32 {
+    let q = key.quad();
+    let [ox, oz] = key.origin();
+    let (x0, z0) = (ox + i as i64 * q, oz + j as i64 * q);
+    gen.cell_top_sampled(x0 as i32, z0 as i32, q as i32, top_samples(key)) + 1
+}
+
+/// What a quad's faces show besides their height, from what level 0 shows
+/// over the same ground ([`WorldGen::ground_faces`]), in 255ths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QuadGround {
+    /// What the quad's top wears: the share of it that is the surface
+    /// block's top, and that is soil; the rest is stone. All of it the
+    /// surface block, but for a quad that shows the floor of a pit
+    /// ([`WorldGen::top_layer`]): all soil, or all stone.
+    pub top: [u8; 2],
+    /// How open level 0's top faces are to the sky.
+    pub top_open: u8,
+    /// Per direction ([`crate::worldgen::GROUND_DIRECTIONS`]): the share of
+    /// level 0's risers that is the surface block's side, and that is soil.
+    /// The rest is stone.
+    pub sides: [[u8; 2]; 4],
+    /// Per direction, how open those risers are.
+    pub side_open: [u8; 4],
+}
+
+impl QuadGround {
+    /// Ground with nothing known about it: open, and the surface block's
+    /// side all the way down.
+    pub const PLAIN: QuadGround = QuadGround {
+        top: [255, 0],
+        top_open: 255,
+        sides: [[255, 0]; 4],
+        side_open: [255; 4],
+    };
+
+    /// **The one place a face's material and occlusion are decided**, on
+    /// this side of the renderer: level 0's own faces over the quad's
+    /// columns, by [`WorldGen::ground_faces`] -- so a wall is the mix of
+    /// surface, soil and stone that level 0's risers facing its way are, by
+    /// depth below each column's *own* surface (issue #423 decision 2), and
+    /// not by how tall the wall is.
+    ///
+    /// Where level 0 has no riser facing a direction among the sampled
+    /// columns, a wall facing it takes the mix of all four directions
+    /// together, and the surface block's side if there is no riser at all.
+    ///
+    /// **The top wears what a voxel cell's top wears** over the same
+    /// columns ([`WorldGen::top_layer`], the voxels' `top_block`): what
+    /// level 0 shows from above one of them, picked by the cell's hash --
+    /// the surface block, or a pit's floor in the share the columns are pit.
+    /// `top` is the quad's own ([`quad_top`]): the hash is the cell's, and a
+    /// cell is its place and its top.
+    pub fn of(gen: &WorldGen, key: PatchKey, i: i32, j: i32, top: i32) -> Self {
+        use crate::worldgen::GroundLayer;
+        let q = key.quad();
+        let [ox, oz] = key.origin();
+        let (x0, z0) = (ox + i as i64 * q, oz + j as i64 * q);
+        // `top - 1`: the top block, which the top face is one above.
+        let wears = match gen.top_layer(x0 as i32, z0 as i32, q as i32, top_samples(key), top - 1) {
+            GroundLayer::Surface => [255, 0],
+            GroundLayer::Soil => [0, 255],
+            GroundLayer::Stone => [0, 0],
+        };
+        let faces = gen.ground_faces(x0 as i32, z0 as i32, q as i32, face_samples(key));
+        let unit = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let all: [f32; 3] = [0, 1, 2].map(|l| faces.sides.iter().map(|s| s[l]).sum());
+        let total: f32 = all.iter().sum();
+        let fallback = if total > 0.0 {
+            [unit(all[0] / total), unit(all[1] / total)]
+        } else {
+            [255, 0]
+        };
+        let sides = [0, 1, 2, 3].map(|d| {
+            match (
+                faces.share(d, GroundLayer::Surface),
+                faces.share(d, GroundLayer::Soil),
+            ) {
+                (Some(surface), Some(soil)) => [unit(surface), unit(soil)],
+                _ => fallback,
+            }
+        });
+        QuadGround {
+            top: wears,
+            top_open: unit(faces.top_open),
+            sides,
+            side_open: faces.side_open.map(unit),
+        }
+    }
+}
 /// Samples per axis averaged into one vertex's height, at most.
 const FOOTPRINT_SAMPLES: i64 = 4;
 
@@ -272,6 +457,19 @@ pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
             heights.push(footprint_mean(gen, ox + i * q, oz + j * q, q));
         }
     }
+    let mut tops = Vec::with_capacity(TOPS_SIDE * TOPS_SIDE);
+    for j in -1..=PATCH_QUADS as i32 {
+        for i in -1..=PATCH_QUADS as i32 {
+            tops.push(quad_top(gen, key, i, j));
+        }
+    }
+    let mut ground = Vec::with_capacity(PATCH_QUADS * PATCH_QUADS);
+    for j in 0..PATCH_QUADS as i32 {
+        for i in 0..PATCH_QUADS as i32 {
+            let top = tops[(j + 1) as usize * TOPS_SIDE + (i + 1) as usize];
+            ground.push(QuadGround::of(gen, key, i, j, top));
+        }
+    }
     let min = heights.iter().copied().fold(f32::INFINITY, f32::min);
     let max = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let (error_max, error) = if q < 2 {
@@ -279,14 +477,19 @@ pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
     } else {
         finer_gap(gen, &heights, ox, oz, q)
     };
-    PatchHeights {
+    let mut patch = PatchHeights {
         key,
         heights,
         min,
         max,
         error,
         error_max,
-    }
+        ground,
+        tops,
+        faces: Vec::new(),
+    };
+    patch.faces = mesh(key, &patch.tops, &patch.ground);
+    patch
 }
 
 /// The mean top of the ground in a `q`-block square centred on `(x, z)`,
@@ -363,7 +566,297 @@ pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
     }
 }
 
+/// Which way a [`Face`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FaceDir {
+    /// A quad's flat top.
+    Top,
+    /// A wall, by the direction it faces: the side of the higher of two
+    /// neighbouring tops, looking out over the lower.
+    PosX,
+    NegX,
+    PosZ,
+    NegZ,
+}
+
+/// One rectangle of a patch drawn as blocks: a flat top, or a wall.
+///
+/// In quads from the patch's low corner, so every corner is on the lattice
+/// of `2^level` blocks. A top spans `i0..i1` by `j0..j1` at height `top`. A
+/// wall stands on one quad line -- `i0 == i1` for one facing along x,
+/// `j0 == j1` for one facing along z -- runs along the other axis, and hangs
+/// from `top` down to [`bottom`](Self::bottom).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Face {
+    pub dir: FaceDir,
+    pub i0: u8,
+    pub j0: u8,
+    pub i1: u8,
+    pub j1: u8,
+    /// The height of a top, or of a wall's upper edge, in blocks.
+    pub top: i32,
+    /// A wall: how many blocks of step it shows -- the difference between
+    /// the two tops it stands between, exactly. Zero for a top, and for a
+    /// wall on the patch's edge whose neighbour is no lower.
+    pub rise: u32,
+    /// A wall on the patch's own edge: the step down to the neighbouring
+    /// patch's quad as this level sees it (the apron), and the patch's skirt
+    /// below that, because the neighbour drawn may be of another level and
+    /// its top there a little different ([`PatchHeights::skirt_blocks`]).
+    pub border: bool,
+    /// The share of the face, in 255ths, that is the surface block (its side
+    /// on a wall, its top on a top) and that is soil; the rest is stone. A
+    /// wall's is [`QuadGround::sides`] for the quad it belongs to and the
+    /// way it faces; a top's is [`QuadGround::top`].
+    pub mix: [u8; 2],
+    /// How open the face is to the sky, in 255ths ([`QuadGround`]).
+    pub open: u8,
+}
+
+impl Face {
+    /// A wall's lower edge, in blocks, for a patch whose skirt is `skirt`
+    /// deep. A top's own height.
+    pub fn bottom(&self, skirt: i32) -> i32 {
+        self.top - self.rise as i32 - if self.border { skirt } else { 0 }
+    }
+}
+
+/// No face crosses a line of this many blocks, on either ground axis, and a
+/// top that touches one is a single quad deep: a chunk.
+///
+/// The voxel rings' box -- the hole the far terrain leaves -- has its sides
+/// on chunk edges (`node::covered_box_3d`: whole nodes of the schedule's
+/// coarsest level, 128 blocks in the game and as little as one chunk for a
+/// small bench or test scene), and the join there
+/// (`cubara_render::far::join`) works on the first quad inside the box. A
+/// face merged across the side, or a wide one against it, would be half in
+/// the hole and half out. So the mesher keeps to the lines everywhere, since
+/// any of them can be the box's side next.
+///
+/// A quad a chunk wide or wider (level 4 and up) is a cell of its own: it
+/// merges with nothing. That costs little, measured: on the generated
+/// terrain more than half of all quad edges carry a step at every level, and
+/// two tops merge only if they are as open to the sky as each other, so
+/// there is next to nothing to merge (`measure::blocks_against_smooth`).
+pub const JOIN_GRID: i64 = 16;
+
+/// What may merge with what: two quads are in the same group when one face
+/// may cover both. Within a [`JOIN_GRID`] cell that is its inner quads
+/// together, each of its four edge rows on its own, and each corner quad
+/// alone.
+fn merge_groups(key: PatchKey) -> Vec<u32> {
+    // Quads a cell; a quad wider than a cell is one itself.
+    let n = (JOIN_GRID / key.quad()).max(1);
+    // Where a quad is in its cell along one axis: the cell, and whether it
+    // is the cell's first (1) or last (2) quad, or neither (0).
+    let along = |patch: i32, k: usize| {
+        let g = patch as i64 * PATCH_QUADS as i64 + k as i64;
+        let (cell, at) = (g.div_euclid(n), g.rem_euclid(n));
+        let cell = (cell - (patch as i64 * PATCH_QUADS as i64).div_euclid(n)) as u32;
+        let edge = if at == 0 {
+            1
+        } else if at == n - 1 {
+            2
+        } else {
+            0
+        };
+        (cell, edge)
+    };
+    let mut groups = Vec::with_capacity(PATCH_QUADS * PATCH_QUADS);
+    for j in 0..PATCH_QUADS {
+        for i in 0..PATCH_QUADS {
+            let ((ci, ei), (cj, ej)) = (along(key.x, i), along(key.z, j));
+            groups.push(if ei != 0 && ej != 0 {
+                // A corner quad: alone.
+                0x8000_0000 | (j * PATCH_QUADS + i) as u32
+            } else {
+                ci | cj << 6 | ei << 12 | ej << 14
+            });
+        }
+    }
+    groups
+}
+
+/// Whether quad lines `k` and `k + 1` along one axis of a patch at `patch`
+/// on its level's grid are in the same [`JOIN_GRID`] cell -- whether a wall
+/// may run across the quad line between them.
+fn same_cell(key: PatchKey, patch: i32, k: usize) -> bool {
+    let n = (JOIN_GRID / key.quad()).max(1);
+    let g = patch as i64 * PATCH_QUADS as i64 + k as i64;
+    g.div_euclid(n) == (g + 1).div_euclid(n)
+}
+
+/// **A patch as blocks** (issue #422): from the tops of its quads and of the
+/// ring of neighbours around them (`tops`, [`TOPS_SIDE`] a side, as
+/// [`PatchHeights::tops`]), the faces a voxel mesher would make of the same
+/// columns.
+///
+/// - **Tops.** Every quad is flat at its top. Neighbours of the same height
+///   that wear the same and are as open to the sky merge into one rectangle,
+///   greedily, row by row -- within the limits of [`JOIN_GRID`].
+/// - **Walls.** Wherever two neighbouring tops differ by `k` blocks there is
+///   a wall exactly `k` blocks tall, standing on the line between them,
+///   belonging to the higher and facing the lower. Walls in a row with the
+///   same top and the same height merge.
+/// - **The edge.** Along the patch's own edge every quad has a wall facing
+///   out, whether or not the neighbour is lower: what the skirt was. It
+///   shows the step down to the neighbour's quad as this level knows it,
+///   and hangs a skirt's depth below that ([`Face::border`]). Both patches
+///   on an edge draw one, back to back; whichever is higher covers the step.
+///
+/// Every coordinate is a whole number of quads and blocks, so the faces of
+/// one patch meet exactly, and so do those of two patches of one level.
+/// Deterministic: the faces come out tops first, then the walls facing along
+/// x line by line, then those along z.
+pub fn mesh(key: PatchKey, tops: &[i32], ground: &[QuadGround]) -> Vec<Face> {
+    assert_eq!(tops.len(), TOPS_SIDE * TOPS_SIDE, "a patch's tops");
+    assert_eq!(ground.len(), PATCH_QUADS * PATCH_QUADS, "a patch's ground");
+    const N: usize = PATCH_QUADS;
+    // By quad, -1 and N being the apron.
+    let top = |i: i32, j: i32| tops[(j + 1) as usize * TOPS_SIDE + (i + 1) as usize];
+    let groups = merge_groups(key);
+    let mut faces = Vec::new();
+
+    // Tops: the widest run of equal quads along x, then as many equal rows
+    // of it along z as there are.
+    let mut done = [false; N * N];
+    let same = |a: usize, b: usize, done: &[bool]| {
+        !done[b]
+            && groups[a] == groups[b]
+            && ground[a].top == ground[b].top
+            && ground[a].top_open == ground[b].top_open
+            && top((a % N) as i32, (a / N) as i32) == top((b % N) as i32, (b / N) as i32)
+    };
+    for j in 0..N {
+        for i in 0..N {
+            let first = j * N + i;
+            if done[first] {
+                continue;
+            }
+            let mut w = 1;
+            while i + w < N && same(first, first + w, &done) {
+                w += 1;
+            }
+            let mut d = 1;
+            while j + d < N && (0..w).all(|k| same(first, (j + d) * N + i + k, &done)) {
+                d += 1;
+            }
+            for dj in 0..d {
+                for di in 0..w {
+                    done[(j + dj) * N + i + di] = true;
+                }
+            }
+            faces.push(Face {
+                dir: FaceDir::Top,
+                i0: i as u8,
+                j0: j as u8,
+                i1: (i + w) as u8,
+                j1: (j + d) as u8,
+                top: top(i as i32, j as i32),
+                rise: 0,
+                border: false,
+                mix: ground[first].top,
+                open: ground[first].top_open,
+            });
+        }
+    }
+
+    // Walls. `along_x`: the walls facing along x, standing on the lines of
+    // constant x and running along z; otherwise the other way round.
+    for along_x in [true, false] {
+        let (patch_run, pos, neg) = if along_x {
+            (key.z, FaceDir::PosX, FaceDir::NegX)
+        } else {
+            (key.x, FaceDir::PosZ, FaceDir::NegZ)
+        };
+        // What the quad `at` along the run, on the low (`false`) or high
+        // side of `line`, shows on a wall facing `dir`: the wall is that
+        // quad's.
+        let shown = |line: i32, k: usize, high: bool, dir: FaceDir| {
+            let across = if high { line } else { line - 1 } as usize;
+            let g = if along_x {
+                ground[k * N + across]
+            } else {
+                ground[across * N + k]
+            };
+            let d = dir as usize - 1;
+            (g.sides[d], g.side_open[d])
+        };
+        for line in 0..=N as i32 {
+            // The wall on this line beside quad `k` of the run, if any:
+            // (direction, top, rise, border, what it shows).
+            let wall = |k: usize| {
+                let (below, above) = if along_x {
+                    (top(line - 1, k as i32), top(line, k as i32))
+                } else {
+                    (top(k as i32, line - 1), top(k as i32, line))
+                };
+                if line == 0 {
+                    // This patch's quad is the one above the line.
+                    let rise = (above - below).max(0) as u32;
+                    Some((neg, above, rise, true, shown(line, k, true, neg)))
+                } else if line == N as i32 {
+                    let rise = (below - above).max(0) as u32;
+                    Some((pos, below, rise, true, shown(line, k, false, pos)))
+                } else if below > above {
+                    let rise = (below - above) as u32;
+                    Some((pos, below, rise, false, shown(line, k, false, pos)))
+                } else if above > below {
+                    let rise = (above - below) as u32;
+                    Some((neg, above, rise, false, shown(line, k, true, neg)))
+                } else {
+                    None
+                }
+            };
+            let mut k = 0;
+            while k < N {
+                let Some(this) = wall(k) else {
+                    k += 1;
+                    continue;
+                };
+                let mut end = k + 1;
+                while end < N && same_cell(key, patch_run, end - 1) && wall(end) == Some(this) {
+                    end += 1;
+                }
+                let (dir, top, rise, border, (mix, open)) = this;
+                let (line, k0, k1) = (line as u8, k as u8, end as u8);
+                let (i0, j0, i1, j1) = if along_x {
+                    (line, k0, line, k1)
+                } else {
+                    (k0, line, k1, line)
+                };
+                faces.push(Face {
+                    dir,
+                    i0,
+                    j0,
+                    i1,
+                    j1,
+                    top,
+                    rise,
+                    border,
+                    mix,
+                    open,
+                });
+                k = end;
+            }
+        }
+    }
+    faces
+}
+
 impl PatchHeights {
+    /// The top of the quad `(i, j)`, in whole blocks; `-1` and
+    /// [`PATCH_QUADS`] are the neighbouring patches' nearest quads.
+    pub fn top(&self, i: i32, j: i32) -> i32 {
+        self.tops[(j + 1) as usize * TOPS_SIDE + (i + 1) as usize]
+    }
+
+    /// [`skirt`](Self::skirt) in whole blocks, rounded up: how far a wall on
+    /// the patch's edge hangs below the step it shows.
+    pub fn skirt_blocks(&self) -> i32 {
+        self.skirt().ceil() as i32
+    }
+
     /// How far the patch's skirt drops below its edge, in blocks: enough to
     /// cover the gap to a neighbour two levels coarser (a split for roughness
     /// can put one there), whose edge is a straight line across four of this
@@ -491,7 +984,9 @@ pub(crate) mod tests {
         for eye in [[8.0, 40.0, 8.0], [8.0, 300.0, 8.0], [8.0, 3000.0, 8.0]] {
             let v = view(eye, 262_144.0);
             for key in select(&v, |_| None) {
-                if key.level == 0 {
+                // The finest patches are the join's: never finer than the
+                // voxel rings' coarsest cell, so as wide as they are.
+                if key.level <= FINEST_LEVEL {
                     continue;
                 }
                 let (min, max) = patch_box(key);
@@ -583,6 +1078,38 @@ pub(crate) mod tests {
         // And something still covers the hole's edge, where the rings end.
         let map = coverage(&keys, 64, 960, 1088);
         assert!(map.contains_key(&(1024, 1024)), "a gap where the rings end");
+    }
+
+    /// **The far terrain's finest quad is the voxel rings' coarsest cell**,
+    /// at any screen height (#422, the review of #423): on a tall display the
+    /// pixel floor lets quads of 4 reach out to 1,589 blocks, finer than the
+    /// level-3 cells at the join, which made a fine band between two coarse
+    /// ones. Rough ground everywhere (`error_of` huge) is the worst case.
+    #[test]
+    fn the_far_terrain_is_never_finer_than_the_join() {
+        let hole = Hole {
+            min: [-1024.0, -1024.0, -1024.0],
+            max: [1024.0, 1024.0, 1024.0],
+        };
+        // The coarsest voxel cell is 8 blocks: the level the far terrain stops at.
+        assert_eq!(1i64 << FINEST_LEVEL, 8);
+        for rows in [1080.0, 1664.0, 2880.0, 4320.0] {
+            let pixel = std::f64::consts::FRAC_PI_3 / rows;
+            let keys = select(
+                &FarView {
+                    eye: [8.0, 40.0, 8.0],
+                    split_ratio: split_ratio_for(16.0, rows, std::f64::consts::FRAC_PI_3),
+                    max_error: 0.0,
+                    min_quad: 4.0 * pixel,
+                    radius: 20_000.0,
+                    hole: Some(hole),
+                },
+                |_| Some(1e9),
+            );
+            assert!(!keys.is_empty());
+            let finest = keys.iter().map(|k| k.level).min().expect("patches");
+            assert_eq!(finest, FINEST_LEVEL, "{rows} rows");
+        }
     }
 
     /// From 3 km up the voxel rings reach nothing, and the far terrain is all
@@ -712,12 +1239,12 @@ pub(crate) mod tests {
             let d = distance(v.eye, min, max);
             // Its children would have been narrower than the floor.
             assert!(
-                key.level == 0 || (key.quad() as f64 / 2.0) < v.min_quad * d,
+                key.level <= FINEST_LEVEL || (key.quad() as f64 / 2.0) < v.min_quad * d,
                 "{key:?} could have been split and was not"
             );
             // And the floor is honoured by the patch itself.
             assert!(
-                key.quad() as f64 >= v.min_quad * d / 2.0 || key.level == 0,
+                key.quad() as f64 >= v.min_quad * d / 2.0 || key.level <= FINEST_LEVEL,
                 "{key:?} split below the floor"
             );
         }
@@ -889,7 +1416,10 @@ pub(crate) mod tests {
     /// is called. Its output, for eyes the game uses and a few it does not
     /// (the origin, a half-block off it, far from it), is pinned as a count
     /// and a hash of the keys in order. The constants were recorded by
-    /// running this on `main`'s `select`, before any change.
+    /// running this on `main`'s `select`, before any change -- and re-recorded
+    /// once, deliberately, for #422: no patch is finer than the voxel rings'
+    /// coarsest cell ([`FINEST_LEVEL`]), which removes every level 0 to 2
+    /// patch (the counts fell from 3,000 and more to 1,300 and 2,100).
     #[test]
     fn select_output_is_pinned() {
         let eyes = [
@@ -912,24 +1442,122 @@ pub(crate) mod tests {
     }
 
     const PINNED: [(usize, u64); 12] = [
-        (3244, 0xd021a1cba451d8ac),
-        (3163, 0x13ece4e45f7f0178),
-        (3091, 0xc3014d635e724bc3),
-        (3193, 0x46c4a11da0776b26),
-        (3214, 0xc0be892670ab4cdc),
-        (3275, 0x4527efdc119d1c28),
-        (3996, 0x7969cf5fccbeeb8c),
-        (3915, 0x885bd8907365cb40),
-        (3843, 0xdf78212800f279bb),
-        (3945, 0x784387a30e13173e),
-        (3962, 0x2a19a00bd6d33854),
-        (4017, 0x4b10f89ba487b11e),
+        (1354, 0x978e180d13ca8d0c),
+        (1351, 0x5eb0a082c904d27f),
+        (1342, 0xa5355f221dec017a),
+        (1342, 0x51d201868e34f8b4),
+        (1342, 0x51d201868e34f8b4),
+        (1355, 0x515ee101814d02d6),
+        (2106, 0xa6596bd608972c34),
+        (2103, 0x35464759fed1d207),
+        (2094, 0x1cc170268a38e04a),
+        (2094, 0x63ddf75f6059ad7c),
+        (2090, 0xdaff0432f4f908e4),
+        (2097, 0x18b30fa785776798),
     ];
 }
 
 #[cfg(test)]
 mod measure {
     use super::*;
+
+    /// Measurement, not a check: how often a quad's top stands above its
+    /// parent quad's, and by how much, per level of the child. Up to
+    /// [`EXACT_TOP_QUAD`] a top is exact and a parent is the highest of its
+    /// children; beyond it both are sampled, and a child looks at columns
+    /// its parent skips. Where it happens, a far patch swapping for its
+    /// coarser parent lowers that ground by this much.
+    #[test]
+    #[ignore]
+    fn a_child_above_its_parent() {
+        let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
+        println!("| child level | quad | parent quads | a child above | mean excess | worst |");
+        println!("|--:|--:|--:|--:|--:|--:|");
+        for level in 2..11u32 {
+            let (mut parents, mut above, mut sum, mut worst) = (0u32, 0u32, 0i64, 0i32);
+            // Plain and mountains alike: patches from the origin to the range.
+            for (x, z) in [(8, 8), (-848, 4832), (5000, -3000), (-20_000, 9000)] {
+                let parent = PatchKey::containing(level + 1, x, z);
+                let child = parent.children()[0];
+                for j in 0..PATCH_QUADS as i32 / 2 {
+                    for i in 0..PATCH_QUADS as i32 / 2 {
+                        let up = quad_top(&gen, parent, i, j);
+                        let down = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                            .map(|(a, b)| quad_top(&gen, child, 2 * i + a, 2 * j + b))
+                            .into_iter()
+                            .max()
+                            .unwrap();
+                        parents += 1;
+                        if down > up {
+                            above += 1;
+                            sum += (down - up) as i64;
+                            worst = worst.max(down - up);
+                        }
+                    }
+                }
+            }
+            println!(
+                "| {level} | {} | {parents} | {:.1}% | {:.1} | {worst} |",
+                1 << level,
+                100.0 * above as f64 / parents as f64,
+                if above > 0 {
+                    sum as f64 / above as f64
+                } else {
+                    0.0
+                },
+            );
+        }
+    }
+
+    /// Measurement, not a check: triangles per level, the smooth surface
+    /// (2,312 a patch, skirt included) against the blocks, over everything
+    /// the three eyes select at High.
+    #[test]
+    #[ignore]
+    fn blocks_against_smooth() {
+        let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
+        let pixel = std::f64::consts::FRAC_PI_3 / 1080.0;
+        for eye in [[8.0, 40.0, 8.0], [8.0, 300.0, 8.0], [8.0, 3000.0, 8.0]] {
+            let view = FarView {
+                eye,
+                split_ratio: split_ratio_for(16.0, 1080.0, std::f64::consts::FRAC_PI_3),
+                max_error: 2.0 * pixel,
+                min_quad: 4.0 * pixel,
+                radius: 262_144.0,
+                hole: Some(Hole {
+                    min: [-1024.0, eye[1] - 1024.0, -1024.0],
+                    max: [1152.0, eye[1] + 1024.0, 1152.0],
+                }),
+            };
+            let patches = build(&gen, &view);
+            let mut by_level = std::collections::BTreeMap::<u32, [usize; 4]>::new();
+            for p in &patches {
+                let e = by_level.entry(p.key.level).or_default();
+                let count = |f: &dyn Fn(&Face) -> bool| p.faces.iter().filter(|x| f(x)).count();
+                e[0] += 1;
+                e[1] += count(&|f| f.dir == FaceDir::Top);
+                e[2] += count(&|f| f.dir != FaceDir::Top && !f.border);
+                e[3] += count(&|f| f.border);
+            }
+            let smooth = patches.len() * 2312;
+            let blocks: usize = patches.iter().map(|p| p.faces.len() * 2).sum();
+            println!(
+                "eye {eye:?}: {} patches, smooth {smooth}, blocks {blocks} ({:+.0}%)",
+                patches.len(),
+                100.0 * (blocks as f64 / smooth as f64 - 1.0)
+            );
+            for (l, [n, t, w, b]) in by_level {
+                println!(
+                    "  level {l:>2}: {n:>4} patches; a patch: {:>5} tops {:>5} walls {:>4} edge \
+                     = {:>5} triangles",
+                    t / n,
+                    w / n,
+                    b / n,
+                    2 * (t + w + b) / n
+                );
+            }
+        }
+    }
 
     /// Measurement, not a check: what the three gate eyes select at 262 km,
     /// with the voxel rings' cube as the hole. How much of it is in view at
@@ -975,5 +1603,888 @@ mod measure {
                 );
             }
         }
+    }
+}
+
+/// The far terrain as blocks (issue #422): [`quad_top`], [`mesh`], and what
+/// holds two patches together.
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    const SEED: u64 = 0x005E_ED00_00C0_FFEE;
+
+    /// [`mesh`] of ground about which nothing but its tops is known.
+    fn mesh_plain(key: PatchKey, tops: &[i32]) -> Vec<Face> {
+        mesh(key, tops, &[QuadGround::PLAIN; PATCH_QUADS * PATCH_QUADS])
+    }
+
+    /// A patch's tops, apron and all, from a function of the quad.
+    fn tops_from(f: impl Fn(i32, i32) -> i32) -> Vec<i32> {
+        let mut tops = Vec::with_capacity(TOPS_SIDE * TOPS_SIDE);
+        for j in -1..=PATCH_QUADS as i32 {
+            for i in -1..=PATCH_QUADS as i32 {
+                tops.push(f(i, j));
+            }
+        }
+        tops
+    }
+
+    /// A cheap, fixed hash of a quad, for tops with steps of every size.
+    fn rough(seed: u64, span: i32) -> impl Fn(i32, i32) -> i32 {
+        move |i, j| {
+            let h = (i as i64 as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add((j as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+                .wrapping_add(seed)
+                .wrapping_mul(0x2545_F491_4F6C_DD1D);
+            20 + ((h >> 40) % span as u64) as i32
+        }
+    }
+
+    /// The keys the properties are tried on: levels with whole cells of
+    /// [`JOIN_GRID`] inside a patch, the level where every quad is a cell,
+    /// and two above the grid altogether.
+    const KEYS: [PatchKey; 5] = [
+        PatchKey::new(0, 1, 2),
+        PatchKey::new(2, -3, 7),
+        PatchKey::new(4, 0, 0),
+        PatchKey::new(7, 2, -1),
+        PatchKey::new(9, 1, 1),
+    ];
+
+    fn walls(faces: &[Face]) -> impl Iterator<Item = &Face> {
+        faces.iter().filter(|f| f.dir != FaceDir::Top)
+    }
+
+    /// **One ground for every level** (issue #423): a quad's top is the top
+    /// face of the voxel cell over the same columns (`WorldGen::cell_top`,
+    /// whatever that rule is: the mean, and a summit at its highest half's
+    /// mean since #437), never above the highest of them and the column's
+    /// own surface at level 0 -- in the mountains, where the three differ.
+    #[test]
+    fn a_quads_top_is_the_voxel_cells_top() {
+        let gen = WorldGen::new(SEED);
+        let highest = |x0: i64, z0: i64, q: i64| {
+            let mut top = i32::MIN;
+            for z in z0..z0 + q {
+                for x in x0..x0 + q {
+                    top = top.max(gen.surface_height(x as i32, z as i32));
+                }
+            }
+            top
+        };
+        // Levels 0 to 2: whole blocks, exactly: a column's own surface at
+        // level 0, and the voxel cell's `cell_top` (never above the highest
+        // column) at levels 1 and 2.
+        for level in 0..3 {
+            let key = PatchKey::containing(level, -848, 4832);
+            let (q, [ox, oz]) = (key.quad(), key.origin());
+            for (i, j) in [(-1, 3), (0, 0), (7, 19), (31, 31), (32, 8)] {
+                let (x0, z0) = (ox + i as i64 * q, oz + j as i64 * q);
+                let top = quad_top(&gen, key, i, j);
+                assert_eq!(top, gen.cell_top(x0 as i32, z0 as i32, q as i32) + 1);
+                assert!(top <= highest(x0, z0, q) + 1);
+                if level == 0 {
+                    assert_eq!(top, highest(x0, z0, q) + 1);
+                }
+            }
+        }
+        // Level 3: eight columns a side, every one looked at -- the level-3
+        // voxel cell over the same columns, `cell_top(.., 8)`.
+        let key = PatchKey::containing(3, -848, 4832);
+        let [ox, oz] = key.origin();
+        for j in -1..=PATCH_QUADS as i32 {
+            for i in -1..=PATCH_QUADS as i32 {
+                let (x0, z0) = (ox + i as i64 * 8, oz + j as i64 * 8);
+                let top = quad_top(&gen, key, i, j);
+                assert_eq!(top, gen.cell_top(x0 as i32, z0 as i32, 8) + 1);
+                assert!(top <= highest(x0, z0, 8) + 1, "({i}, {j}): {top}");
+            }
+        }
+        // Wider: the sampled form of the same rule.
+        let key = PatchKey::containing(6, -848, 4832);
+        let [ox, oz] = key.origin();
+        for (i, j) in [(0, 0), (9, 30), (31, 2)] {
+            let (x0, z0) = (ox + i as i64 * 64, oz + j as i64 * 64);
+            let top = quad_top(&gen, key, i, j);
+            assert_eq!(
+                top,
+                gen.cell_top_sampled(x0 as i32, z0 as i32, 64, TOP_SAMPLES) + 1
+            );
+        }
+    }
+
+    /// **A far crest grows few towers** (#422 on #437's summit rule). The
+    /// zoom pairs of 2026-11-21 saw "thin vertical spires on peak tops and
+    /// ridges" in the far terrain at 1,200 blocks: quads that held a summit
+    /// stood at their highest column while their neighbours stood at their
+    /// means. A quad's top is the voxel cell's ([`quad_top`]), so the far
+    /// terrain follows the voxels' rule to the highest half's mean with
+    /// nothing changed here -- and this holds it there, at the far terrain's
+    /// own widths, the sampled ones included: over 1,792 blocks square
+    /// around the default seed's highest peak, the quads that stand at
+    /// least their own width above all four quads beside them.
+    ///
+    /// Measured: 12, 8 and 5 at quads of 8, 16 and 32. Under the highest
+    /// column (#432's rule, which this is red on) they were 53, 24 and 9.
+    #[test]
+    fn a_far_crest_grows_few_towers() {
+        /// Per far level, the most towers allowed. **Chosen, not derived**:
+        /// the measured counts with a little room.
+        const MOST: [(u32, usize); 3] = [(3, 14), (4, 10), (5, 6)];
+        const SPAN: i32 = 1792;
+        let gen = WorldGen::new(SEED);
+        let (x_lo, z_lo) = (-3072 - 1024, -3232 - 1120);
+        for (level, most) in MOST {
+            let key = PatchKey::new(level, 0, 0);
+            let q = key.quad() as i32;
+            let n = SPAN / q;
+            // Any quad of the level's grid, counted from the patch at the
+            // origin: `quad_top` takes them all.
+            let tops: Vec<i32> = (0..n * n)
+                .map(|k| quad_top(&gen, key, x_lo / q + k % n, z_lo / q + k / n))
+                .collect();
+            let at = |i: i32, j: i32| tops[(j * n + i) as usize];
+            let towers = (1..n - 1)
+                .flat_map(|j| (1..n - 1).map(move |i| (i, j)))
+                .filter(|&(i, j)| {
+                    [at(i - 1, j), at(i + 1, j), at(i, j - 1), at(i, j + 1)]
+                        .iter()
+                        .all(|&beside| at(i, j) - beside >= q)
+                })
+                .count();
+            println!("quads of {q}: {towers} towers");
+            assert!(
+                towers <= most,
+                "quads of {q}: {towers} quads stand alone at least {q} blocks above all four beside them, allowed {most}"
+            );
+        }
+    }
+
+    /// Where the default seed's mountains are riddled with pits: the ground
+    /// the voxels' own pit test measures (`worldgen`'s
+    /// `a_coarse_top_shows_pit_floors_in_the_share_level_0_does`).
+    const PITS: (i32, i32) = (-848, 4832);
+
+    /// **A far quad of 8 wears what the level-3 cell over the same columns
+    /// wears** (#422 on the colour morph's `top_block`): the same pick of
+    /// the same column, so where the far terrain hands the ground to level 3
+    /// no top changes colour -- a pit's floor stays where it was. Held
+    /// against the node the game generates, cell by cell, over four level-3
+    /// nodes of the pitted mountains; both kinds of top must turn up.
+    #[test]
+    fn a_far_top_wears_what_the_voxel_cell_wears() {
+        use crate::worldgen::{OreSet, TerrainBlocks};
+        use cubara_voxel::{BlockId, Chunk};
+        let gen = WorldGen::new(SEED);
+        let blocks = TerrainBlocks {
+            oak: None,
+            ores: OreSet::EMPTY,
+            grass: BlockId(1),
+            soil: BlockId(2),
+            stone: BlockId(3),
+        };
+        let (step, v) = (8, 4);
+        assert_eq!(1i64 << FINEST_LEVEL, step as i64, "level 3's cell");
+        let size = Chunk::SIZE as i32 * step;
+        let (mut surface, mut floors) = (0, 0);
+        let mut nodes = std::collections::BTreeMap::new();
+        for (nx, nz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+            let (ox, oz) = (
+                PITS.0.div_euclid(size) * size + nx * size,
+                PITS.1.div_euclid(size) * size + nz * size,
+            );
+            for lz in 0..Chunk::SIZE as i32 {
+                for lx in 0..Chunk::SIZE as i32 {
+                    let (x0, z0) = (ox + lx * step, oz + lz * step);
+                    let top = gen.cell_top(x0, z0, step);
+                    let oy = top.div_euclid(size) * size;
+                    let node = nodes
+                        .entry((ox, oy, oz))
+                        .or_insert_with(|| gen.generate_aniso([ox, oy, oz], step, v, blocks));
+                    let block = node.get(lx as usize, ((top - oy) / v) as usize, lz as usize);
+                    if block == BlockId::AIR {
+                        continue; // every column a pit: level 3 draws the hole
+                    }
+                    let key = PatchKey::containing(FINEST_LEVEL, x0 as i64, z0 as i64);
+                    let [px, pz] = key.origin();
+                    let (i, j) = (
+                        ((x0 as i64 - px) / step as i64) as i32,
+                        ((z0 as i64 - pz) / step as i64) as i32,
+                    );
+                    let far = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).top;
+                    let voxel = match block {
+                        b if b == blocks.grass => [255, 0],
+                        b if b == blocks.soil => [0, 255],
+                        _ => [0, 0],
+                    };
+                    assert_eq!(
+                        far, voxel,
+                        "the cell at ({x0}, {z0}): level 3 wears {block:?} on top"
+                    );
+                    if far == [255, 0] {
+                        surface += 1;
+                    } else {
+                        floors += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            surface > 500 && floors > 30,
+            "{surface} tops wear the surface block, {floors} a pit's floor"
+        );
+    }
+
+    /// **A far top shows a pit's floor in the share level 0's columns are
+    /// pits**, at every quad width (#422 on `WorldGen::top_block`'s rule):
+    /// over 1,024 blocks square of the pitted mountains, the tops that wear
+    /// something other than the surface block number what the pit share of
+    /// the ground says -- every column of it counted, so a sampled quad is
+    /// held to the ground and not to its own samples. Before the rule the
+    /// far terrain showed none.
+    #[test]
+    fn a_far_top_shows_pit_floors_in_the_share_level_0_does() {
+        /// Per far level, how far the count may be from the expectation, as
+        /// a share of it. **Chosen, not derived**: the pick is a hash per
+        /// quad, so the count is a sample -- 1,010.5, 252.6 and 63.2 quads
+        /// expected here at 8, 16 and 32 blocks (6.17% of the columns are
+        /// pit), 1,010, 261 and 66 measured; the bounds are about three
+        /// standard deviations of a count that size.
+        const WITHIN: [(u32, f64); 3] = [(3, 0.1), (4, 0.2), (5, 0.35)];
+        const SPAN: i32 = 1024;
+        let gen = WorldGen::new(SEED);
+        let (x_lo, z_lo) = (
+            PITS.0.div_euclid(SPAN) * SPAN - SPAN / 2,
+            PITS.1.div_euclid(SPAN) * SPAN - SPAN / 2,
+        );
+        let pit: Vec<bool> = (0..SPAN * SPAN)
+            .map(|k| {
+                let (x, z) = (x_lo + k % SPAN, z_lo + k / SPAN);
+                gen.pit_floor(x, z, gen.surface_height(x, z)).is_some()
+            })
+            .collect();
+        let expected_share = pit.iter().filter(|p| **p).count() as f64 / pit.len() as f64;
+        for (level, within) in WITHIN {
+            let q = 1i32 << level;
+            let quads = (SPAN / q) * (SPAN / q);
+            let expected = expected_share * quads as f64;
+            let mut shown = 0;
+            for k in 0..quads {
+                let (x0, z0) = (x_lo + k % (SPAN / q) * q, z_lo + k / (SPAN / q) * q);
+                let key = PatchKey::containing(level, x0 as i64, z0 as i64);
+                let [px, pz] = key.origin();
+                let (i, j) = (
+                    ((x0 as i64 - px) / q as i64) as i32,
+                    ((z0 as i64 - pz) / q as i64) as i32,
+                );
+                let wears = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).top;
+                shown += (wears != [255, 0]) as u32;
+            }
+            println!(
+                "quads of {q}: {shown} of {quads} tops show a pit's floor, {expected:.1} expected ({:.2}% of the columns are pit)",
+                100.0 * expected_share
+            );
+            assert!(expected > 8.0, "quads of {q}: too few pits to measure");
+            assert!(
+                (shown as f64 - expected).abs() <= within * expected,
+                "quads of {q}: {shown} tops show a pit's floor, {expected:.1} expected"
+            );
+        }
+    }
+
+    /// A quad over ground with no riser at all (a column no neighbour is
+    /// lower than) shows the surface block's side on a wall facing any way:
+    /// `QuadGround::of`'s last fallback, the one a division by no risers at
+    /// all would turn into nothing.
+    #[test]
+    fn a_wall_over_ground_with_no_risers_is_the_surface_blocks_side() {
+        let gen = WorldGen::new(SEED);
+        let key = PatchKey::new(0, 0, 0);
+        let mut found = 0;
+        for j in 1..31 {
+            for i in 1..31 {
+                let [ox, oz] = key.origin();
+                let (x, z) = (ox as i32 + i, oz as i32 + j);
+                let h = gen.surface_height(x, z);
+                let level = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .all(|&(dx, dz)| gen.surface_height(x + dx, z + dz) >= h);
+                if level {
+                    found += 1;
+                    assert_eq!(
+                        QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).sides,
+                        [[255, 0]; 4],
+                        "the column at ({x}, {z})"
+                    );
+                }
+            }
+        }
+        assert!(found > 20, "only {found} columns without a riser");
+    }
+
+    /// **A wall is what level 0's risers facing its way are made of**
+    /// (issue #423 decision 2), not what its own height would suggest: its
+    /// mix and openness are its quad's [`QuadGround`] for its direction, and
+    /// a quad's ground is `WorldGen::ground_faces` of its columns.
+    #[test]
+    fn a_wall_shows_what_level_0_shows_that_way() {
+        use crate::worldgen::GroundLayer;
+        let gen = WorldGen::new(SEED);
+        let key = PatchKey::containing(3, -848, 4832);
+        let patch = generate(&gen, key);
+        let [ox, oz] = key.origin();
+        let unit = |v: f32| (v * 255.0).round() as u8;
+        let (mut below, mut differing) = (0, 0);
+        for f in &patch.faces {
+            // The quad the face belongs to.
+            let (i, j) = match f.dir {
+                FaceDir::Top | FaceDir::NegX | FaceDir::NegZ => (f.i0, f.j0),
+                FaceDir::PosX => (f.i0 - 1, f.j0),
+                FaceDir::PosZ => (f.i0, f.j0 - 1),
+            };
+            let g = patch.ground[j as usize * PATCH_QUADS + i as usize];
+            let level0 =
+                gen.ground_faces((ox + i as i64 * 8) as i32, (oz + j as i64 * 8) as i32, 8, 4);
+            if f.dir == FaceDir::Top {
+                assert_eq!((f.mix, f.open), (g.top, unit(level0.top_open)), "{f:?}");
+                continue;
+            }
+            let d = f.dir as usize - 1;
+            assert_eq!((f.mix, f.open), (g.sides[d], g.side_open[d]), "{f:?}");
+            assert_eq!(f.open, unit(level0.side_open[d]), "{f:?}");
+            if let Some(surface) = level0.share(d, GroundLayer::Surface) {
+                let soil = level0.share(d, GroundLayer::Soil).unwrap();
+                assert_eq!(f.mix, [unit(surface), unit(soil)], "{f:?}");
+                if f.mix[1] > 0 {
+                    below += 1;
+                }
+                // Its direction's own mix, not another's.
+                if g.sides.iter().any(|s| *s != g.sides[d]) {
+                    differing += 1;
+                }
+            }
+        }
+        assert!(
+            below > 200,
+            "only {below} walls show anything under the surface block"
+        );
+        assert!(
+            differing > 200,
+            "only {differing} walls tell one direction from another"
+        );
+    }
+
+    /// **The far terrain's blocks are on the world's block grid**, and on
+    /// the grid of the voxel rings' coarse cells where the two meet: a quad
+    /// of level `L` has its corners on multiples of `2^L` blocks, and at
+    /// level 0 its top is the top face of the column it is.
+    #[test]
+    fn the_steps_are_on_the_block_grid() {
+        let gen = WorldGen::new(SEED);
+        for key in [
+            PatchKey::new(0, 3, -2),
+            PatchKey::new(3, -5, 1),
+            PatchKey::new(6, 0, 0),
+        ] {
+            let [ox, oz] = key.origin();
+            assert_eq!(ox.rem_euclid(key.quad()), 0);
+            assert_eq!(oz.rem_euclid(key.quad()), 0);
+        }
+        // A level-3 quad is one 8-block cell of the coarsest voxel ring;
+        // coarser quads are whole numbers of them.
+        for level in 3..9 {
+            assert_eq!(PatchKey::new(level, 1, 1).quad() % 8, 0);
+        }
+        let key = PatchKey::new(0, 3, -2);
+        let patch = generate(&gen, key);
+        let [ox, oz] = key.origin();
+        for j in -1..=PATCH_QUADS as i32 {
+            for i in -1..=PATCH_QUADS as i32 {
+                let column = gen.surface_height((ox + i as i64) as i32, (oz + j as i64) as i32);
+                assert_eq!(patch.top(i, j), column + 1, "quad ({i}, {j})");
+            }
+        }
+    }
+
+    /// **A step of `k` blocks is a wall of exactly `k` blocks**: over tops
+    /// with steps of every size, each line between two quads of a patch has
+    /// one wall where they differ -- on the line, as tall as the difference,
+    /// hanging from the higher, facing the lower -- and none where they are
+    /// level.
+    #[test]
+    fn a_step_of_k_blocks_is_a_wall_of_exactly_k_blocks() {
+        const N: i32 = PATCH_QUADS as i32;
+        let mut steps = 0;
+        for (n, key) in KEYS.into_iter().enumerate() {
+            for span in [2, 3, 40] {
+                let top = rough(n as u64 * 31 + span as u64, span);
+                let faces = mesh_plain(key, &tops_from(&top));
+                // Every wall, by the unit of quad line it stands on:
+                // (faces along x?, line, quad along it) -> the wall.
+                let mut on = std::collections::HashMap::new();
+                for f in walls(&faces) {
+                    let along_x = matches!(f.dir, FaceDir::PosX | FaceDir::NegX);
+                    assert_eq!(f.i0 == f.i1, along_x, "{f:?}");
+                    assert_eq!(f.j0 == f.j1, !along_x, "{f:?}");
+                    let (line, run) = if along_x {
+                        (f.i0, f.j0..f.j1)
+                    } else {
+                        (f.j0, f.i0..f.i1)
+                    };
+                    assert!(!run.is_empty(), "{f:?} has no length");
+                    for k in run {
+                        let before = on.insert((along_x, line as i32, k as i32), *f);
+                        assert!(before.is_none(), "two walls on one line: {f:?} {before:?}");
+                    }
+                }
+                for along_x in [true, false] {
+                    for line in 1..N {
+                        for k in 0..N {
+                            let (below, above) = if along_x {
+                                (top(line - 1, k), top(line, k))
+                            } else {
+                                (top(k, line - 1), top(k, line))
+                            };
+                            let wall = on.get(&(along_x, line, k));
+                            if below == above {
+                                assert!(wall.is_none(), "a wall between level quads: {wall:?}");
+                                continue;
+                            }
+                            steps += 1;
+                            let wall = wall.unwrap_or_else(|| {
+                                panic!("{key:?}: no wall on line {line} at {k}, {below} to {above}")
+                            });
+                            let want = match (along_x, below > above) {
+                                (true, true) => FaceDir::PosX,
+                                (true, false) => FaceDir::NegX,
+                                (false, true) => FaceDir::PosZ,
+                                (false, false) => FaceDir::NegZ,
+                            };
+                            assert_eq!(wall.dir, want, "{wall:?}");
+                            assert_eq!(wall.top, below.max(above), "{wall:?}");
+                            assert_eq!(wall.rise, below.abs_diff(above), "{wall:?}");
+                            assert!(!wall.border, "{wall:?}");
+                            // Exactly the step: its foot is the lower top.
+                            assert_eq!(wall.bottom(99), below.min(above), "{wall:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(steps > 20_000, "only {steps} steps tried");
+    }
+
+    /// The tops are the quads: each quad is under exactly one top, at its
+    /// own height.
+    #[test]
+    fn every_quad_is_under_one_top_at_its_height() {
+        for (n, key) in KEYS.into_iter().enumerate() {
+            for span in [1, 2, 40] {
+                let top = rough(n as u64 * 17 + span as u64, span);
+                let faces = mesh_plain(key, &tops_from(&top));
+                let mut under = [0u8; PATCH_QUADS * PATCH_QUADS];
+                for f in faces.iter().filter(|f| f.dir == FaceDir::Top) {
+                    assert!(f.i0 < f.i1 && f.j0 < f.j1, "{f:?}");
+                    assert_eq!((f.rise, f.border), (0, false), "{f:?}");
+                    for j in f.j0..f.j1 {
+                        for i in f.i0..f.i1 {
+                            under[j as usize * PATCH_QUADS + i as usize] += 1;
+                            assert_eq!(f.top, top(i as i32, j as i32), "{f:?} over ({i}, {j})");
+                        }
+                    }
+                }
+                assert!(
+                    under.iter().all(|&n| n == 1),
+                    "{key:?}: a quad under {under:?}"
+                );
+            }
+        }
+    }
+
+    /// **Equal neighbours merge**, within a cell of [`JOIN_GRID`]. A level-0
+    /// patch is two cells by two: level ground is nine tops a cell -- its
+    /// 14 x 14 inside as one, its four edge rows, its four corners -- where
+    /// the unmerged cell has 256, and one wall along each cell's stretch of
+    /// the patch's edge. Two plateaus are that again on either side of one
+    /// wall a cell long. Ground with no two neighbours alike merges nothing.
+    #[test]
+    fn equal_neighbours_merge() {
+        let key = PatchKey::new(0, 0, 0);
+        let count = |faces: &[Face], dir: FaceDir| faces.iter().filter(|f| f.dir == dir).count();
+        let flat = mesh_plain(key, &tops_from(|_, _| 30));
+        assert_eq!(count(&flat, FaceDir::Top), 4 * 9);
+        // The inside of the first cell, in one piece.
+        assert!(
+            flat.contains(&Face {
+                dir: FaceDir::Top,
+                i0: 1,
+                j0: 1,
+                i1: 15,
+                j1: 15,
+                top: 30,
+                rise: 0,
+                border: false,
+                mix: [255, 0],
+                open: 255,
+            }),
+            "{flat:?}"
+        );
+        assert_eq!(walls(&flat).count(), 8);
+        for wall in walls(&flat) {
+            assert!(wall.border && wall.rise == 0, "{wall:?}");
+            assert_eq!(
+                (wall.i1 - wall.i0) + (wall.j1 - wall.j0),
+                16,
+                "{wall:?} does not run its cell's length"
+            );
+        }
+
+        // Two plateaus, the step along x = 5: inside the first cells, so
+        // it cuts their insides in two and adds nothing else.
+        let two = mesh_plain(key, &tops_from(|i, _| if i < 5 { 30 } else { 37 }));
+        let inner: Vec<_> = walls(&two).filter(|f| !f.border).copied().collect();
+        let wall = |j0: u8, j1: u8| Face {
+            dir: FaceDir::NegX,
+            i0: 5,
+            j0,
+            i1: 5,
+            j1,
+            top: 37,
+            rise: 7,
+            border: false,
+            mix: [255, 0],
+            open: 255,
+        };
+        assert_eq!(inner, vec![wall(0, 16), wall(16, 32)]);
+        // Each of the two cells it crosses: the inside in two, and its two
+        // edge rows along x in two.
+        assert_eq!(count(&two, FaceDir::Top), 4 * 9 + 2 * 3);
+
+        // Level ground of which one quad is shut in a little more than the
+        // rest: that quad is a top of its own, with its own openness.
+        let mut ground = [QuadGround::PLAIN; PATCH_QUADS * PATCH_QUADS];
+        ground[5 * PATCH_QUADS + 7].top_open = 200;
+        let shaded = mesh(key, &tops_from(|_, _| 30), &ground);
+        let own: Vec<_> = shaded.iter().filter(|f| f.open == 200).collect();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!((own[0].i0, own[0].j0, own[0].i1, own[0].j1), (7, 5, 8, 6));
+        assert!(count(&shaded, FaceDir::Top) > 4 * 9);
+
+        // Level ground of which one quad shows a pit's floor: a top of its
+        // own again, wearing the floor, and no other top wears it.
+        let mut ground = [QuadGround::PLAIN; PATCH_QUADS * PATCH_QUADS];
+        ground[9 * PATCH_QUADS + 3].top = [0, 0];
+        let pitted = mesh(key, &tops_from(|_, _| 30), &ground);
+        let own: Vec<_> = pitted
+            .iter()
+            .filter(|f| f.dir == FaceDir::Top && f.mix != [255, 0])
+            .collect();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!(
+            (own[0].i0, own[0].j0, own[0].i1, own[0].j1, own[0].mix),
+            (3, 9, 4, 10, [0, 0])
+        );
+        assert!(count(&pitted, FaceDir::Top) > 4 * 9);
+
+        // Above the grid a quad is a cell: level ground is a top a quad.
+        let above = mesh_plain(PatchKey::new(4, 0, 0), &tops_from(|_, _| 30));
+        assert_eq!(count(&above, FaceDir::Top), PATCH_QUADS * PATCH_QUADS);
+        assert!(walls(&above).all(|f| f.border));
+
+        // Nothing alike: a top a quad.
+        let none = mesh_plain(key, &tops_from(|i, j| i * 40 + j));
+        assert_eq!(count(&none, FaceDir::Top), PATCH_QUADS * PATCH_QUADS);
+        assert_eq!(walls(&none).filter(|f| !f.border).count(), 2 * 31 * 32);
+    }
+
+    /// **No face crosses a line of [`JOIN_GRID`], and a top that touches one
+    /// is a single quad deep there** -- what the join to the voxels rests on
+    /// (`cubara_render::far::join` moves the corners a quad inside the box's
+    /// side, and a wall is in the box or out of it as a whole). On level
+    /// ground, where everything that may merge does.
+    #[test]
+    fn no_face_crosses_the_join_grid() {
+        for key in [
+            PatchKey::new(0, 3, 2),
+            PatchKey::new(1, -1, 0),
+            PatchKey::new(2, 5, -4),
+            PatchKey::new(3, 0, 0),
+            PatchKey::new(4, -2, 1),
+            PatchKey::new(6, 0, 3),
+        ] {
+            let q = key.quad();
+            let [ox, oz] = key.origin();
+            let faces = mesh_plain(key, &tops_from(|_, _| 30));
+            let mut merged = false;
+            for f in &faces {
+                // In blocks.
+                let (x0, x1) = (ox + f.i0 as i64 * q, ox + f.i1 as i64 * q);
+                let (z0, z1) = (oz + f.j0 as i64 * q, oz + f.j1 as i64 * q);
+                // A quad wider than the grid crosses its lines as it is; a
+                // face must not be more than one of those.
+                let cell = JOIN_GRID.max(q);
+                for (lo, hi) in [(x0, x1), (z0, z1)] {
+                    assert!(
+                        hi == lo || lo.div_euclid(cell) == (hi - 1).div_euclid(cell),
+                        "{key:?}: {f:?} crosses a line, {lo}..{hi}"
+                    );
+                }
+                merged |= (x1 - x0) > q || (z1 - z0) > q;
+                if f.dir != FaceDir::Top {
+                    continue;
+                }
+                let on_line = |v: i64| v.rem_euclid(JOIN_GRID) == 0;
+                if on_line(x0) || on_line(x1) {
+                    assert_eq!(x1 - x0, q, "{key:?}: {f:?} is wide against a line");
+                }
+                if on_line(z0) || on_line(z1) {
+                    assert_eq!(z1 - z0, q, "{key:?}: {f:?} is deep against a line");
+                }
+            }
+            // And the limits are limits, not a ban: below the level where a
+            // quad is a cell, something did merge.
+            assert_eq!(merged, key.level < 4, "{key:?}");
+        }
+    }
+
+    /// Two patches of one level side by side agree on the quads along their
+    /// shared edge: each one's apron is the other's own row. So the wall on
+    /// that edge is exact, as inside a patch.
+    #[test]
+    fn neighbouring_patches_agree_on_the_quads_along_their_edge() {
+        let gen = WorldGen::new(SEED);
+        const N: i32 = PATCH_QUADS as i32;
+        // (5, -27, 151) is in the mountains.
+        for key in [
+            PatchKey::new(0, 2, 5),
+            PatchKey::new(3, 2, 5),
+            PatchKey::new(5, -27, 151),
+        ] {
+            let a = generate(&gen, key);
+            let east = generate(&gen, PatchKey::new(key.level, key.x + 1, key.z));
+            let south = generate(&gen, PatchKey::new(key.level, key.x, key.z + 1));
+            let mut differ = false;
+            for k in 0..N {
+                assert_eq!(a.top(N, k), east.top(0, k), "{key:?} east, {k}");
+                assert_eq!(a.top(N - 1, k), east.top(-1, k), "{key:?} east, {k}");
+                assert_eq!(a.top(k, N), south.top(k, 0), "{key:?} south, {k}");
+                assert_eq!(a.top(k, N - 1), south.top(k, -1), "{key:?} south, {k}");
+                differ |= a.top(N, k) != a.top(N - 1, k);
+            }
+            if key.level == 5 {
+                assert!(differ, "level ground in the mountains proves nothing");
+            }
+        }
+    }
+
+    /// The patch covering the block column `(x, z)`, if any.
+    fn patch_at(patches: &[PatchHeights], x: i64, z: i64) -> Option<&PatchHeights> {
+        patches.iter().find(|p| {
+            let [ox, oz] = p.key.origin();
+            (ox..ox + p.key.size()).contains(&x) && (oz..oz + p.key.size()).contains(&z)
+        })
+    }
+
+    /// The drawn top of the column `(x, z)` of `p`.
+    fn top_at(p: &PatchHeights, x: i64, z: i64) -> i32 {
+        let [ox, oz] = p.key.origin();
+        let q = p.key.quad();
+        p.top(((x - ox) / q) as i32, ((z - oz) / q) as i32)
+    }
+
+    /// How far short of closing the worst edge falls, over everything a view
+    /// selects: for every stretch of every patch's edge with another patch
+    /// beyond it, the wall there must reach from this patch's top down to
+    /// the other's, whatever the other's level. Returns `(stretches checked,
+    /// of them between levels, the worst shortfall in blocks -- zero or less
+    /// when all close)`. `skirt_of` is the skirt a patch's edge walls are
+    /// given.
+    fn worst_gap(
+        patches: &[PatchHeights],
+        skirt_of: impl Fn(&PatchHeights) -> i32,
+    ) -> (usize, usize, i32) {
+        const N: i64 = PATCH_QUADS as i64;
+        let (mut checked, mut between, mut worst) = (0, 0, i32::MIN);
+        for p in patches {
+            let [ox, oz] = p.key.origin();
+            let q = p.key.quad();
+            // Each edge: the wall's direction, and for quad `k` along it, the
+            // column just inside and the step to the column just outside.
+            let edges = [
+                (FaceDir::NegX, 0u8, true),
+                (FaceDir::PosX, N as u8, true),
+                (FaceDir::NegZ, 0u8, false),
+                (FaceDir::PosZ, N as u8, false),
+            ];
+            for (dir, line, along_x) in edges {
+                let inside = if line == 0 { 0 } else { N - 1 };
+                let outside = if line == 0 { -1 } else { N * q };
+                for k in 0..N {
+                    let wall = p
+                        .faces
+                        .iter()
+                        .find(|f| {
+                            f.border && f.dir == dir && {
+                                let (at, run) = if along_x {
+                                    (f.i0, f.j0..f.j1)
+                                } else {
+                                    (f.j0, f.i0..f.i1)
+                                };
+                                at == line && run.contains(&(k as u8))
+                            }
+                        })
+                        .unwrap_or_else(|| panic!("{:?}: no wall on edge {dir:?} at {k}", p.key));
+                    let mine = if along_x {
+                        p.top(inside as i32, k as i32)
+                    } else {
+                        p.top(k as i32, inside as i32)
+                    };
+                    assert_eq!(wall.top, mine, "{:?}: {wall:?}", p.key);
+                    let foot = wall.bottom(skirt_of(p));
+                    // Along this quad's edge, every neighbour beyond it.
+                    let mut s = 0;
+                    while s < q {
+                        let (x, z) = if along_x {
+                            (ox + outside, oz + k * q + s)
+                        } else {
+                            (ox + k * q + s, oz + outside)
+                        };
+                        let Some(other) = patch_at(patches, x, z) else {
+                            // The edge of the view, or the voxels' hole.
+                            s += q;
+                            continue;
+                        };
+                        let theirs = top_at(other, x, z);
+                        checked += 1;
+                        if other.key.level != p.key.level {
+                            between += 1;
+                        }
+                        if mine > theirs {
+                            worst = worst.max(foot - theirs);
+                        }
+                        s += q.min(other.key.quad());
+                    }
+                }
+            }
+        }
+        (checked, between, worst)
+    }
+
+    /// The views the watertightness property is tried on: three seeds, an
+    /// eye on the ground, one on a hill and one in flight, to 40 km, with
+    /// the voxels' hole -- so rough land splits some patches two levels
+    /// below their neighbours.
+    fn watertight_views() -> Vec<(u64, FarView)> {
+        let pixel = std::f64::consts::FRAC_PI_3 / 1080.0;
+        let mut out = Vec::new();
+        for (seed, eye) in [
+            (SEED, [8.0, 40.0, 8.0]),
+            (0x0BAD_5EED, [-3000.0, 300.0, 5200.0]),
+            (1_881_928_537_856_268_101, [640.0, 900.0, -410.0]),
+        ] {
+            out.push((
+                seed,
+                FarView {
+                    eye,
+                    split_ratio: split_ratio_for(16.0, 1080.0, std::f64::consts::FRAC_PI_3),
+                    max_error: 2.0 * pixel,
+                    min_quad: 4.0 * pixel,
+                    radius: 20_000.0,
+                    hole: Some(Hole {
+                        min: [eye[0] - 1024.0, eye[1] - 1024.0, eye[2] - 1024.0],
+                        max: [eye[0] + 1024.0, eye[1] + 1024.0, eye[2] + 1024.0],
+                    }),
+                },
+            ));
+        }
+        out
+    }
+
+    /// **Watertight between patches, whatever their levels** (issue #422
+    /// decision 4: the skirts are walls). Over everything three seeded views
+    /// select: along every edge shared by two patches, the higher one's wall
+    /// reaches down to the lower one's top -- exactly, between two of one
+    /// level, and through its skirt between two of different levels. With
+    /// no skirt at all the same views leave gaps, so the test can tell.
+    #[test]
+    fn no_gap_between_patches_of_any_level() {
+        let (mut checked, mut between) = (0, 0);
+        let mut unskirted = i32::MIN;
+        for (seed, view) in watertight_views() {
+            let patches = build(&WorldGen::new(seed), &view);
+            let (n, m, worst) = worst_gap(&patches, PatchHeights::skirt_blocks);
+            assert!(
+                worst <= 0,
+                "seed {seed:#x}: an edge wall stops {worst} blocks above its neighbour's top"
+            );
+            checked += n;
+            between += m;
+            unskirted = unskirted.max(worst_gap(&patches, |_| 0).2);
+            // Between two of one level the wall is exact: no skirt needed.
+            let same: Vec<PatchHeights> = patches
+                .iter()
+                .filter(|p| p.key.level == patches[0].key.level)
+                .cloned()
+                .collect();
+            let (_, m, worst) = worst_gap(&same, |_| 0);
+            assert_eq!(m, 0);
+            assert!(
+                worst <= 0,
+                "seed {seed:#x}: {worst} between two of one level"
+            );
+        }
+        println!("{checked} stretches, {between} between levels; unskirted worst {unskirted}");
+        assert!(between > 2_000, "only {between} stretches between levels");
+        assert!(
+            unskirted > 0,
+            "no edge needed its skirt, so this proves nothing about it"
+        );
+    }
+
+    /// The same edges have no T-junction left open in the geometry itself:
+    /// every wall stands on whole quads of its own patch, and a finer
+    /// patch's quads divide its coarser neighbour's exactly, so the corners
+    /// of one lie on the lines of the other -- what is left is rounding in
+    /// the projection, which `face.wgsl`'s `CRACK_SEAL` covers, as it does
+    /// for the voxels' greedy mesh.
+    #[test]
+    fn a_finer_patchs_quads_divide_its_neighbours() {
+        let (seed, view) = watertight_views().remove(1);
+        let patches = build(&WorldGen::new(seed), &view);
+        let mut levels = std::collections::BTreeSet::new();
+        for p in &patches {
+            levels.insert(p.key.level);
+            let [ox, oz] = p.key.origin();
+            let q = p.key.quad();
+            // Its edges are on its own grid, and on every finer one.
+            for finer in 0..=p.key.level {
+                assert_eq!(ox.rem_euclid(1 << finer), 0);
+                assert_eq!(oz.rem_euclid(1 << finer), 0);
+                assert_eq!(q.rem_euclid(1 << finer), 0);
+            }
+            for coarser in &patches {
+                if coarser.key.level <= p.key.level {
+                    continue;
+                }
+                // A finer patch is inside one quad line pair of a coarser
+                // one or outside it, never across.
+                let cq = coarser.key.quad();
+                let [cx, cz] = coarser.key.origin();
+                let size = coarser.key.size();
+                let overlaps = ox < cx + size && cx < ox + p.key.size();
+                let overlaps_z = oz < cz + size && cz < oz + p.key.size();
+                assert!(
+                    !(overlaps && overlaps_z),
+                    "{:?} over {:?}",
+                    p.key,
+                    coarser.key
+                );
+                assert_eq!((ox - cx).rem_euclid(cq.min(p.key.size())), 0);
+                assert_eq!((oz - cz).rem_euclid(cq.min(p.key.size())), 0);
+            }
+        }
+        assert!(levels.len() >= 5, "only levels {levels:?}");
     }
 }

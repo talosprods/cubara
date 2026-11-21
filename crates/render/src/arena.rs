@@ -315,7 +315,7 @@ fn facing_runs(
 /// First-fit free-list suballocator over a fixed capacity of fixed-size units
 /// (vertices or indices). Free ranges are kept sorted and coalesced so repeated
 /// load/unload churn doesn't permanently fragment the arena.
-struct SlabAllocator {
+pub(crate) struct SlabAllocator {
     capacity: u32,
     /// Sorted, non-overlapping, non-adjacent `(offset, len)` free ranges.
     free: Vec<(u32, u32)>,
@@ -324,7 +324,7 @@ struct SlabAllocator {
 }
 
 impl SlabAllocator {
-    fn new(capacity: u32) -> Self {
+    pub(crate) fn new(capacity: u32) -> Self {
         Self {
             capacity,
             free: vec![(0, capacity)],
@@ -332,9 +332,13 @@ impl SlabAllocator {
         }
     }
 
+    pub(crate) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
     /// Reserve `n` contiguous units, returning the start offset, or `None` if no
     /// free range is large enough.
-    fn alloc(&mut self, n: u32) -> Option<u32> {
+    pub(crate) fn alloc(&mut self, n: u32) -> Option<u32> {
         if n == 0 {
             return Some(0);
         }
@@ -354,7 +358,7 @@ impl SlabAllocator {
     }
 
     /// Return `[off, off + n)` to the free list, coalescing with adjacent ranges.
-    fn free(&mut self, off: u32, n: u32) {
+    pub(crate) fn free(&mut self, off: u32, n: u32) {
         if n == 0 {
             return;
         }

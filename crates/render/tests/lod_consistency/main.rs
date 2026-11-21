@@ -23,6 +23,8 @@
 //! cargo test -p cubara-render --test lod_consistency -- --ignored --nocapture consistency_report
 //! ```
 
+mod far_rows;
+mod far_study;
 mod harness;
 mod study;
 
@@ -242,13 +244,16 @@ impl Rep {
     /// The face area a direction needs for its colour to be taken, in
     /// square blocks: [`MIN_FACES`] of this representation's own cell faces
     /// and never under [`MIN_AREA`] -- 64 at voxel levels 0 to 2, 512 at
-    /// level 3 (sixteen sides of 8 x 4). The far terrain has no faces: its
-    /// shading is continuous, and [`MIN_AREA`] of it is as much of a colour
-    /// as the same area of blocks.
+    /// level 3 (sixteen sides of 8 x 4). A far quad's wall is one mix and
+    /// one shade a quad wide, on the rows of the voxel level of its width
+    /// (`far::quad_top`), so the far terrain is held by the same count: 512
+    /// at quads of 8, 1,024 at 16.
     fn min_area(self) -> f64 {
         match self {
-            Rep::Voxel(l) => MIN_AREA.max(MIN_FACES * ((1 << l) * cell_height(l)) as f64),
-            Rep::Far(_) | Rep::Stepped(..) => MIN_AREA,
+            Rep::Voxel(l) | Rep::Far(l) => {
+                MIN_AREA.max(MIN_FACES * ((1 << l) * cell_height(l)) as f64)
+            }
+            Rep::Stepped(..) => MIN_AREA,
         }
     }
 }
@@ -944,7 +949,10 @@ fn a_direction_level_0_has_and_a_level_lacks_is_missing() {
     assert_eq!(ranked(l3, 1024.0, 511.0), missing(1024.0, 511.0));
     assert_eq!(ranked(l3, 1024.0, 512.0), Ranked::Delta(0.0));
     assert_eq!(Rep::Voxel(2).min_area(), 64.0);
-    assert_eq!(Rep::Far(5).min_area(), 64.0);
+    // A far quad is held by the same count of its own faces: 16 of 32 x 4.
+    assert_eq!(Rep::Far(5).min_area(), 2048.0);
+    assert_eq!(Rep::Far(3).min_area(), 512.0);
+    assert_eq!(Rep::Far(1).min_area(), 64.0);
 
     // What an asserted tolerance reads: no tolerance admits a missing
     // direction, and an unranked one is not held to any.
@@ -1103,20 +1111,27 @@ fn level_1_matches_level_0_on_the_rolling_hills() {
 }
 
 /// **The far rows measure the far terrain, not something beside it**
-/// (review of #428, finding B2). Two things a wrong far measurement would
+/// (review of #428, finding B2). Three things a wrong far measurement would
 /// get wrong, each held on every steep footprint (that the reference it
 /// is compared with is level 0 is `level_0_draws_its_surface`'s to hold):
 ///
-/// - its tops follow the ground: at quads of four blocks the mean drawn top
-///   is within [`FAR_TOP`] blocks of the height field's;
+/// - its tops are level 0's ground as #423's rule has it: at quads of four
+///   blocks the mean drawn top is within [`FAR_TOP`] blocks of the height
+///   field's -- the mean with the summits kept (up to the half block the
+///   mean is rounded to) -- and no drawn top is ever under the ground's
+///   lowest column of its quad or over its highest, which a swapped height
+///   field (a row of tops read for the wrong quad) would be;
 /// - its risers face downhill: where level 0's risers along an axis face one
 ///   way at least twice as much as the other, the far terrain's larger share
-///   faces the same way.
+///   faces the same way;
+/// - a riser is lit as a side with its occlusion: what it is made of, under
+///   the light of the way it faces, between the fully shaded and the fully
+///   open (`ao_floor`).
 #[test]
 fn the_far_rows_follow_the_ground() {
     /// **Chosen, not derived**: three times the largest magnitude measured
-    /// on this seed's steep footprints (0.16).
-    const FAR_TOP: f64 = 0.5;
+    /// on this seed's steep footprints at quads of four (0.06).
+    const FAR_TOP: f64 = 0.2;
     let setup = Setup::new();
     let footprints: Vec<_> = draw_footprints(&setup.gen, FOOTPRINT_SEED, PER_KIND)
         .into_iter()
@@ -1135,6 +1150,27 @@ fn the_far_rows_follow_the_ground() {
             mean.abs() <= FAR_TOP,
             "{fp:?}: the far tops stand {mean:+.2} blocks off the ground (seed {FOOTPRINT_SEED:#x})"
         );
+        // Every quad of four: its top between its lowest and highest column.
+        for (k, top) in far.tops.iter().enumerate() {
+            if top.is_nan() {
+                continue;
+            }
+            let (i, j) = (
+                (k as i32 % FOOTPRINT) / 4 * 4,
+                (k as i32 / FOOTPRINT) / 4 * 4,
+            );
+            let heights = (0..16).map(|c| {
+                setup
+                    .gen
+                    .surface_height(fp.x0 + i + c % 4, fp.z0 + j + c / 4) as f64
+                    + 1.0
+            });
+            let (lo, hi) = heights.fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
+            assert!(
+                (lo..=hi).contains(top),
+                "{fp:?}: the quad at ({i}, {j}) is drawn at {top}, its ground {lo} to {hi}"
+            );
+        }
         for (plus, minus) in [(1, 2), (3, 4)] {
             let (a, b) = (level0.faces.area[plus], level0.faces.area[minus]);
             if a.max(b) < 4.0 * MIN_AREA || a.max(b) < 2.0 * a.min(b) {
@@ -1153,8 +1189,9 @@ fn the_far_rows_follow_the_ground() {
             top_gap = top_gap.max(delta);
         }
         // A far riser is lit as a side: what it is made of, under the light
-        // of the way it faces, and nothing else (the far terrain has no
-        // ambient occlusion). Lit as a top it would be 1.8 to 3 times this.
+        // of the way it faces, times how open it is (`face_open`, between
+        // `ao_floor` and 1) -- so its colour is between the shaded and the
+        // open one.
         for (d, face) in DIRECTIONS.iter().enumerate().skip(1) {
             let f = &far.faces;
             if f.area[d] < MIN_AREA {
@@ -1163,17 +1200,20 @@ fn the_far_rows_follow_the_ground() {
             let light = face_light(Vec3::from(face.normal()), &setup.lighting);
             let m = &setup.far_materials;
             for c in 0..3 {
-                let expected: f64 = [(STONE, m.stone), (SOIL, m.soil), (SURFACE, m.side)]
+                let open: f64 = [(STONE, m.stone), (SOIL, m.soil), (SURFACE, m.side)]
                     .iter()
                     .map(|&(material, colour)| {
                         f.material[d][material] * (colour[c] * light[c]) as f64
                     })
                     .sum();
+                let floor = setup.lighting.ao_floor as f64;
                 assert!(
-                    (f.lit[d][c] - expected).abs() <= 1e-3 * expected,
-                    "{fp:?}: the far terrain's {} risers are lit {} against {expected}",
+                    f.lit[d][c] <= open * (1.0 + 1e-3)
+                        && f.lit[d][c] >= open * floor * (1.0 - 1e-3),
+                    "{fp:?}: the far terrain's {} risers are lit {} against {open} open, {} shaded",
                     direction_name(d),
-                    f.lit[d][c]
+                    f.lit[d][c],
+                    open * floor
                 );
                 lit_sides += 1;
             }

@@ -77,7 +77,7 @@ const GPU_TIMER_DEPTH: usize = 1024;
 /// `schedule_for_radius`), so a larger radius shows how far render distance
 /// can grow without the draw/triangle cost exploding.
 /// Where the camera is, for [`run`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct View {
     /// A first-person camera at this eye position, turning slowly on the spot
     /// and looking a little down. `None` is the orbit above the whole region
@@ -92,6 +92,11 @@ pub struct View {
     /// game does (`docs/PROPOSAL_FAR_VIEW.md`). Only with an `eye`: the orbit
     /// frames the voxel region from outside, which no player's view does.
     pub far: Option<crate::far_streaming::FarQuality>,
+    /// The far terrain's quads, error bound and floor this many times as
+    /// wide on screen as `far`'s quality names them: the game's
+    /// ([`FAR_QUAD_SCALE`](crate::far_streaming::FAR_QUAD_SCALE)) unless
+    /// `--far-quad-scale` asks for another.
+    pub far_quad_scale: f64,
 }
 
 /// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
@@ -396,8 +401,13 @@ pub fn run(
                 min: min.map(|c| (c * 16) as f64),
                 max: max.map(|c| (c * 16) as f64),
             };
-            let far_view =
-                crate::far_streaming::far_view(eye.map(|v| v as f64), height, Some(hole), quality);
+            let far_view = crate::far_streaming::far_view_scaled(
+                eye.map(|v| v as f64),
+                height,
+                Some(hole),
+                quality,
+                view.far_quad_scale,
+            );
             (Some(hole), far_view)
         }
         _ => (None, None),
@@ -412,15 +422,17 @@ pub fn run(
                 patches.len(),
                 building.elapsed().as_secs_f64()
             );
-            let mut terrain = cubara_render::FarTerrain::new(
-                &device,
-                &queue,
-                patches.len().max(1) as u32,
-                anchor,
-            );
-            for p in &patches {
-                terrain.insert(&queue, crate::far_streaming::to_far_patch(p));
-            }
+            let faces: Vec<_> = patches
+                .iter()
+                .map(crate::far_streaming::to_far_faces)
+                .collect();
+            let far_patches: Vec<_> = patches
+                .iter()
+                .zip(&faces)
+                .map(|(p, f)| crate::far_streaming::to_far_patch(p, f))
+                .collect();
+            let mut terrain =
+                cubara_render::FarTerrain::holding(&device, &queue, &far_patches, anchor);
             // As with the arena below: a far terrain with patches missing is
             // not the view that was asked for, and its frame rate means nothing.
             assert_eq!(
@@ -731,6 +743,7 @@ pub fn run(
     let mut triangles_sum = 0u64;
     let mut far_patches_sum = 0u64;
     let mut far_triangles_sum = 0u64;
+    let mut far_vertices_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
@@ -750,6 +763,7 @@ pub fn run(
         if let Some(f) = far_terrain.as_ref() {
             far_patches_sum += f.drawn() as u64;
             far_triangles_sum += f.drawn_triangles();
+            far_vertices_sum += f.drawn_cost().1;
         }
         let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
@@ -797,9 +811,11 @@ pub fn run(
     );
     if far_terrain.is_some() {
         log::info!(
-            "far terrain drawn: avg {:.0} patches, {:.0} triangles (skirts included)",
+            "far terrain drawn: avg {:.0} patches, {:.0} triangles (skirts included), {:.0} vertices issued (padding included), quad scale x{}",
             far_patches_sum as f64 / MEASURE_FRAMES as f64,
-            far_triangles_sum as f64 / MEASURE_FRAMES as f64
+            far_triangles_sum as f64 / MEASURE_FRAMES as f64,
+            far_vertices_sum as f64 / MEASURE_FRAMES as f64,
+            view.far_quad_scale
         );
     }
 
@@ -821,13 +837,15 @@ pub fn run(
 /// The far-terrain qualities tried against `target_fps`, best-looking first,
 /// each at every gate eye -- stopping at the first that holds it everywhere.
 /// What `--bench gate` (at 1,000) and `--bench tune` (at the monitor's
-/// refresh rate) both run.
+/// refresh rate) both run, at the far quad scale given (the game's unless
+/// `--far-quad-scale` asked for another).
 pub fn try_qualities(
     target_fps: f64,
     size: (u32, u32),
     overlay: bool,
     gpu_timing: GpuTimingMode,
     fog: bool,
+    far_quad_scale: f64,
 ) -> Vec<(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)> {
     let view_radius = crate::streaming::render_radius_chunks();
     let mut tries = Vec::new();
@@ -845,6 +863,7 @@ pub fn try_qualities(
                     eye: Some(gate_eye.eye),
                     squash: Some(crate::streaming::VERTICAL_LOD_SQUASH),
                     far: Some(quality),
+                    far_quad_scale,
                 };
                 (
                     *gate_eye,
