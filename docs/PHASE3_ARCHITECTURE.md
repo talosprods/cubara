@@ -1451,12 +1451,21 @@ mip is its mean). `forest_level_0..3.png` are the four images.
   square blocks that the ground itself hides on screen. Held only on level
   ground; the foot and the height are held everywhere, exactly.
 
-**What it costs.** Per tree, the oak models and their silhouettes (TODO:
-triangles); the silhouette against the two boxes it replaces at level 3 is
-the one increase, at about 230 level-3 trees in view at the gate's ground
-eye (M6). Six draws where there were two. CPU: one `MorphColumns` lookup
-per tree when a node is built (the columns were already worked out for the
-mesh). The gate and flight rows are the lead's, on a quiet machine.
+**What it costs.** Per tree, the oak models are 170, 178 and 186
+triangles (four, five and six blocks tall; 340 to 372 vertices) and the
+silhouette 110 for every height (220 vertices), which replaces the two boxes
+(24 triangles, 48 vertices). That is the one increase: at the gate's ground
+eye (M6, `lod_probe`) 247 level-3 trees are in view on average, so 27,200
+triangles (54,300 vertices) where the boxes were 5,900 (11,900), and at the
+hill eye 264 of them. Levels 1 and 2 draw 20 and 46 trees in view there,
+about 12,000 triangles, as before (the same oak, one model per height now:
+four draws where there was one). Six draws where there were two. CPU: one
+`MorphColumns` lookup per tree when a node is built (the columns were
+already worked out for the mesh); the instance stays 16 bytes. FPS, **not
+quiet** (the machine was in use, on battery, other agents running): no
+difference was measured that stands out from the run-to-run noise at the
+gate's ground eye, where the extra triangles are about 1% of the frame's;
+the gate and flight rows are the lead's, on a quiet machine.
 
 **Tests.** `a_tree_is_the_same_tree_at_every_distance` (the check over the
 48 trees, bounds in `trees.rs`'s `bounds`, each chosen) and
