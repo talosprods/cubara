@@ -111,19 +111,21 @@ pub struct MorphColumns {
 }
 
 impl MorphColumns {
+    /// Where the column at lattice `(x, z)`, `-1..=n` on each axis, is kept
+    /// in `columns` and `morphs`.
+    fn index(&self, x: i32, z: i32) -> usize {
+        debug_assert!((-1..=self.n).contains(&x) && (-1..=self.n).contains(&z));
+        ((z + 1) * (self.n + 2) + (x + 1)) as usize
+    }
+
     /// The column at lattice `(x, z)`, `-1..=n` on each axis.
     pub fn at(&self, x: i32, z: i32) -> [i32; 4] {
-        debug_assert!((-1..=self.n).contains(&x) && (-1..=self.n).contains(&z));
-        self.columns[((z + 1) * (self.n + 2) + (x + 1)) as usize]
+        self.columns[self.index(x, z)]
     }
 
     /// Whether the column at lattice `(x, z)` morphs ([`MorphColumns::morphs`]).
     pub fn morphs_at(&self, x: i32, z: i32) -> bool {
-        debug_assert!((-1..=self.n).contains(&x) && (-1..=self.n).contains(&z));
-        self.morphs
-            .get(((z + 1) * (self.n + 2) + (x + 1)) as usize)
-            .copied()
-            .unwrap_or(false)
+        self.morphs[self.index(x, z)]
     }
 }
 
@@ -2667,44 +2669,63 @@ mod tests {
         }
         let b = tops(&mesh, 1);
         assert!(!b.is_empty() && b.iter().all(|v| v.parent().is_none()));
-        // `a`'s riser toward `b` grows from row 1 to rows 1..5; under a
-        // parent wall there in layer 11 its latent foot (rows 1..4 at full
-        // morph) is drawn in the parent's layer from the start, not its own
-        // block's, so it does not cross-fade while it opens.
+        // `a`'s riser toward `b` grows from row 1 to rows 1..5, its row
+        // rising to 4..5 and a latent foot opening under it to rows 1..4.
+        // Under a parent wall there of two quads -- rows 1..2 in layer 11,
+        // rows 2..5 in layer 12 -- the foot is laid in two pieces, 1..2 and
+        // 2..4 at full morph, each drawn in its parent quad's layer from the
+        // start (so it does not cross-fade while it opens), facing +x as a
+        // riser does once open.
         let mut wall = Mesh {
             vertices: parent_mesh.vertices.clone(),
             indices: parent_mesh.indices.clone(),
             face_indices: [0; 6],
         };
-        let corners = [
-            ([1, 1, 0], 3),
-            ([1, 5, 0], 3),
-            ([1, 5, 2], 3),
-            ([1, 1, 2], 3),
-        ];
-        let start = wall.vertices.len() as u32;
-        wall.vertices.extend(
-            corners
-                .iter()
-                .map(|&([x, y, z], ao)| Vertex::new(x, y, z, ao, Face::PosX, 11, 0, 0)),
-        );
-        wall.indices.extend([0, 1, 2, 0, 2, 3].map(|k| start + k));
+        for (rows, layer) in [((1, 2), 11), ((2, 5), 12)] {
+            let start = wall.vertices.len() as u32;
+            let (y0, y1) = rows;
+            wall.vertices.extend(
+                [[1, y0, 0], [1, y1, 0], [1, y1, 2], [1, y0, 2]]
+                    .map(|[x, y, z]| Vertex::new(x, y, z, 3, Face::PosX, layer, 0, 0)),
+            );
+            wall.indices.extend([0, 1, 2, 0, 2, 3].map(|k| start + k));
+        }
         let under_wall = ParentView::new(
             std::sync::Arc::new(crate::ParentFaces::from_mesh(&wall, [1; 3])),
             [0; 3],
         );
         let (mesh, _) = two_columns_under([2, 5], [1, 1], true, Some(under_wall));
-        let foot: Vec<Vertex> = mesh
-            .vertices
-            .iter()
-            .copied()
-            .filter(|v| v.face() == Face::PosX && v.x() == 1 && v.is_latent())
-            .collect();
-        assert!(!foot.is_empty(), "no latent foot");
-        for v in &foot {
-            assert_eq!(v.tex_layer(), 11, "{v:?}");
-            assert_eq!(v.parent().map(|p| p.0), Some(11), "{v:?}");
+        let at_full = |v: &Vertex| [v.x() as f32, v.y() as f32 + v.morph_delta(), v.z() as f32];
+        let mut pieces = Vec::new();
+        for quad in mesh.indices.chunks(6) {
+            let v: Vec<Vertex> = quad.iter().map(|&i| mesh.vertices[i as usize]).collect();
+            if !(v[0].face() == Face::PosX && v[0].x() == 1 && v[0].is_latent()) {
+                continue;
+            }
+            // Its first triangle, at full morph, faces +x.
+            let [p0, p1, p2] = [0, 1, 2].map(|k| at_full(&v[k]));
+            let (e1, e2) = (
+                [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]],
+                [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]],
+            );
+            assert!(
+                e1[1] * e2[2] - e1[2] * e2[1] > 0.0,
+                "a foot faces away: {v:?}"
+            );
+            let ys: Vec<f32> = v.iter().map(|x| at_full(x)[1]).collect();
+            let (bot, top) = (
+                ys.iter().cloned().fold(f32::MAX, f32::min),
+                ys.iter().cloned().fold(f32::MIN, f32::max),
+            );
+            pieces.push((bot, top, v[0].tex_layer(), v[0].parent().map(|p| p.0)));
         }
+        pieces.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        pieces.dedup();
+        assert_eq!(
+            pieces,
+            vec![(1.0, 2.0, 11, Some(11)), (2.0, 4.0, 12, Some(12))],
+            "the foot's pieces, at full morph"
+        );
         let (still, _) = two_columns_under([2, 5], [1, 1], false, Some(parent()));
         let a = tops(&still, 2);
         assert!(!a.is_empty() && a.iter().all(|v| v.parent().is_none()));
