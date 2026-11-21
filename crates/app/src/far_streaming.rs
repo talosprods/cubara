@@ -1218,7 +1218,7 @@ mod tests {
     /// are few -- the plan works its selection out again every
     /// [`RESELECT_BLOCKS`], and the eye flies 0.4 block a frame. Measured:
     /// 21 of 180. At 32 blocks (what the constant was until blocks turned
-    /// the lag into holes, #422) it was 164, which this is red on. Not
+    /// the lag into holes, #422) it was 132, which this is red on. Not
     /// none: #398's plan (the slack `select` can report) is what makes the
     /// live selection the exact one on every frame, and
     /// `the_live_selection_is_the_exact_one_on_every_frame` there replaces
