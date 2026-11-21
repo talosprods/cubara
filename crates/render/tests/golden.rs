@@ -3347,7 +3347,10 @@ fn stepped_patch_faces(
         for line in 0..=n {
             // Walls facing along x on `line`, beside quad `k` along z; then
             // along z.
-            for (along_x, a, b) in [(true, h(line - 1, k), h(line, k)), (false, h(k, line - 1), h(k, line))] {
+            for (along_x, a, b) in [
+                (true, h(line - 1, k), h(line, k)),
+                (false, h(k, line - 1), h(k, line)),
+            ] {
                 let (lo_dir, hi_dir) = if along_x {
                     (FarDir::PosX, FarDir::NegX)
                 } else {
@@ -3398,10 +3401,17 @@ fn stepped_ground_crack_report() {
     let height = |x: i32, z: i32| {
         let hash = (x.wrapping_mul(73856093) ^ z.wrapping_mul(19349663)) as u32;
         let rough = (hash >> 7) % 5;
-        60 + if (x / 5 + z / 7) % 3 == 0 { 0 } else { rough as i32 }
+        60 + if (x / 5 + z / 7) % 3 == 0 {
+            0
+        } else {
+            rough as i32
+        }
     };
     let origins = [(0, 0), (32, 0), (0, 32), (32, 32)];
-    let faces: Vec<_> = origins.iter().map(|&o| stepped_patch_faces(o, &height)).collect();
+    let faces: Vec<_> = origins
+        .iter()
+        .map(|&o| stepped_patch_faces(o, &height))
+        .collect();
     let patches: Vec<_> = origins
         .iter()
         .zip(&faces)
@@ -3466,5 +3476,7 @@ fn stepped_ground_crack_report() {
         }
     }
     assert!(frames > 20, "only {frames} frames saw much ground");
-    eprintln!("CRACKS: worst of {frames} frames: {worst} pixels of sky with ground on all four sides");
+    eprintln!(
+        "CRACKS: worst of {frames} frames: {worst} pixels of sky with ground on all four sides"
+    );
 }
