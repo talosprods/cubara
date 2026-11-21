@@ -1713,6 +1713,19 @@ pub fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu
 /// it). A caller that changes `Lighting` calls [`crate::SceneRenderer::set_lighting`],
 /// which rebuilds the pipeline with these in the background rather than every
 /// frame.
+/// DBG (temporary, colour-LOD study): one bit of `CUBARA_DBG_MODE`.
+fn dbg_bit(bit: u32) -> f64 {
+    let m: u32 = std::env::var("CUBARA_DBG_MODE")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    if m & bit != 0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
 pub fn mesh_pipeline_constants(
     lighting: &Lighting,
     width: u32,
@@ -1741,13 +1754,11 @@ pub fn mesh_pipeline_constants(
         ("viewport_height", height as f64),
         ("aspect", width as f64 / height as f64),
         // DBG (temporary, colour-LOD study).
-        (
-            "dbg_mode",
-            std::env::var("CUBARA_DBG_MODE")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(0.0),
-        ),
+        ("dbg_b1", dbg_bit(1)),
+        ("dbg_b2", dbg_bit(2)),
+        ("dbg_b4", dbg_bit(4)),
+        ("dbg_b8", dbg_bit(8)),
+        ("dbg_b16", dbg_bit(16)),
     ]
 }
 
@@ -1800,7 +1811,10 @@ pub fn build_mesh_pipeline_from_module(
             module: shader,
             entry_point: Some("vs_main"),
             buffers: &[Some(vertex_layout())],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,

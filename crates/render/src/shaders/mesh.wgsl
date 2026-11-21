@@ -48,7 +48,11 @@ struct Frame {
 @group(0) @binding(0) var<uniform> frame: Frame;
 
 // DBG (temporary, colour-LOD study): experiment bits.
-override dbg_mode: f32 = 0.0;
+override dbg_b1: f32 = 0.0;
+override dbg_b2: f32 = 0.0;
+override dbg_b4: f32 = 0.0;
+override dbg_b8: f32 = 0.0;
+override dbg_b16: f32 = 0.0;
 override ambient_low: f32 = 0.28;
 override ambient_high: f32 = 0.42;
 override ao_floor: f32 = 0.4;
@@ -243,9 +247,8 @@ fn vs_main(in: VsIn) -> VsOut {
     let ao_floor_scaled = mix(ao_floor, 1.0, 1.0 - 1.0 / ao_width);
     let ao = mix(ao_floor_scaled, 1.0, ao_frac);
 
-    let dbg = u32(dbg_mode);
     var uvv = vec2<f32>(u, v);
-    if ((dbg & 1u) != 0u && axis != 1u) {
+    if (dbg_b1 > 0.5 && axis != 1u) {
         var vv = v - morph_delta * morph;
         let y_max = select((corner & 2u) != 0u, (corner & 1u) != 0u, axis == 0u);
         if (latent && !y_max) {
@@ -254,16 +257,16 @@ fn vs_main(in: VsIn) -> VsOut {
         uvv.y = vv;
     }
     var layer_out = tex_layer;
-    if ((dbg & 4u) != 0u && axis != 1u) {
+    if (dbg_b4 > 0.5 && axis != 1u) {
         layer_out = 1u;
     }
-    if ((dbg & 8u) != 0u) {
+    if (dbg_b8 > 0.5) {
         layer_out = 1u;
     }
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(select(ao, 1.0, (dbg & 2u) != 0u), haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
+    out.ao_haze = vec2<f32>(select(ao, 1.0, dbg_b2 > 0.5), haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
     out.uv = uvv;
     out.layer = layer_out;
     return out;
@@ -287,7 +290,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ao = in.ao_haze.x;
 
     var tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    if ((u32(dbg_mode) & 16u) != 0u) {
+    if (dbg_b16 > 0.5) {
         tex = textureSampleLevel(block_textures, block_sampler, in.uv, in.layer, 10.0);
     }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
