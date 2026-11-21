@@ -235,6 +235,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹⁶ | 0 | far only | 3,353 / 3,465 | 0.148 / 0.143 ms | 0.884 / 0.373 ms | `c5b37e6` |
 | 2026-11-21 | Gate eye: flight at #435 x2.5, 2 runs, same conditions; 0 draws⁹⁶ | 0 | far only | 4,161 / 4,339 (+24.7%) | 0.097 / 0.099 ms | 0.232 / 0.282 ms | `098f81e` |
 | 2026-11-21 | Gate eye: flight at #435 x3, 2 runs, same conditions; 0 draws⁹⁶ | 0 | far only | 4,642 / 4,206 (+29.8%) | 0.119 / 0.097 ms | 0.808 / 0.236 ms | `098f81e` at x3 |
+| 2026-11-21 | **Gate eye: ground** at main (#435 merged: the far terrain as blocks, quads x3), A of the A/B for #439 (a tree looks the same at every distance), 2 runs (`GATE: MET at Medium` each; High missed: 1,030 / 1,032), alternating A, B, A, B; AC power, battery 100% and charged, no thermal or performance warning recorded, no input for over two hours, no agents running, 5 quiet minutes before the first run; 792 draws⁹⁷ | -- | -- | 1,139 / 1,160 | 0.421 / 0.415 ms | 1.990 / 1.016 ms | `5f6cf5c` |
+| 2026-11-21 | **Gate eye: ground** at #439 (tree instances with their own height, level 0's occlusion, a silhouette instead of the box canopy at level 3), B, 2 runs (`GATE: MET at Medium` each), same conditions⁹⁷ | -- | -- | 1,083 / 1,095 (−5.3%) | 0.437 / 0.436 ms | 1.310 / 1.077 ms | `5e772aa` |
+| 2026-11-21 | Gate eye: hill at main (A), 2 runs, same conditions⁹⁷ | -- | -- | 1,115 / 1,132 | 0.427 / 0.426 ms | 1.686 / 1.053 ms | `5f6cf5c` |
+| 2026-11-21 | Gate eye: hill at #439, 2 runs, same conditions⁹⁷ | -- | -- | 1,053 / 1,020 (−7.7%) | 0.453 / 0.453 ms | 1.194 / 1.123 ms | `5e772aa` |
+| 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹⁷ | 0 | far only | 4,716 / 4,269 | 0.110 / 0.099 ms | 0.614 / 0.341 ms | `5f6cf5c` |
+| 2026-11-21 | Gate eye: flight at #439, 2 runs, same conditions; 0 draws⁹⁷ | 0 | far only | 4,163 / 4,304 (−5.8%) | 0.097 / 0.098 ms | 0.246 / 0.345 ms | `5e772aa` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3347,3 +3353,14 @@ A swap still counts every pixel whose colour changes, so the typical swap on the
 | toward a mountain, #435 x3 | 0 of 1,783; 0 of 1,798 | 0; 0 | 225; 225 | 2,718 / 21,670 / 34,695; 2,272 / 20,680 / 33,687 | 84 / 118 / 151 / 202; 83 / 100 / 150 / 200 |
 
 At x3 the blocks cost less than main's smooth far surface (+7.0% at the hill eye, the gate's lowest); at x2.5 they hold the gate by 3.5% and stand 1.6% below main at the hill eye, which is why #435 ships x3. The stale frames on the low flight fall from 16 to 1 or 2 with #435's reselect every block. The other builds in the window, for the record and not landed: #439 (trees as level 0 draws them; `2f577d3`) measured 1,019 / 1,022 at the ground eye and **988 / 990 at the hill eye: Medium not met** on main, so it waits for #435; the far-mesh branch (`45100d8`, shared vertices with cut risers) measured 913 / 909 and 860 / 860 at x1.5, 965 / 966 and 914 / 913 at x2, with holes on the low flight at x1.5 (2 and 1 frames) -- fewer vertices than #435 at x2.5 but twice the triangles, and slower: the far pass's cost follows its triangles.
+
+⁹⁷ **#439's quiet A/B on the main #435 made** (main is `5f6cf5c`, #439 is `5e772aa` = `2f577d3` with that main merged in; both built in release at 21:2x and checked distinct; 5 quiet minutes, then gate A, B, A, B, then each flight A, B twice; both runs of each). On the main before #435 (footnote 96) #439 missed Medium at the hill eye (988 / 990); with the far terrain's x3 quads under it, it holds Medium in both runs. High: main 1,030 / 1,032 at the ground eye and 989 / 986 at the hill eye, #439 977 / 981 and 931 / 928, neither holds High.
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 / max | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | 0 of 1,195; 0 of 1,160 | 2; 1 | 262; 236 | 1,643 / 38,309 / 43,042; 2,205 / 40,336 / 60,236 | 100 / 151 / 251 / 251; 86 / 138 / 207 / 241 |
+| low, #439 | 0 of 1,196; 0 of 1,195 | 2; 2 | 253; 257 | 1,583 / 38,681 / 44,992; 1,711 / 35,559 / 47,303 | 100 / 167 / 251 / 251; 100 / 151 / 251 / 251 |
+| toward a mountain, main | 0 of 1,797; 0 of 1,786 | 0; 0 | 228; 226 | 2,303 / 21,201 / 34,746; 2,828 / 27,991 / 39,612 | 83 / 117 / 150 / 200; 84 / 118 / 151 / 202 |
+| toward a mountain, #439 | 0 of 1,788; 0 of 1,797 | 0; 0 | 227; 231 | 2,793 / 21,228 / 37,017; 2,289 / 21,281 / 34,719 | 84 / 117 / 151 / 218; 83 / 100 / 150 / 200 |
+
+The trees cost 5.3% at the ground eye and 7.7% at the hill eye: level 3 now draws each tree as a silhouette of 110 triangles where two boxes had 24 (247 level-3 trees in view at the ground eye, about 27,200 triangles against 5,900), and six draws where there were two. The hill eye keeps 2 to 5% above the gate. What it buys: a tree's top, outline and shade no longer change at the ring edges (the forest's own pixels drawn by one side only: 160 m 18.6% to 9.1%, 288 m 10.1% to 2 pixels, 512 m 66.1% to 0.3%; section 9.7). The flight eye (far terrain only, no trees) moves by its own run-to-run spread (main 4,716 against 4,269).
