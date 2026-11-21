@@ -2667,6 +2667,44 @@ mod tests {
         }
         let b = tops(&mesh, 1);
         assert!(!b.is_empty() && b.iter().all(|v| v.parent().is_none()));
+        // `a`'s riser toward `b` grows from row 1 to rows 1..5; under a
+        // parent wall there in layer 11 its latent foot (rows 1..4 at full
+        // morph) is drawn in the parent's layer from the start, not its own
+        // block's, so it does not cross-fade while it opens.
+        let mut wall = Mesh {
+            vertices: parent_mesh.vertices.clone(),
+            indices: parent_mesh.indices.clone(),
+            face_indices: [0; 6],
+        };
+        let corners = [
+            ([1, 1, 0], 3),
+            ([1, 5, 0], 3),
+            ([1, 5, 2], 3),
+            ([1, 1, 2], 3),
+        ];
+        let start = wall.vertices.len() as u32;
+        wall.vertices.extend(
+            corners
+                .iter()
+                .map(|&([x, y, z], ao)| Vertex::new(x, y, z, ao, Face::PosX, 11, 0, 0)),
+        );
+        wall.indices.extend([0, 1, 2, 0, 2, 3].map(|k| start + k));
+        let under_wall = ParentView::new(
+            std::sync::Arc::new(crate::ParentFaces::from_mesh(&wall, [1; 3])),
+            [0; 3],
+        );
+        let (mesh, _) = two_columns_under([2, 5], [1, 1], true, Some(under_wall));
+        let foot: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|v| v.face() == Face::PosX && v.x() == 1 && v.is_latent())
+            .collect();
+        assert!(!foot.is_empty(), "no latent foot");
+        for v in &foot {
+            assert_eq!(v.tex_layer(), 11, "{v:?}");
+            assert_eq!(v.parent().map(|p| p.0), Some(11), "{v:?}");
+        }
         let (still, _) = two_columns_under([2, 5], [1, 1], false, Some(parent()));
         let a = tops(&still, 2);
         assert!(!a.is_empty() && a.iter().all(|v| v.parent().is_none()));
