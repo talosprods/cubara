@@ -267,8 +267,7 @@ fn whole(subs: &NodeLinks) -> FaceLinks {
     })
 }
 
-/// What to search a node through while its own links are not known yet: what
-/// the nodes that drew the same space before it said.
+/// What to search a node through while its own links are not known yet.
 ///
 /// **Why this exists: the holes of 2026-09-27.** An unknown node used to be a
 /// wall. Flying forward, every node crossing the edge of a ring splits into
@@ -277,29 +276,54 @@ fn whole(subs: &NodeLinks) -> FaceLinks {
 /// curtain had been meshed. Hundreds of blocks of ground vanished and came
 /// back every few seconds (`crate`'s caller measures it: `--bench flight`).
 ///
-/// - **It split** (its parent, or a coarser ancestor, is known): the part of
-///   the ancestor it is, as the ancestor drew it -- one of the ancestor's
-///   sub-blocks, for every sub-block of this node.
+/// - **It split** (its parent, or a coarser ancestor, is known): **open**.
+///   What the ancestor drew there says nothing safe about it, because a
+///   finer node shows openings its ancestor does not: a coarse cell is cave
+///   only where all of its ground is, and its top is the mean of its
+///   columns, so some of them stand below it (issue #423). Open joins
+///   everything the node's own links can, so nothing a line of sight
+///   reaches through it is left out; what it costs is the nodes behind it
+///   that turn out to be hidden, generated once and dropped by the search
+///   that knows its links (23% more nodes generated over that flight).
+///
+///   It used to be the part of the ancestor it is, as the ancestor drew it,
+///   and **that was the hole of 2026-11-21** (the low flight, `--bench
+///   flight --eye 8,120,8`). A pit's floor lay in the top row of a level-0
+///   node, five blocks of it, with the floor one block higher in the row
+///   behind. Its level-1 parent drew all of that floor at the higher block
+///   -- a cell two blocks wide is cave only where both rows are -- which is
+///   in the node above, so as the parent drew it no air touched the plane
+///   between the two nodes, and the search did not step down. The node with
+///   the floor was asked for only after its sibling's own links had arrived
+///   and another search had run: ten frames of sky at the bottom of the
+///   pit. Not that one spot: searched as their ancestors drew them, that
+///   flight's 41 chunk crossings left out 62 nodes whose space had been
+///   drawn until then (45 on the tree before #423, whose coarse cells were
+///   cave by a vote: the same defect, which happened not to show in that
+///   flight). `docs/PHASE3_ARCHITECTURE.md` §9.5 has the measurement.
 /// - **It merged** (some of its children are known): each sub-block is one
 ///   child, as that child drew it whole; a child not known yet is taken as
-///   open.
+///   open. A coarser node draws fewer openings than the nodes it replaces
+///   (caves nest), so this leans the safe way. That is not a proof -- a mean
+///   top can join two columns' air that level 0 keeps apart -- and nothing
+///   was left out behind a merged node in that flight or on the seeded
+///   crossings of
+///   `the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn`;
+///   taking it as open too would have cost 43% more nodes generated where
+///   the split rule costs 23%.
 /// - **Neither**: new ground, at the edge of what is streamed or on the first
 ///   frame. It stays a wall, so what is generated grows outward along what can
 ///   be seen.
 fn stand_in(node: NodeKey, links: &impl Fn(NodeKey) -> Option<NodeLinks>) -> Option<NodeLinks> {
-    // A child is exactly one of its parent's sub-blocks only at grain 2.
-    const _: () = assert!(GRAIN == 2, "stand_in takes a sub-block to be a child");
     let mut ancestor = node;
-    for up in 1..=3 {
+    for _ in 1..=3 {
         ancestor = ancestor.parent();
-        if let Some(known) = links(ancestor) {
-            // The ancestor's sub-block holding this node: the bit `up - 1` of
-            // its position along each axis.
-            let bit = |p: i32| ((p >> (up - 1)) & 1) as usize;
-            let [x, y, z] = node.pos.map(bit);
-            return Some([known[(z * GRAIN + y) * GRAIN + x]; GRAIN * GRAIN * GRAIN]);
+        if links(ancestor).is_some() {
+            return Some(OPEN);
         }
     }
+    // A child is exactly one of its parent's sub-blocks only at grain 2.
+    const _: () = assert!(GRAIN == 2, "stand_in takes a sub-block to be a child");
     let children: Vec<Option<NodeLinks>> = node.children().into_iter().map(links).collect();
     if children.iter().any(Option::is_some) {
         let mut merged = OPEN;
@@ -354,10 +378,11 @@ pub fn visible_nodes(
 ///
 /// `links(node)` is what joins what inside each of a node's sub-blocks; `None`
 /// means not known yet (not generated). An unknown node is included -- it may
-/// well be seen -- and searched through as what drew its space before it did
-/// ([`stand_in`]); only a node nothing is known about is not searched through,
-/// which is what lets a caller generate outward along what can be seen instead
-/// of generating everything.
+/// well be seen -- and searched through on what is known of the nodes that
+/// drew its space before it did ([`stand_in`]: open where it split, as its
+/// children drew it where it merged); only a node nothing is known about is
+/// not searched through, which is what lets a caller generate outward along
+/// what can be seen instead of generating everything.
 ///
 /// The search starts from **every** sub-block of the camera's node, not only
 /// the one the camera is in, so the result holds for any position in that
@@ -744,21 +769,31 @@ mod tests {
         assert_eq!(whole(&subs), FaceLinks::NONE);
     }
 
+    /// A split node is open whatever its ancestor drew in its place: the
+    /// ancestor's rock is no promise about a finer node (`stand_in`).
     #[test]
-    fn a_split_node_is_searched_as_its_ancestor_drew_it() {
-        let parent = NodeKey::new(2, [3, -1, 0]);
+    fn a_split_node_is_searched_as_open() {
+        let parent = NodeKey::new(4, [3, -1, 0]);
         // Only the sub-block at x 1, y 0, z 1 (index 5) is open.
         let mut drawn = [FaceLinks::NONE; 8];
         drawn[5] = FaceLinks::ALL;
         let links = |n: NodeKey| (n == parent).then_some(drawn);
         let children = parent.children();
         assert_eq!(stand_in(children[5], &links), Some(OPEN));
-        assert_eq!(stand_in(children[0], &links), Some([FaceLinks::NONE; 8]));
-        // Two levels down, inside the open half and outside it.
+        assert_eq!(
+            stand_in(children[0], &links),
+            Some(OPEN),
+            "where the parent drew rock"
+        );
+        // Two and three levels down, inside the open part and outside it.
         let inside = children[5].children()[2];
         let outside = children[4].children()[1];
         assert_eq!(stand_in(inside, &links), Some(OPEN));
-        assert_eq!(stand_in(outside, &links), Some([FaceLinks::NONE; 8]));
+        assert_eq!(stand_in(outside, &links), Some(OPEN));
+        assert_eq!(stand_in(outside.children()[7], &links), Some(OPEN));
+        // Four levels down nothing is known of it, nor beside the parent.
+        assert_eq!(stand_in(outside.children()[7].children()[0], &links), None);
+        assert_eq!(stand_in(NodeKey::new(1, [50, 50, 50]), &links), None);
     }
 
     #[test]
@@ -787,15 +822,6 @@ mod tests {
         );
     }
 
-    /// Whether all of `node` lies below the ground's surface.
-    fn underground(world: &World, node: NodeKey) -> bool {
-        let [x, y, z] = node.world_origin();
-        let size = node.extent_chunks() * Chunk::SIZE as i32;
-        (x..x + size)
-            .flat_map(|x| (z..z + size).map(move |z| (x, z)))
-            .all(|(x, z)| world.surface_height(x, z) >= y + size)
-    }
-
     /// **The holes of 2026-09-27.** The moment the camera crosses into another
     /// chunk, some nodes around it split and some merge, and none of those is
     /// meshed yet. Everything the camera could see before and still can must
@@ -819,16 +845,17 @@ mod tests {
             // What the streamer knows the moment the camera has moved: the
             // links of everything from before, and nothing of what is new.
             let partial = visible_nodes(after, &now.nodes, |n| known.links.get(&n).copied());
-            // Lost is allowed in two places only. New ground at the edge of
+            // Lost is allowed in one place only: new ground at the edge of
             // the region, which nothing drew before -- it is generated as the
-            // search reaches it. And inside a cave, where a node's parent drew
-            // a passage too narrow for its coarser blocks: a glimpse into the
-            // dark for the moment the node takes to mesh, never open ground.
+            // search reaches it. (Until #423 a node all under the ground's
+            // surface was let off as well: "a glimpse into the dark, never
+            // open ground". The node under a pit's floor is one of those, and
+            // was the low flight's hole.)
             let stand_in_of = |n: NodeKey| stand_in(n, &|k| known.links.get(&k).copied());
             let lost: Vec<NodeKey> = full
                 .iter()
                 .filter(|n| !partial.contains(n))
-                .filter(|&&n| stand_in_of(n).is_some() && !underground(&world, n))
+                .filter(|&&n| stand_in_of(n).is_some())
                 .copied()
                 .collect();
             assert!(
@@ -838,6 +865,210 @@ mod tests {
                 full.len()
             );
         }
+    }
+
+    /// What a streamer knows of a world: the links of every node a search
+    /// of its has seen so far, each worked out as a mesh job does.
+    struct Streamed<'a> {
+        world: &'a World,
+        registry: &'a BlockRegistry,
+        schedule: &'a [(u32, i32)],
+        links: HashMap<NodeKey, NodeLinks>,
+    }
+
+    impl<'a> Streamed<'a> {
+        fn new(world: &'a World, registry: &'a BlockRegistry, schedule: &'a [(u32, i32)]) -> Self {
+            Self {
+                world,
+                registry,
+                schedule,
+                links: HashMap::new(),
+            }
+        }
+
+        /// One search from `camera` on what is known now: what the streamer
+        /// asks for the moment the camera is there.
+        fn search(&self, camera: ChunkCoord) -> HashSet<NodeKey> {
+            // The game's own vertical squash (`VERTICAL_LOD_SQUASH`).
+            let desired: HashSet<NodeKey> = desired_nodes_3d(camera, 2, self.schedule)
+                .into_iter()
+                .collect();
+            visible_nodes(camera, &desired, |n| self.links.get(&n).copied())
+        }
+
+        /// Search, generate what is seen and not known yet, and search again
+        /// until nothing new is seen: what is drawn once the camera has
+        /// stood still at `camera`.
+        fn settle(&mut self, camera: ChunkCoord) -> HashSet<NodeKey> {
+            let blocks = TerrainBlocks::from_registry(self.registry);
+            loop {
+                let seen = self.search(camera);
+                let new: Vec<NodeKey> = seen
+                    .iter()
+                    .filter(|n| !self.links.contains_key(n))
+                    .copied()
+                    .collect();
+                if new.is_empty() {
+                    return seen;
+                }
+                for n in new {
+                    let chunk = self.world.node_at(n, blocks);
+                    self.links
+                        .insert(n, node_links(chunk.as_ref(), self.registry));
+                }
+            }
+        }
+
+        /// Move the camera to `to` and return the nodes **left out for a
+        /// moment**: seen once everything there has loaded, not asked for by
+        /// the first search after the move, and standing where something was
+        /// drawn until then (new ground at the edge of the region is
+        /// generated as the search reaches it, and is no hole: the far
+        /// terrain stands there meanwhile). Also returns how many nodes that
+        /// first search went through on a guess, per level.
+        fn cross(&mut self, to: ChunkCoord) -> (Vec<NodeKey>, [usize; 4]) {
+            let known: HashSet<NodeKey> = self.links.keys().copied().collect();
+            let drawn_before = |n: NodeKey| stand_in(n, &|k| known.contains(&k).then_some(OPEN));
+            let first = self.search(to);
+            let mut guessed = [0usize; 4];
+            for n in first.iter().filter(|n| !known.contains(n)) {
+                if drawn_before(*n).is_some() {
+                    guessed[n.level as usize] += 1;
+                }
+            }
+            let settled = self.settle(to);
+            let mut lost: Vec<NodeKey> = settled
+                .iter()
+                .filter(|n| !first.contains(n) && drawn_before(**n).is_some())
+                .copied()
+                .collect();
+            lost.sort();
+            (lost, guessed)
+        }
+    }
+
+    /// **The low flight's hole of 2026-11-21** (`--bench flight --eye 8,120,8
+    /// --look 1,-0.15,0.3`, frames 489 to 498 at 1920 x 1080; issue #423).
+    ///
+    /// Crossing from chunk (12, 5, 3) into (12, 5, 4), the level-1 node
+    /// (11, 0, 2) comes inside the level-0 ring and splits. One of its
+    /// children, the level-0 node (22, 0, 5), holds five blocks of a pit's
+    /// floor in its top row. The first search after the crossing has to ask
+    /// for it: the parent leaves when the children that search sees have
+    /// arrived, and a child it did not see is then sky until another search
+    /// has run.
+    ///
+    /// The game's own ring for level 0; level 1 only as far as it takes to
+    /// hold the parent, so this generates a few thousand nodes and not the
+    /// whole render distance.
+    #[test]
+    fn the_node_under_a_pits_floor_is_asked_for_when_its_parent_splits() {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = World::new();
+        let floor = NodeKey::new(0, [22, 0, 5]);
+        // The pit is there, in the default world: under an open sky the
+        // highest block of these five columns is the node's top row, and
+        // the node above them is air.
+        for x in 352..357 {
+            assert!(
+                world.is_solid_at(x, 15, 80, blocks) && !world.is_solid_at(x, 16, 80, blocks),
+                "the pit's floor is not at ({x}, 15, 80): the world changed, find the hole again"
+            );
+        }
+        let schedule = [(0u32, 10), (1, 12)];
+        let mut streamed = Streamed::new(&world, &registry, &schedule);
+        let before = streamed.settle(ChunkCoord::new(12, 5, 3));
+        assert!(
+            before.contains(&floor.parent()) && !before.contains(&floor),
+            "the parent is not what is drawn before the crossing"
+        );
+        let first = streamed.search(ChunkCoord::new(12, 5, 4));
+        assert!(
+            !first.contains(&floor.parent()),
+            "the parent did not split at this crossing"
+        );
+        assert!(
+            first.contains(&floor),
+            "the node that holds the pit's floor is not asked for when its parent splits"
+        );
+        assert!(
+            streamed.settle(ChunkCoord::new(12, 5, 4)).contains(&floor),
+            "the floor cannot be seen at all, so this proves nothing"
+        );
+    }
+
+    /// **The first search after a crossing asks for everything that will be
+    /// seen there**, wherever something was drawn before.
+    ///
+    /// The streamer drops a node the moment the nodes replacing it *that
+    /// the search sees* have arrived (`cubara-app`'s `can_unload`). So a
+    /// node the first search leaves out, and a later one finds, is a hole
+    /// for as long as that takes -- ten frames, in the low flight of
+    /// 2026-11-21. Camera paths through a seeded set of places in the
+    /// default world -- the hills at the origin, on the ground and in the
+    /// air, a mountain, and the pit of that flight -- one chunk at a time
+    /// along every axis, both ways, so nodes split ahead and merge behind at
+    /// every level.
+    ///
+    /// The rings are the game's in kind and smaller (3, 6, 10 and 16
+    /// chunks), so every level splits within a few crossings and a place
+    /// costs hundreds of nodes, not ten thousand.
+    #[test]
+    fn the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn() {
+        let registry = registry();
+        let world = World::new();
+        let schedule = [(0u32, 3), (1, 6), (2, 10), (3, 16)];
+        let ground = |x: i32, z: i32| world.surface_height(x * 16 + 8, z * 16 + 8).div_euclid(16);
+        // (chunk column, chunks above the ground there).
+        let places = [
+            ((0, 0), 0),
+            ((0, 0), 4),
+            // The steepest of the arena test's seeded columns: a mountain.
+            ((336, 213), 1),
+            // Above the pit of the low flight.
+            ((20, 4), 3),
+        ];
+        let path = [
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, -1, 0],
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+            [-1, 0, 0],
+            [-1, 0, 0],
+            [0, 0, -1],
+            [0, 1, 0],
+        ];
+        let mut guessed = [0usize; 4];
+        for ((x, z), up) in places {
+            let mut camera = ChunkCoord::new(x, ground(x, z) + up, z);
+            let mut streamed = Streamed::new(&world, &registry, &schedule);
+            streamed.settle(camera);
+            for step in path {
+                camera =
+                    ChunkCoord::new(camera.x + step[0], camera.y + step[1], camera.z + step[2]);
+                let (lost, on_a_guess) = streamed.cross(camera);
+                assert!(
+                    lost.is_empty(),
+                    "from chunk column ({x}, {z}), stepping {step:?} into {camera:?}: {} nodes are \
+                     seen there and not asked for until another search has run: {lost:?}",
+                    lost.len()
+                );
+                for (level, n) in on_a_guess.iter().enumerate() {
+                    guessed[level] += n;
+                }
+            }
+        }
+        // Levels 0 to 2 split and levels 1 to 3 merge along these paths.
+        assert!(
+            guessed.iter().all(|&n| n >= 20),
+            "nodes searched on a guess, by level: {guessed:?} -- a level hardly split or merged, \
+             so this proves little about it"
+        );
     }
 
     #[test]
