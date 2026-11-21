@@ -185,6 +185,40 @@ pub fn riser_map(own: [i32; 4], nb: [i32; 4]) -> Option<[i32; 4]> {
     (top > s_bot || target > t_bot).then_some([s_bot, top, t_bot, target])
 }
 
+/// The part of `riser` ([`riser_map`]'s `[s_bot, s_top, t_bot, t_top]`)
+/// that lies in a node's rows `0..rows`, and where it is at full morph.
+///
+/// **A riser vertex on the node's floor or ceiling moves only within the
+/// riser's own target**: to the row itself, clamped into `t_bot..=t_top`,
+/// not to where the riser's straight-line map would carry it. The node
+/// across that floor or ceiling draws the rest of the riser, and it may be
+/// a level coarser that does not move at all -- at the top and bottom of a
+/// ring -- while this node is fully morphed: what it shows there is the
+/// riser of the parent ground, and only the row itself (inside the target)
+/// meets it. Carried along the line, the vertex left a gap between the two
+/// nodes: frame 1796 of the toward-peak flight, a riser rows 159..161 ->
+/// 160..163 whose row 160, the floor of a level-0 node on a level-1 one,
+/// was lifted to 161.5 with nothing under it. Where the node across is the
+/// same level both use this one rule, so they still meet; and given
+/// `cubara_world::morph`'s rule that no column morphs across a floor of
+/// its parent level, the clamp leaves the row where it is at every floor a
+/// coarser node can meet.
+fn riser_in_rows(riser: [i32; 4], rows: i32) -> [i32; 4] {
+    let [s_bot, s_top, t_bot, t_top] = riser;
+    let knot = |y: i32| y.clamp(t_bot, t_top);
+    let (bot, to_bot) = if s_bot < 0 {
+        (0, knot(0))
+    } else {
+        (s_bot, t_bot)
+    };
+    let (top, to_top) = if s_top > rows {
+        (rows, knot(rows))
+    } else {
+        (s_top, t_top)
+    };
+    [bot, top, to_bot, to_top]
+}
+
 /// Standard voxel ambient occlusion for one face corner from its three neighbouring
 /// voxels on the air side (the two edge voxels + the diagonal). Two solid edges fully
 /// occlude the corner; otherwise each solid neighbour darkens it one step.
@@ -817,9 +851,10 @@ fn key_morph(
             if !(0..n).contains(&own) {
                 continue;
             }
-            let Some([s_bot, s_top, t_bot, t_top]) = riser_map(column(own), column(other)) else {
+            let Some(riser) = riser_map(column(own), column(other)) else {
                 continue;
             };
+            let [s_bot, s_top, t_bot, t_top] = riser_in_rows(riser, ny);
             if s_bot == t_bot && s_top == t_top {
                 continue; // moves nowhere
             }
@@ -837,6 +872,7 @@ fn key_morph(
                     cell.morph = key;
                 }
             }
+            let [s_bot, s_top, t_bot, t_top] = riser;
             if s_bot == s_top && (0..ny).contains(&(s_top - 1)) {
                 let at = |y: i32| {
                     if d == 0 {

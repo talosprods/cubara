@@ -25,7 +25,11 @@
 //! cave mouth, a pit or an overhang among the rows it shows, or with
 //! anything standing on it (a tree, a player's block) -- and every column
 //! beside one, so that a moving face never shares an edge with a face that
-//! stays. Level 3, whose next level is the far terrain (#422's join).
+//! stays. Level 3, whose next level is the far terrain (#422's join). And
+//! no column morphs across a floor or ceiling of its parent level's nodes
+//! ([`node_columns`]): there the node across may be a coarser one that draws
+//! none of this level's faces, so a column whose parent stands across such
+//! a floor stops at it, and swaps the rest.
 
 use std::f32::consts::SQRT_2;
 
@@ -44,10 +48,13 @@ pub const MORPH_LEVELS: std::ops::RangeInclusive<u32> = 0..=2;
 
 /// The widest band, in blocks of the morph metric. **Chosen, not derived**:
 /// wider spreads a change over more frames, and leaves less of the ring at
-/// its own detail; 64 blocks is 2.7 s at the flight speed of 24 blocks/s.
-/// Levels 1 and 2 get less than this anyway at the default schedule (32 and
-/// 64 blocks): [`morph_bands`] gives each level all the room its ring leaves.
-pub const MAX_BAND: f32 = 64.0;
+/// its own detail; 128 blocks is 5.3 s at the flight speed of 24 blocks/s.
+/// At the default schedule it is level 0's whole ring (0 to 128: the band
+/// starts at the eye), which cost no triangles and halved the toward-peak
+/// flight's holes against 64 (issue #380's study, 2026-11-21); levels 1 and
+/// 2 get less than this anyway (32 and 64 blocks): [`morph_bands`] gives
+/// each level all the room its ring leaves.
+pub const MAX_BAND: f32 = 128.0;
 
 /// A level's morph band, in blocks of [`morph_metric`]: its vertices start
 /// moving to their parent's height at `start` and have arrived at `end`.
@@ -139,7 +146,9 @@ const PAD: i32 = 3;
 /// A column **morphs** where it and its eight neighbours are *pure*: solid
 /// in every row it shows to a neighbour and the row under them (no cave
 /// mouth, pit or overhang there), with nothing standing on it at level 0
-/// (no tree, no player's block). Its target is then its parent cell's top;
+/// (no tree, no player's block). Its target is then its parent cell's top,
+/// held inside the rows of the parent-level node that holds its own top --
+/// and a top lying on such a node's floor keeps its height (see the body);
 /// any other column's target is its own top.
 pub fn node_columns(
     world: &WorldSnapshot,
@@ -197,12 +206,43 @@ pub fn node_columns(
         |cx: i32, cz: i32| (-1..=1).all(|dz| (-1..=1).all(|dx| pure[at(cx + dx, cz + dz)]));
 
     let row = |y_top_block: i32| y_top_block + 1 - oy;
+    // No column morphs across a floor or ceiling of its parent level's
+    // nodes (multiples of their height, `32 * w` blocks): its target is its
+    // parent's top clamped into the rows of the parent-level node that holds
+    // its own top. The node across such a floor may be drawn a level coarser
+    // than this one and not moving (at the top and bottom of a ring, which
+    // the vertical squash makes flat boxes, so a ring's floor cuts a slope
+    // along a contour) -- and a top that crossed into it would be drawn by
+    // nobody there: the node it came from shows it at its morphed height
+    // only in its own rows, the coarse node shows its own ground and nothing
+    // of this level's. What is left is a step the swap shows, on the columns
+    // whose parent stands across such a floor, instead of a hole. Inside one
+    // parent-level node the floors between siblings are always crossed by
+    // nodes of one level, which move a shared top alike, so a column still
+    // morphs all the way there.
+    //
+    // A top lying exactly on such a floor does not move at all. It is the
+    // node below's, but the risers of the columns beside it in the node
+    // above stand on it, and their feet follow it: down into the node below,
+    // which may be the coarse one that draws none of this level's risers.
+    let parent_rows = 32 * w;
+    let morph_target = |top: i32, parent: i32| {
+        if (top + 1).rem_euclid(parent_rows) == 0 {
+            return top;
+        }
+        let k = top.div_euclid(parent_rows);
+        parent.clamp(k * parent_rows - 1, (k + 1) * parent_rows - 1)
+    };
     let mut columns = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
     for cz in -1..=n {
         for cx in -1..=n {
             let top = tops[at(cx, cz)];
             let parent = parent_top(cx, cz);
-            let target = if morphs(cx, cz) { parent } else { top };
+            let target = if morphs(cx, cz) {
+                morph_target(top, parent)
+            } else {
+                top
+            };
             let inside = (0..n).contains(&cx) && (0..n).contains(&cz);
             let (floor, target_floor) = if inside {
                 (top, target)
@@ -479,14 +519,247 @@ mod tests {
         assert!(skipped * 10 < risers, "{skipped} pairs skipped of {risers}");
     }
 
+    /// `geometry`'s quads in world blocks, every vertex moved by factor `f`
+    /// as `mesh.wgsl` moves it. A quad the morph has turned over -- a corner
+    /// that started above another (or level with it and moving further up)
+    /// now below it -- is left out: culled, it covers nothing.
+    fn morphed_quads(
+        geometry: &crate::mesh::NodeGeometry,
+        f: f32,
+    ) -> Vec<(cubara_voxel::Face, [[f32; 3]; 4])> {
+        let o = geometry.origin;
+        geometry
+            .mesh
+            .vertices
+            .chunks(4)
+            .filter_map(|q| {
+                let p: Vec<[f32; 3]> = q
+                    .iter()
+                    .map(|v| {
+                        [
+                            (o[0] + v.x() as i32) as f32,
+                            (o[1] + v.y() as i32) as f32 + v.morph_delta() * f,
+                            (o[2] + v.z() as i32) as f32,
+                        ]
+                    })
+                    .collect();
+                let key = |v: &cubara_voxel::Vertex| (v.y() as f32, v.morph_delta());
+                let turned = (0..4)
+                    .any(|i| (0..4).any(|j| key(&q[i]) > key(&q[j]) && p[i][1] < p[j][1] - 1e-4));
+                (!turned).then(|| (q[0].face(), [p[0], p[1], p[2], p[3]]))
+            })
+            .collect()
+    }
+
+    /// **A node and the node above or below it are closed together** -- the
+    /// joins [`a_morphed_node_is_closed_and_stands_on_its_parent`] leaves
+    /// out. A riser crosses a node's floor or ceiling wherever the ground
+    /// crosses a multiple of the node's height, and each node draws only its
+    /// own rows of it. The node across may be the same level, morphing by the
+    /// same factor; or, at the top and bottom of a ring (the vertical squash
+    /// makes the rings flat boxes, so on a mountain slope a ring's floor
+    /// cuts the ground along a contour), one level coarser and not moving at
+    /// all, while this one is fully morphed -- its own geometry, which is
+    /// what this node's full morph must meet.
+    ///
+    /// For real nodes on the steep mountain, the ones above and below the
+    /// surface, and the pair traced at frame 1796 of the toward-peak flight
+    /// (a level-0 node on a level-1 one): both meshes together, each vertex
+    /// moved by its own node's factor, must hold the riser between every two
+    /// neighbouring columns of which one moves over the whole height
+    /// between their morphed tops, within the two nodes' rows; and a top
+    /// face over every moving column at its morphed top.
+    ///
+    /// Goes red when a riser vertex on a node's floor or ceiling moves where
+    /// the node across does not follow it (frame 1796: a riser's lowest row
+    /// in the upper node was lifted 1.5 blocks off the floor, and the coarse
+    /// node below draws nothing above its own ceiling).
+    #[test]
+    fn a_morphed_node_closes_with_the_nodes_above_and_below() {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        let mesh = |n: NodeKey| crate::mesh::mesh_node(&snapshot, &registry, &layer, n, blocks);
+        let mut fine = vec![NodeKey::new(0, [-190, 10, -201])];
+        for level in MORPH_LEVELS {
+            for n in mountain_nodes(&snapshot, level) {
+                for dy in -1..=1 {
+                    fine.push(NodeKey::new(level, [n.pos[0], n.pos[1] + dy, n.pos[2]]));
+                }
+            }
+        }
+        let (mut risers, mut tops) = (0usize, 0usize);
+        let mut failures = Vec::new();
+        for node in fine {
+            let Some(columns) = node_columns(&snapshot, node, blocks) else {
+                continue;
+            };
+            let Some(own) = mesh(node) else {
+                continue;
+            };
+            let level = node.level;
+            let w = 1i32 << level;
+            let [ox, oy, oz] = node.world_origin();
+            for dy in [-1, 1] {
+                let [px, py, pz] = node.pos;
+                let mut partners = vec![(NodeKey::new(level, [px, py + dy, pz]), false)];
+                if (py + dy).div_euclid(2) != py.div_euclid(2) {
+                    let up = |c: i32| c.div_euclid(2);
+                    partners.push((NodeKey::new(level + 1, [up(px), up(py + dy), up(pz)]), true));
+                }
+                for (other, coarse) in partners {
+                    let other_mesh = mesh(other);
+                    let oy2 = other.world_origin()[1];
+                    let slab = (
+                        oy.min(oy2) as f32,
+                        (oy + 16 * w).max(oy2 + (16 << other.level)) as f32,
+                    );
+                    // What this node must show: beside a coarse node only
+                    // its own rows, since the coarse node shows its own
+                    // ground in its rows (the parent's, which this node's
+                    // full morph meets); beside one of its own level, the
+                    // two together show the morphed ground in both.
+                    let (lo_row, hi_row) = if coarse {
+                        (oy as f32, (oy + 16 * w) as f32)
+                    } else {
+                        (slab.0 + 1e-3, slab.1)
+                    };
+                    let factors: &[f32] = if coarse {
+                        &[1.0]
+                    } else {
+                        &[0.0, 0.25, 0.5, 0.75, 1.0]
+                    };
+                    for &f in factors {
+                        let mut quads = morphed_quads(&own, f);
+                        if let Some(g) = &other_mesh {
+                            quads.extend(morphed_quads(g, if coarse { 0.0 } else { f }));
+                        }
+                        let moves = |c: [i32; 4]| c[1] != c[0];
+                        let h = |c: [i32; 4]| (oy + c[0]) as f32 + (c[1] - c[0]) as f32 * f;
+                        // Drawn by one of the two nodes: a top face belongs
+                        // to the node holding the block under it.
+                        let ours = |c: [i32; 4]| {
+                            [c[0], c[1]].iter().all(|&r| {
+                                let r = (oy + r) as f32;
+                                r > slab.0 && r <= slab.1
+                            })
+                        };
+                        for cz in 0..16 {
+                            for cx in 0..16 {
+                                let a = columns.at(cx, cz);
+                                let (x0, z0) = ((ox + cx * w) as f32, (oz + cz * w) as f32);
+                                let ha = h(a);
+                                if moves(a) && ours(a) && ha >= lo_row && ha <= hi_row {
+                                    let found = quads.iter().any(|(face, q)| {
+                                        *face == cubara_voxel::Face::PosY
+                                            && q.iter().all(|p| (p[1] - ha).abs() < 1e-3)
+                                            && q.iter().map(|p| p[0]).fold(f32::MAX, f32::min) <= x0
+                                            && q.iter().map(|p| p[0]).fold(f32::MIN, f32::max)
+                                                >= x0 + w as f32
+                                            && q.iter().map(|p| p[2]).fold(f32::MAX, f32::min) <= z0
+                                            && q.iter().map(|p| p[2]).fold(f32::MIN, f32::max)
+                                                >= z0 + w as f32
+                                    });
+                                    tops += 1;
+                                    if !found {
+                                        failures.push(format!(
+                                            "{node:?} with {other:?} at f {f}: column ({cx},{cz}) \
+                                             {a:?} has no top face at {ha}"
+                                        ));
+                                    }
+                                }
+                                for (dx, dz) in [(1, 0), (0, 1)] {
+                                    let (nx, nz) = (cx + dx, cz + dz);
+                                    if nx >= 16 || nz >= 16 {
+                                        continue;
+                                    }
+                                    let b = columns.at(nx, nz);
+                                    if !moves(a) && !moves(b) || !ours(a) || !ours(b) {
+                                        continue;
+                                    }
+                                    let hb = h(b);
+                                    let (lo, hi) = (ha.min(hb).max(lo_row), ha.max(hb).min(hi_row));
+                                    if hi - lo < 1e-3 {
+                                        continue;
+                                    }
+                                    let axis = if dx == 1 { 0 } else { 2 };
+                                    let sign = if ha > hb { 1 } else { -1 };
+                                    let face = cubara_voxel::Face::from_axis_sign(axis, sign);
+                                    let plane = if dx == 1 {
+                                        x0 + w as f32
+                                    } else {
+                                        z0 + w as f32
+                                    };
+                                    let along = if dx == 1 { z0 } else { x0 };
+                                    let other_axis = 2 - axis;
+                                    let mut cover: Vec<(f32, f32)> = quads
+                                        .iter()
+                                        .filter(|(fc, q)| {
+                                            *fc == face
+                                                && q.iter().all(|p| p[axis] == plane)
+                                                && q.iter()
+                                                    .map(|p| p[other_axis])
+                                                    .fold(f32::MAX, f32::min)
+                                                    <= along
+                                                && q.iter()
+                                                    .map(|p| p[other_axis])
+                                                    .fold(f32::MIN, f32::max)
+                                                    >= along + w as f32
+                                        })
+                                        .map(|(_, q)| {
+                                            let ys = q.iter().map(|p| p[1]);
+                                            (
+                                                ys.clone().fold(f32::MAX, f32::min),
+                                                ys.fold(f32::MIN, f32::max),
+                                            )
+                                        })
+                                        .collect();
+                                    cover.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
+                                    let mut reached = lo;
+                                    for (bottom, top) in cover {
+                                        if bottom <= reached + 1e-3 {
+                                            reached = reached.max(top);
+                                        }
+                                    }
+                                    risers += 1;
+                                    if reached < hi - 1e-3 {
+                                        failures.push(format!(
+                                            "{node:?} with {other:?} at f {f}: ({cx},{cz}) {a:?} \
+                                             / ({nx},{nz}) {b:?}: tops {ha}/{hb}, risers cover \
+                                             {lo}..{reached} of ..{hi}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "checked {tops} tops and {risers} risers; {} gaps",
+            failures.len()
+        );
+        for line in failures.iter().take(40) {
+            eprintln!("  {line}");
+        }
+        assert!(failures.is_empty(), "{} gaps", failures.len());
+        assert!(
+            tops > 1000 && risers > 1000,
+            "checked {tops} tops, {risers} risers"
+        );
+    }
+
     #[test]
     fn the_default_schedule_has_a_band_for_levels_0_to_2_and_none_for_3() {
         let bands = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH);
-        // 160 m edge: ends 32 before it, 64 wide (the cap).
+        // 160 m edge: ends 32 before it, and the cap (128) reaches the eye.
         assert_eq!(
             bands[0],
             Some(MorphBand {
-                start: 64.0,
+                start: 0.0,
                 end: 128.0
             })
         );
@@ -804,7 +1077,8 @@ mod tests {
                     geometry.mesh.vertices.chunks(4).collect();
                 // Horizontal edges of quads that move, by height: (y, a, b)
                 // with a and b the (x, z) ends.
-                let mut edges: std::collections::HashMap<u32, Vec<([u32; 2], [u32; 2])>> =
+                type Edge = ([u32; 2], [u32; 2]);
+                let mut edges: std::collections::HashMap<u32, Vec<Edge>> =
                     std::collections::HashMap::new();
                 for q in &quads {
                     if q.iter().all(|v| v.morph_delta() == 0.0) {
@@ -880,21 +1154,17 @@ mod tests {
             DEFAULT_RING_SCHEDULE,
         );
         // Per level: [triangles, vertices] without and with the morph, latent
-        // quads, quads that move, the largest delta, nodes, milliseconds.
-        let mut rows = [[0u64; 9]; 4];
+        // quads, quads that move, nodes. No mesh times: wall-clock time has
+        // no place in a simulation crate (`scripts/check-architecture.sh`,
+        // rule 1), and the cost that matters here is geometry.
+        let mut rows = [[0u64; 7]; 4];
         let mut largest = 0f32;
         for &node in &nodes {
             let l = node.level as usize;
-            let start = std::time::Instant::now();
             let plain =
                 crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, false);
-            let t_plain = start.elapsed();
-            let start = std::time::Instant::now();
             let morphed =
                 crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, true);
-            let t_morph = start.elapsed();
-            rows[l][7] += t_plain.as_micros() as u64;
-            rows[l][8] += t_morph.as_micros() as u64;
             rows[l][6] += 1;
             if let Some(g) = plain {
                 rows[l][0] += g.mesh.triangle_count() as u64;
@@ -920,8 +1190,8 @@ mod tests {
             "morph cost census around {eye:?}: {} nodes, radius 64, squash {SQUASH}",
             nodes.len()
         );
-        println!("| level | nodes | triangles, plain | triangles, morph | change | vertices, plain | vertices, morph | change | latent quads | quads that move | mesh ms plain / morph |");
-        println!("|---|---|---|---|---|---|---|---|---|---|---|");
+        println!("| level | nodes | triangles, plain | triangles, morph | change | vertices, plain | vertices, morph | change | latent quads | quads that move |");
+        println!("|---|---|---|---|---|---|---|---|---|---|");
         let mut total = [0u64; 4];
         for (l, r) in rows.iter().enumerate() {
             if r[6] == 0 {
@@ -932,7 +1202,7 @@ mod tests {
             }
             let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
             println!(
-                "| {l} | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | {} | {} | {:.0} / {:.0} |",
+                "| {l} | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | {} | {} |",
                 r[6],
                 r[0],
                 r[2],
@@ -941,14 +1211,12 @@ mod tests {
                 r[3],
                 pct(r[1], r[3]),
                 r[4],
-                r[5],
-                r[7] as f64 / 1000.0,
-                r[8] as f64 / 1000.0
+                r[5]
             );
         }
         let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
         println!(
-            "| all | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | | | |",
+            "| all | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | | |",
             nodes.len(),
             total[0],
             total[2],
@@ -998,8 +1266,19 @@ mod tests {
                             cx.div_euclid(pw) * pw,
                             cz.div_euclid(pw) * pw,
                             pw,
+                        ) + 1
+                            - o[1];
+                        // Face rows, world: the parent-level node rows the
+                        // top face is in, which the target never leaves.
+                        let rows = 32 * w;
+                        let face = top + o[1];
+                        assert_ne!(face.rem_euclid(rows), 0, "a top on a floor moved");
+                        let floor = (face - 1).div_euclid(rows) * rows - o[1];
+                        assert_eq!(
+                            target,
+                            parent.clamp(floor, floor + rows),
+                            "level {level} ({x}, {z})"
                         );
-                        assert_eq!(target, parent + 1 - o[1], "level {level} ({x}, {z})");
                     }
                 }
             }
