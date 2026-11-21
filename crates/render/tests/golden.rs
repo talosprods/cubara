@@ -577,6 +577,33 @@ fn terrain_renders_as_expected() {
     assert_golden("terrain", &World::new(), Shot::default());
 }
 
+/// `Lighting::ao_floor` reaches the vertex stage, where `mesh.wgsl` resolves
+/// AO: the terrain with no AO floor at all (fully open everywhere) differs
+/// from the default over every shaded corner. Until the colour morph the
+/// mesh pipeline passed its constants to the fragment stage only, so the
+/// vertex stage used the shader's default floor whatever `Lighting` said --
+/// and this frame came out the same as the default one.
+#[test]
+fn the_ao_floor_reaches_the_vertex_stage() {
+    let Some(lit) = render_world(&World::new(), Shot::default()) else {
+        headless::skip_or_require_gpu("the_ao_floor_reaches_the_vertex_stage");
+        return;
+    };
+    let open = Shot {
+        lighting: cubara_render::Lighting {
+            ao_floor: 1.0,
+            ..cubara_render::Lighting::default()
+        },
+        ..Shot::default()
+    };
+    let open = render_world(&World::new(), open).expect("a GPU");
+    let changed = differing_pixels(&open, &lit)
+        .iter()
+        .filter(|p| p.delta > TOLERANCE)
+        .count();
+    assert!(changed > 10_000, "an AO floor of 1 changed only {changed} pixels");
+}
+
 #[test]
 fn distance_fog_fades_the_far_ring_into_the_sky() {
     // Package 2 (cross-session engine review): distance fog dissolves the
@@ -3070,8 +3097,10 @@ fn a_fully_morphed_level_draws_its_parents_colours() {
                 .filter(|p| p.delta > TOLERANCE)
                 .count()
         };
-        let with = changed(&render_mountain(level, Some(full), true).expect("a GPU"));
-        let without = changed(&render_mountain(level, Some(full), false).expect("a GPU"));
+        let with_frame = render_mountain(level, Some(full), true).expect("a GPU");
+        let without_frame = render_mountain(level, Some(full), false).expect("a GPU");
+        let with = changed(&with_frame);
+        let without = changed(&without_frame);
         let pixels = (parent.width * parent.height) as f64;
         eprintln!(
             "level {level} fully morphed against level {}: {with} pixels over tolerance with \

@@ -47,14 +47,6 @@ struct Frame {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
-// DBG (temporary, colour-LOD study): experiment bits.
-override dbg_b1: f32 = 0.0;
-override dbg_b2: f32 = 0.0;
-override dbg_b4: f32 = 0.0;
-override dbg_b8: f32 = 0.0;
-override dbg_b16: f32 = 0.0;
-override dbg_b32: f32 = 0.0;
-override dbg_b64: f32 = 0.0;
 override ambient_low: f32 = 0.28;
 override ambient_high: f32 = 0.42;
 override ao_floor: f32 = 0.4;
@@ -255,40 +247,24 @@ fn vs_main(in: VsIn) -> VsOut {
     let ao_floor_scaled = mix(ao_floor, 1.0, 1.0 - 1.0 / ao_width);
     let ao = mix(ao_floor_scaled, 1.0, ao_frac);
 
-    var uvv = vec2<f32>(u, v);
-    if (dbg_b1 > 0.5 && axis != 1u) {
-        var vv = v - morph_delta * morph;
-        let y_max = select((corner & 2u) != 0u, (corner & 1u) != 0u, axis == 0u);
-        if (latent && !y_max) {
-            vv = vv - 1.0;
-        }
-        uvv.y = vv;
-    }
-    var layer_out = tex_layer;
-    if (dbg_b4 > 0.5 && axis != 1u) {
-        layer_out = 1u;
-    }
-    if (dbg_b8 > 0.5) {
-        layer_out = 1u;
-    }
     // The colour morph (word 3, `Vertex::with_parent`): the texture layer
     // and the openness the parent level draws where this vertex goes at full
     // morph. Its light and its colour blend toward them by the same factor
     // that moves it, so at the end of its band a node shows its parent's
     // colours as well as its parent's shape, and the swap changes neither.
     let has_parent = (in.packed3 & (1u << 20u)) != 0u;
-    let parent_layer = select(layer_out, in.packed3 & 0xFFFu, has_parent);
+    let parent_layer = select(tex_layer, in.packed3 & 0xFFFu, has_parent);
     let parent_open = f32((in.packed3 >> 12u) & 0xFFu) / 255.0;
     let colour_morph = select(0.0, morph, has_parent);
     let lit_ao = mix(ao, mix(ao_floor, 1.0, parent_open), colour_morph);
-    let blend = select(0.0, colour_morph, parent_layer != layer_out);
+    let blend = select(0.0, colour_morph, parent_layer != tex_layer);
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec3<f32>(select(lit_ao, 1.0, dbg_b2 > 0.5 || (dbg_b32 > 0.5 && axis != 1u) || (dbg_b64 > 0.5 && axis == 1u)), haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y), blend);
-    out.uv = uvv;
-    out.layer = layer_out;
+    out.ao_haze = vec3<f32>(lit_ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y), blend);
+    out.uv = vec2<f32>(u, v);
+    out.layer = tex_layer;
     out.parent_layer = parent_layer;
     return out;
 }
@@ -319,9 +295,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.ao_haze.z > 0.0) {
         let parent = textureSampleGrad(block_textures, block_sampler, in.uv, in.parent_layer, uv_dx, uv_dy);
         tex = mix(tex, parent, in.ao_haze.z);
-    }
-    if (dbg_b16 > 0.5) {
-        tex = textureSampleLevel(block_textures, block_sampler, in.uv, in.layer, 10.0);
     }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
     let lit = tex.rgb * sun_color * (ambient + diffuse) * ao;
