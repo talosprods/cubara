@@ -72,9 +72,9 @@ fn replacements_of(node: NodeKey, visible: &HashSet<NodeKey>) -> Vec<NodeKey> {
 /// What a node joins does not depend on where the camera is, but a node
 /// outside the render distance is not worth remembering -- except one level
 /// either side of it: a node that has just split or merged is searched through
-/// as what drew its space before, until its own links arrive
-/// (`cubara_world::visibility`'s stand-in). Forgetting the parent the moment
-/// it split made the new children walls again, one search later.
+/// on what is known of the nodes that drew its space before, until its own
+/// links arrive (`cubara_world::visibility`'s stand-in). Forgetting the parent
+/// the moment it split made the new children walls again, one search later.
 fn worth_remembering(node: NodeKey, desired: &HashSet<NodeKey>) -> bool {
     desired.contains(&node)
         || desired.contains(&node.parent())
@@ -139,9 +139,54 @@ fn forget_visible_again(pending: &mut HashMap<NodeKey, u64>, visible: &HashSet<N
 /// Drawing both meanwhile is not the alternative: a node and its replacement
 /// approximate the same surface, so both in the arena at once is z-fighting
 /// rather than a hole. Hence *swap*, in one `apply_node_updates` call.
-fn can_unload(node: NodeKey, visible: &HashSet<NodeKey>, resident: &HashSet<NodeKey>) -> bool {
+///
+/// **Nor does it leave while a bare node beside it is still loading**
+/// (`loading`: the nodes seen and not drawn yet). The nodes replacing this
+/// one can show openings it did not: a pit's floor a block lower, a cave it
+/// drew shut (issue #423; the low flight's hole of 2026-11-21). The node seen
+/// through such an opening may be one nothing has drawn so far -- under the
+/// pit's floor, behind the cave's mouth. The search asks for it in the same
+/// answer as the replacements (`cubara_world::visibility`'s stand-in), but it
+/// replaces nothing, so nothing kept this node drawn until it had arrived:
+/// sky in the opening for the frames between. A line of sight leaves this
+/// node's space through one of its faces, so the nodes waited for are the
+/// ones [`beside`] it, and of those only the [`bare`] ones: a neighbour that
+/// is itself a replacement still has the node it replaces drawn in its place.
+fn can_unload(
+    node: NodeKey,
+    visible: &HashSet<NodeKey>,
+    resident: &HashSet<NodeKey>,
+    loading: &[NodeKey],
+) -> bool {
     let replacements = replacements_of(node, visible);
-    replacements.is_empty() || replacements.iter().all(|r| resident.contains(r))
+    replacements.is_empty()
+        || (replacements.iter().all(|r| resident.contains(r))
+            && !loading
+                .iter()
+                .any(|&n| beside(node, n) && bare(n, resident)))
+}
+
+/// Whether the boxes of `a` and `b` share a face: they touch along one axis
+/// and overlap along the other two. Sharing only an edge or a corner is not
+/// beside -- a line of sight crosses from node to node through faces.
+fn beside(a: NodeKey, b: NodeKey) -> bool {
+    let ((a0, a1), (b0, b1)) = (node_box(a), node_box(b));
+    (0..3).any(|i| {
+        (a1[i] == b0[i] || b1[i] == a0[i])
+            && (0..3)
+                .filter(|&j| j != i)
+                .all(|j| a0[j] < b1[j] && b0[j] < a1[j])
+    })
+}
+
+/// Whether nothing is drawn in `node`'s place while it loads: not the parent
+/// it would split from, not a child it would merge from, and not an earlier
+/// mesh of its own (a node meshed again after an edit stays drawn). Ground
+/// the search has only now reached.
+fn bare(node: NodeKey, resident: &HashSet<NodeKey>) -> bool {
+    !resident.contains(&node)
+        && !resident.contains(&node.parent())
+        && !node.children().iter().any(|c| resident.contains(c))
 }
 
 /// A box in blocks, `(min, max)` with `max` exclusive: what the streamer
@@ -647,9 +692,7 @@ impl NodeStreaming {
         for &node in &resident_stale {
             mark_stale(&mut self.swap_pending, node, &self.visible, done.frame);
         }
-        let (unload_now, held): (Vec<NodeKey>, Vec<NodeKey>) = resident_stale
-            .into_iter()
-            .partition(|&n| can_unload(n, &self.visible, &self.resident));
+        let (unload_now, held, loading) = self.leave_or_hold(resident_stale);
         for &node in &unload_now {
             self.resident.remove(&node);
             if let Some(lag) = resolve_swap(&mut self.swap_pending, node, &self.visible, self.frame)
@@ -661,11 +704,9 @@ impl NodeStreaming {
         let to_unload: Vec<NodeId> = unload_now.into_iter().map(to_node_id).collect();
         renderer.apply_node_updates(to_unload, std::iter::empty());
 
-        let mut to_load: Vec<NodeKey> = self
-            .visible
-            .iter()
-            .filter(|n| !self.resident.contains(n) && !self.mesh_pool.is_in_flight(**n))
-            .copied()
+        let mut to_load: Vec<NodeKey> = loading
+            .into_iter()
+            .filter(|n| !self.mesh_pool.is_in_flight(*n))
             .collect();
         node::sort_nearest_first(&mut to_load, done.center);
         // One snapshot for the whole batch (issue #387 decision 2): every job
@@ -813,27 +854,56 @@ impl NodeStreaming {
         // (#262). Release those in the *same* call, so the coarse node and the
         // fine ones that replace it are never both in the arena -- and never
         // neither.
-        let released: Vec<NodeId> = if self.held.is_empty() {
-            Vec::new()
-        } else {
-            let ready: Vec<NodeKey> = self
-                .held
-                .iter()
-                .filter(|&&n| can_unload(n, &self.visible, &self.resident))
-                .copied()
-                .collect();
-            for node in &ready {
-                self.held.remove(node);
-                self.resident.remove(node);
-                if let Some(lag) =
-                    resolve_swap(&mut self.swap_pending, *node, &self.visible, self.frame)
-                {
-                    self.swap_lags.push(lag);
-                }
-            }
-            ready.into_iter().map(to_node_id).collect()
-        };
+        let released = self.release_held();
         renderer.apply_node_updates(released, meshed);
+    }
+
+    /// Let go of the held nodes that can leave now ([`can_unload`]), and
+    /// return them for the renderer to drop:
+    /// [`drain_meshes`](Self::drain_meshes)'s bookkeeping, apart from the
+    /// GPU.
+    fn release_held(&mut self) -> Vec<NodeId> {
+        if self.held.is_empty() {
+            return Vec::new();
+        }
+        // What is seen and not drawn yet is being meshed
+        // (`follow_visibility` asks for all of it), so the pool's own short
+        // list is read, every frame something is held, rather than
+        // `visible`, which is a hundred times longer. A node being meshed
+        // again after an edit is in it too, and is not bare.
+        let loading: Vec<NodeKey> = self.mesh_pool.in_flight().collect();
+        let ready: Vec<NodeKey> = self
+            .held
+            .iter()
+            .filter(|&&n| can_unload(n, &self.visible, &self.resident, &loading))
+            .copied()
+            .collect();
+        for node in &ready {
+            self.held.remove(node);
+            self.resident.remove(node);
+            if let Some(lag) =
+                resolve_swap(&mut self.swap_pending, *node, &self.visible, self.frame)
+            {
+                self.swap_lags.push(lag);
+            }
+        }
+        ready.into_iter().map(to_node_id).collect()
+    }
+
+    /// Of the drawn nodes a search's answer has made stale: the ones that
+    /// leave at once, the ones held until they can ([`can_unload`]), and --
+    /// since both need it -- what the answer sees that is not drawn yet.
+    /// [`follow_visibility`](Self::follow_visibility)'s decision, apart from
+    /// the GPU.
+    fn leave_or_hold(&self, stale: Vec<NodeKey>) -> (Vec<NodeKey>, Vec<NodeKey>, Vec<NodeKey>) {
+        // Asked for by `follow_visibility` next, or already being meshed. A
+        // stale node waits for the bare ones beside it as well as for its
+        // replacements.
+        let loading = loading_nodes(&self.visible, &self.resident);
+        let (leave, hold) = stale
+            .into_iter()
+            .partition(|&n| can_unload(n, &self.visible, &self.resident, &loading));
+        (leave, hold, loading)
     }
 
     /// Every swap's lag so far, in frames (issue #378): a node with a
@@ -924,6 +994,147 @@ fn boxes_in_blocks(nodes: Vec<NodeKey>) -> Vec<BlockBox> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The chunk arena holds the game's own selection where the ground is
+    /// steepest**, with room for a swap (issue #423). Past its capacity
+    /// `ChunkArena::insert` skips a node -- a hole in the world, with one
+    /// line in the log -- so a change that makes meshes larger has to go red
+    /// here first.
+    ///
+    /// The selection is the game's (`desired_nodes_3d` at
+    /// [`VERTICAL_LOD_SQUASH`] over the default ring schedule), centred on
+    /// the ground of the steepest of a **seeded** set of chunk columns of
+    /// the default world, and meshed as a mesh job meshes it. Vertices and
+    /// indices are what the arena counts.
+    ///
+    /// **Every node of the selection is counted, seen or not.** The game
+    /// uploads only the nodes its visibility search reaches, so this is
+    /// more than is resident: from the ground at the worst column here 58%
+    /// of it. It is an upper bound for an eye on the ground. It is **not**
+    /// one by construction for an eye raised above the mountain, where
+    /// nearly everything selected is in sight -- but the selection is
+    /// smaller there, and of eleven eyes tried (up to seventeen chunks above
+    /// three mountains) the most resident was 3,462,428 vertices against
+    /// this test's 4,280,540. So the number held here is above everything
+    /// found resident; a test that searched from raised eyes as well would
+    /// cost several times this one's minute.
+    ///
+    /// **[`SWAP_OVERLAP`] is chosen, not derived**: while the player moves,
+    /// a node and the nodes replacing it are resident together until the
+    /// swap is done, so the peak is above any steady state. A quarter more
+    /// is an allowance, not a measurement; the lead's follow-up to #423 is
+    /// to derive the capacity from the selection instead of holding a
+    /// constant to it.
+    #[test]
+    fn the_arena_holds_the_selection_around_a_mountain() {
+        use cubara_render::ChunkArena;
+        use cubara_world::mesh::mesh_node;
+        const SWAP_OVERLAP: f64 = 1.25;
+        /// Chunk columns drawn, and how many of the steepest are meshed.
+        const CANDIDATES: usize = 64;
+        const CENTRES: usize = 3;
+        const SEED: u64 = 0x0423_A7E4_A000_0001;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let registry = BlockRegistry::load(&root.join("assets/blocks")).expect("assets/blocks");
+        let structures = cubara_voxel::StructureRegistry::load(&root.join("assets/structures"))
+            .expect("assets/structures");
+        let ores = cubara_voxel::OreRegistry::load(&root.join("assets/ores")).expect("assets/ores");
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&structures, &registry)
+            .with_ores(&ores, &registry);
+        let world = World::new();
+
+        // SplitMix64, so the columns are the seed's and not picked.
+        let mut state = SEED;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        // How steep the ground is around a column: the mean step between
+        // surface heights 16 blocks apart, over the 512 blocks either side
+        // (the three finest rings, where the triangles are).
+        let steepness = |cx: i32, cz: i32| -> i64 {
+            let at = |i: i32, j: i32| world.surface_height((cx + i) * 16 + 8, (cz + j) * 16 + 8);
+            let mut sum = 0i64;
+            for j in -32..32 {
+                for i in -32..32 {
+                    sum +=
+                        ((at(i + 1, j) - at(i, j)).abs() + (at(i, j + 1) - at(i, j)).abs()) as i64;
+                }
+            }
+            sum
+        };
+        let mut columns: Vec<(i64, i32, i32)> = (0..CANDIDATES)
+            .map(|_| {
+                let (cx, cz) = ((next() % 750) as i32 - 375, (next() % 750) as i32 - 375);
+                (steepness(cx, cz), cx, cz)
+            })
+            .collect();
+        columns.sort();
+        columns.reverse();
+
+        let (mut worst, mut at) = ((0usize, 0usize), (0, 0));
+        for &(_, cx, cz) in &columns[..CENTRES] {
+            let ground = world.surface_height(cx * 16 + 8, cz * 16 + 8) + 2;
+            let centre = ChunkCoord::new(cx, ground.div_euclid(16), cz);
+            let nodes =
+                node::desired_nodes_3d(centre, VERTICAL_LOD_SQUASH, node::DEFAULT_RING_SCHEDULE);
+            let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let (vertices, indices) = std::thread::scope(|scope| {
+                // Every `workers`-th node each: the list is ordered by
+                // level, so a contiguous split would hand one worker all of
+                // the heavy ones.
+                let handles: Vec<_> = (0..workers)
+                    .map(|k| {
+                        let (world, registry, nodes) = (&world, &registry, &nodes);
+                        scope.spawn(move || {
+                            let layer_of = |_: &str| 0;
+                            let (mut v, mut i) = (0usize, 0usize);
+                            for &node in nodes.iter().skip(k).step_by(workers) {
+                                if let Some(g) = mesh_node(world, registry, &layer_of, node, blocks)
+                                {
+                                    v += g.mesh.vertices.len();
+                                    i += g.mesh.indices.len();
+                                }
+                            }
+                            (v, i)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("a mesh worker"))
+                    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+            });
+            println!(
+                "chunk column ({cx}, {cz}), ground at {ground}: {} nodes, {vertices} vertices, {indices} indices",
+                nodes.len()
+            );
+            if vertices > worst.0 {
+                (worst, at) = ((vertices, indices), (cx, cz));
+            }
+        }
+        // The seed finds real mountains: a selection well above the one
+        // around the origin (3.0 million vertices).
+        assert!(
+            worst.0 > 3_500_000,
+            "the steepest column drawn, {at:?}, has {} vertices: not a mountain (seed {SEED:#x})",
+            worst.0
+        );
+        for (what, used, capacity) in [
+            ("vertices", worst.0, ChunkArena::VERTEX_CAPACITY),
+            ("indices", worst.1, ChunkArena::INDEX_CAPACITY),
+        ] {
+            assert!(
+                used as f64 * SWAP_OVERLAP <= capacity as f64,
+                "around chunk column {at:?} the selection has {used} {what}; with {SWAP_OVERLAP} for a swap that is over the arena's {capacity} (seed {SEED:#x})"
+            );
+        }
+    }
 
     /// Issue #424: the far terrain is left out only on the search's own
     /// word, about the chunk the eye is in, with nothing pending.
@@ -1072,7 +1283,7 @@ mod tests {
 
         // Nothing has arrived: holding it is the only thing that is not a hole.
         let mut resident: HashSet<NodeKey> = HashSet::from([parent]);
-        assert!(!can_unload(parent, &visible, &resident));
+        assert!(!can_unload(parent, &visible, &resident, &[]));
 
         // Seven of eight is still a hole -- an `any` here instead of `all`
         // would leave one eighth of the mountain missing, which is precisely
@@ -1080,12 +1291,12 @@ mod tests {
         for kid in kids.iter().take(7) {
             resident.insert(*kid);
             assert!(
-                !can_unload(parent, &visible, &resident),
+                !can_unload(parent, &visible, &resident, &[]),
                 "released with {kid:?} the last one missing"
             );
         }
         resident.insert(kids[7]);
-        assert!(can_unload(parent, &visible, &resident));
+        assert!(can_unload(parent, &visible, &resident, &[]));
     }
 
     /// Walking away merges eight into one, and had the identical hole. A fix
@@ -1099,11 +1310,222 @@ mod tests {
         let resident: HashSet<NodeKey> = kids.iter().copied().collect();
 
         for kid in &kids {
-            assert!(!can_unload(*kid, &visible, &resident));
+            assert!(!can_unload(*kid, &visible, &resident, &[]));
         }
         let with_parent: HashSet<NodeKey> = resident.union(&visible).copied().collect();
         for kid in &kids {
-            assert!(can_unload(*kid, &visible, &with_parent));
+            assert!(can_unload(*kid, &visible, &with_parent, &[]));
+        }
+    }
+
+    /// **The low flight's hole, on the side that lets a node go** (issue
+    /// #423). A level-1 node splits; its eight children have arrived. One of
+    /// them shows a pit the parent drew shut, and the pit's floor is in the
+    /// node below -- which nothing has drawn so far and which is still being
+    /// meshed. Letting the parent go now shows sky at the bottom of the pit.
+    #[test]
+    fn a_node_stays_until_the_bare_node_beside_it_has_arrived() {
+        let parent = NodeKey::new(1, [11, 1, 2]);
+        let kids = children_of(parent);
+        // Under the parent's box, beside it: the level-0 node below a child.
+        let below = NodeKey::new(0, [22, 1, 5]);
+        assert!(beside(parent, below) && !kids.contains(&below));
+        let visible: HashSet<NodeKey> = kids.iter().copied().chain([below]).collect();
+        let mut resident: HashSet<NodeKey> = kids.iter().copied().chain([parent]).collect();
+
+        assert!(
+            !can_unload(parent, &visible, &resident, &[below]),
+            "released with the node under the pit's floor still loading"
+        );
+        // It arrived: nothing is loading, and the parent goes.
+        resident.insert(below);
+        assert!(can_unload(parent, &visible, &resident, &[]));
+    }
+
+    /// A split parent whose children are all drawn, held, with the bare
+    /// node under one of them seen: the streamer's own state for the two
+    /// tests below.
+    fn held_parent_beside_a_bare_node(s: &mut NodeStreaming) -> (NodeKey, NodeKey) {
+        let parent = NodeKey::new(1, [11, 1, 2]);
+        let below = NodeKey::new(0, [22, 1, 5]);
+        for kid in children_of(parent) {
+            s.visible.insert(kid);
+            s.resident.insert(kid);
+        }
+        s.visible.insert(below);
+        s.resident.insert(parent);
+        (parent, below)
+    }
+
+    /// The rule above reaches the frame: as meshes land, a held node is let
+    /// go only once the bare node beside it is no longer **in the mesh
+    /// pool** -- which is where the frame reads what is still loading from.
+    #[test]
+    fn a_held_node_is_not_released_while_the_pool_meshes_a_bare_node_beside_it() {
+        let mut s = real_streaming();
+        let world = Arc::new(World::new().snapshot());
+        let (parent, below) = held_parent_beside_a_bare_node(&mut s);
+        s.held.insert(parent);
+        s.mesh_pool
+            .request(&world, &s.registry, &s.layer_of, below, s.blocks);
+
+        assert_eq!(
+            s.release_held(),
+            Vec::new(),
+            "released while the node beside it was being meshed"
+        );
+        assert!(s.held.contains(&parent) && s.resident.contains(&parent));
+        // The pool no longer meshes it -- it landed, or was given up -- and
+        // the parent goes. Read from the pool and not from what is seen and
+        // not drawn: a node nobody is meshing would never land, and waiting
+        // for it would hold the parent for ever.
+        s.mesh_pool.cancel(below);
+        assert_eq!(s.release_held(), vec![to_node_id(parent)]);
+        assert!(!s.held.contains(&parent) && !s.resident.contains(&parent));
+    }
+
+    /// And it reaches a search's answer: a stale node whose replacements are
+    /// all drawn already is still held for the bare node that answer has
+    /// just seen beside it, which is about to be asked for.
+    #[test]
+    fn a_search_answer_holds_a_node_for_the_bare_node_it_sees_beside_it() {
+        let mut s = real_streaming();
+        let (parent, below) = held_parent_beside_a_bare_node(&mut s);
+
+        let (leave, hold, loading) = s.leave_or_hold(vec![parent]);
+        assert_eq!(
+            (leave, hold),
+            (Vec::new(), vec![parent]),
+            "left with the node beside it not asked for yet"
+        );
+        assert_eq!(loading, vec![below], "what is seen and not drawn");
+        // With that node drawn nothing is loading, and the parent leaves.
+        s.resident.insert(below);
+        assert_eq!(
+            s.leave_or_hold(vec![parent]),
+            (vec![parent], Vec::new(), Vec::new())
+        );
+    }
+
+    /// Only a **bare** node **beside** it holds a node back. Anything else
+    /// that is loading has something drawn in its place, or cannot be seen
+    /// into from this node's space -- and waiting for those would tie every
+    /// swap to every other.
+    #[test]
+    fn a_node_does_not_wait_for_what_is_drawn_meanwhile_or_not_beside_it() {
+        let parent = NodeKey::new(1, [11, 1, 2]);
+        let kids = children_of(parent);
+        let with = |more: &[NodeKey]| -> HashSet<NodeKey> {
+            kids.iter().copied().chain(more.iter().copied()).collect()
+        };
+        let drawn = |more: &[NodeKey]| -> HashSet<NodeKey> {
+            kids.iter()
+                .copied()
+                .chain([parent])
+                .chain(more.iter().copied())
+                .collect()
+        };
+
+        // A neighbour's child, with that neighbour still drawn: the
+        // neighbour stands in its place until it arrives.
+        let neighbour = NodeKey::new(1, [12, 1, 2]);
+        let its_child = children_of(neighbour)[0];
+        assert!(beside(parent, its_child));
+        assert!(can_unload(
+            parent,
+            &with(&[its_child]),
+            &drawn(&[neighbour]),
+            &[its_child]
+        ));
+        // The same child with the neighbour gone is bare, and is waited for.
+        assert!(!can_unload(
+            parent,
+            &with(&[its_child]),
+            &drawn(&[]),
+            &[its_child]
+        ));
+
+        // A coarser node merging beside it, its children still drawn.
+        let merging = NodeKey::new(2, [6, 0, 1]);
+        let one_of_its = children_of(merging)[0];
+        assert!(beside(parent, merging));
+        assert!(can_unload(
+            parent,
+            &with(&[merging]),
+            &drawn(&[one_of_its]),
+            &[merging]
+        ));
+        assert!(!can_unload(
+            parent,
+            &with(&[merging]),
+            &drawn(&[]),
+            &[merging]
+        ));
+
+        // A node beside it that is being meshed again after an edit: its
+        // earlier mesh is drawn meanwhile.
+        let edited = NodeKey::new(0, [22, 1, 5]);
+        assert!(beside(parent, edited));
+        assert!(can_unload(
+            parent,
+            &with(&[edited]),
+            &drawn(&[edited]),
+            &[edited]
+        ));
+
+        // Bare, and not beside: two nodes away, and touching only an edge.
+        let far = NodeKey::new(0, [26, 2, 4]);
+        let edge = NodeKey::new(0, [24, 1, 4]);
+        assert!(!beside(parent, far) && !beside(parent, edge));
+        assert!(can_unload(
+            parent,
+            &with(&[far, edge]),
+            &drawn(&[]),
+            &[far, edge]
+        ));
+
+        // And a node nothing replaces leaves at once whatever is loading
+        // beside it: its place is not being looked into any more.
+        let gone = NodeKey::new(1, [40, 0, 40]);
+        let beside_it = NodeKey::new(1, [41, 0, 40]);
+        assert!(can_unload(
+            gone,
+            &HashSet::from([beside_it]),
+            &HashSet::from([gone]),
+            &[beside_it]
+        ));
+    }
+
+    /// Beside is a shared face, at any two levels; an edge or a corner in
+    /// common is not, and neither is a node inside the other.
+    #[test]
+    fn beside_is_a_shared_face() {
+        let node = NodeKey::new(1, [0, 0, 0]); // chunks 0..2 on every axis
+        for (other, want) in [
+            (NodeKey::new(1, [1, 0, 0]), true),
+            (NodeKey::new(1, [-1, 0, 0]), true),
+            (NodeKey::new(1, [0, 1, 0]), true),
+            (NodeKey::new(1, [0, -1, 0]), true),
+            (NodeKey::new(1, [0, 0, 1]), true),
+            (NodeKey::new(1, [0, 0, -1]), true),
+            // A finer node on a face, and a coarser one that holds a face.
+            (NodeKey::new(0, [2, 1, 0]), true),
+            (NodeKey::new(0, [1, -1, 1]), true),
+            (NodeKey::new(2, [0, 0, -1]), true),
+            // An edge, a corner.
+            (NodeKey::new(1, [1, 1, 0]), false),
+            (NodeKey::new(1, [1, 1, 1]), false),
+            (NodeKey::new(0, [2, 2, 0]), false),
+            // Apart.
+            (NodeKey::new(1, [2, 0, 0]), false),
+            (NodeKey::new(0, [3, 0, 0]), false),
+            // Inside it, around it, itself.
+            (NodeKey::new(0, [1, 1, 1]), false),
+            (NodeKey::new(2, [0, 0, 0]), false),
+            (node, false),
+        ] {
+            assert_eq!(beside(node, other), want, "{other:?}");
+            assert_eq!(beside(other, node), want, "{other:?}, the other way round");
         }
     }
 
@@ -1132,9 +1554,9 @@ mod tests {
         let gone = NodeKey::new(1, [40, 0, 40]);
         let elsewhere: HashSet<NodeKey> = HashSet::from([NodeKey::new(1, [-40, 0, -40])]);
         let resident: HashSet<NodeKey> = HashSet::from([gone]);
-        assert!(can_unload(gone, &elsewhere, &resident));
+        assert!(can_unload(gone, &elsewhere, &resident, &[]));
         // Including when nothing at all is visible (walked into a cave).
-        assert!(can_unload(gone, &HashSet::new(), &resident));
+        assert!(can_unload(gone, &HashSet::new(), &resident, &[]));
     }
 
     /// The property the old code broke, stated over chunks rather than nodes:
@@ -1152,7 +1574,7 @@ mod tests {
         let mut parent_gone = false;
         for kid in kids.iter().chain(std::iter::once(&kids[7])) {
             resident.insert(*kid);
-            if !parent_gone && can_unload(parent, &visible, &resident) {
+            if !parent_gone && can_unload(parent, &visible, &resident, &[]) {
                 resident.remove(&parent);
                 parent_gone = true;
             }

@@ -46,4 +46,4 @@ pub use smelt::{SmeltBook, SmeltError, SmeltRecipe, SmeltRecipeDef};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
 pub use tree_shape::{tree_bounds, tree_part_at, TreePart};
-pub use voxel::{face_ao, face_ao_of, Chunk, MeshContext};
+pub use voxel::{face_ao_of, Chunk, MeshContext};

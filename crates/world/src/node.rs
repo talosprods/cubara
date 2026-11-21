@@ -76,12 +76,32 @@ impl NodeKey {
     ///
     /// A node's **horizontal** cell width is `2^level` blocks, unchanged --
     /// that's [`extent_chunks`](Self::extent_chunks) itself, numerically.
+    ///
+    /// **These are the rows a node stores** -- what generation, caves and
+    /// the visibility links work in. What it *draws* is
+    /// [`drawn_row_blocks`](Self::drawn_row_blocks): since issue #423 a row
+    /// of four is cut off at its column's exact top.
     pub fn cell_height_blocks(self) -> i32 {
         if self.level <= 2 {
             1
         } else {
             4
         }
+    }
+
+    /// The height, in blocks, of the rows this level's ground is **drawn**
+    /// in: one, at every level. Level 3 *stores* rows of
+    /// [`cell_height_blocks`](Self::cell_height_blocks) and draws the one
+    /// that holds a column's top cut off at it (issue #423,
+    /// `cubara_voxel::AnisoChunk::with_tops`), so its steps are the ground's
+    /// own, to the block, like every other level's.
+    ///
+    /// What anything about a level's *drawn* steps reads -- border samples,
+    /// a screen-space measurement of a riser -- where generation and storage
+    /// read `cell_height_blocks`. `mesh::tests::a_node_is_drawn_in_block_rows`
+    /// holds it to what a generated node says of itself.
+    pub fn drawn_row_blocks(self) -> i32 {
+        1
     }
 
     /// This node's own lattice cell counts `[nx, ny, nz]` (R1b): 16 on x/z,

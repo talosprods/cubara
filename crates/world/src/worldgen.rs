@@ -351,23 +351,187 @@ const DISTANT_CAVE_DEPTH: i32 = 24;
 const CAVE_CARVE_AMOUNT: f32 = 1_000_000.0;
 const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 
-/// The most the cave noise can change per block along one axis.
-///
-/// One octave of value noise moves at most 3 per lattice unit per axis (a
-/// smoothstep's slope peaks at 1.5, across values that differ by at most 2);
-/// octaves scale that by their frequency and weight, and the sum is normalised
-/// the way `fbm3` normalises. Used only to skip samples that cannot disagree,
-/// so an overestimate costs speed and an underestimate would cost correctness
-/// -- `the_cave_slope_bound_holds` checks it against the noise itself.
-fn cave_noise_slope() -> f32 {
-    let (mut freq, mut amp, mut sum, mut norm) = (CAVE_FREQ, 1.0f32, 0.0f32, 0.0f32);
-    for _ in 0..CAVE_OCTAVES {
-        sum += 3.0 * freq * amp;
-        norm += amp;
-        freq *= CAVE_LACUNARITY;
-        amp *= CAVE_GAIN;
+/// Which of the level-0 side faces under a coarse cell speaks for it
+/// ([`WorldGen::coarse_block`]): its own hash stream, so retuning caves or
+/// trees cannot move it. Arbitrary, as every mix constant is.
+const COARSE_FACE_SEED_MIX: u64 = 0x423B_10C5_A11E_7E15;
+
+/// One level-0 column under a coarse cell ([`NodeGround`]): the `y` of its
+/// surface block, and of its four neighbours' -- which is where it shows a
+/// side at level 0, every row above a neighbour's surface and at or under
+/// its own -- and where in the cell it stands.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Covered {
+    pub(crate) surface: i32,
+    pub(crate) around: [i32; 4],
+    /// Blocks from the cell's corner, along x and along z.
+    pub(crate) at: [u8; 2],
+}
+
+/// The ground under a coarse node, cell by cell: what
+/// [`WorldGen::generate_aniso`] makes the node of.
+pub(crate) struct NodeGround {
+    /// Columns per cell: the cell's width squared.
+    per_cell: usize,
+    /// Every cell's level-0 columns, **sorted by surface, ascending**, cell
+    /// after cell (`z` outer). All of them say what the cell's sides are
+    /// made of ([`WorldGen::coarse_block`]).
+    columns: Vec<Covered>,
+    /// Every cell's top ([`WorldGen::cell_top`]).
+    tops: Vec<i32>,
+    /// Per cell, the lowest surface among its columns' neighbours: at or
+    /// under it none of the cell's columns shows a side face at level 0.
+    lows: Vec<i32>,
+    /// Per cell, the lowest top among the four cells beside it: where its
+    /// own risers end. Beside a cell of the next node, whose top this node
+    /// does not work out, [`OUTSIDE_FOOT`] cells' widths under the lowest
+    /// column along that edge.
+    feet: Vec<i32>,
+}
+
+/// How far under the lowest column along a node's edge the foot of a riser
+/// is taken to be, in cells' widths, where the cell beyond the edge belongs
+/// to the next node and its top is not worked out. **Chosen, not derived**:
+/// deep enough for a slope of four blocks to the block across that cell; a
+/// row taken for part of a riser that is in fact buried is never seen.
+const OUTSIDE_FOOT: i32 = 2;
+
+/// One cell of a [`NodeGround`].
+#[derive(Clone, Copy)]
+struct CellColumns<'a> {
+    columns: &'a [Covered],
+    top: i32,
+    low: i32,
+    foot: i32,
+}
+
+impl NodeGround {
+    /// The ground of a node of 16 x 16 cells, each `step` blocks wide, over
+    /// the height field `height(i, j)`, asked in blocks from the node's
+    /// corner: anywhere from one cell's width outside the node to one cell's
+    /// width past its far side (a column's neighbours, and the cells around
+    /// a cell that might hold a summit). The world's own field for a real
+    /// node ([`WorldGen::node_ground`]); a test hands in one made by hand.
+    pub(crate) fn over(step: i32, height: impl Fn(i32, i32) -> i32) -> Self {
+        let cells = Chunk::SIZE as i32;
+        let per_cell = (step * step) as usize;
+        let count = (cells * cells) as usize;
+        let mut columns = Vec::with_capacity(count * per_cell);
+        let (mut tops, mut lows) = (Vec::with_capacity(count), Vec::with_capacity(count));
+        for cz in 0..cells {
+            for cx in 0..cells {
+                let start = columns.len();
+                for dz in 0..step {
+                    for dx in 0..step {
+                        let (i, j) = (cx * step + dx, cz * step + dz);
+                        columns.push(Covered {
+                            surface: height(i, j),
+                            around: [
+                                height(i + 1, j),
+                                height(i - 1, j),
+                                height(i, j + 1),
+                                height(i, j - 1),
+                            ],
+                            at: [dx as u8, dz as u8],
+                        });
+                    }
+                }
+                let cell = &mut columns[start..];
+                // A fixed order among columns as high as each other: the
+                // hash that picks a cell's face walks them in this order.
+                cell.sort_unstable_by_key(|c| (c.surface, c.at[1], c.at[0]));
+                lows.push(
+                    cell.iter()
+                        .flat_map(|c| c.around)
+                        .min()
+                        .expect("a cell covers a column"),
+                );
+                tops.push(WorldGen::top_over(
+                    &height,
+                    cx * step,
+                    cz * step,
+                    step,
+                    step,
+                ));
+            }
+        }
+        // Where each cell's risers end: the lowest top beside it.
+        let feet = (0..count as i32)
+            .map(|at| {
+                let (cx, cz) = (at % cells, at / cells);
+                GROUND_DIRECTIONS
+                    .into_iter()
+                    .enumerate()
+                    .map(|(d, [dx, dz])| {
+                        let (nx, nz) = (cx + dx, cz + dz);
+                        if (0..cells).contains(&nx) && (0..cells).contains(&nz) {
+                            return tops[(nz * cells + nx) as usize];
+                        }
+                        // The next node's cell: from the columns of it that
+                        // stand along this edge.
+                        let edge = |c: &&Covered| {
+                            let along = c.at[if dx != 0 { 0 } else { 1 }] as i32;
+                            along == if dx + dz > 0 { step - 1 } else { 0 }
+                        };
+                        columns[at as usize * per_cell..][..per_cell]
+                            .iter()
+                            .filter(edge)
+                            .map(|c| c.around[d])
+                            .min()
+                            .expect("a cell has a column on every edge")
+                            - OUTSIDE_FOOT * step
+                    })
+                    .min()
+                    .expect("four sides")
+            })
+            .collect();
+        Self {
+            per_cell,
+            columns,
+            tops,
+            lows,
+            feet,
+        }
     }
-    sum / norm
+
+    fn cell(&self, at: usize) -> CellColumns<'_> {
+        CellColumns {
+            columns: &self.columns[at * self.per_cell..][..self.per_cell],
+            top: self.tops[at],
+            low: self.lows[at],
+            foot: self.feet[at],
+        }
+    }
+}
+
+/// The level-0 columns one coarse cell covers and the top it draws
+/// ([`WorldGen::cell_ground`]): what a neighbouring node needs to know what
+/// the cell shows at a block, without generating its node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellGround {
+    /// The cell's corner column, and its width in blocks.
+    pub x0: i32,
+    pub z0: i32,
+    pub w: i32,
+    /// The `y` of the top block the cell draws ([`WorldGen::cell_top`]).
+    pub top: i32,
+    /// The `y` of the highest surface among its columns.
+    pub peak: i32,
+    /// Each column's surface, row by row (`z` outer).
+    surfaces: Vec<i32>,
+}
+
+/// `a / b` for `b > 0`, rounded to the nearest whole number, **a half to
+/// the even one**: rounding halves one way would lift (or lower) every cell
+/// whose columns split evenly, and that is a level of the whole ground
+/// standing a fraction of a block off the next.
+fn div_round_half_even(a: i64, b: i64) -> i64 {
+    let (q, r) = (a.div_euclid(b), a.rem_euclid(b));
+    match (2 * r).cmp(&b) {
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Equal => q + (q & 1),
+    }
 }
 
 // Ore shape. Each ore carries its own frequency and threshold from its data
@@ -492,28 +656,20 @@ impl WorldGen {
         self.seed
     }
 
+    /// The surface a cell of `step` blocks at corner `(x, z)` is judged
+    /// against: its top, [`cell_top`](Self::cell_top). At `step` 1 it is the
+    /// block's own column.
+    ///
+    /// (Main took the mean of four of the cell's columns, rounded down; the
+    /// first version of issue #423 the highest of all of them. Why neither
+    /// is in `cell_top`'s own doc comment.)
+    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
+        self.cell_top(x, z, step.max(1))
+    }
+
     /// The terrain height field in blocks: a fractal noise surface that
     /// [`density`](Self::density)'s solid/air split (before caves) is
     /// measured against. A pure function of `(seed, x, z)` alone (§8.1).
-    /// The surface height a cell of `step` blocks at column `(x, z)` is judged
-    /// against: the average of four columns spread around the middle of the
-    /// cell -- all four of its columns at `step` 2, which has no middle column.
-    /// At `step` 1 it is the block's own column.
-    pub fn cell_surface_height(&self, x: i32, z: i32, step: i32) -> i32 {
-        if step <= 1 {
-            return self.surface_height(x, z);
-        }
-        let (near, far) = (step / 4, (3 * step) / 4);
-        let sum: i32 = [(near, near), (far, near), (near, far), (far, far)]
-            .iter()
-            .map(|&(dx, dz)| self.surface_height(x + dx, z + dz))
-            .sum();
-        // Rounded down. Columns of 28, 28, 27 and 27 hold 2 of the 8 blocks in
-        // a cell at 28-29: clearly air. Rounding their 27.5 to nearest said 28,
-        // and solid -- measured, it was the whole of the remaining error.
-        sum.div_euclid(4)
-    }
-
     pub fn surface_height(&self, x: i32, z: i32) -> i32 {
         let n = fbm2(
             self.seed,
@@ -557,26 +713,17 @@ impl WorldGen {
     }
 
     /// [`density`](Self::density), given an already-known `surface_height(x,
-    /// z)` -- the shared body every per-voxel query below funnels through,
+    /// z)` -- the shared body every per-block query below funnels through,
     /// so the 2D height-field noise (expensive: [`TERRAIN_OCTAVES`] octaves
     /// of hashing) is computed by the caller once per column and passed in,
     /// not recomputed per voxel. See [`generate`](Self::generate)'s doc
     /// comment for why that matters.
     ///
-    /// **`step` is the size of the cell being asked about**, in blocks: 1 for a
-    /// block, 2^L for a cell of a level-L node. Every feature answers for the
-    /// whole cell, not for its corner -- that is the contract that lets any
-    /// feature, present or future, be drawn at a distance without the renderer
-    /// knowing it exists. Coarse nodes are this same function at a larger
-    /// `step`; there is no second, feature-less path for them.
-    ///
-    /// `surface` must be [`cell_surface_height`](Self::cell_surface_height) for
-    /// the same cell: the height field is judged at the middle of the cell's
-    /// column, against the middle of the cell, for the same reason caves are --
-    /// a steep slope sampled at one corner of an 8-block cell is a step in the
-    /// wrong place.
-    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32, step: i32) -> f32 {
-        let terrain = (surface - (y + (step - 1) / 2) + 1) as f32;
+    /// **One block of level 0.** A coarse cell is not this function at a
+    /// larger size: its top is [`cell_top`](Self::cell_top), and it is cave
+    /// where [`row_is_cave`](Self::row_is_cave) says so.
+    fn density_at(&self, x: i32, y: i32, z: i32, surface: i32) -> f32 {
+        let terrain = (surface - y + 1) as f32;
         if terrain <= 0.0 {
             // Already air from the height field alone. `carved` below is
             // always >= 0 (it's either 0 or CAVE_CARVE_AMOUNT), so caves can
@@ -591,9 +738,7 @@ impl WorldGen {
             // surface-amortization above it together fix.
             return terrain;
         }
-        // A coarse cell wholly deeper than `DISTANT_CAVE_DEPTH` is not carved.
-        let shallow = step <= 1 || y + step > surface - DISTANT_CAVE_DEPTH;
-        let carved = if shallow && self.cave_at(x, y, z, step) {
+        let carved = if self.cave_at(x, y, z) {
             CAVE_CARVE_AMOUNT
         } else {
             0.0
@@ -601,86 +746,304 @@ impl WorldGen {
         terrain - carved
     }
 
-    /// [`density_at`], for R1b's anisotropic coarse-node path: the vertical
-    /// window is `v` blocks (the node's own cell height, decision 1) rather
-    /// than the horizontal cell width -- so a node whose cells are `2^level`
-    /// blocks wide but only `v` tall samples its solid/air split, and its
-    /// caves, over exactly `v` blocks of height, not `2^level`.
+    /// The ground under the coarse node at `(x0, z0)` whose cells are `step`
+    /// blocks wide: every cell's level-0 columns, its top and where its
+    /// columns show their sides ([`NodeGround`]).
     ///
-    /// **Not the same function as `density_at` with `step = v`.** That
-    /// function's `step <= 1` branch means "always sample caves, regardless
-    /// of depth" -- correct for a genuine single-block query (`density`,
-    /// `is_solid`, raycasting), which must never approximate a cell it has
-    /// no business treating as one. Reusing it here would make it true of
-    /// every `v = 1` cell too (levels 1-2's rings), which defeats the
-    /// "generation costs about 2x today's, not 2^level x" requirement
-    /// (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R1): a `v = 1` coarse column
-    /// would sample cave noise at every one of its 32 (level 1) or 64 (level
-    /// 2) rows, not just the ones near the surface. This keeps the same
-    /// depth-gated skip the old isotropic coarse path had (`shallow`,
-    /// `DISTANT_CAVE_DEPTH`) regardless of how small `v` is.
-    fn density_at_v(&self, x: i32, y: i32, z: i32, surface: i32, v: i32) -> f32 {
-        let terrain = (surface - (y + (v - 1) / 2) + 1) as f32;
-        if terrain <= 0.0 {
-            return terrain;
-        }
-        let shallow = y + v > surface - DISTANT_CAVE_DEPTH;
-        let carved = if shallow && self.cave_at(x, y, z, v) {
-            CAVE_CARVE_AMOUNT
-        } else {
-            0.0
-        };
-        terrain - carved
+    /// Every column of the node's footprint and of one ring around it is
+    /// asked once -- 1,156 heights at level 1, 16,900 at level 3 -- and a
+    /// cell at the node's edge that might hold a summit asks the cells
+    /// beyond it as well (up to one cell's width out; few do). That is what
+    /// deriving every level from level 0's own columns costs, and
+    /// `generation_cost_report` (`crates/render/tests/lod_consistency`)
+    /// measures it.
+    fn node_ground(&self, x0: i32, z0: i32, step: i32) -> NodeGround {
+        // The node's columns and a cell's width around them, each worked
+        // out when it is first asked for.
+        let side = (Chunk::SIZE as i32 + 2) * step;
+        let grid = vec![std::cell::Cell::new(i32::MIN); (side * side) as usize];
+        NodeGround::over(step, |i, j| {
+            let slot = &grid[((j + step) * side + i + step) as usize];
+            if slot.get() == i32::MIN {
+                slot.set(self.surface_height(x0 + i, z0 + j));
+            }
+            slot.get()
+        })
     }
 
-    /// [`block_at_on_surface`], using [`density_at_v`] and probing material at
-    /// the vertical window `v` implies, exactly as [`block_at_on_surface`]
-    /// does for `step` -- see [`density_at_v`] for why this is a separate
-    /// function rather than a call with `step = v`.
-    fn block_at_on_surface_v(
+    /// The block a coarse cell at corner `(x, y, z)` draws, or `None` for
+    /// air: `v` blocks tall, over the level-0 columns of `cell`.
+    ///
+    /// **Solid** from the cell's top ([`cell_top`](Self::cell_top)) down: a
+    /// row is solid while its lowest block is at or under the top, and the
+    /// row that holds the top is cut off at it when the node is drawn
+    /// ([`generate_aniso`](Self::generate_aniso)). **Air where a cave has
+    /// carved all of it** ([`row_is_cave`](Self::row_is_cave)).
+    ///
+    /// **Made of what level 0's faces show there** (issue #423 decision 2:
+    /// "a coarse riser face takes the mix of materials that level 0's faces
+    /// show over the same footprint"). At level 0 a column shows a side face
+    /// at every row above a neighbour's surface and at or under its own,
+    /// made of [`ground_layer`](Self::ground_layer) at that row's depth
+    /// below the column's **own** surface. A coarse cell's rows stand for
+    /// all the side faces its columns show at those rows, and the cell wears
+    /// the layer of **one of them, picked by a hash of the cell's
+    /// position** -- so over many cells every layer shows in the share it
+    /// has at level 0, whichever way the slope runs. A gentle slope's coarse
+    /// riser is then the surface block's side nearly row after row, as its
+    /// many one-block risers are at level 0; a steep one is about a third
+    /// soil, as level 0's two- and three-block risers are; stone shows where
+    /// a column stands more than `1 + SOIL_DEPTH` above a neighbour, which
+    /// is a cliff at level 0 too.
+    ///
+    /// Two rules came before, and each was a measured error
+    /// (`crates/render/tests/lod_consistency`, on steep ground, where level
+    /// 0's sides are 66% surface block, 33% soil, 0.1% stone):
+    /// - by depth below the *cell's* surface (main until #423): one grass
+    ///   row, three of soil, then stone down a riser as tall as the cell is
+    ///   wide times the slope -- 7 to 40% stone, the owner's "from afar it
+    ///   is mostly stone";
+    /// - by depth below the lowest covered surface at or above the row (the
+    ///   first version of this function): never stone, but the *least*
+    ///   depth any of the cell's columns offers, so 81 to 99% surface block
+    ///   -- a mountain all grass side from afar and a third soil up close.
+    ///
+    /// **Where no covered column shows a side at these rows.** A cell's top
+    /// is the mean of its columns, so on a slope its riser reaches below the
+    /// lowest of them, down to the top of the next cell (`cell.foot`): rows
+    /// that level 0 shows from that cell's columns. Such a row wears **one
+    /// of all the side faces the cell's columns show, at any row**, by the
+    /// same hash: the same slope, so the same mix. At or under the foot --
+    /// the wall of a pit, the inside of the ground -- a row wears the layer
+    /// below the lowest covered surface at or above it, which is stone in
+    /// the end. (By depth alone, these rows came out as bands of soil and
+    /// stone along the foot of every riser on a slope that steepens: the
+    /// stone of issue #423 again.)
+    ///
+    /// **The cell that holds the top** wears the surface block, as every
+    /// real column's top does (#296): its top face is most of what is seen
+    /// of it.
+    ///
+    /// `cell.low` is the lowest surface among the covered columns'
+    /// neighbours: at or under it no covered column shows a side, so those
+    /// cells -- most of a node -- are spared the count.
+    fn coarse_block(
         &self,
         x: i32,
         y: i32,
         z: i32,
-        surface: i32,
+        cell: CellColumns,
         blocks: TerrainBlocks,
         v: i32,
     ) -> Option<BlockId> {
-        let top_cell = v > 1 && surface < y + v + (v - 1) / 2;
-        let probe = if top_cell { surface } else { y + v - 1 };
-        (self.density_at_v(x, y, z, surface, v) > 0.0)
-            .then(|| self.material_at(x, probe, z, surface, blocks))
+        let CellColumns {
+            columns: covered,
+            top,
+            low,
+            foot,
+        } = cell;
+        if y > top {
+            return None;
+        }
+        let peak = covered
+            .last()
+            .expect("a cell covers at least one column")
+            .surface;
+        // The columns that reach this row: the others have no block in it.
+        let reaching = &covered[covered.partition_point(|c| c.surface < y)..];
+        let reaching_blocks = reaching
+            .iter()
+            .map(|c| (x + c.at[0] as i32, z + c.at[1] as i32, c.surface));
+        if self.row_is_cave(reaching_blocks, peak, top, y, v) {
+            return None;
+        }
+        // The cell that holds the top.
+        if top < y + v {
+            return Some(self.material_at(x, top, z, top, blocks));
+        }
+        // The level-0 side faces at this cell's rows: one for every
+        // neighbour a column stands above, at each row it reaches.
+        let faces = |c: &Covered, row: i32| -> u64 {
+            if row > c.surface {
+                return 0;
+            }
+            c.around.iter().filter(|&&n| n < row).count() as u64
+        };
+        let shown: u64 = if y + v - 1 <= low {
+            0
+        } else {
+            reaching
+                .iter()
+                .map(|c| (y..y + v).map(|row| faces(c, row)).sum::<u64>())
+                .sum()
+        };
+        let hash = crate::noise::hash(self.seed ^ COARSE_FACE_SEED_MIX, x, y, z);
+        if shown > 0 {
+            let mut pick = hash % shown;
+            for c in reaching {
+                for row in y..y + v {
+                    let n = faces(c, row);
+                    if pick < n {
+                        return Some(self.material_at(x, row, z, c.surface, blocks));
+                    }
+                    pick -= n;
+                }
+            }
+            unreachable!("the pick is under the number of faces counted")
+        }
+        // No covered column shows a side here.
+        let row = y + v - 1;
+        if row > foot {
+            // Part of a riser: one of all the cell's faces. A column shows
+            // a neighbour one face for every block it stands above it, the
+            // first of its own surface block.
+            let every = |c: &Covered| -> u64 {
+                c.around
+                    .iter()
+                    .map(|&n| (c.surface - n).max(0) as u64)
+                    .sum()
+            };
+            let all: u64 = covered.iter().map(every).sum();
+            if all > 0 {
+                let mut pick = hash % all;
+                for c in covered {
+                    for &n in &c.around {
+                        let tall = (c.surface - n).max(0) as u64;
+                        if pick < tall {
+                            let depth = pick as i32;
+                            return Some(self.material_at(
+                                x,
+                                c.surface - depth,
+                                z,
+                                c.surface,
+                                blocks,
+                            ));
+                        }
+                        pick -= tall;
+                    }
+                }
+                unreachable!("the pick is under the number of faces counted")
+            }
+        }
+        let at = covered
+            .partition_point(|c| c.surface < row)
+            .min(covered.len() - 1);
+        Some(self.material_at(x, row, z, covered[at].surface, blocks))
     }
 
-    /// Whether the `v`-tall cell at `(x, y, z)` (R1b's anisotropic path) is
-    /// certainly solid, given the column's `surface` -- [`solid_at_step_on`]'s
-    /// counterpart for a vertical window that isn't the same as the node's
-    /// horizontal cell width. Used only for `level >= 1`; level 0's single
-    /// blocks go through the exact, never-approximated [`density`] instead
-    /// (see [`crate::World::certainly_solid_at_v`]).
-    pub fn solid_at_v_on(&self, x: i32, y: i32, z: i32, v: i32, surface: i32) -> bool {
-        self.density_at_v(x, y, z, surface, v) > 0.0
-    }
-
-    /// The `y` of the topmost block a coarse node whose vertical cells are
-    /// `v` blocks tall ([`crate::node::NodeKey::cell_height_blocks`])
-    /// actually draws at column `(x, z)` -- what issue #332 (R2) decision 1
-    /// calls "the column's drawn top": exactly [`surface_height`](Self::surface_height)
-    /// at `v = 1` (levels 0-2, since every row is already one block), and the
-    /// top of whichever `v`-tall row holds the surface otherwise (level 3,
-    /// `v = 4`) -- "within half a cell" of the exact surface, which is as
-    /// close as a node that coarse ever draws its own ground.
+    /// Whether a cave has carved away the row of `v` blocks from `y` of a
+    /// coarse cell whose top is `top` and whose highest column is `peak`:
+    /// `columns` its level-0 columns as `(x, z, surface)`.
     ///
-    /// A row starts solid while its own middle (`row*v + (v-1)/2`) is at or
-    /// under the surface -- the same boundary [`density_at_v`] tests, so this
-    /// can never disagree with what `generate_aniso` actually meshes. Rows
-    /// are at world `y` multiples of `v` with no node-specific offset: every
-    /// node's own [`chunk_origin`](crate::node::NodeKey::chunk_origin) scaled
-    /// to blocks is already a multiple of `v` (`16 * 2^level` is a multiple
-    /// of 4 from level 2 up), so the row grid a tree needs to stand on is the
-    /// same regardless of which node its column happens to belong to.
-    pub fn drawn_top(&self, x: i32, z: i32, v: i32) -> i32 {
-        self.cell_top(x, z, 1, v)
+    /// **Only where every block of ground in the row is cave at level 0**:
+    /// every block of the cell's columns in these rows that is at or under
+    /// its own column's surface (and at or under the cell's top, above which
+    /// the row is not drawn). One block of rock among them and the cell
+    /// stays whole.
+    ///
+    /// **So caves nest, and a pit only ever opens on approach.** A finer
+    /// cell inside this one covers some of the same blocks; if all of this
+    /// cell's are cave, so are all of its, and level 0 is the blocks
+    /// themselves. Whatever a level draws carved, every finer level draws
+    /// open there too (`coarse_caves_nest`,
+    /// `crates/render/tests/lod_consistency`). A cave narrower than a cell
+    /// is detail: it shows when the level that can hold it is drawn.
+    ///
+    /// Until #423's second round a cell of rows one block tall was cave
+    /// where the noise at its corner block was, and a level-3 cell where
+    /// most of eight samples near its middle were: a cell-wide pit could
+    /// open at level 3 over ground every finer level drew whole (up to 267
+    /// columns of a 64-block footprint, 8 x 8 blocks at a time and up to 12
+    /// deep), and close again as the player came nearer.
+    ///
+    /// **Only within [`DISTANT_CAVE_DEPTH`] of the highest column**: a row
+    /// whose lowest block is deeper than that below `peak` is rock. Measured
+    /// from the highest covered column and the row's lowest block so that
+    /// this nests as well -- a finer cell's highest column is no higher and
+    /// its row no lower.
+    ///
+    /// The first block of rock ends the count, and nearly every cell has
+    /// one at the first block asked: one noise sample a cell, as a cave
+    /// sample has always cost.
+    fn row_is_cave(
+        &self,
+        columns: impl Iterator<Item = (i32, i32, i32)>,
+        peak: i32,
+        top: i32,
+        y: i32,
+        v: i32,
+    ) -> bool {
+        if y <= peak - DISTANT_CAVE_DEPTH {
+            return false;
+        }
+        let last = (y + v - 1).min(top);
+        let mut ground = false;
+        for (x, z, surface) in columns {
+            for row in y..=last.min(surface) {
+                if !self.cave_at(x, row, z) {
+                    return false;
+                }
+                ground = true;
+            }
+        }
+        // No ground in the row at all is not a cave: the row is above the
+        // top, and never asked.
+        ground
+    }
+
+    /// The level-0 columns the cell `w` blocks wide at corner `(x0, z0)`
+    /// covers, and its top ([`CellGround`]): `w * w` surface heights, and
+    /// for a cell that might hold a summit a look at the cells around it.
+    pub fn cell_ground(&self, x0: i32, z0: i32, w: i32) -> CellGround {
+        let w = w.max(1);
+        let surfaces: Vec<i32> = (0..w * w)
+            .map(|k| self.surface_height(x0 + k % w, z0 + k / w))
+            .collect();
+        let top = Self::top_over(
+            &|x: i32, z: i32| {
+                if (x0..x0 + w).contains(&x) && (z0..z0 + w).contains(&z) {
+                    surfaces[((z - z0) * w + x - x0) as usize]
+                } else {
+                    self.surface_height(x, z)
+                }
+            },
+            x0,
+            z0,
+            w,
+            w,
+        );
+        CellGround {
+            x0,
+            z0,
+            w,
+            top,
+            peak: *surfaces.iter().max().expect("a cell covers a column"),
+            surfaces,
+        }
+    }
+
+    /// Whether a coarse node whose rows are `v` blocks tall draws the block
+    /// at row `y` of `cell` solid: at or under the cell's top, in a row no
+    /// cave has carved away ([`row_is_cave`](Self::row_is_cave), the rule
+    /// [`generate_aniso`](Self::generate_aniso) builds the node by). For
+    /// judging what a neighbouring node of another level of detail draws,
+    /// without generating it.
+    ///
+    /// `y` is **a block row**, not a stored row's corner: the node is cut
+    /// off at the cell's top as it is drawn, so a block above the top is air
+    /// whatever row it is stored in.
+    pub fn cell_draws_solid(&self, cell: &CellGround, y: i32, v: i32) -> bool {
+        if y > cell.top {
+            return false;
+        }
+        let row = y.div_euclid(v) * v;
+        let w = cell.w;
+        let columns = cell
+            .surfaces
+            .iter()
+            .enumerate()
+            .map(|(k, &surface)| (cell.x0 + k as i32 % w, cell.z0 + k as i32 / w, surface));
+        !self.row_is_cave(columns, cell.peak, cell.top, row, v)
     }
 
     /// What a column is made of `depth` blocks below its own surface
@@ -700,74 +1063,161 @@ impl WorldGen {
         }
     }
 
-    /// The `y` of the top block a cell `w` blocks wide and deep, with rows
-    /// `v` blocks tall, draws over the columns `[x0, x0 + w) x [z0, z0 + w)`:
-    /// **the highest of their level-0 surfaces** (issue #423 decision 1: the
-    /// max, so a peak or a ridge keeps its height at every level), rounded to
-    /// the row that holds it the same way at every level. The top *face* is
-    /// one above.
+    /// The `y` of the top block a cell `w` blocks wide and deep draws over
+    /// the columns `[x0, x0 + w) x [z0, z0 + w)`: **the mean of their
+    /// level-0 surfaces, rounded to the nearest block (a half to the even
+    /// one) -- and the highest of them where the cell holds a summit.** The
+    /// top *face* is one above.
     ///
-    /// At `w = 1, v = 1` this is [`surface_height`](Self::surface_height)
-    /// itself: level 0 is the same function, not a special case.
+    /// **A cell holds a summit** when the highest column of the nine cells
+    /// around -- itself and its eight neighbours -- is one of its own (the
+    /// first of them, `z` then `x`, where several are as high).
     ///
-    /// **The rounding** (`v > 1`): a row is solid while its own middle
-    /// (`row * v + (v - 1) / 2`) is at or under the surface, so the top drawn
-    /// is the top block of the last such row -- within `-1..=+2` blocks of
-    /// the surface at `v = 4`. The same boundary `density_at_v` tests, which
-    /// is what a coarse node meshes.
+    /// At `w = 1` this is [`surface_height`](Self::surface_height) itself:
+    /// level 0 is the same function, not a special case.
     ///
-    /// Costs `w * w` surface heights. [`cell_top_sampled`](Self::cell_top_sampled)
-    /// is the cheaper form for a cell too wide to visit every column of.
-    pub fn cell_top(&self, x0: i32, z0: i32, w: i32, v: i32) -> i32 {
-        self.cell_top_sampled(x0, z0, w, v, w)
+    /// **Why this rule** (issue #423, second round; the study is
+    /// `height_rule_study_report` in `crates/render/tests/lod_consistency`,
+    /// and its table is in `docs/PHASE3_ARCHITECTURE.md` §9.4). A swap
+    /// replaces a cell by the four finer cells under it, so what changes on
+    /// screen is the coarser top minus the finer ones.
+    /// - The **mean** leaves that difference with no direction: the tops
+    ///   under a cell stand as much above it as below, so a slope neither
+    ///   sinks nor rises as a ring edge passes over it. The highest column
+    ///   (the first version of #423) stood every slope higher the coarser
+    ///   the level, and the slope sank 7 to 9 pixels at every edge; main's
+    ///   mean of four columns rounded *down* stood it half a block low.
+    /// - The mean alone lowers what stands out: a peak lost 6 blocks by
+    ///   level 3 and grew back edge by edge. **A summit is kept exactly**,
+    ///   and it nests: the finer cell that holds the same column holds a
+    ///   summit too (its nine cells lie inside the coarser cell's nine), all
+    ///   the way down to the column itself. So a peak, a hilltop and the
+    ///   high points of a ridge stand at level 0's height at every level,
+    ///   and only narrow as the player comes nearer.
+    ///
+    /// **It does not nest as the max did**: about half of a slope's columns
+    /// stand above the coarser cell that covered them, half below. Nothing
+    /// may assume a coarser level is at or above a finer one.
+    ///
+    /// **No rounding to rows.** Level 3 stores rows of four blocks, and the
+    /// row that holds this top is cut off at it when the node is drawn
+    /// ([`generate_aniso`](Self::generate_aniso)), so every level's top face
+    /// is exactly one above this, and a far quad's is too.
+    ///
+    /// Costs `w * w` surface heights, and for a cell whose own columns are
+    /// not level a look at its neighbours that stops at the first column
+    /// above its highest. [`cell_top_sampled`](Self::cell_top_sampled) is
+    /// the cheaper form for a cell too wide to visit every column of.
+    pub fn cell_top(&self, x0: i32, z0: i32, w: i32) -> i32 {
+        self.cell_top_sampled(x0, z0, w, w)
     }
 
     /// [`cell_top`](Self::cell_top) over an `n` x `n` grid of the cell's
-    /// columns instead of all of them: `min(n, w)^2` surface heights. **The
-    /// one implementation** -- `cell_top` is this at `n = w`, and for any
-    /// `n >= w` the two are the same number.
+    /// columns instead of all of them: the mean of `min(n, w)^2` surface
+    /// heights, or the highest of them where the first highest sample of
+    /// the nine cells around, each sampled on its own grid, is one of this
+    /// cell's. **The one implementation** ([`top_over`](Self::top_over)) --
+    /// `cell_top` is this at `n = w`, and for any `n >= w` the two are the
+    /// same number.
     ///
-    /// The sample columns are fixed by the cell alone: `x0 + a * (w / n)` for
-    /// `a` in `0..n`, and the same along `z` (`w / n` rounded down, at least
-    /// one block). So the answer is a pure function of `(seed, x0, z0, w, v,
-    /// n)`, the same on every machine and whichever neighbour asks.
+    /// The sample columns are fixed by the cell alone
+    /// ([`sample_columns`](Self::sample_columns)): `n` to a side, `w / n`
+    /// apart, **centred in the cell**, so that the mean of a slope's samples
+    /// is the slope at the cell's middle. So the answer is a pure function
+    /// of `(seed, x0, z0, w, n)`, the same on every machine and whichever
+    /// neighbour asks.
     ///
-    /// It can miss a peak narrower than the spacing, and so can only be
-    /// *lower* than the exact top; by how much is measured, per cell width,
-    /// by `stepped_top_rule_report` in `crates/render/tests/lod_consistency`.
-    /// **It does not nest**: a cell half as wide sampled with the same `n`
-    /// looks at columns its parent skips, so a child's top can stand above
-    /// its parent's. With the exact form a parent's top is the highest of
-    /// its children's, always.
-    pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, v: i32, n: i32) -> i32 {
-        let mut top = i32::MIN;
-        for (x, z) in Self::sample_columns(x0, z0, w, n) {
-            top = top.max(self.surface_height(x, z));
-        }
-        Self::row_top(top, v)
+    /// It can miss a peak narrower than the spacing, and its mean is a
+    /// sample of the cell's; by how much is measured, per cell width, by
+    /// `stepped_top_rule_report` in `crates/render/tests/lod_consistency`.
+    /// **A summit does not nest here**: a cell half as wide sampled with the
+    /// same `n` looks at columns its parent skips.
+    pub fn cell_top_sampled(&self, x0: i32, z0: i32, w: i32, n: i32) -> i32 {
+        Self::top_over(&|x, z| self.surface_height(x, z), x0, z0, w, n)
     }
 
-    /// The columns an `n` x `n` sampling of a cell `w` blocks wide from
-    /// `(x0, z0)` visits: every column when `n >= w`. Shared by
-    /// [`cell_top_sampled`](Self::cell_top_sampled) and
-    /// [`ground_faces`](Self::ground_faces), so the top and the faces of one
-    /// cell are judged on the same columns.
-    fn sample_columns(x0: i32, z0: i32, w: i32, n: i32) -> impl Iterator<Item = (i32, i32)> {
+    /// **The rule for a cell's top**, over any height field: `height(x, z)`
+    /// a column's surface. [`cell_top`](Self::cell_top) and
+    /// [`cell_top_sampled`](Self::cell_top_sampled) are this over the
+    /// world's own field, and a node's cells are this over the heights the
+    /// node has already asked for ([`NodeGround`]) -- one body, whoever
+    /// calls (`ARCHITECTURE.md` Rule 5).
+    fn top_over(height: &impl Fn(i32, i32) -> i32, x0: i32, z0: i32, w: i32, n: i32) -> i32 {
+        let (count, step, lead) = Self::sampling(w, n);
+        // Sample `(a, b)` of the cell `(ci, cj)` cells from this one.
+        let sample = |ci: i32, cj: i32, a: i32, b: i32| {
+            height(
+                x0 + ci * w.max(1) + lead + a * step,
+                z0 + cj * w.max(1) + lead + b * step,
+            )
+        };
+        let (mut sum, mut high, mut first) = (0i64, i32::MIN, (0, 0));
+        for b in 0..count {
+            for a in 0..count {
+                let h = sample(0, 0, a, b);
+                sum += h as i64;
+                if h > high {
+                    (high, first) = (h, (a, b));
+                }
+            }
+        }
+        let mean = div_round_half_even(sum, (count * count) as i64) as i32;
+        if mean == high {
+            // Level ground, or near enough that the summit changes nothing.
+            return high;
+        }
+        // A summit: no sample of the eight cells around is higher, and none
+        // that comes before this cell's first highest (`z`, then `x`) is as
+        // high. The cells the highest sample leans towards are asked first:
+        // on a slope the first sample uphill ends the search.
+        let lean = (2 * first.0 - (count - 1), 2 * first.1 - (count - 1));
+        let mut around = [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+        around.sort_by_key(|&(ci, cj)| -(ci * lean.0 + cj * lean.1));
+        for (ci, cj) in around {
+            for b in 0..count {
+                for a in 0..count {
+                    let h = sample(ci, cj, a, b);
+                    let before = cj < 0 || (cj == 0 && (b < first.1 || (b == first.1 && ci < 0)));
+                    if h > high || (h == high && before) {
+                        return mean;
+                    }
+                }
+            }
+        }
+        high
+    }
+
+    /// How an `n` x `n` sampling of a cell `w` blocks wide is laid out: the
+    /// samples to a side (`n`, but no more than `w`), the blocks between
+    /// them (`w / n` rounded down, at least one) and the blocks from the
+    /// cell's corner to the first (half of what one sample stands for, so
+    /// the grid is centred in the cell).
+    fn sampling(w: i32, n: i32) -> (i32, i32, i32) {
         let w = w.max(1);
         let count = n.clamp(1, w);
         let step = w / count;
-        (0..count).flat_map(move |b| (0..count).map(move |a| (x0 + a * step, z0 + b * step)))
+        (count, step, (step - 1) / 2)
     }
 
-    /// The top block of the last row of `v` blocks whose middle is at or
-    /// under `surface`: [`cell_top`](Self::cell_top)'s rounding.
-    fn row_top(surface: i32, v: i32) -> i32 {
-        if v <= 1 {
-            return surface;
-        }
-        let bound = surface + 1 - (v - 1) / 2;
-        let row = (bound - 1).div_euclid(v);
-        row * v + (v - 1)
+    /// The columns an `n` x `n` sampling of a cell `w` blocks wide from
+    /// `(x0, z0)` visits ([`sampling`](Self::sampling)): every column when
+    /// `n >= w`. Shared by [`cell_top_sampled`](Self::cell_top_sampled) and
+    /// [`ground_faces`](Self::ground_faces), so the top and the faces of one
+    /// cell are judged on the same columns.
+    fn sample_columns(x0: i32, z0: i32, w: i32, n: i32) -> impl Iterator<Item = (i32, i32)> {
+        let (count, step, lead) = Self::sampling(w, n);
+        (0..count).flat_map(move |b| {
+            (0..count).map(move |a| (x0 + lead + a * step, z0 + lead + b * step))
+        })
     }
 
     /// What level 0 shows over the columns `[x0, x0 + w) x [z0, z0 + w)`:
@@ -855,9 +1305,11 @@ impl WorldGen {
         out
     }
 
-    /// Every tree whose trunk chunk column `node` covers, standing on
-    /// [`drawn_top`](Self::drawn_top) rather than the exact surface (issue
-    /// #332, R2 decision 1) -- the same sites [`tree_site`](Self::tree_site)
+    /// Every tree whose trunk chunk column `node` covers, standing on the
+    /// top of the cell of this node that draws the ground under it
+    /// ([`cell_top`](Self::cell_top); issue #332, R2 decision 1, and #423)
+    /// rather than on its own column's surface -- the same sites
+    /// [`tree_site`](Self::tree_site)
     /// places at level 0, so a tree never pops in or out crossing a ring
     /// edge. `None` at level 0: its real voxel trees are grown by
     /// [`block_at`](Self::block_at)/[`is_solid_with_trees`](Self::is_solid_with_trees)
@@ -873,7 +1325,7 @@ impl WorldGen {
         if node.level == 0 {
             return Vec::new();
         }
-        let v = node.cell_height_blocks();
+        let w = node.extent_chunks();
         let origin = node.chunk_origin();
         let extent = node.extent_chunks();
         let mut out = Vec::new();
@@ -882,7 +1334,9 @@ impl WorldGen {
                 let Some(site) = self.tree_site(cx, cz, blocks) else {
                     continue;
                 };
-                let top = self.drawn_top(site.x, site.z, v);
+                // The cell of this node that draws the ground under the trunk.
+                let (cx, cz) = (site.x.div_euclid(w) * w, site.z.div_euclid(w) * w);
+                let top = self.cell_top(cx, cz, w);
                 out.push(TreeSite {
                     base: top + 1,
                     ..site
@@ -892,60 +1346,20 @@ impl WorldGen {
         out
     }
 
-    /// Whether the cell of `step` blocks at `(x, y, z)` is cave.
-    ///
-    /// A block is cave where the cave noise crosses the threshold. A larger
-    /// cell is cave where **most of it** is: eight samples spread through the
-    /// cell, carved on four or more. Sampling a coarse cell at a single point
-    /// is what made distant caves look like noise punched through the ground
-    /// (`PHASE1_ARCHITECTURE.md` §8.6) -- a cave narrower than the cell hit or
-    /// missed by luck. Taking the majority keeps what is really there at that
-    /// size and drops what is smaller than a cell, so a ravine or a cavern is
-    /// still a ravine or a cavern from a kilometre away.
-    ///
-    /// Eight samples per cell would make coarse nodes expensive, so the centre
-    /// is sampled first: the noise cannot change faster than
-    /// [`cave_noise_slope`], so when the centre is further from the threshold
-    /// than the samples are from the centre, all eight agree with it.
-    fn cave_at(&self, x: i32, y: i32, z: i32, step: i32) -> bool {
-        let noise = |px: f32, py: f32, pz: f32| {
-            fbm3(
-                self.seed ^ CAVE_SEED_MIX,
-                px * CAVE_FREQ,
-                py * CAVE_FREQ,
-                pz * CAVE_FREQ,
-                CAVE_OCTAVES,
-                CAVE_LACUNARITY,
-                CAVE_GAIN,
-            )
-        };
-        if step <= 1 {
-            return noise(x as f32, y as f32, z as f32) > CAVE_THRESHOLD;
-        }
-        // A block samples the noise at its own integer coordinate, so a cell of
-        // blocks x..x+step-1 is centred on x + (step-1)/2.
-        let span = (step - 1) as f32;
-        let (cx, cy, cz) = (
-            x as f32 + span * 0.5,
-            y as f32 + span * 0.5,
-            z as f32 + span * 0.5,
-        );
-        let centre = noise(cx, cy, cz);
-        let reach = span * 0.25;
-        if (centre - CAVE_THRESHOLD).abs() > cave_noise_slope() * reach * 3.0 {
-            return centre > CAVE_THRESHOLD;
-        }
-        let mut caves = 0;
-        for dx in [-reach, reach] {
-            for dy in [-reach, reach] {
-                for dz in [-reach, reach] {
-                    if noise(cx + dx, cy + dy, cz + dz) > CAVE_THRESHOLD {
-                        caves += 1;
-                    }
-                }
-            }
-        }
-        caves >= 4
+    /// Whether the block at `(x, y, z)` is cave: where the cave noise
+    /// crosses the threshold. **A block, and only a block**: a coarse cell is
+    /// cave where every block of ground in it is
+    /// ([`row_is_cave`](Self::row_is_cave)), which asks this of each.
+    fn cave_at(&self, x: i32, y: i32, z: i32) -> bool {
+        fbm3(
+            self.seed ^ CAVE_SEED_MIX,
+            x as f32 * CAVE_FREQ,
+            y as f32 * CAVE_FREQ,
+            z as f32 * CAVE_FREQ,
+            CAVE_OCTAVES,
+            CAVE_LACUNARITY,
+            CAVE_GAIN,
+        ) > CAVE_THRESHOLD
     }
 
     /// Terrain density at a world position: positive means solid. The
@@ -962,7 +1376,7 @@ impl WorldGen {
     /// solid" and "the surface block is solid" contradict each other by
     /// exactly one block.
     pub fn density(&self, x: i32, y: i32, z: i32) -> f32 {
-        self.density_at(x, y, z, self.surface_height(x, z), 1)
+        self.density_at(x, y, z, self.surface_height(x, z))
     }
 
     /// Shorthand for `density(x, y, z) > 0.0` -- what a single-block
@@ -1112,7 +1526,7 @@ impl WorldGen {
         // The density check is the second half: a cave can carve the ground
         // out from under a surface height, and a tree must not grow on air.
         if self.material_at(x, surface, z, surface, blocks) != oak.grows_on
-            || self.density_at(x, surface, z, surface, 1) <= 0.0
+            || self.density_at(x, surface, z, surface) <= 0.0
         {
             return None;
         }
@@ -1158,8 +1572,8 @@ impl WorldGen {
     }
 
     /// The block at a world position given an already-known
-    /// `surface_height(x, z)`, or `None` for air. What
-    /// [`generate`](Self::generate) calls per lattice cell.
+    /// `surface_height(x, z)`, or `None` for air: one block of level 0.
+    /// (A coarse cell is [`coarse_block`](Self::coarse_block).)
     fn block_at_on_surface(
         &self,
         x: i32,
@@ -1167,22 +1581,9 @@ impl WorldGen {
         z: i32,
         surface: i32,
         blocks: TerrainBlocks,
-        step: i32,
     ) -> Option<BlockId> {
-        // A coarse cell wears what the top block inside it would: the one
-        // holding the surface is grass, not the soil or stone at its corner.
-        // Judged at its corner, every distant field turned brown and grey.
-        //
-        // And the topmost cell of a column wears the surface block, whichever
-        // of its blocks the surface falls in. A cell is solid while its middle
-        // is at or under the surface, so the top one's top block can sit up to
-        // `(step - 1) / 2` blocks under it -- and judged there, a third of the
-        // distant tops wore soil, where every real column has grass on top.
-        // The cell above is air: its middle is over the surface.
-        let top_cell = step > 1 && surface < y + step + (step - 1) / 2;
-        let probe = if top_cell { surface } else { y + step - 1 };
-        (self.density_at(x, y, z, surface, step) > 0.0)
-            .then(|| self.material_at(x, probe, z, surface, blocks))
+        (self.density_at(x, y, z, surface) > 0.0)
+            .then(|| self.material_at(x, y, z, surface, blocks))
     }
 
     /// The block at a world position, or `None` for air. Exposed for
@@ -1196,14 +1597,11 @@ impl WorldGen {
     /// happens per chunk rather than per voxel. Getting that wrong is not a
     /// correctness bug, it is a 5x frame-time regression, which is how it was
     /// found.
-    /// Whether the cell a node with cells `step` blocks wide generates at
-    /// corner `(x, y, z)` is solid, given that cell's
-    /// [`cell_surface_height`](Self::cell_surface_height) -- the
-    /// same answer [`generate`](Self::generate) gives, one cell at a time. For
-    /// judging what a neighbouring node of another level of detail draws,
-    /// without generating it.
-    pub fn solid_at_step_on(&self, x: i32, y: i32, z: i32, step: i32, surface: i32) -> bool {
-        self.density_at(x, y, z, surface, step) > 0.0
+    /// Whether the generated block at `(x, y, z)` is solid, given its
+    /// column's `surface_height` -- [`is_solid`](Self::is_solid) for a
+    /// caller that has the height already.
+    pub fn solid_on(&self, x: i32, y: i32, z: i32, surface: i32) -> bool {
+        self.density_at(x, y, z, surface) > 0.0
     }
 
     /// The lowest and highest value [`surface_height`](Self::surface_height)
@@ -1249,7 +1647,7 @@ impl WorldGen {
         z: i32,
         blocks: TerrainBlocks,
     ) -> Option<BlockId> {
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, 1)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
     }
 
     pub fn block_at(&self, x: i32, y: i32, z: i32, blocks: TerrainBlocks) -> Option<BlockId> {
@@ -1263,7 +1661,7 @@ impl WorldGen {
                 return Some(block);
             }
         }
-        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks, 1)
+        self.block_at_on_surface(x, y, z, self.surface_height(x, z), blocks)
     }
 
     /// Whether `(x, y, z)` is solid **including trees**, given the ids that
@@ -1323,19 +1721,30 @@ impl WorldGen {
     /// per-voxel routes -- `block_at` and `is_solid_with_trees` -- are the ones
     /// that do. They differ by design, and this comment is the design.
     pub fn generate(&self, origin: [i32; 3], step: i32, blocks: TerrainBlocks) -> Chunk {
+        if step > 1 {
+            // A coarse lattice of cubes: the one coarse rule, at `v = step`,
+            // drawn whole (no cut at the tops). Only tests build one.
+            let ground = self.node_ground(origin[0], origin[2], step);
+            return Chunk::from_fn(|lx, ly, lz| {
+                let x = origin[0] + lx as i32 * step;
+                let y = origin[1] + ly as i32 * step;
+                let z = origin[2] + lz as i32 * step;
+                self.coarse_block(x, y, z, ground.cell(lz * Chunk::SIZE + lx), blocks, step)
+                    .unwrap_or(BlockId::AIR)
+            });
+        }
         let mut surfaces = [[0i32; Chunk::SIZE]; Chunk::SIZE];
         for (lz, row) in surfaces.iter_mut().enumerate() {
-            let z = origin[2] + lz as i32 * step;
+            let z = origin[2] + lz as i32;
             for (lx, cell) in row.iter_mut().enumerate() {
-                let x = origin[0] + lx as i32 * step;
-                *cell = self.cell_surface_height(x, z, step);
+                *cell = self.surface_height(origin[0] + lx as i32, z);
             }
         }
         Chunk::from_fn(|lx, ly, lz| {
-            let x = origin[0] + lx as i32 * step;
-            let y = origin[1] + ly as i32 * step;
-            let z = origin[2] + lz as i32 * step;
-            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks, step)
+            let x = origin[0] + lx as i32;
+            let y = origin[1] + ly as i32;
+            let z = origin[2] + lz as i32;
+            self.block_at_on_surface(x, y, z, surfaces[lz][lx], blocks)
                 .unwrap_or(BlockId::AIR)
         })
     }
@@ -1343,17 +1752,20 @@ impl WorldGen {
     /// [`generate`](Self::generate), for a coarse (level > 0) node's
     /// anisotropic lattice (R1b, issue #327 decisions 1/2): cells stay 16
     /// wide/deep at `step_h` (`2^level`) blocks each, but the 16 tall rows
-    /// become `16 * step_h / v` rows of `v` blocks each. The column's surface
-    /// is `cell_surface_height(x, z, step_h)`, exactly as `generate` judges
-    /// it -- the horizontal footprint doesn't change. Vertically, every row
-    /// goes through [`block_at_on_surface_v`](Self::block_at_on_surface_v),
-    /// which applies at a `v`-block window rather than `generate`'s
-    /// `step`-block one: a `v = 1` row is exact at that `(x, z)` the way a
-    /// real level-0 block is (same material banding, same per-block cave
-    /// resolution), just sampled every `step_h` blocks horizontally instead
-    /// of every block -- and like `density_at_v`, it stays cheap deep below
-    /// the surface regardless of how small `v` is (no `step_h`-wide cave
-    /// noise column, no `2^level`x cost).
+    /// become `16 * step_h / v` rows of `v` blocks each.
+    ///
+    /// Every cell is [`coarse_block`](Self::coarse_block) over the level-0
+    /// columns it covers ([`node_ground`](Self::node_ground)): its top is
+    /// [`cell_top`](Self::cell_top), what it is made of is what level 0's
+    /// faces show at its rows, and it is cave where all of its ground is
+    /// (issue #423). Caves are asked only near the surface, so a node stays
+    /// cheap deep below it regardless of how small `v` is.
+    ///
+    /// **Rows taller than a block are cut off at the top** (`v > 1`, level
+    /// 3): the node carries each column's exact top
+    /// ([`AnisoChunk::with_tops`]) and is drawn up to it and no further, so
+    /// its top face is where the ground is, to the block, as at every other
+    /// level.
     ///
     /// No trees, for the same reason [`generate`](Self::generate) has none.
     pub fn generate_aniso(
@@ -1363,24 +1775,49 @@ impl WorldGen {
         v: i32,
         blocks: TerrainBlocks,
     ) -> AnisoChunk {
+        let ground = self.node_ground(origin[0], origin[2], step_h);
+        self.generate_aniso_over(origin, step_h, v, blocks, &ground)
+    }
+
+    /// [`generate_aniso`](Self::generate_aniso) over the ground `ground`
+    /// instead of the world's own: the one body of the two, so that a test
+    /// can hand in a height field made by hand -- a flat one, say
+    /// ([`NodeGround::over`]) -- and get the node the game would make of it.
+    pub(crate) fn generate_aniso_over(
+        &self,
+        origin: [i32; 3],
+        step_h: i32,
+        v: i32,
+        blocks: TerrainBlocks,
+        ground: &NodeGround,
+    ) -> AnisoChunk {
         let nx = Chunk::SIZE;
         let nz = Chunk::SIZE;
         let ny = ((Chunk::SIZE as i32 * step_h) / v).max(1) as usize;
-        let mut surfaces = [[0i32; Chunk::SIZE]; Chunk::SIZE];
-        for (lz, row) in surfaces.iter_mut().enumerate() {
-            let z = origin[2] + lz as i32 * step_h;
-            for (lx, cell) in row.iter_mut().enumerate() {
-                let x = origin[0] + lx as i32 * step_h;
-                *cell = self.cell_surface_height(x, z, step_h);
-            }
-        }
-        AnisoChunk::from_fn([nx, ny, nz], [step_h, v, step_h], |lx, ly, lz| {
+        assert_eq!(
+            ground.per_cell,
+            (step_h * step_h) as usize,
+            "the ground of a node of this cell width"
+        );
+        let chunk = AnisoChunk::from_fn([nx, ny, nz], [step_h, v, step_h], |lx, ly, lz| {
             let x = origin[0] + lx as i32 * step_h;
             let y = origin[1] + ly as i32 * v;
             let z = origin[2] + lz as i32 * step_h;
-            self.block_at_on_surface_v(x, y, z, surfaces[lz][lx], blocks, v)
+            self.coarse_block(x, y, z, ground.cell(lz * Chunk::SIZE + lx), blocks, v)
                 .unwrap_or(BlockId::AIR)
-        })
+        });
+        if v == 1 {
+            // Rows one block tall end at the top already.
+            return chunk;
+        }
+        // Rows of `v` blocks: the one that holds a cell's top is cut off
+        // there, so the top face is where the ground is, to the block.
+        let tops = ground
+            .tops
+            .iter()
+            .map(|top| (top - origin[1]).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+            .collect();
+        chunk.with_tops(tops)
     }
 }
 
@@ -1755,37 +2192,6 @@ mod tests {
     }
 
     #[test]
-    fn drawn_top_is_the_surface_itself_at_v_one() {
-        // Levels 0-2 (issue #332, R2 decision 1): a tree there stands at
-        // exactly the real surface, same as a level-0 tree.
-        let gen = WorldGen::new(0x77EE_5EED);
-        for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
-            assert_eq!(gen.drawn_top(x, z, 1), gen.surface_height(x, z));
-        }
-    }
-
-    #[test]
-    fn drawn_top_is_within_half_a_cell_at_v_four() {
-        // Level 3 (R2 decision 1: "within half a cell at level 3's v = 4"),
-        // and always the top block of a 4-tall row -- never a value a level-3
-        // node's own mesh wouldn't actually draw as the top of a cell.
-        let gen = WorldGen::new(0x77EE_5EED);
-        for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12), (5, 5)] {
-            let surface = gen.surface_height(x, z);
-            let top = gen.drawn_top(x, z, 4);
-            assert!(
-                (top - surface).abs() <= 2,
-                "({x},{z}): drawn top {top} vs surface {surface}, more than half a 4-cell off"
-            );
-            assert_eq!(
-                top.rem_euclid(4),
-                3,
-                "({x},{z}): {top} is not the top block of a 4-tall row"
-            );
-        }
-    }
-
-    #[test]
     fn node_trees_is_empty_at_level_zero() {
         // Level 0 already grows real voxel trees (`block_at`); `node_trees`
         // must not place a second, independent set on top of them.
@@ -1833,34 +2239,47 @@ mod tests {
         }
     }
 
+    /// **A tree stands on the ground its node draws under it** (issue #332,
+    /// R2 decision 1; issue #423): at every coarse level its base is one
+    /// above the top of the cell that holds its trunk -- the mean of the
+    /// level-0 columns that cell covers, or its summit -- and not one above
+    /// its own column's surface, which the cell's top face can stand over or
+    /// under. Held on every tree of sixteen node columns a level, and each
+    /// level must show trees for which the two differ, or the test could not
+    /// tell them apart.
     #[test]
-    fn node_trees_stands_on_the_drawn_top_not_the_exact_surface_at_level_three() {
-        // `drawn_top` is tested directly above; this proves `node_trees`
-        // actually *calls* it for level 3 rather than handing back
-        // `tree_site`'s own exact-surface base unmodified -- a search wide
-        // enough to find at least one tree whose base differs from the
-        // exact surface, which a `node_trees` that skipped the adjustment
-        // would never produce.
+    fn a_tree_stands_on_the_top_of_the_cell_that_draws_its_ground() {
         let gen = WorldGen::new(0x77EE_5EED);
         let blocks = tree_blocks();
-        let mut saw_adjustment = false;
-        'search: for nx in -4..4 {
-            for nz in -4..4 {
-                let node = crate::node::NodeKey::new(3, [nx, 0, nz]);
-                for t in gen.node_trees(node, blocks) {
-                    let exact = gen.surface_height(t.x, t.z) + 1;
-                    if t.base != exact {
-                        saw_adjustment = true;
-                        break 'search;
+        for level in 1..=3u32 {
+            let (mut trees, mut lifted) = (0, 0);
+            for nx in -2..2 {
+                for nz in -2..2 {
+                    let node = crate::node::NodeKey::new(level, [nx, 0, nz]);
+                    let w = node.extent_chunks();
+                    for t in gen.node_trees(node, blocks) {
+                        let (cx, cz) = (t.x.div_euclid(w) * w, t.z.div_euclid(w) * w);
+                        let (top, _, _, _) =
+                            top_by_hand(&|x, z| gen.surface_height(x, z), cx, cz, w);
+                        assert_eq!(
+                            t.base,
+                            top + 1,
+                            "level {level}: the tree at ({}, {}) does not stand on its cell's top",
+                            t.x,
+                            t.z
+                        );
+                        trees += 1;
+                        if t.base != gen.surface_height(t.x, t.z) + 1 {
+                            lifted += 1;
+                        }
                     }
                 }
             }
+            assert!(
+                trees >= 8 && lifted >= 2,
+                "level {level}: {trees} trees, {lifted} of them on a cell top that is not their own column's"
+            );
         }
-        assert!(
-            saw_adjustment,
-            "no level-3 tree ever differed from the exact surface -- \
-             drawn_top's v=4 snapping is not being exercised by node_trees"
-        );
     }
 
     /// **T332-edge**, the issue's own bar: a tree site exactly at the 160 m
@@ -1868,8 +2287,8 @@ mod tests {
     /// it as real voxel blocks (`tree_site`, the same rule `block_at` uses);
     /// a level-1 node covering the same chunk column must grow the identical
     /// tree (`node_trees`) -- same column, same height, same standing base
-    /// (`v = 1` at level 1, so `drawn_top` is exact) -- or crossing that ring
-    /// edge pops a tree in or out.
+    /// (the ground its cell draws) -- or crossing that ring edge pops a tree
+    /// in or out.
     #[test]
     fn a_tree_at_the_160m_edge_is_a_tree_on_both_sides_of_the_swap() {
         use crate::node::NodeKey;
@@ -1900,9 +2319,26 @@ mod tests {
                 panic!("level-1 node {node:?} grows no tree at ({}, {}), level 0 does -- a tree would vanish crossing the edge", level0.x, level0.z)
             });
 
+        // It stands on the ground the level-1 node draws under it: the top
+        // of its 2-block cell, which is the mean of that cell's four columns
+        // or its summit (issue #423) -- so within what the cell's own
+        // columns differ of where level 0 stands it, above or below.
+        let (cx2, cz2) = (level0.x.div_euclid(2) * 2, level0.z.div_euclid(2) * 2);
         assert_eq!(
-            same_tree.base, level0.base,
-            "a tree changed standing height crossing the 160m edge"
+            same_tree.base,
+            gen.cell_top(cx2, cz2, 2) + 1,
+            "a level-1 tree does not stand on its cell's top"
+        );
+        let columns = (0..2)
+            .flat_map(|dx| (0..2).map(move |dz| (dx, dz)))
+            .map(|(dx, dz)| gen.surface_height(cx2 + dx, cz2 + dz));
+        let (lowest, highest) = (columns.clone().min().unwrap(), columns.max().unwrap());
+        assert!(
+            (lowest + 1..=highest + 1).contains(&same_tree.base)
+                && (lowest + 1..=highest + 1).contains(&level0.base),
+            "a tree moved from {} to {} crossing the 160m edge, over columns {lowest}..={highest}",
+            level0.base,
+            same_tree.base
         );
         assert_eq!(
             same_tree.height, level0.height,
@@ -1934,109 +2370,203 @@ mod tests {
         assert_eq!(WorldGen::ground_layer(500), GroundLayer::Stone);
     }
 
-    /// Level 0 is the same function, not a special case; and a cell's top is
-    /// the highest column in it, found here by looking at every one.
-    #[test]
-    fn a_cells_top_is_its_highest_column() {
-        let gen = WorldGen::new(DEFAULT_TEST_SEED);
-        for (ox, oz) in GROUND_CORNERS {
-            assert_eq!(gen.cell_top(ox, oz, 1, 1), gen.surface_height(ox, oz));
-            for w in [2, 4, 8, 16] {
-                for (cx, cz) in [(0, 0), (3, 1), (-2, 5)] {
-                    let (x0, z0) = (ox + cx * w, oz + cz * w);
-                    let highest = (0..w)
-                        .flat_map(|dz| (0..w).map(move |dx| (dx, dz)))
-                        .map(|(dx, dz)| gen.surface_height(x0 + dx, z0 + dz))
-                        .max()
-                        .unwrap();
-                    assert_eq!(gen.cell_top(x0, z0, w, 1), highest, "w {w} at ({x0}, {z0})");
-                    // Rows of four: the top block of a row, within the
-                    // rounding's -1..=+2 of the surface.
-                    let rounded = gen.cell_top(x0, z0, w, 4);
-                    assert_eq!(rounded.rem_euclid(4), 3);
-                    assert!(
-                        (-1..=2).contains(&(rounded - highest)),
-                        "{rounded} vs {highest}"
-                    );
+    /// A cell's top worked out the long way, from every column of the nine
+    /// cells around it: `(top, mean, highest, holds a summit)`. The test's
+    /// own arithmetic, sharing nothing with `top_over` but the rounding.
+    fn top_by_hand(
+        height: &dyn Fn(i32, i32) -> i32,
+        x0: i32,
+        z0: i32,
+        w: i32,
+    ) -> (i32, i32, i32, bool) {
+        let own: Vec<i32> = (0..w * w).map(|k| height(x0 + k % w, z0 + k / w)).collect();
+        let sum: i64 = own.iter().map(|&h| h as i64).sum();
+        let mean = div_round_half_even(sum, (w * w) as i64) as i32;
+        let highest = *own.iter().max().unwrap();
+        // The first highest column of the 3w x 3w square, z then x.
+        let mut first = (i32::MIN, 0, 0);
+        for z in z0 - w..z0 + 2 * w {
+            for x in x0 - w..x0 + 2 * w {
+                let h = height(x, z);
+                if h > first.0 {
+                    first = (h, x, z);
                 }
             }
         }
+        let summit = (x0..x0 + w).contains(&first.1) && (z0..z0 + w).contains(&first.2);
+        (if summit { highest } else { mean }, mean, highest, summit)
     }
 
-    /// A parent's exact top is the highest of its four children's: what
-    /// keeps a coarser level from ever standing below a finer one.
     #[test]
-    fn exact_tops_nest() {
+    fn a_half_rounds_to_the_even_block() {
+        for (a, b, want) in [
+            (1, 2, 0),
+            (3, 2, 2),
+            (5, 2, 2),
+            (-1, 2, 0),
+            (-3, 2, -2),
+            (1, 4, 0),
+            (3, 4, 1),
+            (-3, 4, -1),
+            (6, 4, 2),
+            (10, 4, 2),
+            (7, 1, 7),
+            (-7, 1, -7),
+        ] {
+            assert_eq!(div_round_half_even(a, b), want, "{a} / {b}");
+        }
+    }
+
+    /// Level 0 is the same function, not a special case; and a cell's top is
+    /// the mean of its columns -- or its highest column where it holds a
+    /// summit -- found here by looking at every column of the nine cells
+    /// around it. Both kinds must turn up, and a summit must stand above its
+    /// own mean somewhere, or the test could not tell the rule from either
+    /// half of it.
+    #[test]
+    fn a_cells_top_is_its_columns_mean_and_its_summit() {
         let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let height = |x: i32, z: i32| gen.surface_height(x, z);
+        let (mut summits, mut lifted, mut means, mut under) = (0, 0, 0, 0);
         for (ox, oz) in GROUND_CORNERS {
+            assert_eq!(gen.cell_top(ox, oz, 1), gen.surface_height(ox, oz));
             for w in [2, 4, 8, 16] {
-                let (x0, z0) = (ox.div_euclid(w) * w, oz.div_euclid(w) * w);
-                let h = w / 2;
-                let children = [(0, 0), (h, 0), (0, h), (h, h)]
-                    .map(|(dx, dz)| gen.cell_top(x0 + dx, z0 + dz, h, 1));
-                assert_eq!(
-                    gen.cell_top(x0, z0, w, 1),
-                    *children.iter().max().unwrap(),
-                    "w {w} at ({x0}, {z0})"
-                );
-            }
-        }
-        // **Rows of four do not nest exactly** (level 3, `v = 4`): a top is
-        // rounded to the row that holds it, within -1..=+2 blocks of the
-        // exact one. So a level-3 cell can stand a block BELOW the highest
-        // level-2 cell it covers, and up to two above; all four occur.
-        let mut seen = std::collections::BTreeSet::new();
-        for (ox, oz) in GROUND_CORNERS {
-            for (dx, dz) in (0..8).flat_map(|a| (0..8).map(move |b| (a, b))) {
-                let (x0, z0) = (ox.div_euclid(8) * 8 + dx * 8, oz.div_euclid(8) * 8 + dz * 8);
-                let children = [(0, 0), (4, 0), (0, 4), (4, 4)]
-                    .map(|(cx, cz)| gen.cell_top(x0 + cx, z0 + cz, 4, 1));
-                let off = gen.cell_top(x0, z0, 8, 4) - *children.iter().max().unwrap();
-                assert!(
-                    (-1..=2).contains(&off),
-                    "the level-3 cell at ({x0}, {z0}) stands {off} off its highest child"
-                );
-                seen.insert(off);
-            }
-        }
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [-1, 0, 1, 2]);
-    }
-
-    /// The sampled top is the exact one once it samples every column, never
-    /// above it, and at one sample it is the corner column alone.
-    #[test]
-    fn a_sampled_top_is_exact_at_full_count_and_never_higher() {
-        let gen = WorldGen::new(DEFAULT_TEST_SEED);
-        let mut lower = 0;
-        for (ox, oz) in GROUND_CORNERS {
-            for w in [4, 8, 16, 32] {
-                let exact = gen.cell_top(ox, oz, w, 1);
-                assert_eq!(gen.cell_top_sampled(ox, oz, w, 1, w), exact);
-                assert_eq!(gen.cell_top_sampled(ox, oz, w, 1, 4 * w), exact);
-                assert_eq!(
-                    gen.cell_top_sampled(ox, oz, w, 1, 1),
-                    gen.surface_height(ox, oz)
-                );
-                for n in [2, 4] {
-                    let sampled = gen.cell_top_sampled(ox, oz, w, 1, n);
-                    assert!(sampled <= exact, "w {w} n {n}: {sampled} above {exact}");
-                    // The columns it says it visits, and no others.
-                    let step = w / n.min(w);
-                    let by_hand = (0..n.min(w))
-                        .flat_map(|b| (0..n.min(w)).map(move |a| (a, b)))
-                        .map(|(a, b)| gen.surface_height(ox + a * step, oz + b * step))
-                        .max()
-                        .unwrap();
-                    assert_eq!(sampled, by_hand, "w {w} n {n}");
-                    if sampled < exact {
-                        lower += 1;
+                for cz in -4..4 {
+                    for cx in -4..4 {
+                        let (x0, z0) = (ox + cx * w, oz + cz * w);
+                        let (top, mean, highest, summit) = top_by_hand(&height, x0, z0, w);
+                        assert_eq!(gen.cell_top(x0, z0, w), top, "w {w} at ({x0}, {z0})");
+                        if summit {
+                            summits += 1;
+                            lifted += (highest > mean) as u32;
+                        } else {
+                            means += 1;
+                            under += (mean < highest) as u32;
+                        }
                     }
                 }
             }
         }
         assert!(
-            lower > 0,
-            "no sampled top ever missed a column: nothing was tested"
+            summits >= 20 && lifted >= 10 && means >= 500 && under >= 200,
+            "{summits} summits ({lifted} above their mean), {means} means ({under} under their highest column)"
+        );
+    }
+
+    /// **A summit is a summit at every finer level**, and stands at the same
+    /// height: the half-width cell that holds a summit cell's highest column
+    /// holds a summit too, down to the column itself. That is what keeps a
+    /// peak from growing or shrinking as the levels swap.
+    #[test]
+    fn a_summit_stands_at_every_finer_level() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let height = |x: i32, z: i32| gen.surface_height(x, z);
+        let mut followed = 0;
+        for (ox, oz) in GROUND_CORNERS {
+            for cz in -6..6 {
+                for cx in -6..6 {
+                    let (x0, z0) = (
+                        ox.div_euclid(16) * 16 + cx * 16,
+                        oz.div_euclid(16) * 16 + cz * 16,
+                    );
+                    let (top, mean, _, summit) = top_by_hand(&height, x0, z0, 16);
+                    if !summit || top == mean {
+                        continue;
+                    }
+                    // The first highest column of the cell, z then x.
+                    let (px, pz) = (0..16 * 16)
+                        .map(|k| (x0 + k % 16, z0 + k / 16))
+                        .find(|&(x, z)| height(x, z) == top)
+                        .unwrap();
+                    for w in [8, 4, 2, 1] {
+                        let (cx0, cz0) = (px.div_euclid(w) * w, pz.div_euclid(w) * w);
+                        assert_eq!(
+                            gen.cell_top(cx0, cz0, w),
+                            top,
+                            "the summit at ({px}, {pz}), {top} high, in the cell of {w} at ({cx0}, {cz0})"
+                        );
+                    }
+                    followed += 1;
+                }
+            }
+        }
+        assert!(followed >= 5, "only {followed} summits followed down");
+    }
+
+    /// **A coarse cell stands as much above its columns as below them**:
+    /// over the cells that hold no summit, the top minus the columns' mean
+    /// comes to nothing, at every width. That is what leaves a swap with no
+    /// direction -- the first version of #423 (the highest column) stood
+    /// +1.2, +3.5 and +8.0 blocks over a steep slope's mean at widths 2, 4
+    /// and 8, and main's mean rounded down stood half a block under.
+    #[test]
+    fn a_cells_top_leans_neither_up_nor_down() {
+        /// **Chosen, not derived**: a twentieth of a block, over some
+        /// thousand cells a width (measured: 0.02 at most).
+        const LEAN: f64 = 0.05;
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let height = |x: i32, z: i32| gen.surface_height(x, z);
+        // The default seed's mountains: slopes, where a lean would show.
+        let (mx, mz) = (-848, 4832);
+        for w in [2, 4, 8] {
+            let (mut lean, mut cells) = (0f64, 0u32);
+            for cz in 0..256 / w {
+                for cx in 0..256 / w {
+                    let (x0, z0) = (mx + cx * w, mz + cz * w);
+                    let (_, _, _, summit) = top_by_hand(&height, x0, z0, w);
+                    if summit {
+                        continue;
+                    }
+                    let sum: i64 = (0..w * w)
+                        .map(|k| height(x0 + k % w, z0 + k / w) as i64)
+                        .sum();
+                    lean += gen.cell_top(x0, z0, w) as f64 - sum as f64 / (w * w) as f64;
+                    cells += 1;
+                }
+            }
+            let lean = lean / cells as f64;
+            println!("width {w}: {cells} cells, top - mean = {lean:+.4}");
+            assert!(cells >= 900, "width {w}: only {cells} cells");
+            assert!(
+                lean.abs() <= LEAN,
+                "width {w}: a cell's top stands {lean:+.3} blocks off its columns' mean"
+            );
+        }
+    }
+
+    /// The sampled top is the exact one once it samples every column; with
+    /// fewer it is the rule over its own samples -- `n` to a side, centred in
+    /// the cell, the nine cells around sampled alike -- and at one sample it
+    /// is the column at the cell's middle.
+    #[test]
+    fn a_sampled_top_is_exact_at_full_count_and_the_rule_over_its_samples() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let mut differs = 0;
+        for (ox, oz) in GROUND_CORNERS {
+            for w in [4, 8, 16, 32] {
+                let exact = gen.cell_top(ox, oz, w);
+                assert_eq!(gen.cell_top_sampled(ox, oz, w, w), exact);
+                assert_eq!(gen.cell_top_sampled(ox, oz, w, 4 * w), exact);
+                for n in [1, 2, 4] {
+                    let sampled = gen.cell_top_sampled(ox, oz, w, n);
+                    // The columns it says it visits, and no others: the
+                    // sample grid as a height field of its own, `n` wide.
+                    let step = w / n.min(w);
+                    let lead = (step - 1) / 2;
+                    let grid = |a: i32, b: i32| {
+                        gen.surface_height(ox + lead + a * step, oz + lead + b * step)
+                    };
+                    let (by_hand, _, _, _) = top_by_hand(&grid, 0, 0, n.min(w));
+                    assert_eq!(sampled, by_hand, "w {w} n {n}");
+                    if sampled != exact {
+                        differs += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            differs > 0,
+            "no sampled top ever differed from the exact one: nothing was tested"
         );
     }
 
@@ -2187,17 +2717,67 @@ mod tests {
         }
     }
 
+    /// **`generate` at a step of one is level 0: the per-block rule, block
+    /// for block** (`terrain_block_at`), and never the coarse one. The two
+    /// part where it matters most to a player underground: a coarse cell is
+    /// not carved more than `DISTANT_CAVE_DEPTH` under the surface, a block
+    /// is carved at any depth. So the chunks compared here reach well below
+    /// that, and the test requires caves down there to have been compared.
+    #[test]
+    fn generate_at_step_one_is_the_per_block_rule() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let blocks = test_blocks();
+        let mut deep_air = 0;
+        for (ox, oz) in [(0, 0), (-304, 176), (1200, 896)] {
+            let surface = gen.surface_height(ox, oz);
+            for oy in [surface - 96, surface - 64, surface - 16] {
+                let origin = [ox, oy.div_euclid(16) * 16, oz];
+                let chunk = gen.generate(origin, 1, blocks);
+                for lz in 0..Chunk::SIZE {
+                    for ly in 0..Chunk::SIZE {
+                        for lx in 0..Chunk::SIZE {
+                            let (x, y, z) = (
+                                origin[0] + lx as i32,
+                                origin[1] + ly as i32,
+                                origin[2] + lz as i32,
+                            );
+                            let want = gen.terrain_block_at(x, y, z, blocks);
+                            assert_eq!(
+                                chunk.get(lx, ly, lz),
+                                want.unwrap_or(BlockId::AIR),
+                                "block ({x}, {y}, {z})"
+                            );
+                            if want.is_none() && y < gen.surface_height(x, z) - DISTANT_CAVE_DEPTH {
+                                deep_air += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            deep_air > 100,
+            "only {deep_air} blocks of cave deeper than a coarse cell is carved: nothing to tell the rules apart by"
+        );
+    }
+
     /// The top of a coarse column is the surface block, as the top of every
-    /// real column is, and only the top. Seen from far away, those tops are most of what the
+    /// real column is. Seen from far away, those tops are most of what the
     /// ground is; when a third of them wore soil (the cell's own top block
     /// sits under the surface), the distant fields came out patched with
     /// brown.
+    ///
+    /// (This also held "and only the top: the cell under it is soil or
+    /// stone" until issue #423. That was the bug: on a slope the cells under
+    /// a coarse top are the tops of the lower columns it covers, and level 0
+    /// shows their sides. `a_coarse_riser_is_made_of_level_0s_faces` is what
+    /// holds the cells under the top now.)
     #[test]
     fn a_coarse_columns_top_is_the_surface_block() {
         let gen = WorldGen::new(0xCAFE);
         let blocks = test_blocks();
         for step in [2, 4, 8] {
-            let (mut tops, mut soil, mut buried_grass) = (0u32, 0u32, 0u32);
+            let (mut tops, mut soil) = (0u32, 0u32);
             for (ox, oz) in [(0, 0), (-300, 170), (500, 20), (-700, -640), (1200, 900)] {
                 let x0 = ox;
                 let z0 = oz;
@@ -2214,7 +2794,7 @@ mod tests {
                         // carve it away).
                         let Some(ly) = (0..Chunk::SIZE).rev().find(|&ly| {
                             let y = oy + ly as i32 * step;
-                            surface < y + step + (step - 1) / 2 && surface >= y + (step - 1) / 2
+                            (y..y + step).contains(&surface)
                         }) else {
                             continue;
                         };
@@ -2226,11 +2806,6 @@ mod tests {
                         if block != blocks.grass {
                             soil += 1;
                         }
-                        // And only the top: the cell under it, where a lower
-                        // neighbour bares its side, is soil or stone.
-                        if ly > 0 && node.get(lx, ly - 1, lz) == blocks.grass {
-                            buried_grass += 1;
-                        }
                     }
                 }
             }
@@ -2239,189 +2814,294 @@ mod tests {
                 soil, 0,
                 "step {step}: {soil} of {tops} coarse tops are not the surface block"
             );
-            assert_eq!(
-                buried_grass, 0,
-                "step {step}: {buried_grass} cells under a coarse top wear the surface block"
-            );
         }
     }
 
-    /// **The contract that keeps distance rendering independent of what the
-    /// world contains**: a coarse cell is solid where most of the blocks it
-    /// stands for are, and air where most are air.
+    /// **A coarse riser is made of what level 0's faces show** (issue #423
+    /// decision 2). At level 0 a column shows a side face at every row above
+    /// a neighbour's surface and at or under its own, made of `ground_layer`
+    /// at that row's depth below its own surface. Every solid cell of a
+    /// coarse node, at levels 1, 2 and 3:
     ///
-    /// Checked only where the blocks agree clearly (at least three quarters one
-    /// way) -- a cell half cave and half rock can honestly go either way. The
-    /// bound is set from measurement: taking the majority is 0.00% for caves and
-    /// at most 0.23% at the surface; sampling one corner of each cell, which
-    /// §8.6 tried and rejected, is up to 2.0%, and generating no caves at all
-    /// 4.0%. A
-    /// feature that is only generated at full detail fails this the moment it is
-    /// big enough to matter: caves did, before they were generated at every
-    /// scale, and so will a ravine or a cavern added without its coarse form.
+    /// - wears a layer that one of the level-0 faces at its rows, within its
+    ///   columns, shows -- counted here from `surface_height` alone;
+    /// - or, where no covered column shows a side there but the row is part
+    ///   of a riser (above the lowest top beside the cell), a layer that one
+    ///   of the cell's faces at any row shows;
+    /// - or, at or under that foot, the layer below the lowest covered
+    ///   column that reaches the row;
+    /// - or, as the cell that holds the top, the surface block.
+    ///
+    /// **And the layers show in level 0's shares**: weighing each cell by
+    /// the faces it stands for, the share of every layer among the cells is
+    /// within `SHARE` of its share among the faces. On this mountain a third
+    /// of level 0's faces are soil. Depth below the cell's own top gave
+    /// mostly stone here, and the least depth any covered column offers gave
+    /// nine tenths surface block; this test is red on both.
     #[test]
-    fn a_coarse_cell_is_what_most_of_its_blocks_are() {
-        let gen = WorldGen::new(0xCAFE);
+    fn a_coarse_riser_is_made_of_level_0s_faces() {
+        /// **Chosen, not derived**: a hash picks one face per cell, so the
+        /// shares are a sample. Over the thousands of cells of one-block rows
+        /// counted here they land within a point of level 0's; at level 3
+        /// some 150 cells stand for the faces and they land within three
+        /// (all printed below).
+        const SHARE: [f64; 3] = [0.03, 0.03, 0.06];
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
         let blocks = test_blocks();
-        for step in [2, 4, 8] {
-            // Deep, where the caves are, and across the surface, where the
-            // height field is -- a future ravine lives in one or the other.
-            for (ox, oy, oz) in [
-                (0, -16 * step, 0),
-                (-128, -16 * step, 64),
-                (256, -16 * step, -200),
-                (40, 32 - 8 * step, -90),
-                (-300, 32 - 8 * step, 170),
-                (500, 16 - 8 * step, 20),
-                (-700, 16 - 8 * step, -640),
-            ] {
-                let origin = [ox, oy, oz];
-                // Judged per region: a surface error averaged in with deep
-                // rock, where there is none, would hide under the bound.
-                let (mut decisive, mut wrong) = (0u32, 0u32);
-                let (mut deep, mut deep_air) = (0u32, 0u32);
-                let coarse = gen.generate(origin, step, blocks);
-                for lz in 0..Chunk::SIZE {
-                    for ly in 0..Chunk::SIZE {
-                        for lx in 0..Chunk::SIZE {
-                            let (x0, y0, z0) = (
-                                origin[0] + lx as i32 * step,
-                                origin[1] + ly as i32 * step,
-                                origin[2] + lz as i32 * step,
-                            );
-                            let mut solid = 0;
-                            for dx in 0..step {
-                                for dy in 0..step {
-                                    for dz in 0..step {
-                                        if gen.block_at(x0 + dx, y0 + dy, z0 + dz, blocks).is_some()
-                                        {
-                                            solid += 1;
-                                        }
+        let layer_of = |block: BlockId| match block {
+            b if b == blocks.grass => GroundLayer::Surface,
+            b if b == blocks.soil => GroundLayer::Soil,
+            b if b == blocks.stone => GroundLayer::Stone,
+            other => panic!("a coarse cell of {other:?}"),
+        };
+        // The default seed's mountains (`far.rs` frames a patch here too).
+        let (mx, mz): (i32, i32) = (-848, 4832);
+        for ((step, v), allowed) in [(2, 1), (4, 1), (8, 4)].into_iter().zip(SHARE) {
+            let size = 16 * step;
+            let (ox, oz) = (mx.div_euclid(size) * size, mz.div_euclid(size) * size);
+            // Level 0's faces per layer, and the same faces filed under the
+            // layer the cell that stands for them wears.
+            let (mut level0, mut coarse) = ([0u64; 3], [0u64; 3]);
+            let (mut bare, mut reach, mut tops) = (0u32, 0u32, 0u32);
+            let mut nodes = std::collections::BTreeMap::new();
+            for lz in 0..Chunk::SIZE as i32 {
+                for lx in 0..Chunk::SIZE as i32 {
+                    let (x0, z0) = (ox + lx * step, oz + lz * step);
+                    let columns: Vec<(i32, [i32; 4])> = (0..step)
+                        .flat_map(|dz| (0..step).map(move |dx| (x0 + dx, z0 + dz)))
+                        .map(|(x, z)| {
+                            let around = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                                .map(|(dx, dz)| gen.surface_height(x + dx, z + dz));
+                            (gen.surface_height(x, z), around)
+                        })
+                        .collect();
+                    let top = gen.cell_surface_height(x0, z0, step);
+                    // Every face of the cell, at any row, by layer.
+                    let mut all = [0u64; 3];
+                    for (h, around) in &columns {
+                        for n in around {
+                            for row in n + 1..=*h {
+                                all[WorldGen::ground_layer(h - row) as usize] += 1;
+                            }
+                        }
+                    }
+                    // From under every face of the cell up to its top.
+                    let low = columns
+                        .iter()
+                        .flat_map(|(h, around)| around.iter().copied().chain([*h]))
+                        .min()
+                        .unwrap()
+                        - 2 * v;
+                    for oy in (low.div_euclid(size)..=top.div_euclid(size)).map(|n| n * size) {
+                        let node = nodes
+                            .entry(oy)
+                            .or_insert_with(|| gen.generate_aniso([ox, oy, oz], step, v, blocks));
+                        for ly in 0..node.dims()[1] {
+                            let y = oy + ly as i32 * v;
+                            if y + v <= low || y > top {
+                                continue;
+                            }
+                            let block = node.get(lx as usize, ly, lz as usize);
+                            if block == BlockId::AIR {
+                                continue; // above the top, or a cave
+                            }
+                            let wears = layer_of(block);
+                            let at = format!("step {step} cell ({x0}, {y}, {z0})");
+                            if top < y + v {
+                                assert_eq!(wears, GroundLayer::Surface, "{at}: the top cell");
+                                tops += 1;
+                                continue;
+                            }
+                            let mut here = [0u64; 3];
+                            for row in y..y + v {
+                                for (h, around) in &columns {
+                                    if row <= *h {
+                                        let faces = around.iter().filter(|n| **n < row).count();
+                                        here[WorldGen::ground_layer(h - row) as usize] +=
+                                            faces as u64;
                                     }
                                 }
                             }
-                            let cells = step * step * step;
-                            // Deeper than distant caves reach, a coarse cell
-                            // is rock whatever its blocks are.
-                            let surface = gen.cell_surface_height(x0, z0, step);
-                            if y0 + step - 1 < surface - DISTANT_CAVE_DEPTH {
-                                deep += 1;
-                                if coarse.get(lx, ly, lz) == BlockId::AIR {
-                                    deep_air += 1;
+                            let faces: u64 = here.iter().sum();
+                            if faces == 0 {
+                                let row = y + v - 1;
+                                // Where the cell's risers end: the lowest
+                                // top beside it, or -- across the node's
+                                // edge -- two cells' widths under the
+                                // lowest column along that edge.
+                                let foot = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(d, (dx, dz)): (usize, (i32, i32))| {
+                                        if (0..16).contains(&(lx + dx))
+                                            && (0..16).contains(&(lz + dz))
+                                        {
+                                            return gen.cell_surface_height(
+                                                x0 + dx * step,
+                                                z0 + dz * step,
+                                                step,
+                                            );
+                                        }
+                                        (0..step)
+                                            .map(|k| {
+                                                let (ex, ez) = match (dx, dz) {
+                                                    (1, _) => (step - 1, k),
+                                                    (-1, _) => (0, k),
+                                                    (_, 1) => (k, step - 1),
+                                                    _ => (k, 0),
+                                                };
+                                                columns[(ez * step + ex) as usize].1[d]
+                                            })
+                                            .min()
+                                            .unwrap()
+                                            - 2 * step
+                                    })
+                                    .min()
+                                    .unwrap();
+                                if row > foot && all.iter().sum::<u64>() > 0 {
+                                    // Part of a riser: one of all the
+                                    // cell's faces.
+                                    assert!(
+                                        all[wears as usize] > 0,
+                                        "{at}: wears {wears:?}, which none of the cell's level-0 faces shows ({all:?})"
+                                    );
+                                    reach += 1;
+                                    continue;
                                 }
+                                let reaches =
+                                    columns.iter().map(|c| c.0).filter(|h| *h >= row).min();
+                                assert_eq!(
+                                    wears,
+                                    WorldGen::ground_layer(reaches.unwrap_or(top) - row),
+                                    "{at}: no level-0 face at these rows"
+                                );
+                                bare += 1;
                                 continue;
                             }
-                            let majority = if solid * 4 >= cells * 3 {
-                                true
-                            } else if solid * 4 <= cells {
-                                false
-                            } else {
-                                continue;
-                            };
-                            decisive += 1;
-                            if (coarse.get(lx, ly, lz) != BlockId::AIR) != majority {
-                                wrong += 1;
+                            assert!(
+                                here[wears as usize] > 0,
+                                "{at}: wears {wears:?}, which none of the {faces} level-0 faces there shows ({here:?})"
+                            );
+                            for (sum, n) in level0.iter_mut().zip(here) {
+                                *sum += n;
                             }
+                            coarse[wears as usize] += faces;
                         }
                     }
                 }
-                assert_eq!(
-                    deep_air, 0,
-                    "step {step} at {origin:?}: a distant cave below its depth"
-                );
-                if decisive == 0 {
-                    assert!(deep > 0, "step {step} at {origin:?}: nothing was judged");
-                    continue;
-                }
-                let rate = wrong as f64 / decisive as f64;
-                assert!(
-                    rate < 0.005,
-                    "step {step} at {origin:?}: {wrong} of {decisive} clear cells ({:.1}%) disagree with their blocks",
-                    rate * 100.0
-                );
             }
-        }
-    }
-
-    /// Skipping the eight samples when the centre is far from the threshold is
-    /// only an optimisation: it must never change an answer.
-    #[test]
-    fn skipping_cave_samples_never_changes_a_cell() {
-        let gen = WorldGen::new(7);
-        for step in [2, 4, 8, 16] {
-            for i in 0..4000 {
-                let (x, y, z) = (i * 37 % 911 - 450, i * 53 % 613 - 300, i * 71 % 787 - 390);
-                let span = (step - 1) as f32;
-                let (cx, cy, cz) = (
-                    x as f32 + span * 0.5,
-                    y as f32 + span * 0.5,
-                    z as f32 + span * 0.5,
-                );
-                let r = span * 0.25;
-                let noise = |px: f32, py: f32, pz: f32| {
-                    fbm3(
-                        gen.seed ^ CAVE_SEED_MIX,
-                        px * CAVE_FREQ,
-                        py * CAVE_FREQ,
-                        pz * CAVE_FREQ,
-                        CAVE_OCTAVES,
-                        CAVE_LACUNARITY,
-                        CAVE_GAIN,
-                    )
-                };
-                let mut n = 0;
-                for dx in [-r, r] {
-                    for dy in [-r, r] {
-                        for dz in [-r, r] {
-                            n += (noise(cx + dx, cy + dy, cz + dz) > CAVE_THRESHOLD) as i32;
-                        }
-                    }
-                }
-                assert_eq!(
-                    gen.cave_at(x, y, z, step),
-                    n >= 4,
-                    "step {step} at ({x},{y},{z})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_cave_slope_bound_holds() {
-        let gen = WorldGen::new(3);
-        let slope = cave_noise_slope();
-        let noise = |x: f32, y: f32, z: f32| {
-            fbm3(
-                gen.seed ^ CAVE_SEED_MIX,
-                x * CAVE_FREQ,
-                y * CAVE_FREQ,
-                z * CAVE_FREQ,
-                CAVE_OCTAVES,
-                CAVE_LACUNARITY,
-                CAVE_GAIN,
-            )
-        };
-        let mut steepest = 0.0f32;
-        for i in 0..200_000 {
-            let (x, y, z) = (
-                (i % 997) as f32 * 0.31,
-                (i % 499) as f32 * 0.47,
-                (i % 331) as f32 * 0.73,
+            let total: u64 = level0.iter().sum();
+            let share = |n: u64| n as f64 / total as f64;
+            println!(
+                "step {step}: {total} faces, level 0 {:.3?}, the cells {:.3?}; {bare} cells with none, {reach} under their lowest column, {tops} top cells",
+                level0.map(share),
+                coarse.map(share)
             );
-            let here = noise(x, y, z);
-            for (dx, dy, dz) in [(0.05, 0.0, 0.0), (0.0, 0.05, 0.0), (0.0, 0.0, 0.05)] {
-                let rate = (noise(x + dx, y + dy, z + dz) - here).abs() / 0.05;
-                steepest = steepest.max(rate);
+            assert!(
+                total > 1000,
+                "step {step}: only {total} faces on this mountain"
+            );
+            assert!(
+                share(level0[GroundLayer::Soil as usize]) > 0.2,
+                "step {step}: this mountain's faces are not soil enough to tell the rules apart"
+            );
+            assert!(
+                bare > 0 && reach > 0 && tops > 0,
+                "step {step}: {bare}, {reach}, {tops}"
+            );
+            for (layer, (a, b)) in level0.into_iter().zip(coarse).enumerate() {
+                assert!(
+                    (share(a) - share(b)).abs() <= allowed,
+                    "step {step}, layer {layer}: {:.3} of level 0's faces, {:.3} of the cells'",
+                    share(a),
+                    share(b)
+                );
             }
         }
-        assert!(
-            steepest <= slope * 1.001,
-            "noise moved {steepest} per block, bound is {slope}"
-        );
-        assert!(
-            steepest > slope * 0.3,
-            "bound {slope} is far above the steepest {steepest}: skipping would never happen"
-        );
+    }
+
+    /// **A coarse cell is cave only where all of its ground is** (issue
+    /// #423, second round): every solid-or-carved cell of coarse nodes, at
+    /// levels 1, 2 and 3 as the game generates them, against the blocks it
+    /// stands for.
+    ///
+    /// - At or under its top and within `DISTANT_CAVE_DEPTH` of its highest
+    ///   column, a cell-row is air exactly when every block of ground in it
+    ///   -- at or under its own column's surface, and at or under the
+    ///   cell's top -- is cave at level 0.
+    /// - Deeper than that it is rock, whatever its blocks are.
+    /// - Above its top it is air.
+    ///
+    /// The rule this replaces was a vote (a cell was cave where the noise at
+    /// its corner was, or where most of eight samples in it were): a cell
+    /// could open a pit over ground no finer level opened, and close it
+    /// again as the player came nearer. This one can only ever show less
+    /// cave than the level under it. Both outcomes must turn up here, and
+    /// cells that the old vote would have carved, or the test could not
+    /// tell the rules apart.
+    #[test]
+    fn a_coarse_cell_is_cave_only_where_all_its_ground_is() {
+        let gen = WorldGen::new(0xCAFE);
+        let blocks = test_blocks();
+        for (step, v) in [(2, 1), (4, 1), (8, 4)] {
+            let size = 16 * step;
+            let (mut carved, mut whole_with_cave, mut deep) = (0u32, 0u32, 0u32);
+            for (ox, oz) in [(0, 0), (-128, 64), (256, -256), (-768, -640), (512, 128)] {
+                let (ox, oz): (i32, i32) = (ox / size * size, oz / size * size);
+                for oy in [-size, 0, size] {
+                    let node = gen.generate_aniso([ox, oy, oz], step, v, blocks);
+                    for lz in 0..Chunk::SIZE {
+                        for lx in 0..Chunk::SIZE {
+                            let (x0, z0) = (ox + lx as i32 * step, oz + lz as i32 * step);
+                            let top = gen.cell_top(x0, z0, step);
+                            let columns: Vec<(i32, i32, i32)> = (0..step * step)
+                                .map(|k| (x0 + k % step, z0 + k / step))
+                                .map(|(x, z)| (x, z, gen.surface_height(x, z)))
+                                .collect();
+                            let peak = columns.iter().map(|c| c.2).max().unwrap();
+                            for ly in 0..node.dims()[1] {
+                                let y = oy + ly as i32 * v;
+                                let at = format!("step {step} cell ({x0}, {y}, {z0}), top {top}");
+                                let air = node.get(lx, ly, lz) == BlockId::AIR;
+                                if y > top {
+                                    assert!(air, "{at}: solid above its top");
+                                    continue;
+                                }
+                                // Its ground, block by block.
+                                let (mut ground, mut cave) = (0u32, 0u32);
+                                for &(x, z, surface) in &columns {
+                                    for row in y..=(y + v - 1).min(top).min(surface) {
+                                        ground += 1;
+                                        cave += gen.block_at(x, row, z, blocks).is_none() as u32;
+                                    }
+                                }
+                                assert!(ground > 0, "{at}: no ground at or under its top");
+                                if y <= peak - DISTANT_CAVE_DEPTH {
+                                    assert!(!air, "{at}: a distant cave below its depth");
+                                    deep += (cave == ground) as u32;
+                                    continue;
+                                }
+                                assert_eq!(
+                                    air,
+                                    cave == ground,
+                                    "{at}: {cave} of its {ground} blocks of ground are cave"
+                                );
+                                carved += air as u32;
+                                // What a vote would have opened: most of it cave.
+                                whole_with_cave += (!air && 2 * cave >= ground) as u32;
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "step {step}: {carved} cells carved, {whole_with_cave} whole though half cave or more, {deep} all cave but too deep"
+            );
+            assert!(
+                carved >= 20 && whole_with_cave >= 20,
+                "step {step}: {carved} carved, {whole_with_cave} kept whole: not enough to tell the rules apart"
+            );
+        }
     }
 
     #[test]

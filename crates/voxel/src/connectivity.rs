@@ -89,9 +89,17 @@ impl FaceLinks {
     /// per axis, since a coarse node's region may not be a cube (its vertical
     /// cell count differs from its horizontal one). What
     /// `cubara_world::visibility::node_links` calls for each of a node's
-    /// `GRAIN`³ sub-blocks, so cave-culling links are worked out from the
-    /// exact same lattice meshing and border sampling read (decision 6, one
-    /// storage type).
+    /// `GRAIN`³ sub-blocks.
+    ///
+    /// **Over the lattice the node is drawn on** ([`NodeChunk::mesh_dims`],
+    /// read through [`NodeChunk::drawn`]): `min` and `size` are in its
+    /// cells. That is the lattice meshing and border sampling read, so what
+    /// this says can be seen through is what is drawn as open. A node cut
+    /// off at its columns' tops (level 3, issue #423) stores rows of four
+    /// blocks that are solid wherever any of the four is, and its links were
+    /// first worked out on those: rock, in the one to three blocks of air
+    /// above every top -- the unsafe direction for a search that must never
+    /// leave out what a line of sight reaches.
     pub fn of_region_node(
         chunk: &NodeChunk,
         registry: &BlockRegistry,
@@ -99,7 +107,7 @@ impl FaceLinks {
         size: [usize; 3],
     ) -> Self {
         Self::of_region_dyn(
-            |x, y, z| chunk.get(min[0] + x, min[1] + y, min[2] + z),
+            |x, y, z| chunk.drawn(min[0] + x, min[1] + y, min[2] + z),
             registry,
             size,
         )
@@ -313,6 +321,42 @@ mod tests {
         assert_eq!(
             FaceLinks::of_region(&tunnel, &r, [0, 0, 0], 16),
             FaceLinks::of_chunk(&tunnel, &r)
+        );
+    }
+
+    /// **A node's links are those of what it draws.** A lattice of rows four
+    /// blocks tall, every stored cell rock, cut off two blocks under the top
+    /// of its highest row: what is drawn has two blocks of air above the
+    /// ground, joining the four sides and the top, and the stored rows have
+    /// none.
+    #[test]
+    fn a_cut_node_is_seen_through_where_it_is_drawn_open() {
+        use crate::aniso::AnisoChunk;
+        let r = registry();
+        let stored = AnisoChunk::from_fn([16, 4, 16], [8, 4, 8], |_, _, _| BlockId::STONE);
+        // The highest block of ground in every column: two under the top.
+        let cut = stored.clone().with_tops(vec![13; 16 * 16]);
+        let (stored, cut) = (NodeChunk::Aniso(stored), NodeChunk::Aniso(cut));
+        assert_eq!(
+            FaceLinks::of_region_node(&stored, &r, [0, 0, 0], stored.mesh_dims()),
+            FaceLinks::NONE,
+            "drawn whole, it is rock"
+        );
+        let links = FaceLinks::of_region_node(&cut, &r, [0, 0, 0], cut.mesh_dims());
+        for (a, b) in [
+            (Face::PosX, Face::NegX),
+            (Face::PosZ, Face::NegZ),
+            (Face::PosX, Face::PosY),
+            (Face::NegZ, Face::PosY),
+        ] {
+            assert!(links.joins(a, b), "{a:?} and {b:?} across the air on top");
+        }
+        assert!(!links.joins(Face::PosY, Face::NegY), "rock under the air");
+        assert!(!links.joins(Face::PosX, Face::NegY));
+        // The lower half is rock, as stored and as drawn.
+        assert_eq!(
+            FaceLinks::of_region_node(&cut, &r, [0, 0, 0], [16, 8, 16]),
+            FaceLinks::NONE
         );
     }
 

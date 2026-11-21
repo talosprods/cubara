@@ -163,11 +163,11 @@ fn mesh_chunk(
     let ctx = MeshContext { registry, layer_of };
     let origin = node.world_origin();
     let scale = 1.0f32;
-    let surfaces = std::cell::RefCell::new(HashMap::new());
+    let ground = std::cell::RefCell::new(BorderGround::default());
     let covered =
-        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::All);
+        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
     let may_be_solid =
-        |gx, gy, gz| border_samples(world, node, blocks, &surfaces, [gx, gy, gz], Want::Any);
+        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
     let (mesh, local_aabb) = build_mesh_bounded_occluded_node(chunk, &ctx, covered, may_be_solid)?;
     Some(NodeGeometry {
         mesh,
@@ -205,6 +205,15 @@ pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
     out
 }
 
+/// The ground [`border_samples`] has asked about while one node is meshed:
+/// level 0's columns by `(x, z)`, and the cells of coarser neighbours by
+/// corner and width.
+#[derive(Default)]
+struct BorderGround {
+    columns: HashMap<(i32, i32), i32>,
+    cells: HashMap<(i32, i32, i32), crate::worldgen::CellGround>,
+}
+
 /// Which answer [`border_samples`] gives over the cells it looks at.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Want {
@@ -214,10 +223,12 @@ enum Want {
     Any,
 }
 
-/// What `node`'s neighbours draw at its outside cell `g` -- grid coordinates
-/// with exactly one axis at `-1` or `16`: whether every neighbour draws it solid
-/// ([`Want::All`], so a border face against it can be left out) or some
-/// neighbour might ([`Want::Any`], so a skirt beside it may be needed).
+/// What `node`'s neighbours draw at its outside cell `g` -- coordinates in
+/// the lattice the node is drawn on (`NodeChunk::mesh_dims`: block rows at
+/// every level), with exactly one axis at `-1` or that axis's cell count:
+/// whether every neighbour draws it solid ([`Want::All`], so a border face
+/// against it can be left out) or some neighbour might ([`Want::Any`], so a
+/// skirt beside it may be needed).
 ///
 /// **The neighbour may be drawn at a different level of detail**, and which one
 /// depends on where the camera is, which a node's mesh cannot know: it is built
@@ -228,6 +239,12 @@ enum Want {
 /// - **the same level** -- one cell, sampled where that node samples it;
 /// - **one coarser** -- the double-size cell that contains it;
 /// - **one finer** -- the four half-size cells that touch the face.
+///
+/// Each is asked what it draws **at this block row**
+/// (`World::certainly_solid_at_v`): a cell is solid at a block at or under
+/// its column's exact top, in a row that is not cave. Level 3's rows are
+/// four blocks tall and cut off at that top (issue #423), so a row is not
+/// the question.
 ///
 /// If any of those is air, some neighbour draws an opening there, and this
 /// face is what a player looking through it would see -- so it stays. Drop it
@@ -240,43 +257,56 @@ fn border_samples(
     world: &WorldSnapshot,
     node: NodeKey,
     blocks: TerrainBlocks,
-    surfaces: &std::cell::RefCell<HashMap<(i32, i32, i32), i32>>,
+    ground: &std::cell::RefCell<BorderGround>,
     g: [i32; 3],
     want: Want,
 ) -> bool {
     let level = node.level;
-    // This node's own per-axis cell size in blocks (R1b): `[2^level, v,
-    // 2^level]`, not a single scalar `step` any more -- the node's lattice
-    // is no longer a cube of cells, even though its world footprint still
-    // is. `g` is a grid coordinate in *this* lattice (exactly one axis at
-    // `-1` or that axis's own cell count, from `lattice_dims`), so each axis
-    // converts to world blocks by its own cell size, not a shared one.
-    let step = [
-        node.extent_chunks(),
-        node.cell_height_blocks(),
-        node.extent_chunks(),
-    ];
-    let dims = node.lattice_dims();
+    // The lattice this node is drawn on (`NodeChunk::mesh_dims`): cells
+    // `2^level` blocks wide and deep, in rows **one block tall at every
+    // level**. Level 3 stores rows of four and is drawn cut off at its exact
+    // tops, on block rows (issue #423), so its border is asked about block
+    // by block too. `g` is a coordinate in that lattice (exactly one axis at
+    // `-1` or that axis's own cell count).
+    let w = node.extent_chunks();
+    let step = [w, node.drawn_row_blocks(), w];
+    let dims = [16, 16 * w / step[1], 16];
     let origin = node.world_origin();
     let p = [
         origin[0] + g[0] * step[0],
         origin[1] + g[1] * step[1],
         origin[2] + g[2] * step[2],
     ];
+    // Whether the cell of level `at` that holds block `q` is drawn solid
+    // there: its top and its own rows (`World::certainly_solid_at_v`).
     // Surface heights are the expensive part of a sample, and one node's
-    // border touches few columns, so each is computed once per node.
+    // border touches few columns, so each cell's are computed once per node.
     let solid = |q: [i32; 3], at: u32| {
-        if want == Want::Any && at == 0 {
-            // Trees count here: leaving one out could drop a skirt a trunk at
-            // the border needs, where for covering it can only keep a face.
-            return world.is_solid_at(q[0], q[1], q[2], blocks);
+        if at == 0 {
+            if want == Want::Any {
+                // Trees count here: leaving one out could drop a skirt a
+                // trunk at the border needs, where for covering it can only
+                // keep a face.
+                return world.is_solid_at(q[0], q[1], q[2], blocks);
+            }
+            let surface = *ground
+                .borrow_mut()
+                .columns
+                .entry((q[0], q[2]))
+                .or_insert_with(|| world.surface_height(q[0], q[2]));
+            return world.certainly_solid_at(q[0], q[1], q[2], surface);
         }
         let step_h = 1 << at;
-        let surface = *surfaces
-            .borrow_mut()
-            .entry((q[0], q[2], step_h))
-            .or_insert_with(|| world.cell_surface_height(q[0], q[2], step_h));
-        world.certainly_solid_at_v(q[0], q[1], q[2], at, surface)
+        let (x, z) = (
+            q[0].div_euclid(step_h) * step_h,
+            q[2].div_euclid(step_h) * step_h,
+        );
+        let mut ground = ground.borrow_mut();
+        let cell = ground
+            .cells
+            .entry((x, z, step_h))
+            .or_insert_with(|| world.cell_ground(x, z, step_h));
+        world.certainly_solid_at_v(q[1], at, cell)
     };
     // `All` stops at the first air, `Any` at the first solid.
     let decided = |is_solid: bool| match want {
@@ -288,43 +318,24 @@ fn border_samples(
     if decided(solid(p, level)) {
         return answer_if_decided;
     }
-    // The coarser neighbour's own cell size, per axis -- not simply `2 *
-    // step` any more, since the coarser level's `v` isn't necessarily double
-    // this one's (decision 1's v sequence is 1, 1, 1, 4: level 3's cell is
-    // 4x its level-2 neighbour's, not 2x).
-    let coarser = NodeKey::new(level + 1, [0, 0, 0]);
-    let coarser_step = [
-        coarser.extent_chunks(),
-        coarser.cell_height_blocks(),
-        coarser.extent_chunks(),
-    ];
-    let q = [0, 1, 2].map(|k| p[k].div_euclid(coarser_step[k]) * coarser_step[k]);
-    if decided(solid(q, level + 1)) {
+    // The coarser neighbour's cell that holds this block.
+    if decided(solid(p, level + 1)) {
         return answer_if_decided;
     }
     if level > 0 {
-        // The finer layer that touches this face: the near sub-cell of the
-        // outside cell along the face's axis, and every finer sub-cell
-        // across it -- `this_step[k] / finer_step[k]` of them per cross
-        // axis, which is 1 (no subdivision: level 1/0 and 2/1 share the same
-        // `v`), 2 (the usual isotropic halving, including every horizontal
-        // axis always) or 4 (level 3's `v = 4` down to level 2's `v = 1`),
-        // never assumed to be 2 the way a single scalar `half` would.
-        let finer = NodeKey::new(level - 1, [0, 0, 0]);
-        let finer_step = [
-            finer.extent_chunks(),
-            finer.cell_height_blocks(),
-            finer.extent_chunks(),
-        ];
+        // The finer layer that touches this face: the near half of the
+        // outside cell along the face's axis, and both halves across it --
+        // horizontally, that is; a row is one block at every level.
+        let half = [w / 2, step[1], w / 2];
         let axis = (0..3)
             .find(|&k| g[k] == -1 || g[k] == dims[k])
             .expect("a border cell");
         let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
         let mut f = p;
         if g[axis] == -1 {
-            f[axis] += step[axis] - finer_step[axis];
+            f[axis] += step[axis] - half[axis];
         }
-        let steps = |k: usize| (0..step[k]).step_by(finer_step[k].max(1) as usize);
+        let steps = |k: usize| (0..step[k]).step_by(half[k] as usize);
         for da in steps(a) {
             for db in steps(b) {
                 let mut r = f;
@@ -600,11 +611,13 @@ mod tests {
             .entry(node)
             .or_insert_with(|| world.node_at(node, blocks));
         let o = node.world_origin();
-        let (sy, sh) = (node.cell_height_blocks(), node.extent_chunks());
-        let i = |k: usize, step: i32| ((p[k] - o[k]) / step) as usize;
-        chunk
-            .as_ref()
-            .is_some_and(|c| c.get(i(0, sh), i(1, sy), i(2, sh)) != cubara_voxel::BlockId::AIR)
+        chunk.as_ref().is_some_and(|c| {
+            // The lattice the node is drawn on: level 3's rows of four are
+            // cut at exact tops and drawn on block rows.
+            let scale = c.mesh_scale();
+            let i = |k: usize| ((p[k] - o[k]) / scale[k]) as usize;
+            c.drawn(i(0), i(1), i(2)) != cubara_voxel::BlockId::AIR
+        })
     }
 
     /// Whether `node`'s mesh has a face on the plane `axis = at`, pointing
@@ -675,6 +688,7 @@ mod tests {
             (2, 1),
             (2, 3),
             (3, 2),
+            (3, 3),
         ] {
             let big = 1i32 << la.max(lb);
             for axis in [0usize, 2] {
@@ -741,6 +755,101 @@ mod tests {
             mismatched > 100,
             "only {mismatched} of {checked} cells differ: the test sees nothing"
         );
+    }
+
+    /// **Flat ground is drawn at its surface at every level** (issue #423;
+    /// found by the lead's audit of the 512-block ring, 2026-11-20). A field
+    /// made by hand, flat at height `t`, as each coarse level generates and
+    /// meshes it: the top faces stand at `t + 1`, where level 0's do -- for
+    /// every `t` mod 4.
+    ///
+    /// Level 3 used to round its top to rows of four blocks: -1, +2, +1, 0
+    /// blocks off for `t` mod 4 = 0, 1, 2, 3. On a plain at 1 mod 4 it stood
+    /// two blocks above level 2, a wall ringing the player 512 blocks out.
+    #[test]
+    fn a_flat_field_is_drawn_at_its_surface_at_every_level() {
+        use crate::worldgen::NodeGround;
+        let registry = test_registry();
+        let layer_of = |_: &str| 0;
+        let ctx = MeshContext {
+            registry: &registry,
+            layer_of: &layer_of,
+        };
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let gen = crate::WorldGen::new(World::new().seed());
+        let mut failures = Vec::new();
+        for t in 40..48 {
+            for level in 1..=3u32 {
+                let node = NodeKey::new(level, [0, 0, 0]);
+                let (w, v) = (node.extent_chunks(), node.cell_height_blocks());
+                let flat = NodeGround::over(w, |_, _| t);
+                // The node that holds the surface.
+                let oy = t.div_euclid(16 * w) * 16 * w;
+                let chunk = gen.generate_aniso_over([0, oy, 0], w, v, blocks, &flat);
+                let mesh = chunk.build_mesh(&ctx);
+                // Each cell's highest top face, in blocks from the node's foot.
+                let mut tops = std::collections::BTreeMap::<(u32, u32), u32>::new();
+                for quad in mesh.vertices.chunks(4) {
+                    if quad[0].face() != cubara_voxel::Face::PosY {
+                        continue;
+                    }
+                    let lo =
+                        |f: fn(&cubara_voxel::Vertex) -> u32| quad.iter().map(f).min().unwrap();
+                    let hi =
+                        |f: fn(&cubara_voxel::Vertex) -> u32| quad.iter().map(f).max().unwrap();
+                    for z in (lo(|q| q.z())..hi(|q| q.z())).step_by(w as usize) {
+                        for x in (lo(|q| q.x())..hi(|q| q.x())).step_by(w as usize) {
+                            let top = tops.entry((x, z)).or_default();
+                            *top = (*top).max(quad[0].y());
+                        }
+                    }
+                }
+                // The world's caves still carve this field (it is not where
+                // the world's own ground is, so they are many) and open a
+                // pit in some cells. Nothing stands above the surface, and
+                // a good part of the field is at it: a quarter of the cells
+                // at least (chosen, not derived; 105 to 185 of 256 are).
+                let highest = oy + tops.values().copied().max().unwrap_or(0) as i32;
+                let at_it = tops.values().filter(|&&y| oy + y as i32 == t + 1).count();
+                if highest != t + 1 || at_it < 64 {
+                    failures.push(format!(
+                        "surface {t} (mod 4 = {}), level {level}: the highest top face is at {highest}, level 0's is at {}; {at_it} of 256 cells are there",
+                        t % 4,
+                        t + 1
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n  {}", failures.join("\n  "));
+    }
+
+    /// `NodeKey::drawn_row_blocks` is what a generated node says of itself:
+    /// the lattice its mesh is built on, and `border_samples` is asked
+    /// about, has rows that tall and fills the node -- at level 3 too, whose
+    /// stored rows are four blocks.
+    #[test]
+    fn a_node_is_drawn_in_block_rows() {
+        let registry = test_registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = World::new();
+        for level in 0..=3u32 {
+            let node = (-2..3)
+                .map(|ny| NodeKey::new(level, [0, ny, 0]))
+                .find_map(|node| world.node_at(node, blocks).map(|chunk| (node, chunk)));
+            let (node, chunk) = node.expect("a node with ground in it");
+            let rows = node.drawn_row_blocks();
+            assert_eq!(chunk.mesh_scale()[1], rows, "level {level}");
+            assert_eq!(
+                chunk.mesh_dims()[1] as i32 * rows,
+                16 * node.extent_chunks(),
+                "level {level}: the rows fill the node"
+            );
+            assert_eq!(
+                chunk.dims()[1] as i32 * node.cell_height_blocks(),
+                16 * node.extent_chunks(),
+                "level {level}: the stored rows fill it too"
+            );
+        }
     }
 
     #[test]

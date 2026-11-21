@@ -83,8 +83,8 @@ const TIME_BUDGET: Duration = Duration::from_secs(300);
 
 /// Mirrors `cubara_render::arena::{VERTEX_CAPACITY, INDEX_CAPACITY}`. If those
 /// change, check whether this bound should move too.
-const VERTEX_CAPACITY: u64 = 4_000_000;
-const INDEX_CAPACITY: u64 = 6_000_000;
+const VERTEX_CAPACITY: u64 = 8_000_000;
+const INDEX_CAPACITY: u64 = 12_000_000;
 
 #[test]
 fn radius_64_world_load_settles_within_budget() {

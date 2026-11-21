@@ -2910,3 +2910,118 @@ fn without_the_anchor_the_shifted_scene_falls_apart() {
         diff.differing_fraction * 100.0
     );
 }
+
+/// One mountain face, drawn whole at `level`, from a fixed eye beside it
+/// (issue #423): the same 256-block square of the default world's nearest
+/// range, every node of it at one level of detail, terrain only (no trees,
+/// no ore -- other systems draw those, and the ground is what is compared).
+///
+/// **The same view at every level, not four distances**: the level is what
+/// is under test, and one view makes the four images comparable side by
+/// side, which is how the owner looks at them.
+fn render_mountain_at_level(level: u32) -> Option<Frame> {
+    use cubara_world::node::NodeKey;
+    let world = World::new();
+    let registry = real_registry();
+    let blocks = TerrainBlocks::from_registry(&registry);
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    // Aligned to a level-3 node (128 blocks), so every level tiles it whole.
+    let (x0, z0, side) = (-1024i32, 4736i32, 256i32);
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for z in (z0..z0 + side).step_by(4) {
+        for x in (x0..x0 + side).step_by(4) {
+            let h = world.surface_height(x, z);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+    }
+    let size = 16 << level;
+    let mut nodes = Vec::new();
+    for ny in (lo - 16).div_euclid(size)..=(hi + 16).div_euclid(size) {
+        for nz in z0.div_euclid(size)..(z0 + side).div_euclid(size) {
+            for nx in x0.div_euclid(size)..(x0 + side).div_euclid(size) {
+                nodes.push(NodeKey::new(level, [nx, ny, nz]));
+            }
+        }
+    }
+    let meshed = mesh_nodes(&world, &registry, &layer_of, nodes, blocks)
+        .into_iter()
+        .filter_map(to_meshed_node);
+    // Level with the upper slopes, off one corner, looking across the face.
+    let eye = glam::DVec3::new((x0 - 70) as f64, (hi + 20) as f64, (z0 - 70) as f64);
+    let shot = Shot {
+        camera: Some((eye, glam::Vec3::new(1.0, -0.42, 1.0))),
+        ..Shot::default()
+    };
+    let _gpu = gpu_lifecycle::lock();
+    headless::render(meshed, shot)
+}
+
+/// **Every level shows the same mountain** (issue #423, the owner's
+/// play-test of 2026-11-14): `mountain_level_0..3.png`, one mountain face
+/// drawn at each level of detail from one eye.
+///
+/// Before #423 the four images were four mountains: level 0 grass, level 1
+/// streaked with stone, levels 2 and 3 mostly stone bands, each lower at the
+/// ridge than the last (the images from before the fix are kept in
+/// `docs/images/423/`). The numbers behind them are the consistency
+/// harness's (`tests/lod_consistency`); these are for looking at, and they
+/// pin the look against the next change.
+#[test]
+fn a_mountain_is_the_same_mountain_at_every_level() {
+    for level in 0..=3u32 {
+        let name = format!("mountain_level_{level}");
+        let Some(frame) = render_mountain_at_level(level) else {
+            headless::skip_or_require_gpu(&name);
+            return;
+        };
+        assert_frame_golden(&name, Some(frame));
+    }
+}
+
+/// The four mountain images against each other, as numbers: the mean colour
+/// of the land each coarse level draws is within [`MOUNTAIN_COLOUR`] of
+/// level 0's, per channel on the 0-255 scale the image is stored in.
+///
+/// **The bound is chosen, not derived**: under the old rule the stone bands
+/// put levels 2 and 3 well outside it (measured in the PR), and the new
+/// images sit well inside. It is a whole-image mean, so it is not T3 (the
+/// harness is, per face direction and without a camera); it is the same
+/// claim checked through the real renderer.
+#[test]
+fn the_mountains_mean_colour_holds_across_levels() {
+    const MOUNTAIN_COLOUR: f64 = 6.0;
+    let mut means = Vec::new();
+    for level in 0..=3u32 {
+        let Some(frame) = render_mountain_at_level(level) else {
+            headless::skip_or_require_gpu("the_mountains_mean_colour_holds_across_levels");
+            return;
+        };
+        // Land only: the sky is the clear colour, the same in every image,
+        // and a level that draws a fuller mountain covers more of it.
+        let sky = [frame.pixels[0], frame.pixels[1], frame.pixels[2]];
+        let (mut sum, mut n) = ([0f64; 3], 0f64);
+        for px in frame.pixels.as_chunks::<4>().0 {
+            if px[..3] != sky {
+                for c in 0..3 {
+                    sum[c] += px[c] as f64;
+                }
+                n += 1.0;
+            }
+        }
+        assert!(n > 10_000.0, "level {level}: the mountain is not in view");
+        means.push(sum.map(|s| s / n));
+    }
+    eprintln!("mountain mean colour per level: {means:?}");
+    for (level, mean) in means.iter().enumerate().skip(1) {
+        for c in 0..3 {
+            let delta = (mean[c] - means[0][c]).abs();
+            assert!(
+                delta <= MOUNTAIN_COLOUR,
+                "level {level}: channel {c} is {delta:.1} off level 0's ({mean:?} against {:?})",
+                means[0]
+            );
+        }
+    }
+}

@@ -45,6 +45,10 @@ pub struct AnisoChunk {
     /// [`build_mesh_with_neighbours`]: Self::build_mesh_with_neighbours
     scale: [i32; 3],
     storage: ChunkStorage,
+    /// Per column (`z * nx + x`), the node-local block row of the exact top
+    /// of its ground ([`with_tops`](Self::with_tops)); `None` for a lattice
+    /// drawn as it is stored.
+    tops: Option<Box<[i16]>>,
 }
 
 impl AnisoChunk {
@@ -81,6 +85,74 @@ impl AnisoChunk {
             dims,
             scale,
             storage: ChunkStorage::from_ids(&ids),
+            tops: None,
+        }
+    }
+
+    /// **Cut every column off at its exact top** (issue #423). `tops` holds,
+    /// per column (`z * nx + x`), the node-local block row of the highest
+    /// block of ground in it, and nothing above that is drawn -- so a cell
+    /// whose rows are taller than a block (level 3's rows of four) still
+    /// shows its top face where the ground is, to the block, and the riser
+    /// between two columns is as tall as their tops differ. The rows under
+    /// the top stay as they are stored.
+    ///
+    /// Rows of four alone put the top face -1, +2, +1 or 0 blocks from the
+    /// ground, by its height mod 4: a plain at 1 mod 4 stood two blocks
+    /// above the finer level beside it, a wall ringing the player where the
+    /// two meet.
+    ///
+    /// A top above the lattice cuts nothing; one below it leaves the column
+    /// empty. The mesh is then built on rows one block tall
+    /// ([`mesh_dims`](Self::mesh_dims)).
+    pub fn with_tops(mut self, tops: Vec<i16>) -> Self {
+        assert_eq!(
+            tops.len(),
+            self.dims[0] * self.dims[2],
+            "one top per column"
+        );
+        self.tops = Some(tops.into_boxed_slice());
+        self
+    }
+
+    /// The lattice the mesh is built on, and the one a border sample is
+    /// asked about: the stored one, or -- cut at exact tops
+    /// ([`with_tops`](Self::with_tops)) -- the same columns in rows one
+    /// block tall.
+    pub fn mesh_dims(&self) -> [usize; 3] {
+        match self.tops {
+            Some(_) => [
+                self.dims[0],
+                self.dims[1] * self.scale[1] as usize,
+                self.dims[2],
+            ],
+            None => self.dims,
+        }
+    }
+
+    /// Blocks per cell of [`mesh_dims`](Self::mesh_dims)' lattice.
+    pub fn mesh_scale(&self) -> [i32; 3] {
+        match self.tops {
+            Some(_) => [self.scale[0], 1, self.scale[2]],
+            None => self.scale,
+        }
+    }
+
+    /// What is drawn at cell `(x, y, z)` of [`mesh_dims`](Self::mesh_dims)'
+    /// lattice: the stored cell that holds it, or air above the column's
+    /// top. **The one reading of a cut node** -- the mesher, and whoever
+    /// asks what a node shows at a block, go through here.
+    #[inline]
+    pub fn drawn(&self, x: usize, y: usize, z: usize) -> BlockId {
+        match &self.tops {
+            None => self.get(x, y, z),
+            Some(tops) => {
+                if y as i32 > tops[z * self.dims[0] + x] as i32 {
+                    BlockId::AIR
+                } else {
+                    self.get(x, y / self.scale[1] as usize, z)
+                }
+            }
         }
     }
 
@@ -108,35 +180,35 @@ impl AnisoChunk {
         }
     }
 
-    /// [`Chunk::block_at`]'s bounds handling, over this lattice's own `dims`.
+    /// [`Chunk::block_at`]'s bounds handling, over the lattice the mesh is
+    /// built on ([`mesh_dims`](Self::mesh_dims)).
     fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
         if x < 0 || y < 0 || z < 0 {
             return BlockId::AIR;
         }
         let (x, y, z) = (x as usize, y as usize, z as usize);
-        if x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
+        let dims = self.mesh_dims();
+        if x >= dims[0] || y >= dims[1] || z >= dims[2] {
             return BlockId::AIR;
         }
-        self.get(x, y, z)
+        self.drawn(x, y, z)
     }
 
-    /// [`Chunk::build_mesh_with_neighbours`], over this lattice's own `dims`
-    /// and `scale` -- so the emitted vertex positions are already final
-    /// node-local *block* coordinates (decision 3), not lattice-cell ones.
+    /// [`Chunk::build_mesh_with_neighbours`], over the lattice this node is
+    /// drawn on ([`mesh_dims`](Self::mesh_dims), [`mesh_scale`](Self::mesh_scale))
+    /// -- so the emitted vertex positions are already final node-local
+    /// *block* coordinates (decision 3), not lattice-cell ones. `occluded`
+    /// and `may_be_solid` are asked in that lattice's coordinates.
     pub fn build_mesh_with_neighbours(
         &self,
         ctx: &MeshContext,
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
-        let dims = [
-            self.dims[0] as i32,
-            self.dims[1] as i32,
-            self.dims[2] as i32,
-        ];
+        let dims = self.mesh_dims().map(|n| n as i32);
         greedy_mesh(
             dims,
-            self.scale,
+            self.mesh_scale(),
             |x, y, z| self.block_at(x, y, z),
             occluded,
             may_be_solid,
@@ -187,6 +259,34 @@ impl NodeChunk {
         match self {
             NodeChunk::Uniform(c) => c.is_empty(),
             NodeChunk::Aniso(a) => a.is_empty(),
+        }
+    }
+
+    /// The lattice this node is drawn on, in cells: [`dims`](Self::dims),
+    /// but for a coarse node cut at exact tops ([`AnisoChunk::with_tops`]),
+    /// whose rows are then one block tall.
+    pub fn mesh_dims(&self) -> [usize; 3] {
+        match self {
+            NodeChunk::Uniform(_) => [Chunk::SIZE; 3],
+            NodeChunk::Aniso(a) => a.mesh_dims(),
+        }
+    }
+
+    /// Blocks per cell of [`mesh_dims`](Self::mesh_dims)' lattice.
+    pub fn mesh_scale(&self) -> [i32; 3] {
+        match self {
+            NodeChunk::Uniform(_) => [1; 3],
+            NodeChunk::Aniso(a) => a.mesh_scale(),
+        }
+    }
+
+    /// What this node draws at cell `(x, y, z)` of
+    /// [`mesh_dims`](Self::mesh_dims)' lattice ([`AnisoChunk::drawn`]).
+    #[inline]
+    pub fn drawn(&self, x: usize, y: usize, z: usize) -> BlockId {
+        match self {
+            NodeChunk::Uniform(c) => c.get(x, y, z),
+            NodeChunk::Aniso(a) => a.drawn(x, y, z),
         }
     }
 
@@ -241,6 +341,79 @@ mod tests {
 
     fn zero_layer(_: &str) -> u32 {
         0
+    }
+
+    /// Issue #423: a lattice with rows taller than a block, cut off at its
+    /// columns' exact tops. Four columns of 8-block cells in two rows of four
+    /// blocks, all solid as stored; their tops at block rows 5, 2, 7 and
+    /// under the lattice. Each is drawn up to its top and no further -- the
+    /// stored row that holds the top is cut, the one above it is gone, a
+    /// column whose top is under the lattice is empty -- and the mesh is
+    /// built on block rows, its top faces one above each top.
+    #[test]
+    fn a_lattice_cut_at_its_tops_is_drawn_up_to_them() {
+        let registry = registry();
+        let ctx = MeshContext {
+            registry: &registry,
+            layer_of: &zero_layer,
+        };
+        let stored = AnisoChunk::from_fn([2, 2, 2], [8, 4, 8], |_, _, _| BlockId::STONE);
+        assert_eq!(stored.mesh_dims(), [2, 2, 2], "uncut: drawn as stored");
+        assert_eq!(stored.mesh_scale(), [8, 4, 8]);
+        assert_eq!(stored.drawn(1, 1, 1), BlockId::STONE);
+
+        // Per column `z * nx + x`.
+        let tops = [5i16, 2, 7, -1];
+        let cut = stored.clone().with_tops(tops.to_vec());
+        assert_eq!(cut.mesh_dims(), [2, 8, 2], "block rows");
+        assert_eq!(cut.mesh_scale(), [8, 1, 8]);
+        assert_eq!(cut.dims(), [2, 2, 2], "stored as it was");
+        for z in 0..2 {
+            for x in 0..2 {
+                let top = tops[z * 2 + x] as i32;
+                for y in 0..8 {
+                    let want = if y as i32 <= top {
+                        BlockId::STONE
+                    } else {
+                        BlockId::AIR
+                    };
+                    assert_eq!(cut.drawn(x, y, z), want, "column ({x}, {z}), block row {y}");
+                }
+            }
+        }
+
+        // The mesh: each column's highest top face is one above its top.
+        let mesh = cut.build_mesh(&ctx);
+        for z in 0..2u32 {
+            for x in 0..2u32 {
+                let top = tops[(z * 2 + x) as usize] as i32;
+                let highest = mesh
+                    .vertices
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|q| q[0].face() == crate::Face::PosY)
+                    .filter(|q| {
+                        let inside = |f: fn(&crate::Vertex) -> u32, cell: u32| {
+                            q.iter().map(f).min().unwrap() <= cell * 8
+                                && q.iter().map(f).max().unwrap() >= (cell + 1) * 8
+                        };
+                        inside(|v| v.x(), x) && inside(|v| v.z(), z)
+                    })
+                    .map(|q| q[0].y() as i32)
+                    .max();
+                let want = (top >= 0).then_some(top + 1);
+                assert_eq!(highest, want, "column ({x}, {z}): its top face");
+            }
+        }
+        // And the stored lattice, uncut, draws every column to the full
+        // eight blocks.
+        let whole = stored.build_mesh(&ctx);
+        assert!(whole
+            .vertices
+            .iter()
+            .filter(|v| v.face() == crate::Face::PosY)
+            .all(|v| v.y() == 8));
     }
 
     #[test]

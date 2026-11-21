@@ -84,26 +84,26 @@ impl ViewSpec {
 }
 
 /// **T1, as a measurement.** The on-screen height, in pixels, of a vertical
-/// terrain step one **cell** of `level` tall, seen at `distance` blocks.
+/// terrain step one **row** of `level` tall, seen at `distance` blocks.
 ///
-/// A coarse cell's height is [`NodeKey::cell_height_blocks`] for `level` --
-/// one source, read here rather than duplicated: `v = 1` at levels 0-2 and
-/// `v = 4` at level 3 (R1b/R1c, issue #327, landed in #329). Wherever the
-/// terrain climbs, the riser a node draws is that tall. Just outside a ring
-/// edge this is the tallest step the ring draws.
+/// The rows a level's ground is drawn in are [`NodeKey::drawn_row_blocks`]
+/// tall -- one source, read here rather than duplicated: one block at every
+/// level. Wherever the terrain climbs a block, the riser a node draws is
+/// that tall.
 ///
 /// **Before R1b/R1c this doubled at every edge** (a cell was `2^level` blocks
 /// tall regardless of level, so going up a level always doubled the riser:
 /// 6.4 -> 12.9 px at 160 m). That was the diagnosis in
-/// `docs/PROPOSAL_LOD_TRANSITIONS.md` section 1. Now that coarse cells keep
-/// block-height rows through level 2, the 160 m and 288 m edges (both bridge
-/// levels <= 2, so `v` is 1 on both sides) draw the *same* step on both
-/// sides: [`no_ring_edge_doubles_a_step_on_screen`] asserts that, at issue
-/// #327's Done-when bound (1.25x and 7 px). The 512 m edge (level 2's
-/// 1-block cell meeting level 3's 4-block one) still jumps -- that is ring
-/// 3's own decision (M4), measured by that test but not asserted by it.
+/// `docs/PROPOSAL_LOD_TRANSITIONS.md` section 1. Coarse cells then kept
+/// block-height rows through level 2, so the 160 m and 288 m edges drew the
+/// *same* step on both sides: [`no_ring_edge_doubles_a_step_on_screen`]
+/// asserts that, at issue #327's Done-when bound (1.25x and 7 px). **The
+/// 512 m edge jumped until issue #423** (level 2's 1-block rows meeting
+/// level 3's rows of four); level 3 still stores rows of four
+/// ([`NodeKey::cell_height_blocks`]) but draws its top row cut off at the
+/// exact top, so that edge is the same step on both sides too.
 pub fn max_step_px(view: ViewSpec, level: u32, distance: f32) -> f32 {
-    let v = NodeKey::new(level, [0, 0, 0]).cell_height_blocks() as f32;
+    let v = NodeKey::new(level, [0, 0, 0]).drawn_row_blocks() as f32;
     v / distance / view.pixel_angle()
 }
 
@@ -526,10 +526,10 @@ pub fn report(yaw_samples: usize) -> String {
     );
     let _ = writeln!(
         s,
-        "| edge | cell height inside -> outside (blocks) | step px inside -> outside |"
+        "| edge | drawn row height inside -> outside (blocks) | step px inside -> outside |"
     );
     let _ = writeln!(s, "|---|---|---|");
-    let cell_height = |level: u32| NodeKey::new(level, [0, 0, 0]).cell_height_blocks();
+    let cell_height = |level: u32| NodeKey::new(level, [0, 0, 0]).drawn_row_blocks();
     for e in edge_steps(view, schedule) {
         let _ = writeln!(
             s,
@@ -650,9 +650,10 @@ pub fn format_m2(name: &str, eye: [f32; 3]) -> String {
 // - **Reference**: the exact block height field everywhere
 //   (`WorldGen::surface_height`), with no coarsening at all -- the ground
 //   truth M4's numbers are measured against.
-// - **(i) ring 3 at `v`**: today's state at `v = 4`; `m4::coarse_top` also
-//   takes `v = 1, 2` (the same sensitivity M2 already prints; candidate
-//   (i) itself is `v = 4`).
+// - **(i) ring 3 at `v`**: the state M4 decided on was `v = 4`;
+//   `m4::coarse_top` also takes `v = 1, 2` (the same sensitivity M2
+//   already prints; candidate (i) itself is `v = 4`). Since issue #423 the
+//   game draws ring 3's tops exactly, which is this candidate at `v = 1`.
 // - **(ii) the far terrain from 512 m**: `cubara_world::far` (the same
 //   `far::select`/`far::generate` the game calls beyond 1,024 m today,
 //   through `far_streaming::far_view`), just with a hole that stops 512 m
@@ -766,15 +767,20 @@ mod m4 {
         }
     }
 
-    /// `cell_surface_height`-based drawn top for a coarse ring node,
-    /// generalized from [`WorldGen::generate_aniso`]'s own
-    /// `block_at_on_surface_v` quantization -- **not**
-    /// [`WorldGen::drawn_top`], which samples the *exact* column for R2's
-    /// trees (that function's doc comment explains why trees and the node's
-    /// own mesh read two different surfaces, and §3 R2's own risk note is
-    /// exactly that mismatch). `step_h` is the node's horizontal cell width
-    /// (`2^level`); `v` is `NodeKey::cell_height_blocks()`, left as a
-    /// parameter so M2's `v` sweep (1, 2, 4) can reuse this too.
+    /// The drawn top of a coarse ring node's cell over `(x, z)`:
+    /// [`WorldGen::cell_surface_height`] itself -- the mean of the columns
+    /// the cell covers, or its summit, which is what the game draws at every
+    /// level (issue #423: level 3's stored rows of four are cut off at it)
+    /// and what R2's trees stand on. `step_h` is the node's horizontal cell
+    /// width (`2^level`).
+    ///
+    /// `v` is the height of the rows the top is **drawn** in. The game's is
+    /// one block at every level ([`production_cell_height`]), and then this
+    /// is `WorldGen`'s number and nothing else. A taller `v` is a rule the
+    /// game does not have -- option A's `2^level` rows, M2's sweep -- and
+    /// only for those does this round the top to a row, the way such a row
+    /// was drawn before #423: solid while its middle is at or under the
+    /// surface.
     pub fn coarse_top(gen: &WorldGen, x: i32, z: i32, step_h: i32, v: i32) -> i32 {
         let (cx, cz) = (x.div_euclid(step_h) * step_h, z.div_euclid(step_h) * step_h);
         let surface = gen.cell_surface_height(cx, cz, step_h);
@@ -825,17 +831,19 @@ mod m4 {
         (lo, hi)
     }
 
-    /// A level's vertical cell height in blocks, as a parameter (issue
-    /// #381 as amended, decision 2): the harness never forks
-    /// [`NodeKey::cell_height_blocks`] behind `cfg(test)`; it takes the
-    /// `v` rule as an argument and the production rule is one of the two
-    /// below.
+    /// The height in blocks of the rows a level's ground is drawn in, as a
+    /// parameter (issue #381 as amended, decision 2): the harness never
+    /// forks the game's rule behind `cfg(test)`; it takes the rule as an
+    /// argument and the production rule is one of the two below.
     pub type CellHeight = fn(u32) -> i32;
 
-    /// The cell height the game meshes with -- [`NodeKey::cell_height_blocks`]
-    /// read, not copied: `1` at levels 0-2, `4` at level 3 (R1b/R1c, #329).
+    /// The rows the game draws its ground in --
+    /// [`NodeKey::drawn_row_blocks`] read, not copied: one block at every
+    /// level. (Level 3 stores rows of four, `NodeKey::cell_height_blocks`,
+    /// and until issue #423 drew them whole: this was 4 there, and the
+    /// 512 m edge showed it.)
     pub fn production_cell_height(level: u32) -> i32 {
-        NodeKey::new(level, [0, 0, 0]).cell_height_blocks()
+        NodeKey::new(level, [0, 0, 0]).drawn_row_blocks()
     }
 
     /// Option A, the state before R1 (`docs/PROPOSAL_LOD_TRANSITIONS.md`
@@ -937,9 +945,10 @@ mod m4 {
         /// The exact block height field, blocky, with no far terrain at all
         /// (bounded by `MAX_DISTANCE` like everything else).
         Reference,
-        /// Today's state (`ring3_v = 4`) or a sensitivity row (1, 2) --
-        /// blocky through 1,024 m, the real far terrain (today's hole)
-        /// beyond it.
+        /// Ring 3's tops drawn in rows of `ring3_v` blocks -- 1 is the game
+        /// since issue #423, 4 was candidate (i) as M4 decided it, 2 a
+        /// sensitivity row -- blocky through 1,024 m, the real far terrain
+        /// (today's hole) beyond it.
         RingThree { ring3_v: i32, far: &'a FarField },
         /// Candidate (ii): blocky through 512 m (levels 0-2 only), the far
         /// terrain (hole at 512 m) beyond it.
@@ -1621,8 +1630,10 @@ mod m4 {
         )
     }
 
-    /// M4's results table, over the gate eyes plus the low eye, at ring 3's
-    /// candidate (i) = `v = 4` (today's).
+    /// M4's results table, over the gate eyes plus the low eye, with ring 3
+    /// as the game draws it ([`production_cell_height`]: tops to the block
+    /// since issue #423; the table M4 decided on was taken at candidate
+    /// (i)'s rows of four).
     pub fn report() -> String {
         let gen = WorldGen::new(World::new().seed());
         let mut s = String::new();
@@ -1642,10 +1653,16 @@ mod m4 {
             .iter()
             .filter(|g| g.name == "ground" || g.name == "hill")
         {
-            let r = measure_eye(&gen, g.name, g.eye, GATE_PITCH, 4);
+            let r = measure_eye(&gen, g.name, g.eye, GATE_PITCH, production_cell_height(3));
             let _ = writeln!(s, "{}", format_eye(&r));
         }
-        let low = measure_eye(&gen, "low (F6 fallback)", LOW_EYE, LOW_EYE_PITCH, 4);
+        let low = measure_eye(
+            &gen,
+            "low (F6 fallback)",
+            LOW_EYE,
+            LOW_EYE_PITCH,
+            production_cell_height(3),
+        );
         let _ = writeln!(s, "{}", format_eye(&low));
         s
     }
@@ -1718,7 +1735,7 @@ mod m4 {
     //
     // **Option A is the positive control, in the same test.** The vertical
     // cell `v` is a parameter (`CellHeight`): `production_cell_height`
-    // reads `NodeKey::cell_height_blocks` and `option_a_cell_height` is
+    // reads `NodeKey::drawn_row_blocks` and `option_a_cell_height` is
     // `2^level`, the state before R1 -- no `cfg(test)` fork anywhere. The
     // test asserts that A fails its own calibrated threshold at the 160 m
     // edge and at the 288 m edge: at each, the worst case over eyes and
@@ -1749,11 +1766,13 @@ mod m4 {
     // as not reached by this metric rather than quietly redefined: setting
     // the constant to 2.0 turns this test red on today's code.
     //
-    // **The 512 m edge is measured, not asserted**, as in T1: level 2's
-    // 1-block cell meeting level 3's 4-block one is ring 3's accepted
-    // decision (M4, #335). The real schedule already exceeds its threshold
-    // there in four of the six cases -- the metric agreeing with T1 about
-    // where the one remaining step is.
+    // **The 512 m edge is measured, not asserted.** Until issue #423 level
+    // 2's 1-block rows met level 3's rows of four there (ring 3's decision,
+    // M4, #335) and the real schedule exceeded its threshold in four of the
+    // six cases -- the metric agreeing with T1 about where the one
+    // remaining step was. With level 3's tops drawn to the block it exceeds
+    // it in one (the hill eye at yaw 0: band max 0.044 against 0.032).
+    // Whether to assert this edge too is this test's owner's call (#381).
     // -----------------------------------------------------------------------
 
     /// The band around an edge, as an angle so it is the same *view* at
@@ -2526,11 +2545,11 @@ mod m4 {
             }
         }
 
-        /// `coarse_top` at a taller `v` rounds to the top of whichever
-        /// `v`-tall row holds the surface -- within half a cell either way
-        /// (never more, R2 decision 1's own bound, pinned for `drawn_top`
-        /// itself by `drawn_top_is_within_half_a_cell_at_v_four` in
-        /// `worldgen.rs`), and always the top block of a `v`-aligned row.
+        /// `coarse_top` at a taller `v` -- a rule the game does not have
+        /// (option A, M2's sweep) -- rounds to the top of the last `v`-tall
+        /// row whose middle is at or under the surface: within half a cell
+        /// either way, never more, and always the top block of a
+        /// `v`-aligned row.
         #[test]
         fn coarse_top_quantizes_to_a_v_aligned_row_within_half_a_cell() {
             let gen = WorldGen::new(World::new().seed());
@@ -2584,21 +2603,21 @@ mod m4 {
             assert_eq!(s, vec![(0, 10), (1, 18), (2, 32), (2, 64)]);
         }
 
-        /// The two cell-height rules T4 compares: production reads
-        /// `NodeKey::cell_height_blocks` (1, 1, 1, 4) and option A is
+        /// The two row-height rules T4 compares: production reads
+        /// `NodeKey::drawn_row_blocks` (1 at every level) and option A is
         /// `2^level` (1, 2, 4, 8) -- they agree only at level 0.
         #[test]
         fn the_cell_height_rules_are_production_and_two_to_the_level() {
             for level in 0..4 {
                 assert_eq!(
                     production_cell_height(level),
-                    NodeKey::new(level, [0, 0, 0]).cell_height_blocks()
+                    NodeKey::new(level, [0, 0, 0]).drawn_row_blocks()
                 );
                 assert_eq!(option_a_cell_height(level), 1 << level);
             }
             assert_eq!(production_cell_height(1), 1);
             assert_eq!(option_a_cell_height(1), 2);
-            assert_eq!(production_cell_height(3), 4);
+            assert_eq!(production_cell_height(3), 1);
             assert_eq!(option_a_cell_height(3), 8);
         }
 
@@ -2790,7 +2809,7 @@ mod r6 {
     /// A coarse node's drawn top FACE at `(x, z)`, generalized to any
     /// `level` -- [`m4::coarse_top`] plus the `+ 1` that turns a top solid
     /// row into a face, read from [`m4::production_cell_height`] rather
-    /// than copying `NodeKey::cell_height_blocks` (Rule 5, and the render
+    /// than copying `NodeKey::drawn_row_blocks` (Rule 5, and the render
     /// crate may not depend on `cubara-world` -- #380's own finding that
     /// Δ comes from the caller).
     pub fn top_face(gen: &WorldGen, level: u32, x: i32, z: i32) -> i32 {
@@ -3103,7 +3122,7 @@ mod r6 {
         let _ = writeln!(
             s,
             "R6 residual pop per level pair (#380 decision 8, amendment E) -- \
-             d = fine - coarse, Delta = cell_height_blocks(coarse level), \
+             d = fine - coarse, Delta = drawn_row_blocks(coarse level), \
              pixels at 1080 rows / 60 degrees FOV, half-fade = 7.5 frames at 60 Hz"
         );
         let _ = writeln!(
@@ -3376,25 +3395,25 @@ mod tests {
     /// (#329) a coarse cell was `2^level` blocks tall, so every ring edge
     /// doubled the riser (`a_coarse_step_doubles_at_every_ring_edge_today`,
     /// this test's previous shape, pinned 6.4 -> 12.9 px at 160 m and so on).
-    /// Since then a cell's height is `NodeKey::cell_height_blocks`: 1 block at
-    /// levels 0-2, 4 at level 3. The 160 m and 288 m edges both bridge levels
-    /// <= 2, so the cell height is 1 on either side of them: the step drawn
-    /// just outside must be no taller on screen than the one just inside, at
-    /// most 1.25x and at most 7 px (the Done-when bound).
+    /// Since then the rows a level draws its ground in are one block tall
+    /// (`NodeKey::drawn_row_blocks`), at levels 0-2 from R1b and at level 3
+    /// from issue #423 (its stored rows of four are cut off at the exact
+    /// top). So at every edge the step drawn just outside must be no taller
+    /// on screen than the one just inside, at most 1.25x and at most 7 px
+    /// (the Done-when bound).
     ///
-    /// **The 512 m edge is measured here but not asserted.** It bridges level
-    /// 2 (1 block) to level 3 (4 blocks), which still jumps 4x -- that is
-    /// ring 3's own decision (`PROPOSAL_LOD_TRANSITIONS.md` §3 R1, candidate
-    /// (i) level-3 `v = 4` versus candidate (ii) C+R5), owned by M4, not by
-    /// this issue. Printing it keeps the number on record without this test
-    /// pretending the decision has already been made.
+    /// **The 512 m edge is asserted with the others since #423.** It
+    /// bridged level 2 (1 block) to level 3 (rows of 4), jumped 4x, and was
+    /// printed here without a bound while ring 3's rows were M4's to decide;
+    /// on flat ground at some heights the two levels stood two blocks apart
+    /// there, which is what ended it.
     #[test]
     fn no_ring_edge_doubles_a_step_on_screen() {
         let steps = edge_steps(ViewSpec::gate(), DEFAULT_RING_SCHEDULE);
         assert_eq!(steps.len(), 3, "160 m, 288 m and 512 m");
 
-        let asserted = [(160, 6.4), (288, 3.6)];
-        for (s, (edge, px)) in steps[..2].iter().zip(asserted) {
+        let asserted = [(160, 6.4), (288, 3.6), (512, 2.0)];
+        for (s, (edge, px)) in steps.iter().zip(asserted) {
             assert_eq!(s.edge.edge_blocks, edge);
             assert!(near(s.inside_px, px), "{edge} m inside {}", s.inside_px);
             assert!(near(s.outside_px, px), "{edge} m outside {}", s.outside_px);
@@ -3410,15 +3429,6 @@ mod tests {
                 s.outside_px
             );
         }
-
-        // The 512 m edge: level 2 (v = 1) meeting level 3 (v = 4). Recorded,
-        // not asserted against the Done-when ratio -- see the doc comment.
-        let edge_512 = &steps[2];
-        assert_eq!(edge_512.edge.edge_blocks, 512, "it is the third edge");
-        println!(
-            "512 m (M4/ring 3 owns this, not asserted here): inside {:.1} px, outside {:.1} px",
-            edge_512.inside_px, edge_512.outside_px
-        );
     }
 
     /// **T4** (`PROPOSAL_LOD_TRANSITIONS.md` §6, issue #381 as amended):
@@ -3455,7 +3465,7 @@ mod tests {
             );
             if r.edge.edge_blocks == 512 {
                 println!(
-                    "{label}: measured, not asserted (ring 3 owns the 4x step): rows {:?}, R1 D \
+                    "{label}: measured, not asserted: rows {:?}, R1 D \
                      {:.4} / {:.4} against threshold {:.4} / {:.4}, HF {:.3}; A D {:.4} / {:.4}",
                     r.production.band,
                     r.production.real.max,
@@ -3530,11 +3540,12 @@ mod tests {
             ..v
         };
         assert!((max_step_px(tall, 0, 100.0) / max_step_px(v, 0, 100.0) - 2.0).abs() < 1e-4);
-        // Level 3's cell is 4 blocks tall (`NodeKey::cell_height_blocks`);
-        // levels 0-2 are 1 block. Before R1b/R1c this ratio was 8.0 (`2^3`,
-        // `2^level` regardless of level); now it is the cell-height ratio,
-        // 4.0.
-        assert!((max_step_px(v, 3, 100.0) / max_step_px(v, 0, 100.0) - 4.0).abs() < 1e-4);
+        // Every level draws its ground in rows one block tall
+        // (`NodeKey::drawn_row_blocks`). Before R1b/R1c this ratio was 8.0
+        // (`2^3`, `2^level` regardless of level); from then until issue #423
+        // it was 4.0, level 3's rows of four drawn whole; now a step is a
+        // step at every level.
+        assert!((max_step_px(v, 3, 100.0) / max_step_px(v, 0, 100.0) - 1.0).abs() < 1e-4);
     }
 
     /// A node holding one box of geometry whose index runs are `faces`
