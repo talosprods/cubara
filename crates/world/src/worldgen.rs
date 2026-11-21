@@ -356,6 +356,18 @@ const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 /// trees cannot move it. Arbitrary, as every mix constant is.
 const COARSE_FACE_SEED_MIX: u64 = 0x423B_10C5_A11E_7E15;
 
+/// Which of a coarse cell's columns its top shows from above
+/// ([`WorldGen::top_block`]): its own hash stream, apart from the sides'.
+/// Arbitrary, as every mix constant is.
+const COARSE_TOP_SEED_MIX: u64 = 0x7E0F_5A6B_2C19_D4E3;
+
+/// How far [`WorldGen::from_above`] looks down a pit for its floor, in
+/// blocks. Measured on the default seed's mountains, pit floors lie 13 to
+/// 27 blocks under the surface; this is past the deepest with room to
+/// spare. Chosen, not derived: a pit deeper than this shows the block it
+/// stops at.
+const PIT_FLOOR_SEARCH: i32 = 48;
+
 /// One level-0 column under a coarse cell ([`NodeGround`]): the `y` of its
 /// surface block, and of its four neighbours' -- which is where it shows a
 /// side at level 0, every row above a neighbour's surface and at or under
@@ -859,7 +871,7 @@ impl WorldGen {
         }
         // The cell that holds the top.
         if top < y + v {
-            return Some(self.material_at(x, top, z, top, blocks));
+            return Some(self.top_block(x, z, top, covered, blocks));
         }
         // The level-0 side faces at this cell's rows: one for every
         // neighbour a column stands above, at each row it reaches.
@@ -929,6 +941,51 @@ impl WorldGen {
             .partition_point(|c| c.surface < row)
             .min(covered.len() - 1);
         Some(self.material_at(x, row, z, covered[at].surface, blocks))
+    }
+
+    /// The block a coarse cell's top wears, its top face being most of what
+    /// is seen of it: **what level 0 shows from above over one of its
+    /// columns, picked by a hash of the cell** ([`from_above`]) -- so over
+    /// many cells each thing level 0 shows from above shows in the share it
+    /// has there, as the cell's riser rows do for the sides.
+    ///
+    /// Until the colour morph every top cell wore the surface block (#296),
+    /// and a coarse level showed a pit only where every column of a cell is
+    /// one (`row_is_cave`, the nesting rule): on the default seed's
+    /// mountains pits open 6.1% of level 0's columns, and the coarse levels
+    /// showed 5.1, 3.4 and 1.3% of their ground as pit at cell widths 2, 4
+    /// and 8 -- the grey patches a mountain lost from afar (the zoom pairs of
+    /// 2026-11-21). A cell that is partly pit now wears the pit's floor in the
+    /// share its columns are pit.
+    ///
+    /// [`from_above`]: Self::from_above
+    fn top_block(&self, x: i32, z: i32, top: i32, covered: &[Covered], blocks: TerrainBlocks) -> BlockId {
+        let k = crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % covered.len() as u64;
+        let c = covered[k as usize];
+        match self.from_above(x + c.at[0] as i32, z + c.at[1] as i32, c.surface, blocks) {
+            Some(floor) => floor,
+            None => self.material_at(x, top, z, top, blocks),
+        }
+    }
+
+    /// What level 0 shows from directly above the column `(x, z)` whose
+    /// surface block is at `surface`, where that is not the surface block:
+    /// the floor of the pit a cave has opened there (the first block of
+    /// ground under the carved surface, within [`PIT_FLOOR_SEARCH`]), made of
+    /// what that depth is made of. `None` where the column's surface block
+    /// stands (no cave carves it): it shows the surface block.
+    ///
+    /// The one rule a coarser representation reads a column's top colour
+    /// from; the far terrain is to read the same (#422).
+    pub fn from_above(&self, x: i32, z: i32, surface: i32, blocks: TerrainBlocks) -> Option<BlockId> {
+        if !self.cave_at(x, surface, z) {
+            return None;
+        }
+        let floor = (1..=PIT_FLOOR_SEARCH)
+            .map(|d| surface - d)
+            .find(|&y| !self.cave_at(x, y, z))
+            .unwrap_or(surface - PIT_FLOOR_SEARCH);
+        Some(self.material_at(x, floor, z, surface, blocks))
     }
 
     /// Whether a cave has carved away the row of `v` blocks from `y` of a
