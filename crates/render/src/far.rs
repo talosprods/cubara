@@ -1457,8 +1457,10 @@ mod tests {
                 format!("    vec3<f32>({:.1}, {:.1}, {:.1}),\n", n.x, n.y, n.z)
             })
             .collect();
+        // Five lines in a row, so the line endings count: a checkout on
+        // Windows has `\r\n` in the shader, and this was red there alone.
         assert!(
-            wgsl.contains(&normals),
+            wgsl.replace("\r\n", "\n").contains(&normals),
             "FACE_NORMALS is not FarDir's order"
         );
     }
