@@ -217,6 +217,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-21 | Gate eye: hill at #437, 2 runs, same conditions; 388 draws⁹³ | -- | -- | 1,092 / 1,092 (+0.4%) | 0.441 / 0.441 ms | 1.032 / 1.037 ms | `bf1dd42` |
 | 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,486 / 3,485 | 0.143 / 0.143 ms | 0.371 / 0.373 ms | `c3c862d` |
 | 2026-11-21 | Gate eye: flight at #437, 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,488 / 3,487 | 0.142 / 0.142 ms | 0.367 / 0.361 ms | `bf1dd42` |
+| 2026-11-21 | **Gate eye: ground** at #436 (levels 0-2 morph their heights across the ring edge), C of the A/B/C in footnote 93, 2 runs (`GATE: MET at Medium` each), same conditions; 792 draws (437/1,439 nodes), 12.8% more triangles than main (1,559,548 against 1,382,520)⁹³ ⁹⁴ | -- | -- | 1,122 / 1,124 (−2.5%) | 0.433 / 0.431 ms | 1.020 / 0.998 ms | `35bc349` |
+| 2026-11-21 | Gate eye: hill at #436, 2 runs, same conditions; 390 draws⁹³ | -- | -- | 1,080 / 1,080 (−0.7%) | 0.448 / 0.448 ms | 1.051 / 1.049 ms | `35bc349` |
+| 2026-11-21 | Gate eye: flight at #436, 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,487 / 3,482 | 0.142 / 0.143 ms | 0.367 / 0.369 ms | `35bc349` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3294,3 +3297,14 @@ Main's first low flight shows the hole #432 closes (a pit's floor seen as sky wh
 | toward a mountain, #437 | 0 of 1,799; 0 of 1,799 | 0; 0 | 186; 190 | 3,197 / 44,743; 3,282 / 44,805 | 83 / 117 / 150 / 167; 83 / 100 / 133 / 167 |
 
 The mountain zoom pairs (a far view cropped and enlarged against the near view of the same ground, judged by a vision model) put level 3 against level 1 at severity 1 with this rule, against 3 ("pillars and spires along the crests") before it; the plain mean, measured as a reference, puts level 3 against level 2 at 4 (the peak sinks).
+
+⁹⁴ **#436's two flights against main, from the A/B/C in footnote 93** (the same window and conditions; main is `c3c862d`, #436 is `35bc349`, both runs of each):
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 / max | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | 0 of 1,197; 0 of 1,198 | 14; 14 | 175; 173 | 6,409 / 42,349 / 53,263; 6,266 / 42,185 / 52,976 | 84 / 117 / 150 / 150; 83 / 117 / 150 / 150 |
+| low, #436 | 0 of 1,194; 0 of 1,188 | 14; 14 | 203; 198 | 3,852 / 39,621 / 66,724; 4,601 / 49,857 / 61,061 | 84 / 134 / 151 / 168; 84 / 135 / 168 / 168 |
+| toward a mountain, main | 0 of 1,799; 0 of 1,799 | 0; 0 | 185; 189 | 3,246 / 42,974 / 71,682; 3,704 / 44,849 / 71,808 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 167 |
+| toward a mountain, #436 | 0 of 1,799; 0 of 1,799 | 0; 0 | 208; 208 | 3,223 / **22,347** / 25,887; 3,138 / **22,352** / 27,585 | 83 / 100 / 133 / 183 (both) |
+
+Toward a mountain the morph halves the worst swaps (p99 22,347 against 42,974 pixels; max 26,000 against 72,000), which is what it is for: heights slide over a band instead of stepping in one frame. A swap still counts its pixels when only shading changes, which is the residual (riser materials and ambient occlusion per level, trees). The cost is 2.5% at the ground eye from the triangles the per-cell move keys add, and a longer swap-lag tail on both flights (max 168 and 183 ms against 150 and 167). No hole on either flight.

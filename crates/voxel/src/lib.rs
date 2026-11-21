@@ -28,7 +28,8 @@ pub use angle::Angle;
 pub use aniso::{AnisoChunk, NodeChunk};
 pub use block::BlockId;
 pub use bounds::{
-    build_mesh_bounded, build_mesh_bounded_occluded, build_mesh_bounded_occluded_node, Aabb,
+    build_mesh_bounded, build_mesh_bounded_occluded, build_mesh_bounded_occluded_node,
+    build_mesh_bounded_occluded_node_morph, Aabb,
 };
 pub use connectivity::FaceLinks;
 pub use coord::ChunkCoord;
@@ -36,7 +37,7 @@ pub use fixed::{Fixed, FixedVec3, FRAC_BITS};
 pub use item::{
     ItemDef, ItemId, ItemRegistry, ItemRegistryError, ItemStack, ItemState, Rarity, StackError,
 };
-pub use mesh::{Face, Mesh, Vertex};
+pub use mesh::{Face, Mesh, Vertex, MAX_MORPH_DELTA, MORPH_DELTA_STEP};
 pub use ore::{OreDef, OreError, OreRegistry};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
 pub use registry::{
@@ -46,4 +47,4 @@ pub use smelt::{SmeltBook, SmeltError, SmeltRecipe, SmeltRecipeDef};
 pub use storage::{ChunkPayloadError, ChunkStorage};
 pub use structure::{StructureDef, StructureError, StructureRegistry};
 pub use tree_shape::{tree_bounds, tree_part_at, TreePart};
-pub use voxel::{face_ao_of, Chunk, MeshContext};
+pub use voxel::{face_ao_of, riser_map, Chunk, MeshContext, MorphColumns};

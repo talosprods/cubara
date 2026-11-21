@@ -115,6 +115,28 @@ const AO_WIDTH_MASK: u32 = (1 << AO_WIDTH_BITS) - 1;
 /// old isotropic `Chunk::build_mesh_lod`, whose downsample factor can reach
 /// 16) clamps to this rather than overflowing the field.
 pub const MAX_AO_WIDTH_LOG2: u32 = AO_WIDTH_MASK;
+/// The distance morph (issue #380, the study of 2026-11-20; CDLOD
+/// geomorphing): which level's morph band moves this vertex (2 bits) and how
+/// far it moves, vertically, once fully morphed (10 bits, signed, in
+/// [`MORPH_DELTA_STEP`]s) -- word 2's bits 20-21 and 22-31, the last of its
+/// spare bits.
+const MORPH_LEVEL_SHIFT: u32 = AO_WIDTH_SHIFT + AO_WIDTH_BITS;
+const MORPH_LEVEL_MASK: u32 = 0b11;
+const MORPH_DELTA_SHIFT: u32 = MORPH_LEVEL_SHIFT + 2;
+const MORPH_DELTA_BITS: u32 = 32 - MORPH_DELTA_SHIFT;
+/// The unit a morph delta is stored in, in blocks: a quarter block, so ten
+/// bits reach 128 blocks either way. A column's top and the ends of a riser
+/// move by whole blocks and are stored exactly; only the rows a riser is
+/// split into by material in between are rounded, and they stay inside the
+/// riser's plane. Chosen, not derived.
+pub const MORPH_DELTA_STEP: f32 = 0.25;
+/// Word 1's one spare bit: this vertex is a corner of a latent riser, one
+/// the distance morph opens from no height (`crate::voxel`). `mesh.wgsl`
+/// scales its vertical crack seal by the morph factor, so unmorphed it stays
+/// flat and morphed it seals like any riser.
+const LATENT_BIT: u32 = 1 << 31;
+/// The largest morph delta a vertex can carry, in blocks.
+pub const MAX_MORPH_DELTA: f32 = ((1i32 << (MORPH_DELTA_BITS - 1)) - 1) as f32 * MORPH_DELTA_STEP;
 
 /// A single mesh vertex, packed into 12 bytes: node-local lattice position,
 /// baked ambient occlusion, texture-array layer, face direction, this
@@ -123,8 +145,8 @@ pub const MAX_AO_WIDTH_LOG2: u32 = AO_WIDTH_MASK;
 ///
 /// ```text
 /// word 0:  x:10  y:10  z:10  ao:2
-/// word 1:  tex_layer:12  face:3  u:8  v:8  (1 spare)
-/// word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  (12 spare)
+/// word 1:  tex_layer:12  face:3  u:8  v:8  latent:1
+/// word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  morph_level:2  morph_delta:10
 /// ```
 ///
 /// `u`/`v` are *this vertex's* coordinate -- 0 or the greedy quad's extent,
@@ -238,6 +260,62 @@ impl Vertex {
         (self.packed2 >> AO_WIDTH_SHIFT) & AO_WIDTH_MASK
     }
 
+    /// Returns a copy of this vertex that the distance morph moves (issue
+    /// #380 study): `level` picks the morph band (`mesh.wgsl` reads the
+    /// node's level's band), and `delta` is how far up (or down, negative)
+    /// the vertex moves at a morph factor of 1, in blocks -- rounded to
+    /// [`MORPH_DELTA_STEP`] and clamped to [`MAX_MORPH_DELTA`] either way.
+    /// A delta of 0 is a vertex the morph leaves where it is.
+    pub fn with_morph(self, level: u32, delta: f32) -> Self {
+        debug_assert!(level <= MORPH_LEVEL_MASK, "morph level out of range");
+        let max = (1i32 << (MORPH_DELTA_BITS - 1)) - 1;
+        let q = ((delta / MORPH_DELTA_STEP).round() as i32).clamp(-max, max);
+        let mask = (MORPH_LEVEL_MASK << MORPH_LEVEL_SHIFT) | (u32::MAX << MORPH_DELTA_SHIFT);
+        Self {
+            packed2: (self.packed2 & !mask)
+                | ((level & MORPH_LEVEL_MASK) << MORPH_LEVEL_SHIFT)
+                | ((q as u32) << MORPH_DELTA_SHIFT),
+            ..self
+        }
+    }
+
+    /// Returns a copy of this vertex marked as a corner of a latent riser
+    /// (word 1's spare bit, [`LATENT_BIT`]).
+    pub fn with_latent(self, latent: bool) -> Self {
+        Self {
+            packed1: (self.packed1 & !LATENT_BIT) | if latent { LATENT_BIT } else { 0 },
+            ..self
+        }
+    }
+
+    /// Whether [`with_latent`](Self::with_latent) marked this vertex.
+    pub fn is_latent(self) -> bool {
+        self.packed1 & LATENT_BIT != 0
+    }
+
+    /// The morph band level [`with_morph`](Self::with_morph) set.
+    pub fn morph_level(self) -> u32 {
+        (self.packed2 >> MORPH_LEVEL_SHIFT) & MORPH_LEVEL_MASK
+    }
+
+    /// The vertical move at full morph, in blocks; 0 for a vertex nobody
+    /// has called [`with_morph`](Self::with_morph) on. The arithmetic shift
+    /// carries the sign, as `mesh.wgsl`'s does.
+    pub fn morph_delta(self) -> f32 {
+        ((self.packed2 as i32) >> MORPH_DELTA_SHIFT) as f32 * MORPH_DELTA_STEP
+    }
+
+    /// Returns a copy of this vertex at node-local height `y` -- for a riser
+    /// laid down with no height of its own, whose rows the morph opens
+    /// ([`crate::voxel`]'s latent risers).
+    pub fn with_y(self, y: u32) -> Self {
+        debug_assert!(y <= POS_MASK, "position out of range");
+        Self {
+            packed0: (self.packed0 & !(POS_MASK << POS_BITS)) | (y << POS_BITS),
+            ..self
+        }
+    }
+
     pub fn node_index(self) -> u32 {
         self.packed2 & NODE_INDEX_MASK
     }
@@ -329,6 +407,48 @@ mod tests {
     #[test]
     fn vertex_is_twelve_bytes() {
         assert_eq!(std::mem::size_of::<Vertex>(), 12);
+    }
+
+    /// The distance morph's bits (issue #380's study) round-trip -- a
+    /// negative delta through the arithmetic shift, a too-large one clamped,
+    /// the latent flag -- and leave every other field as it was.
+    #[test]
+    fn a_vertex_carries_its_morph_and_keeps_the_rest() {
+        let base = Vertex::new(1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
+            .with_corner(true, false)
+            .with_ao_width(3)
+            .with_node_index(0xBEEF);
+        for (level, delta) in [(0, 0.0), (1, -3.25), (2, 17.5), (3, -128.0)] {
+            let v = base.with_morph(level, delta).with_latent(level % 2 == 1);
+            assert_eq!(v.morph_level(), level);
+            assert_eq!(v.morph_delta(), delta.max(-MAX_MORPH_DELTA));
+            assert_eq!(v.is_latent(), level % 2 == 1);
+            assert_eq!(
+                (
+                    v.x(),
+                    v.y(),
+                    v.z(),
+                    v.ao(),
+                    v.face(),
+                    v.tex_layer(),
+                    v.u(),
+                    v.v()
+                ),
+                (1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
+            );
+            assert_eq!(
+                (v.corner(), v.ao_width_log2(), v.node_index()),
+                ((true, false), 3, 0xBEEF)
+            );
+        }
+        assert_eq!(base.with_morph(1, 1000.0).morph_delta(), MAX_MORPH_DELTA);
+        assert_eq!(
+            base.with_morph(1, 0.3).morph_delta(),
+            0.25,
+            "quarter blocks"
+        );
+        assert_eq!(base.with_y(9).y(), 9);
+        assert_eq!(base.with_y(9).z(), 512);
     }
 
     #[test]

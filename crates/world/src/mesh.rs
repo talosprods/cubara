@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use cubara_voxel::{
-    build_mesh_bounded_occluded_node, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext, NodeChunk,
+    build_mesh_bounded_occluded_node_morph, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext,
+    NodeChunk,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -138,8 +139,22 @@ pub fn mesh_node(
     node: NodeKey,
     blocks: TerrainBlocks,
 ) -> Option<NodeGeometry> {
+    mesh_node_with(world, registry, layer_of, node, blocks, true)
+}
+
+/// [`mesh_node`], with the distance morph baked in or not (issue #380's
+/// study): `false` is the mesh as it was before the morph, which a census
+/// counts the morph's cost against.
+pub fn mesh_node_with(
+    world: &WorldSnapshot,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    morph: bool,
+) -> Option<NodeGeometry> {
     let chunk = world.node_at(node, blocks)?;
-    mesh_chunk(world, registry, layer_of, node, blocks, &chunk)
+    mesh_chunk_with(world, registry, layer_of, node, blocks, &chunk, morph)
 }
 
 /// Mesh `node` from its already generated blocks.
@@ -160,7 +175,26 @@ fn mesh_chunk(
     blocks: TerrainBlocks,
     chunk: &NodeChunk,
 ) -> Option<NodeGeometry> {
+    mesh_chunk_with(world, registry, layer_of, node, blocks, chunk, true)
+}
+
+/// [`mesh_chunk`], the distance morph baked in where `morph` is set and the
+/// node's level morphs ([`crate::morph::node_columns`]).
+fn mesh_chunk_with(
+    world: &WorldSnapshot,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    chunk: &NodeChunk,
+    morph: bool,
+) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
+    let columns = if morph {
+        crate::morph::node_columns(world, node, blocks)
+    } else {
+        None
+    };
     let origin = node.world_origin();
     let scale = 1.0f32;
     let ground = std::cell::RefCell::new(BorderGround::default());
@@ -168,7 +202,13 @@ fn mesh_chunk(
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
     let may_be_solid =
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
-    let (mesh, local_aabb) = build_mesh_bounded_occluded_node(chunk, &ctx, covered, may_be_solid)?;
+    let (mesh, local_aabb) = build_mesh_bounded_occluded_node_morph(
+        chunk,
+        &ctx,
+        covered,
+        may_be_solid,
+        columns.as_ref(),
+    )?;
     Some(NodeGeometry {
         mesh,
         local_aabb,

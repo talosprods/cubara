@@ -594,6 +594,7 @@ fn distance_fog_fades_the_far_ring_into_the_sky() {
     let target = glam::vec3(120.0, 15.0, 120.0);
     let (fog_start, fog_end) = Lighting::fog_range((region_radius * 16) as f32);
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius,
@@ -643,6 +644,7 @@ fn a_cave_mouth_is_visible() {
     let eye = glam::vec3(-6.0, 27.0, -2.0);
     let target = glam::vec3(-15.0, 29.0, -2.0);
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 3,
@@ -686,6 +688,7 @@ fn iron_ore_is_visible_in_a_cave_wall() {
     let eye = glam::vec3(-25.5, 17.5, 5.5);
     let target = glam::vec3(-31.0, 17.5, 5.5);
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 3,
@@ -892,6 +895,50 @@ fn the_288_m_edge_matches_a_finer_ring_on_screen() {
     assert_frame_golden("ring_edge_288m", Some(frame));
 }
 
+/// **#380's visual pin**: the height morph, drawn. The eye stands at 90
+/// blocks, looking toward +x and slightly down, over the real 160 m, 288 m and
+/// 512 m rings, so the ground ahead is in levels 0, 1 and 2's bands at once.
+/// With the morph off the same meshes draw as they were meshed; the two
+/// frames must differ (else the shader or the vertex bits stopped carrying
+/// the morph) and the morph-on frame is the golden.
+#[test]
+fn the_level_one_ring_morphs_its_heights_on_screen() {
+    let world = World::new();
+    let eye = glam::Vec3::new(8.0, 90.0, 8.0);
+    let squash = 2;
+    let schedule = schedule_for_radius(32);
+    let bands = cubara_world::morph::morph_bands(&schedule, squash);
+    let params = cubara_render::MorphParams {
+        bands: bands.map(|band| band.map(|b| (b.start, b.end))),
+        squash: squash as f32,
+    };
+    let shot = |morph| Shot {
+        region_radius: 32,
+        camera: Some((eye.as_dvec3(), glam::Vec3::new(1.0, -0.35, 0.0))),
+        morph,
+        ..Shot::default()
+    };
+    let Some(off) = render_frustum_nodes(&world, shot(None), &schedule) else {
+        headless::skip_or_require_gpu("the_level_one_ring_morphs_its_heights_on_screen");
+        return;
+    };
+    let on = render_frustum_nodes(&world, shot(Some(params)), &schedule).expect("a GPU");
+    let moved = differing_pixels(&on, &off)
+        .iter()
+        .filter(|p| p.delta > TOLERANCE)
+        .count();
+    eprintln!("morph on against off: {moved} pixels over tolerance");
+    assert!(
+        moved >= MORPH_MIN_MOVED_PIXELS,
+        "the morph moved only {moved} pixels over tolerance"
+    );
+    assert_frame_golden("morph_level_1", Some(on));
+}
+
+/// The least pixels the morph must change in that frame (chosen, not
+/// derived: a quarter of the 82,000 this frame shows, far over backend noise).
+const MORPH_MIN_MOVED_PIXELS: usize = 20_000;
+
 /// Mesh exactly `schedule`'s nodes around the origin (never level 0, which
 /// callers assert for themselves) with trees, and again with every node's
 /// `trees` cleared -- same terrain, same auto-framed camera either way, so
@@ -1043,6 +1090,7 @@ fn the_selected_block_shows_an_outline() {
         .expect("the block this shot is framed around");
 
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 3,
@@ -1119,6 +1167,7 @@ fn a_block_being_dug_shows_cracks() {
         .expect("the block this shot is framed around");
 
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 3,
@@ -1197,6 +1246,7 @@ fn items_show_their_icons() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1276,6 +1326,7 @@ fn the_hotbar_shows_slots_counts_and_the_held_one() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1405,6 +1456,7 @@ fn the_inventory_screen_shows_slots_a_recipe_and_the_cursor() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1502,6 +1554,7 @@ fn an_item_name_shows_beside_the_cursor() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1559,6 +1612,7 @@ fn the_crosshair_marks_the_centre_of_the_screen() {
     // rim and the ground behind it.
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1607,6 +1661,7 @@ fn hearts_show_health_including_a_half() {
     // 13 of 20: six full hearts, one half, three empty.
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1679,6 +1734,7 @@ fn the_furnace_screen_shows_input_fuel_and_output() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1792,6 +1848,7 @@ fn a_furnace_shows_its_flame_and_progress() {
 
     let world = World::new();
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -1882,6 +1939,7 @@ fn distinct_materials_render_with_distinct_textures() {
     ];
 
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 0, // unused by render_chunks -- the chunk list is explicit
@@ -2012,6 +2070,7 @@ fn three_players_stand_in_front_of_the_camera() {
         ]
     };
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius: 2,
@@ -2624,6 +2683,7 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     let add3 = |p: [i32; 3]| [p[0] + s32[0], p[1] + s32[1], p[2] + s32[2]];
     let hole = (add3(hole.0), add3(hole.1));
     let shot = Shot {
+        morph: None,
         width: 960,
         height: 540,
         region_radius,

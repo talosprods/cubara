@@ -32,6 +32,8 @@ mod screenshot;
 mod settings;
 mod streaming;
 mod tick_cost;
+#[cfg(test)]
+mod transition_study;
 
 use std::sync::Arc;
 
@@ -137,6 +139,10 @@ struct App {
     bench: Option<WindowBench>,
     /// `--no-tune`: never start the start-up `--bench tune` child.
     no_tune: bool,
+    /// `--no-morph`: draw every level of detail where it was meshed -- the
+    /// swap as it was before the distance morph (issue #380's study), for
+    /// looking at the two side by side.
+    no_morph: bool,
     /// `--present fifo|mailbox|immediate`: asked for when the surface offers it.
     present: Option<wgpu::PresentMode>,
     /// Whether the window is covered, and whether it is minimised: either
@@ -564,7 +570,7 @@ impl ApplicationHandler for App {
         // mode (issue #425).
         self.settings = settings::load(&self.paths.settings).unwrap_or_default();
         let (cap, window_use, wanted) = (self.settings.frame_cap, self.window_use(), self.present);
-        let (renderer, mesh_assets) = Renderer::new(
+        let (mut renderer, mesh_assets) = Renderer::new(
             window.clone(),
             self.game.camera_pose(),
             |offered| present::present_mode_for(cap, window_use, wanted, offered),
@@ -575,6 +581,9 @@ impl ApplicationHandler for App {
         );
         if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
             log::warn!("--present {m:?} is not offered here");
+        }
+        if !self.no_morph {
+            renderer.set_morph(streaming::morph_params());
         }
         log::info!(
             "frame cap {cap:?}: the window presents {:?}",
@@ -1134,6 +1143,7 @@ fn main() {
         std::process::exit(2);
     });
     let no_tune = args.iter().any(|a| a == "--no-tune");
+    let no_morph = args.iter().any(|a| a == "--no-morph");
     let present = args.iter().position(|a| a == "--present").map(|i| {
         args.get(i + 1)
             .and_then(|m| present::parse_present(m))
@@ -1355,6 +1365,7 @@ fn main() {
                     every: number("--every", 0.25),
                     size,
                     quality: far_streaming::FarQuality::High,
+                    morph: !args.iter().any(|a| a == "--no-morph"),
                 };
                 // `--frames-every N`: also write every Nth rendered frame to
                 // the `--frames` directory, numbered, for a video.
@@ -1497,6 +1508,7 @@ fn main() {
         paths,
         bench,
         no_tune,
+        no_morph,
         present,
         ..App::default()
     };
