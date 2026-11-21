@@ -492,3 +492,173 @@ fn far_height_rule_study_report() {
         );
     }
 }
+
+/// The mountain the zoom test looks at (`--eye` on a line towards it, the
+/// same ground from 3,000 blocks down to 100): this seed's peak, and the
+/// low corner of the square of ground the two reports below measure.
+const ZOOM_PEAK: [i32; 2] = [-3072, -3232];
+
+/// The mean of the columns `WorldGen::cell_top_sampled(x0, z0, w, n)`
+/// samples, half to even: the rule without its summits, at any width.
+fn sampled_mean(height: &impl Fn(i32, i32) -> i32, x0: i32, z0: i32, w: i32, n: i32) -> i32 {
+    let count = n.clamp(1, w);
+    let step = w / count;
+    let lead = (step - 1) / 2;
+    let sum: i64 = (0..count)
+        .flat_map(|b| (0..count).map(move |a| (a, b)))
+        .map(|(a, b)| height(x0 + lead + a * step, z0 + lead + b * step) as i64)
+        .sum();
+    div_round_half_even(sum, (count * count) as i64) as i32
+}
+
+/// **Where the spires on a far ridge come from** (the zoom test of
+/// 2026-11-21: the far terrain at 1,200 blocks, enlarged, against the same
+/// ground at 400 drawn by level 2 -- "thin vertical spires on peak tops and
+/// ridges"). Per cell width, over 1,792 blocks square around the peak: how
+/// many cells stand at least their own width above all four neighbours, by
+/// the rule as it is, by the mean alone, and with the summit's lift over the
+/// mean capped -- and what each cap costs a summit in height.
+///
+/// A spire is the summit's lift, and it is the rule's at every width: a
+/// cell that holds a summit stands at its highest column while the cells
+/// around it stand at their means. At 8 blocks that is level 3's cell and
+/// the far terrain's finest quad alike (one number, `far::quad_top`), so
+/// there is no far rule to bring into line; capping the lift is a change to
+/// the rule of `docs/PHASE3_ARCHITECTURE.md` section 9.3 for the voxels too.
+///
+/// ```text
+/// cargo test --release -p cubara-render --test lod_consistency -- --ignored --nocapture summit_lift_report
+/// ```
+#[test]
+#[ignore]
+fn summit_lift_report() {
+    use std::collections::HashMap;
+    let gen = WorldGen::new(cubara_world::World::new().seed());
+    const SPAN: i32 = 1792;
+    let (x_lo, z_lo) = (ZOOM_PEAK[0] - 1024, ZOOM_PEAK[1] - 1120);
+    let height = |x: i32, z: i32| gen.surface_height(x, z);
+    println!("| cell width | summits lifted (mean, most) | cells a width above all four neighbours: rule / mean / lift capped at w/2 / at w/4 | a summit lowered by the cap w/2 (mean, most) | by w/4 |");
+    println!("|---|---|---|---|---|");
+    for w in [4, 8, 16, 32] {
+        let n = if w <= 8 { w } else { SAMPLES };
+        let mut tops: [HashMap<(i32, i32), i32>; 4] = Default::default();
+        let (mut lifts, mut lost) = (Vec::new(), [Vec::new(), Vec::new()]);
+        for cz in 0..SPAN / w {
+            for cx in 0..SPAN / w {
+                let (x0, z0) = (x_lo + cx * w, z_lo + cz * w);
+                let rule = gen.cell_top_sampled(x0, z0, w, n);
+                let mean = sampled_mean(&height, x0, z0, w, n);
+                let capped = [rule.min(mean + w / 2), rule.min(mean + w / 4)];
+                for (map, top) in tops.iter_mut().zip([rule, mean, capped[0], capped[1]]) {
+                    map.insert((cx, cz), top);
+                }
+                if rule > mean {
+                    lifts.push(rule - mean);
+                    lost[0].push(rule - capped[0]);
+                    lost[1].push(rule - capped[1]);
+                }
+            }
+        }
+        let spires = |map: &HashMap<(i32, i32), i32>| {
+            map.iter()
+                .filter(|(&(cx, cz), &top)| {
+                    [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                        .iter()
+                        .all(|(dx, dz)| map.get(&(cx + dx, cz + dz)).is_some_and(|&n| top - n >= w))
+                })
+                .count()
+        };
+        let stat = |v: &[i32]| {
+            format!(
+                "{:.1}, {}",
+                v.iter().sum::<i32>() as f64 / v.len().max(1) as f64,
+                v.iter().max().copied().unwrap_or(0)
+            )
+        };
+        println!(
+            "| {w} | {} of {} cells ({}) | {} / {} / {} / {} | {} | {} |",
+            lifts.len(),
+            tops[0].len(),
+            stat(&lifts),
+            spires(&tops[0]),
+            spires(&tops[1]),
+            spires(&tops[2]),
+            spires(&tops[3]),
+            stat(&lost[0]),
+            stat(&lost[1]),
+        );
+    }
+}
+
+/// **What the grey patches on a slope are** (the same zoom test: "grey
+/// stone patches that level 3 shows are missing"): not a riser's material.
+/// Over 1,024 blocks square around the peak, level 0's risers are almost
+/// never stone, while one column in twenty shows stone from above: the floor
+/// of a pit a cave has opened. A coarse cell is a cave only where all its
+/// ground is (`WorldGen::row_is_cave`, PHASE1 section 8.6), so the pits thin
+/// out cell width by cell width, and the far terrain -- a height field
+/// (`WorldGen::ground_faces`: "caves are not in it") -- has none.
+///
+/// The share of the ground every column of whose cell a cave opens is an
+/// upper bound on what a level of that cell width can still show as a pit;
+/// it is not the voxel rule itself, which judges row by row.
+///
+/// ```text
+/// cargo test --release -p cubara-render --test lod_consistency -- --ignored --nocapture pits_by_cell_width_report
+/// ```
+#[test]
+#[ignore]
+fn pits_by_cell_width_report() {
+    let gen = WorldGen::new(cubara_world::World::new().seed());
+    const SPAN: i32 = 1024;
+    let (x_lo, z_lo) = (ZOOM_PEAK[0] - 512, ZOOM_PEAK[1] - 512);
+    // A column a cave opens: its surface block carved away; and how far
+    // down the first block left is.
+    let depth_of = |x: i32, z: i32| -> Option<i32> {
+        let surface = gen.surface_height(x, z);
+        if gen.is_solid(x, surface, z) {
+            return None;
+        }
+        Some(
+            (1..64)
+                .find(|&d| gen.is_solid(x, surface - d, z))
+                .unwrap_or(64),
+        )
+    };
+    let open: Vec<Option<i32>> = (0..SPAN * SPAN)
+        .map(|k| depth_of(x_lo + k % SPAN, z_lo + k / SPAN))
+        .collect();
+    let columns = open.len() as f64;
+    let opened = open.iter().flatten().count() as f64;
+    let stone = open
+        .iter()
+        .flatten()
+        .filter(|&&d| d > cubara_world::SOIL_DEPTH)
+        .count() as f64;
+    let risers = gen.ground_faces(x_lo, z_lo, SPAN, SPAN);
+    let by_layer: Vec<f64> = (0..3)
+        .map(|l| risers.sides.iter().map(|s| s[l] as f64).sum())
+        .collect();
+    let faces: f64 = by_layer.iter().sum();
+    println!(
+        "level 0, {SPAN} blocks square around the peak: risers {:.2}% surface block, {:.2}% soil, {:.3}% stone; a cave opens {:.2}% of the columns, and under {:.2}% of all columns the first block down is stone",
+        100.0 * by_layer[0] / faces,
+        100.0 * by_layer[1] / faces,
+        100.0 * by_layer[2] / faces,
+        100.0 * opened / columns,
+        100.0 * stone / columns,
+    );
+    println!("| cell width | share of the ground in cells whose every column a cave opens |");
+    println!("|---|---|");
+    for w in [1, 2, 4, 8, 16] {
+        let n = SPAN / w;
+        let all = (0..n * n)
+            .filter(|k| {
+                let (cx, cz) = (k % n, k / n);
+                (0..w * w)
+                    .all(|c| open[((cz * w + c / w) * SPAN + cx * w + c % w) as usize].is_some())
+            })
+            .count();
+        println!("| {w} | {:.2}% |", 100.0 * all as f64 / (n * n) as f64);
+    }
+}

@@ -1160,3 +1160,74 @@ too few walls in a footprint to measure; both are indications, not
 guarantees. A quad of 16 can leave a direction level 0 has without a wall of
 its own (one cliff footprint of forty). Far quads of 2 and 4 exist only in
 tests: the join clamp never draws them.
+
+**What the far terrain costs, and why** (M3, 1920x1080, Medium, the gate's
+eyes; single runs on a machine that was not quiet, so the differences count
+and the absolute numbers do not -- the formal rows are `BENCHMARKS.md`'s).
+The blocks cost 0.99 ms a frame at the ground eye and 1.15 ms at the hill
+eye, where the smooth surface they replace cost about 0.29 ms. Found by
+switching parts of the pass off, since this backend's GPU timestamps are
+invalid:
+
+| the far pass, changed | ground eye, ms | hill eye, ms |
+|---|--:|--:|
+| as built | 0.99 | 1.15 |
+| every vertex sent off screen (full vertex shader, nothing rasterised) | 0.82 | |
+| the vertex shader returning at once (no buffer read, no light, no fog) | 0.84 | 0.86 |
+| the same, one vertex a face (the index buffer pointing all six at it) | 0.25 at the flight eye, of 0.55 | |
+| half the pixels (960x540, the same patches) | unchanged at the flight eye | |
+| a shared-corner mesh of the same quads, trivial shader (below) | 0.51 | 0.52 |
+
+So it is **the number of vertices the GPU is asked to shade, at about 0.4 ns
+each whatever the shader does** -- not the storage-buffer fetch, not the
+light or the fog, not overdraw or fill (0.15 to 0.29 ms is all the
+rasteriser's), not the draws (five to seven). A face is four vertices of its
+own, a quad has about two faces that can face the eye, and a run is padded
+to its class: about 9 vertices a quad, 1.96 million a frame, where the
+smooth surface shared one vertex among four quads. Vertices are reused only within
+some 64 of the index stream (measured: the second triangle of each face
+pointed 16 faces back costs next to nothing, 32 faces back half again).
+
+What follows from that, none of it built here:
+
+- **Shared corners.** A top's four corners are also the upper edge of its
+  walls, and a wall's lower edge is the next quad's corners: four vertices a
+  quad for every face of it, in one fixed index list for every patch (one
+  draw, no classes, no padding), each face's colour carried flat from a
+  corner of its own. Prototyped with a trivial shader at the same patches:
+  the vertex part goes from 0.84 to 0.51 ms, which with the rasteriser's
+  share is about 790 FPS at the ground eye and 715 at the hill eye where the
+  blocks as built measure 636 and 577 -- 1.4 times, not the 3.4 the gate
+  wants. Four vertices a quad is the least blocks can have.
+- **Coarser quads** (`far_view_scaled`; the default is the owner's): as
+  built, x1.5 measures 853 / 787 FPS (ground / hill), x2 907 / 836, x2.5
+  1,127 / 1,050 -- the first that holds 1,000. With shared corners the same
+  arithmetic puts that at about x2.
+- **Not drawing what is hidden** helps one eye only: from the ground eye 11
+  to 21% of the patches the frustum passes leave a pixel on screen (two
+  directions, at High), from the hill eye 83 to 92% -- and the hill eye is
+  the one the gate turns on.
+
+**What the zoom test found in the far terrain, and what it is** (2026-11-21;
+`far_study.rs`'s `summit_lift_report` and `pits_by_cell_width_report`):
+
+- *Spires on peaks and ridges* are the summit's lift, the rule's own at
+  every width: around this seed's peak 53 of 50,176 cells of 8 stand eight
+  blocks or more above all four neighbours, and 3 would by the mean alone
+  (24 against 1 at 16 blocks, 87 against 4 at 4). A cell of 8 is level 3's
+  and the far terrain's alike, so the far terrain has no rule of its own to
+  correct; the lift capped at half the width leaves 18 (8 at 16 blocks) and
+  lowers a summit by 0.5 blocks on average and 12 at most (0.9 and 25). That
+  is a change to §9.3 for the voxels as well, and is not made here.
+- *Grey patches on slopes* are not a riser's material: level 0's risers
+  there are 79% surface block, 21% soil and 0.08% stone. They are the floors
+  of pits a cave has opened -- 6.1% of the columns, stone under 5.0% -- and a
+  coarse cell is a cave only where all its ground is, so they thin out with
+  the cell: 5.1% of the ground at 2 blocks, 3.4% at 4, 1.3% at 8, 0.05% at
+  16. The patches the test saw missing lie 300 to 420 blocks from the near
+  eye and 800 to 920 from the far one: level 2 against level 3. The far
+  terrain draws no pit at all (at most 1.3% of its finest quads would be one
+  by the voxels' rule). A wall keeps the blend of its footprint's risers: one
+  layer a wall, picked by a hash as a voxel cell must, was tried and puts a
+  footprint's walls 4.4/255 off level 0's colour at quads of 16, where the
+  bound is 3.25 and the blend measures 2.4.
