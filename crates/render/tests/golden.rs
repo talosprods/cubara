@@ -3400,6 +3400,17 @@ fn a_forest_swaps_nothing_at_its_ring_edges() {
 /// Per edge (160, 288, 512 m), the most [`a_forest_swaps_nothing_at_its_ring_edges`]
 /// lets change: the share of the trees' pixels drawn by one side only, and
 /// their mean colour on the image's 0-255 scale. **Chosen, not derived**:
-/// a little over what this build measures on the M3 (in the PR, with what
-/// main and each injected defect measure).
-const FOREST_EDGE: [(f64, f64); 3] = [(1.0, 255.0), (1.0, 255.0), (1.0, 255.0)];
+/// over what this build measures on the M3 and under what main did there
+/// (`c5b37e6`, the same test on main's renderer):
+///
+/// | edge | main: pixels, colour | this build | bound |
+/// |---|---|---|---|
+/// | 160 m | 18.6%, 1.2 | 9.1%, 0.8 | 12%, 1.5 |
+/// | 288 m | 10.1%, 1.8 | 0.0% (2 pixels), 0.0 | 1%, 0.5 |
+/// | 512 m | 66.1%, 7.9 | 0.3%, 1.7 | 2%, 3.0 |
+///
+/// What is left at 160 m is the ground (the test's doc comment); at 512 m
+/// the silhouette's flat colours against the oak's texture, resolved at
+/// this close a view (each tree tens of pixels; at 512 m a few, and the
+/// texture's mip is its mean).
+const FOREST_EDGE: [(f64, f64); 3] = [(0.12, 1.5), (0.01, 0.5), (0.02, 3.0)];
