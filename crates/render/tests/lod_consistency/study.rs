@@ -100,11 +100,23 @@ pub enum Rule {
     /// are as high).
     LevelMaxSummits,
     /// [`Rule::MeanEven`], and the highest column in a cell that holds a
-    /// summit. **The rule chosen**: `WorldGen::cell_top`.
+    /// summit: the rule #432 built, which grew towers on the crests.
     MeanSummits,
+    /// [`Rule::MeanSummits`] with a summit's lift over the mean capped at
+    /// half the cell's width.
+    MeanSummitsCapHalf,
+    /// [`Rule::MeanSummits`] with a summit at the column three quarters of
+    /// the way up the cell (never under the mean) instead of the highest.
+    MeanSummitsQ75,
+    /// The same at nine tenths of the way up.
+    MeanSummitsQ90,
+    /// [`Rule::MeanSummits`] with a summit at the highest mean of the four
+    /// half-width cells it splits into. **The rule chosen**:
+    /// `WorldGen::cell_top`.
+    MeanSummitsChildMean,
 }
 
-pub const RULES: [Rule; 13] = [
+pub const RULES: [Rule; 17] = [
     Rule::Max,
     Rule::MeanFloor,
     Rule::MeanRound,
@@ -118,6 +130,10 @@ pub const RULES: [Rule; 13] = [
     Rule::LevelMaxEven,
     Rule::LevelMaxSummits,
     Rule::MeanSummits,
+    Rule::MeanSummitsCapHalf,
+    Rule::MeanSummitsQ75,
+    Rule::MeanSummitsQ90,
+    Rule::MeanSummitsChildMean,
 ];
 
 impl Rule {
@@ -135,7 +151,11 @@ impl Rule {
             Rule::MeanEven => "mean, half to even",
             Rule::LevelMaxEven => "level top, half to even",
             Rule::LevelMaxSummits => "level top + summits",
-            Rule::MeanSummits => "mean + summits (chosen)",
+            Rule::MeanSummits => "mean + summits (#432)",
+            Rule::MeanSummitsCapHalf => "mean + summits, lift <= w/2",
+            Rule::MeanSummitsQ75 => "mean + summits at p75",
+            Rule::MeanSummitsQ90 => "mean + summits at p90",
+            Rule::MeanSummitsChildMean => "mean + summits at best half (chosen)",
         }
     }
 }
@@ -246,6 +266,45 @@ pub fn top(rule: Rule, h: &[i32], w: i32, crest: bool, summit: bool) -> i32 {
             } else {
                 div_round_even(sum, n) as i32
             }
+        }
+        Rule::MeanSummitsCapHalf => {
+            let mean = div_round_even(sum, n) as i32;
+            if summit {
+                max.min(mean + w / 2)
+            } else {
+                mean
+            }
+        }
+        Rule::MeanSummitsQ75 | Rule::MeanSummitsQ90 => {
+            let mean = div_round_even(sum, n) as i32;
+            let (num, den) = if rule == Rule::MeanSummitsQ75 {
+                (3, 4)
+            } else {
+                (9, 10)
+            };
+            if summit {
+                quantile(&sorted(), num, den).max(mean)
+            } else {
+                mean
+            }
+        }
+        Rule::MeanSummitsChildMean => {
+            let mean = div_round_even(sum, n) as i32;
+            if !summit || w < 2 {
+                return mean;
+            }
+            let half = w / 2;
+            (0..4)
+                .map(|q| {
+                    let (qa, qb) = (q % 2 * half, q / 2 * half);
+                    let s: i64 = (0..half * half)
+                        .map(|k| h[((qb + k / half) * w + qa + k % half) as usize] as i64)
+                        .sum();
+                    div_round_even(s, (half * half) as i64) as i32
+                })
+                .max()
+                .expect("four children")
+                .max(mean)
         }
     }
 }
@@ -501,7 +560,7 @@ fn kind_name(kind: Terrain) -> &'static str {
 }
 
 /// **The rule the study chose is the one the game has**: this file's copy
-/// of it (`Rule::MeanSummits`, written out from the height field so that it
+/// of it (`Rule::MeanSummitsChildMean`, written out from the height field so that it
 /// can stand beside the rules that were not chosen) gives every cell the top
 /// `WorldGen::cell_top` gives it, at every coarse level, over one window of
 /// each kind of terrain. Without this the table could describe a rule the
@@ -516,7 +575,7 @@ fn the_chosen_rule_is_the_games() {
         let window = Window::around(&gen, fp);
         for level in 1..=3u32 {
             let w = 1i32 << level;
-            let tops = window.tops(Rule::MeanSummits, level);
+            let tops = window.tops(Rule::MeanSummitsChildMean, level);
             let means = window.tops(Rule::MeanEven, level);
             // Every cell with its eight neighbours inside the window.
             for cj in 1..SIDE / w - 1 {
