@@ -194,7 +194,7 @@ impl Rng {
     }
 
     /// A value in `-range..range`.
-    fn within(&mut self, range: i32) -> i32 {
+    pub fn within(&mut self, range: i32) -> i32 {
         (self.next() % (2 * range as u64)) as i32 - range
     }
 }
@@ -362,6 +362,8 @@ pub struct Setup {
     pub far_materials: Materials,
     /// Per footprint, which level-0 columns a cave has carved ([`Setup::carved`]).
     carved: std::cell::RefCell<CarvedMasks>,
+    /// `assets/structures`: the oak's shape.
+    pub structures: cubara_voxel::StructureRegistry,
 }
 
 impl Setup {
@@ -403,6 +405,10 @@ impl Setup {
             materials,
             far_materials: cubara_render::far::ground_materials(SOIL_DEPTH as f32),
             carved: Default::default(),
+            structures: cubara_voxel::StructureRegistry::load(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/structures"),
+            )
+            .expect("assets/structures must be valid"),
         }
     }
 
@@ -438,6 +444,19 @@ impl Setup {
             .iter()
             .position(|t| t == name)
             .unwrap_or_else(|| panic!("no layer for {name}")) as u32
+    }
+
+    /// The mean colour of texture `layer`, linear: what a face of it shows
+    /// before its light and its shade.
+    pub fn colour(&self, layer: u32) -> Vec3 {
+        self.colours[layer as usize]
+    }
+
+    /// The real terrain palette **with the oak**, as the game plays: what
+    /// grows the trees `trees.rs` measures. ([`Setup::blocks`] has none:
+    /// the ground is measured on its own.)
+    pub fn tree_blocks(&self) -> TerrainBlocks {
+        self.blocks.with_oak(&self.structures, &self.registry)
     }
 }
 

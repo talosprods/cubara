@@ -166,7 +166,8 @@ pub fn load_structures() -> cubara_voxel::StructureRegistry {
         .expect("assets/structures must load")
 }
 
-/// The two static tree models (issue #332, R2 decision 3), built from
+/// The static tree models (issue #332, R2 decision 3; one per trunk height
+/// of each kind since #433), built from
 /// [`load_structures`] and the mesh assets [`load_mesh_assets`] already
 /// built -- everything [`SceneRenderer::new`] needs to bind them, uploaded
 /// once here alongside the block texture array rather than inside
@@ -916,9 +917,10 @@ impl Renderer {
         let tree_models = load_tree_models(&device, &queue, &mesh_assets);
         // Same `assets/structures` read `load_tree_models` already did
         // internally (it has no way to hand the registry back out) -- cheap,
-        // and the one place issue #332's culling box needs to know how far a
-        // tree instance reaches from its own position.
-        let tree_local_bounds = crate::trees::tree_instance_bounds(&load_structures());
+        // and the one place the tree arena learns which heights there are
+        // models of, and how far a tree instance reaches from its own
+        // position (issue #332's culling box).
+        let tree_shapes = crate::trees::TreeShapes::of(&load_structures());
         let scene = SceneRenderer::new(
             &device,
             &queue,
@@ -963,7 +965,7 @@ impl Renderer {
             adapter_name,
             arena,
             far,
-            trees: crate::trees::TreeArena::new(tree_local_bounds, anchor),
+            trees: crate::trees::TreeArena::new(tree_shapes, anchor),
             uploads: Uploads::new(),
             swapped_out: Vec::new(),
             last_frame: Instant::now(),
@@ -1366,7 +1368,7 @@ impl Renderer {
                     far: Some(&self.far),
                     trees: Some(crate::scene::TreeDraw {
                         oak: self.trees.oak_instances(),
-                        boxed: self.trees.box_instances(),
+                        silhouette: self.trees.silhouette_instances(),
                         anchor: self.trees.anchor(),
                     }),
                     overlay: overlay.as_deref(),
@@ -2031,17 +2033,18 @@ pub fn build_figure_pipeline(
     })
 }
 
-const TREE_VERTEX_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+const TREE_VERTEX_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     0 => Float32x3, // position
     1 => Float32x3, // normal
     2 => Float32x2, // uv
     3 => Float32,   // layer
     4 => Float32x3, // color
+    5 => Float32,   // open
 ];
 
 /// One tree-model vertex (`crate::trees::TreeVertex`): local position,
 /// normal, this corner's own tile coordinate, texture layer (or negative for
-/// "use `color`"), and a flat colour.
+/// "use `color`"), a flat colour, and how open the corner is (its baked AO).
 pub const fn tree_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<crate::trees::TreeVertex>() as wgpu::BufferAddress,
@@ -2051,13 +2054,14 @@ pub const fn tree_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 }
 
 const TREE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
-    5 => Float32x3, // position, relative to the node's origin
-    6 => Uint32,    // node_index into `node_origins`
+    6 => Float32x3, // position, relative to the node's origin
+    7 => Uint32,    // node_index into `node_origins`, and the morph
 ];
 
 /// One tree instance (`crate::trees::TreeInstance`): a node-relative
-/// position added to the model's local one, and the node's slot in the
-/// origins buffer the shader adds back.
+/// position added to the model's local one, and one word holding the node's
+/// slot in the origins buffer the shader adds back and the distance morph
+/// that moves the tree with the ground under it.
 pub const fn tree_instance_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<crate::trees::TreeInstance>() as wgpu::BufferAddress,
@@ -2479,12 +2483,19 @@ mod tests {
             }
         };
         let node = |id: NodeId, mesh: cubara_voxel::Mesh, trees: Vec<[i32; 3]>| MeshedNode {
+            trees: trees
+                .into_iter()
+                .map(|base| crate::trees::TreePlacement {
+                    base,
+                    height: 5,
+                    morph: 0,
+                })
+                .collect(),
             id,
             origin: [0, 0, 0],
             scale: 1.0,
             mesh,
             local_aabb: crate::culling::Aabb::new(glam::Vec3::ZERO, glam::Vec3::splat(32.0)),
-            trees,
             tree_model: crate::trees::TreeModel::Oak,
         };
         let mut swapped_out = Vec::new();

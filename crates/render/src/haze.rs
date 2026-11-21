@@ -6,12 +6,14 @@
 //! and `g(delta) = (1 - exp(-delta)) / delta`. `amount = 1 - exp(-tau)`.
 //!
 //! This function mirrors the WGSL line for line; the tests below run on the
-//! CPU, so the model is pinned with no GPU. The three shader sources that
-//! include the WGSL are defined here, once, as consts.
+//! CPU, so the model is pinned with no GPU. The shader sources that include
+//! the WGSL are defined here, once, as consts -- with `morph.wgsl`, the
+//! distance morph's factor, which the terrain and the trees share.
 
-/// `haze.wgsl` prepended to `mesh.wgsl`.
+/// `haze.wgsl` and `morph.wgsl` prepended to `mesh.wgsl`.
 pub(crate) const MESH_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/morph.wgsl"),
     include_str!("shaders/mesh.wgsl")
 );
 /// `haze.wgsl` prepended to `far.wgsl`.
@@ -24,9 +26,11 @@ pub(crate) const FIGURE_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
     include_str!("shaders/figure.wgsl")
 );
-/// `haze.wgsl` prepended to `trees.wgsl` (issue #332, R2).
+/// `haze.wgsl` and `morph.wgsl` prepended to `trees.wgsl` (issue #332, R2;
+/// the morph since #433: a tree rides the ground under it).
 pub(crate) const TREES_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/morph.wgsl"),
     include_str!("shaders/trees.wgsl")
 );
 

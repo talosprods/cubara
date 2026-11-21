@@ -969,14 +969,15 @@ pub struct MeshedNode {
     /// them against its anchor with one exact integer subtraction, so no
     /// absolute `f32` position ever enters this crate (issue #379).
     pub local_aabb: Aabb,
-    /// The blocks the trees this node's footprint grows stand on (the
-    /// trunk's base block, in world blocks; issue #332, R2 decision 2) --
-    /// empty for a node with none, which is every level-0 node (its trees
-    /// are already in `mesh`) and any coarse node whose footprint happens to
-    /// grow none.
-    pub trees: Vec<[i32; 3]>,
-    /// Which static model `trees` draws with: the real oak at levels 1-2,
-    /// boxes at level 3 (decision 3). Meaningless when `trees` is empty.
+    /// The trees this node's footprint grows: where each stands (the
+    /// trunk's base block, in world blocks; issue #332, R2 decision 2), its
+    /// trunk height and its morph (#433) -- empty for a node with none,
+    /// which is every level-0 node (its trees are already in `mesh`) and
+    /// any coarse node whose footprint happens to grow none.
+    pub trees: Vec<crate::trees::TreePlacement>,
+    /// Which model `trees` draws with: the real oak at levels 1-2, its
+    /// silhouette from level 3 (decision 3, #433). Meaningless when `trees`
+    /// is empty.
     pub tree_model: crate::trees::TreeModel,
 }
 
