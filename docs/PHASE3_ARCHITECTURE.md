@@ -1255,9 +1255,19 @@ well as its parent's shape.** Three parts:
   and cells merge only where they show the same of their parent -- the same
   quad, or two quads equally open all over.
 - **`mesh.wgsl` blends by the morph factor**: the light toward the parent's
-  openness, and, where the parent's layer is another, the colour toward
-  that texture, sampled with the gradients of the fragment's own (so at
-  the same mip) under a branch nearly every fragment skips.
+  openness over the whole band, and, where the parent's layer is another,
+  the colour toward that texture **over the band's second half**, sampled
+  with the gradients of the fragment's own (so at the same mip) under a
+  branch most fragments skip. The second half because a second sample is
+  the one real cost here and the first half is the near ground, most of
+  the frame: over the whole band the gate's ground eye lost 6.4% against
+  4.1% (below).
+- **A parent is made once for its children** (`cubara_world::mesh`'s
+  `ParentCache`, shared by the mesh pool's workers): its eight children
+  are requested together, and each needs the same parent generated and
+  meshed. An accelerator only (§3): keyed by the snapshot and the node,
+  and a node built with it is built exactly as without
+  (`a_parent_is_made_once_for_its_children_and_changes_nothing`).
 
 **The fourth vertex word was measured before it was built.** No spare bits
 were left in three words (#436 took the last); a padded 16-byte vertex
@@ -1294,13 +1304,13 @@ pixels over the tolerance, and its luminance in pixel-equivalents):
 | edge | main | the colour morph | luminance, main -> colour |
 |---|---|---|---|
 | 0<->1 (160 m) | 16,398 | **4,959** (-70%) | 2,368 -> 786 |
-| 1<->2 (288 m) | 12,933 | **4,705** (-64%) | 2,020 -> 1,003 |
-| 2<->3 (512 m) | 21,080 | **9,208** (-56%) | 3,982 -> 1,596 |
+| 1<->2 (288 m) | 12,933 | **4,735** (-63%) | 2,020 -> 1,003 |
+| 2<->3 (512 m) | 21,080 | **9,217** (-56%) | 3,982 -> 1,597 |
 
 The floor of the table above is 3,027, 3,657 and 6,594: what is left is
 what does not morph. At 512 m a little of it is new -- a cell partly over a
 pit wears the floor now, and its children beside the pit do not morph, so
-they swap from the floor's colour rather than the surface's (9,208 against
+they swap from the floor's colour rather than the surface's (9,217 against
 8,641 with the colour morph alone). The holes the morph opens are those of
 #436, unchanged (210 of 450 frames checked, at most 34 pixels; the same
 count as main's). `a_fully_morphed_level_draws_its_parents_colours` (GPU)
@@ -1309,3 +1319,18 @@ unmorphed: 20,558, 22,204 and 21,383 pixels of 921,600 over the tolerance
 with the parent's colours, 52,043, 50,104 and 47,546 without -- what is left
 is ground beside caves and pits and along the node floors that cut a slope
 (#436's limit), which neither colour nor shape can morph.
+
+**What it costs** (M3, not a quiet machine; alternating with main, two
+rounds each). `--bench gate` stays MET at Medium: ground 1,127 and 1,130 FPS
+on main against 1,078 and 1,079 (-4.4%), hill 1,082 and 1,083 against 1,059
+and 1,059 (-2.1%). About half of it is the second texture sample (light
+only, no texture blend: 1,084 and 1,060 in one round each), the rest the
+quads the parent's look cuts (+2.6% of the ground eye's vertices, +2.2% of
+the hill's) and the vertex stage's work. The flights keep HOLES at 0 (low:
+0 of 1,195 and 0 of 1,193; toward the mountain: 0 of 1,796 and 0 of 1,799)
+and their pops halve (p50 3,745 and 4,332 px on main against 1,665 and 1,512
+on the low flight). A child's parent is generated and meshed once for its
+siblings; the low flight's swap lag p50 / p90 / p99 is 100 / 151 / 251 and
+101 / 151 / 235 ms against main's 84 / 134 / 167 and 84 / 134 / 184 (119 /
+237 / 339 before the cache), the flight toward the mountain's 84 / 100 / 150
+against 84 / 100 / 134.
