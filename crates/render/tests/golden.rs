@@ -977,6 +977,20 @@ fn the_level_one_ring_morphs_its_heights_on_screen() {
 /// derived: a quarter of the 82,000 this frame shows, far over backend noise).
 const MORPH_MIN_MOVED_PIXELS: usize = 20_000;
 
+/// The least share of the frame turning a ring's trees on must change for
+/// them to count as drawn ([`trees_continue_past_the_first_ring`],
+/// [`level_three_trees_draw_as_silhouettes`]). **Chosen, not derived.** The
+/// two frames are rendered on one machine, one after the other, and the
+/// same scene renders byte-identically there
+/// (`the_same_scene_renders_byte_identically`): with no trees drawn the
+/// share is exactly 0. Measured with trees: 0.57% at levels 1-2, and at
+/// level 3 0.49% with the oak's silhouette (#433) where the two boxes
+/// before it, whose square canopy covered four more columns a tree and
+/// shaded none, drew more. Until #433 these tests borrowed the goldens'
+/// [`MAX_DIFFERING`] (0.5%), a cross-backend noise budget that does not
+/// apply to two renders on one machine.
+const TREES_DRAWN: f64 = 0.002;
+
 /// Mesh exactly `schedule`'s nodes around the origin (never level 0, which
 /// callers assert for themselves) with trees, and again with every node's
 /// `trees` cleared -- same terrain, same auto-framed camera either way, so
@@ -1064,10 +1078,9 @@ fn trees_continue_past_the_first_ring() {
         diff.max_channel_delta
     );
     assert!(
-        diff.differing_fraction > MAX_DIFFERING,
-        "turning trees on changed only {:.4}% of pixels (same threshold the \
-         goldens use for cross-backend noise) -- nothing R2 added is \
-         actually visible past the first ring",
+        diff.differing_fraction > TREES_DRAWN,
+        "turning trees on changed only {:.4}% of pixels -- nothing R2 added \
+         is actually visible past the first ring",
         diff.differing_fraction * 100.0
     );
 }
@@ -1097,7 +1110,7 @@ fn level_three_trees_draw_as_silhouettes() {
         diff.max_channel_delta
     );
     assert!(
-        diff.differing_fraction > MAX_DIFFERING,
+        diff.differing_fraction > TREES_DRAWN,
         "turning trees on at level 3 changed only {:.4}% of pixels -- the \
          silhouette model is not actually visible",
         diff.differing_fraction * 100.0
