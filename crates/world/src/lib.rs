@@ -19,6 +19,7 @@ pub mod chunk_state;
 pub mod durable;
 pub mod far;
 pub mod mesh;
+pub mod morph;
 pub mod node;
 mod noise;
 pub mod raycast;

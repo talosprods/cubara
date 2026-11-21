@@ -494,8 +494,8 @@ fn consistency_report() {
 /// under the rule for a cell's top (`WorldGen::cell_top`, and its sampled
 /// form for quads too wide to visit every column of), per quad width, with
 /// the highest column -- the first version of #423 -- beside it. The mean
-/// keeps the ground where it is and a summit keeps its height; the highest
-/// column can only raise the ground. Measured, so the choice is not a
+/// keeps the ground where it is and a summit keeps most of its height; the
+/// highest column can only raise the ground. Measured, so the choice is not a
 /// guess; `height_rule_study_report` is the study the rule was chosen by.
 #[test]
 #[ignore]
@@ -1500,8 +1500,9 @@ struct One {
     /// a pit, the level's own cave.
     pits: usize,
     /// Whether the footprint's highest column is a summit as the height rule
-    /// has it (the level-3 cell that holds it stands at its height, and so
-    /// every finer cell that holds it): `shape.peak` is then held to zero.
+    /// has it (the cell that holds it, at every level, stands at the mean of
+    /// its highest half-width cell): `shape.peak` is then held to a bound
+    /// per level, and never above level 0's.
     summit: bool,
 }
 
@@ -1549,9 +1550,8 @@ fn unshaded(setup: &Setup, f: &Faces, d: usize) -> Option<[f64; 3]> {
 
 /// Whether the highest of `fp`'s `counted` columns (the first, `z` then
 /// `x`) is a summit as `WorldGen::cell_top` has it at level 3: the first
-/// highest column of the nine level-3 cells around it -- and then, the rule
-/// says, of every finer cell's nine as well, so every level stands at its
-/// height there. A footprint cut out of a slope has its highest column at
+/// highest column of the nine level-3 cells around it -- and then of every
+/// finer cell's nine as well, so every level lifts its cell there. A footprint cut out of a slope has its highest column at
 /// its edge, with higher ground beyond: no summit, and no level owes it a
 /// peak.
 fn holds_a_summit(setup: &Setup, fp: Footprint, counted: &[bool]) -> bool {
@@ -2102,9 +2102,15 @@ fn a_mountain_is_made_of_the_same_from_afar() {
 ///   cell as below it and a swap has no direction. With the highest column
 ///   (the first version of #423) the same number was +1.8, +5.3 and +12.0
 ///   blocks on the worst footprint, and that is what sank at every ring;
-/// - **a summit keeps its height, exactly, at every level**: where the
-///   footprint's highest column is a summit (`holds_a_summit`), the level's
-///   highest top is level 0's. Enough footprints must hold one;
+/// - **a summit keeps its height at level 1 exactly, and most of it
+///   beyond**: where the footprint's highest column is a summit
+///   (`holds_a_summit`), the level's highest top is never above level 0's,
+///   and under it by no more than `SUMMIT`'s bound on any footprint and its
+///   mean over them. A coarse summit stands at the mean of its highest
+///   half-width cell (the summit study, `PHASE3_ARCHITECTURE.md` §9.3), so
+///   it gives up a little at levels 2 and 3 where the highest column (#432)
+///   gave up nothing and the plain mean gave up 0.8, 2.0 and 6.0 blocks on
+///   steep ground. Enough footprints must hold one;
 /// - **the skyline** -- the highest top along every row and line of columns
 ///   -- stays within a mean distance that starts near one block at level 1
 ///   and scales with the cell;
@@ -2116,7 +2122,9 @@ fn a_mountain_is_made_of_the_same_from_afar() {
 ///
 /// **The bounds are chosen, not derived**, just over the worst footprint
 /// measured: mean column 0.03, 0.06 and 0.26 blocks off, skyline 1.31, 3.26
-/// and 7.18 blocks at levels 1, 2, 3 (all three on cliffs). #423 starts the
+/// and 7.18 blocks at levels 1, 2, 3 (all three on cliffs); the summit 0,
+/// 2 and 6 blocks under level 0's at worst (a cliff), 0, 0.8 and 2.2 in the
+/// mean. #423 starts the
 /// skyline at 1 block for level 1: that holds on the hills and the gentle
 /// slopes (worst 0.70) and on all but one steep and three cliff footprints.
 /// The skyline here is a *distance*, and a cell's flat top stands off a
@@ -2127,7 +2135,11 @@ fn a_coarse_level_keeps_level_0s_shape() {
     /// Per level: the most the mean column may stand off level 0, and the
     /// most the skyline's mean distance may be.
     const SHAPE: [(f64, f64); 3] = [(0.1, 1.5), (0.1, 3.5), (0.3, 7.5)];
+    /// Per level: the most a summit may stand under level 0's on any one
+    /// footprint, and in the mean over the footprints that hold one.
+    const SUMMIT: [(f64, f64); 3] = [(0.0, 0.0), (2.0, 1.0), (6.0, 2.5)];
     let mut summits = [0usize; 3];
+    let mut summit_sum = [0f64; 3];
     for one in coarse_footprints() {
         let (lean_bound, skyline_bound) = SHAPE[one.level as usize - 1];
         let at = one.at();
@@ -2137,10 +2149,13 @@ fn a_coarse_level_keeps_level_0s_shape() {
         );
         let (peak, ..) = spread(&one.shape.peak);
         if one.summit {
-            summits[one.level as usize - 1] += 1;
-            assert_eq!(
-                peak, 0.0,
-                "{at}: the summit stands {peak:+.2} blocks off level 0's"
+            let l = one.level as usize - 1;
+            summits[l] += 1;
+            summit_sum[l] += peak;
+            assert!(
+                (-SUMMIT[l].0..=0.0).contains(&peak),
+                "{at}: the summit stands {peak:+.2} blocks off level 0's, allowed {} under and none over",
+                SUMMIT[l].0
             );
         }
         let (lean, ..) = spread(&one.shape.column);
@@ -2163,6 +2178,15 @@ fn a_coarse_level_keeps_level_0s_shape() {
         summits.iter().all(|&n| n >= 8),
         "footprints that hold a summit, per level: {summits:?}"
     );
+    for l in 0..3 {
+        let mean = summit_sum[l] / summits[l] as f64;
+        assert!(
+            mean >= -SUMMIT[l].1,
+            "level {}: the summits stand {mean:+.2} blocks off level 0's in the mean, allowed {} under",
+            l + 1,
+            SUMMIT[l].1
+        );
+    }
 }
 
 /// **Coarse caves nest: a pit only ever opens on approach** (issue #423,

@@ -211,6 +211,21 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-21 | Gate eye: hill at #432 (B), 2 runs, same conditions; 388 draws (203/674 nodes)⁹² | -- | -- | 1,088 / 1,084 (−4.6%) | 0.442 / 0.442 ms | 1.042 / 1.034 ms | `28f541a` |
 | 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹² | 0 | far only | 3,485 / 3,483 | 0.143 / 0.143 ms | 0.369 / 0.367 ms | `df1aaf3` |
 | 2026-11-21 | Gate eye: flight at #432 (B), 2 runs, same conditions; 0 draws⁹² | 0 | far only | 3,485 / 3,450 | 0.143 / 0.142 ms | 0.369 / 0.368 ms | `28f541a` |
+| 2026-11-21 | **Gate eye: ground** at main, A of the A/B/C for #437 (summits at the highest half's mean) and #436 (levels 0-2 morph), 2 runs (`GATE: MET at Medium` each), alternating A, B, C, A, B, C; AC power, battery 100% and charged, no thermal or performance warning recorded, built-in display only at brightness 0, external monitor unplugged, no agents running, 5 quiet minutes before the first run; 778 draws (437/1,439 nodes)⁹³ | -- | -- | 1,151 / 1,150 | 0.420 / 0.420 ms | 0.995 / 0.999 ms | `c3c862d` |
+| 2026-11-21 | Gate eye: ground at #437, 2 runs, same conditions; 778 draws⁹³ | -- | -- | 1,156 / 1,154 (+0.4%) | 0.419 / 0.418 ms | 0.990 / 0.988 ms | `bf1dd42` |
+| 2026-11-21 | Gate eye: hill at main (A), 2 runs, same conditions; 388 draws (203/674 nodes)⁹³ | -- | -- | 1,090 / 1,085 | 0.442 / 0.442 ms | 1.042 / 1.081 ms | `c3c862d` |
+| 2026-11-21 | Gate eye: hill at #437, 2 runs, same conditions; 388 draws⁹³ | -- | -- | 1,092 / 1,092 (+0.4%) | 0.441 / 0.441 ms | 1.032 / 1.037 ms | `bf1dd42` |
+| 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,486 / 3,485 | 0.143 / 0.143 ms | 0.371 / 0.373 ms | `c3c862d` |
+| 2026-11-21 | Gate eye: flight at #437, 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,488 / 3,487 | 0.142 / 0.142 ms | 0.367 / 0.361 ms | `bf1dd42` |
+| 2026-11-21 | **Gate eye: ground** at #436 (levels 0-2 morph their heights across the ring edge), C of the A/B/C in footnote 93, 2 runs (`GATE: MET at Medium` each), same conditions; 792 draws (437/1,439 nodes), 12.8% more triangles than main (1,559,548 against 1,382,520)⁹³ ⁹⁴ | -- | -- | 1,122 / 1,124 (−2.5%) | 0.433 / 0.431 ms | 1.020 / 0.998 ms | `35bc349` |
+| 2026-11-21 | Gate eye: hill at #436, 2 runs, same conditions; 390 draws⁹³ | -- | -- | 1,080 / 1,080 (−0.7%) | 0.448 / 0.448 ms | 1.051 / 1.049 ms | `35bc349` |
+| 2026-11-21 | Gate eye: flight at #436, 2 runs, same conditions; 0 draws⁹³ | 0 | far only | 3,487 / 3,482 | 0.142 / 0.143 ms | 0.367 / 0.369 ms | `35bc349` |
+| 2026-11-21 | **Gate eye: ground** at main (#436 merged), A of the A/B for #438 (the colour morph), 2 runs (`GATE: MET at Medium` each), alternating A, B, A, B; AC power, battery 100% and charged, no thermal or performance warning recorded, screen locked with no input for 10 hours, no agents running, 5 quiet minutes before the first run; 792 draws (437/1,439 nodes)⁹⁵ | -- | -- | 1,125 / 1,126 | 0.431 / 0.430 ms | 1.021 / 1.008 ms | `b2fc847` |
+| 2026-11-21 | **Gate eye: ground** at #438 (a morphing node draws its parent's colours and shade; coarse tops show pit floors; 16-byte vertex), B, 2 runs (`GATE: MET at Medium` each), same conditions; 792 draws⁹⁵ | -- | -- | 1,078 / 1,078 (−4.2%) | 0.450 / 0.449 ms | 1.030 / 1.034 ms | `cf9a623` |
+| 2026-11-21 | Gate eye: hill at main (A), 2 runs, same conditions; 390 draws (203/674 nodes)⁹⁵ | -- | -- | 1,083 / 1,084 | 0.446 / 0.446 ms | 1.052 / 1.050 ms | `b2fc847` |
+| 2026-11-21 | Gate eye: hill at #438, 2 runs, same conditions; 390 draws⁹⁵ | -- | -- | 1,059 / 1,059 (−2.2%) | 0.456 / 0.457 ms | 1.070 / 1.066 ms | `cf9a623` |
+| 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹⁵ | 0 | far only | 3,489 / 3,488 | 0.142 / 0.143 ms | 0.370 / 0.377 ms | `b2fc847` |
+| 2026-11-21 | Gate eye: flight at #438, 2 runs, same conditions; 0 draws⁹⁵ | 0 | far only | 3,487 / 3,489 | 0.142 / 0.142 ms | 0.367 / 0.371 ms | `cf9a623` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3275,3 +3290,38 @@ The two 1920x1080 flights from `scripts/check-phase-gate.sh`, both runs, main th
 | toward a mountain, #432 | 0 of 1,798; 0 of 1,799 | 0; 0 | 186; 184 | **3,040** / 39,136; **3,712** / 43,942 | 1; 1 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 167 |
 
 Main's first low flight shows the hole #432 closes (a pit's floor seen as sky while the node under it loads, `docs/PHASE3_ARCHITECTURE.md` §9.5); it is intermittent there, which is why the second run reads 0. The cost of closing it is the swap lag's tail on the low flight (p90 100 to 117 ms, p99 117 to 150 ms): a split node is now searched as open, so the first search after a crossing asks for about 23% more nodes, each generated, found hidden and dropped. That drop counts as a swap, which is why POPS has more swaps (173 against 118) and a higher p50 on the low flight while its p99 falls; toward a mountain the swap pixels' median falls from 11,227 to 3,040. STALE (13 to 14 against 12 to 13) predates this PR and is not changed by it.
+
+⁹³ **#437 (a coarse summit stands at its highest half's mean) and #436 (levels 0-2 morph their heights) against main on the M3, one A/B/C at `c3c862d`, `bf1dd42` and `35bc349`, 2026-11-21.** Release builds, `--bench gate` twice per binary alternating main, #436, #437, then each flight twice per binary, in one window: AC power with the battery at 100% and charged, no thermal or performance warning recorded by `pmset -g therm`, the built-in display only, at brightness 0, the external monitor unplugged, no agents or builds running, and 5 quiet minutes before the first run. Both runs of each are in the rows as they came out; #436's rows are in its own PR.
+
+#437 changes only which height a coarse cell holding a summit takes, so it draws the same nodes (778 at the ground eye, 388 at the hill eye) and 0.3% fewer triangles at the ground eye (1,378,112 against 1,382,520); every eye is within 0.5% of main. The flights, main then #437, both runs:
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | 0 of 1,197; 0 of 1,198 | 14; 14 | 175; 173 | 6,409 / 42,349; 6,266 / 42,185 | 84 / 117 / 150 / 150; 83 / 117 / 150 / 150 |
+| low, #437 | 0 of 1,199; 0 of 1,199 | 14; 15 | 171; 175 | 6,616 / 39,000; 6,422 / 38,452 | 83 / 117 / 150 / 150 (both) |
+| toward a mountain, main | 0 of 1,799; 0 of 1,799 | 0; 0 | 185; 189 | 3,246 / 42,974; 3,704 / 44,849 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 167 |
+| toward a mountain, #437 | 0 of 1,799; 0 of 1,799 | 0; 0 | 186; 190 | 3,197 / 44,743; 3,282 / 44,805 | 83 / 117 / 150 / 167; 83 / 100 / 133 / 167 |
+
+The mountain zoom pairs (a far view cropped and enlarged against the near view of the same ground, judged by a vision model) put level 3 against level 1 at severity 1 with this rule, against 3 ("pillars and spires along the crests") before it; the plain mean, measured as a reference, puts level 3 against level 2 at 4 (the peak sinks).
+
+⁹⁴ **#436's two flights against main, from the A/B/C in footnote 93** (the same window and conditions; main is `c3c862d`, #436 is `35bc349`, both runs of each):
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 / max | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | 0 of 1,197; 0 of 1,198 | 14; 14 | 175; 173 | 6,409 / 42,349 / 53,263; 6,266 / 42,185 / 52,976 | 84 / 117 / 150 / 150; 83 / 117 / 150 / 150 |
+| low, #436 | 0 of 1,194; 0 of 1,188 | 14; 14 | 203; 198 | 3,852 / 39,621 / 66,724; 4,601 / 49,857 / 61,061 | 84 / 134 / 151 / 168; 84 / 135 / 168 / 168 |
+| toward a mountain, main | 0 of 1,799; 0 of 1,799 | 0; 0 | 185; 189 | 3,246 / 42,974 / 71,682; 3,704 / 44,849 / 71,808 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 167 |
+| toward a mountain, #436 | 0 of 1,799; 0 of 1,799 | 0; 0 | 208; 208 | 3,223 / **22,347** / 25,887; 3,138 / **22,352** / 27,585 | 83 / 100 / 133 / 183 (both) |
+
+Toward a mountain the morph halves the worst swaps (p99 22,347 against 42,974 pixels; max 26,000 against 72,000), which is what it is for: heights slide over a band instead of stepping in one frame. A swap still counts its pixels when only shading changes, which is the residual (riser materials and ambient occlusion per level, trees). The cost is 2.5% at the ground eye from the triangles the per-cell move keys add, and a longer swap-lag tail on both flights (max 168 and 183 ms against 150 and 167). No hole on either flight.
+
+⁹⁵ **#438's quiet A/B and its two flights** (main is `b2fc847`, #438 is `cf9a623`, both built in release from the same worktree at 10:39 and checked distinct; the run waited for 5 quiet minutes, then gate A, B, A, B, then each flight A, B twice; both runs of each):
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 / max | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | 0 of 1,194; 0 of 1,196 | 15; 15 | 202; 207 | 3,962 / 38,584 / 48,920; 4,035 / 36,655 / 65,378 | 84 / 134 / 168 / 168; 84 / 134 / 151 / 167 |
+| low, #438 | 0 of 1,194; 0 of 1,187 | 16; 16 | 258; 254 | **1,650** / 39,233 / 45,777; **1,827** / 40,286 / 64,951 | 101 / 151 / 235 / 235; 101 / 152 / 253 / 253 |
+| toward a mountain, main | 0 of 1,798; 0 of 1,798 | 0; 0 | 204; 214 | 2,984 / 24,937 / 34,100; 2,886 / 25,379 / 32,631 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 184 |
+| toward a mountain, #438 | 0 of 1,798; 0 of 1,799 | 0; 0 | 226; 227 | 2,821 / **17,819** / 32,721; 2,590 / **18,612** / 39,209 | 83 / 117 / 150 / 200; 83 / 100 / 150 / 200 |
+
+A swap still counts every pixel whose colour changes, so the typical swap on the low flight now changes less than half the pixels it did (p50 1,650 and 1,827 against 3,962 and 4,035), and the worst swaps toward the mountain drop by a quarter (p99 17,819 and 18,612 against 24,937 and 25,379). The cost is 4.2% at the ground eye and 2.2% at the hill eye (CPU/frame +0.019 and +0.010 ms): the extra quads cut where the parent's quads are (+2.6% and +2.2% vertices at the two eyes) and the texture cross-fade's second sample over the band's second half; a padded 16-byte vertex on its own measured free before the build (PR #438). The longer swap lag on the low flight (p99 235 and 253 against 151 and 168 ms) is each sibling group's parent being generated and meshed once (`ParentCache`). No hole on either flight. Gemini's zoom pairs (the lead's check, not a test) put every level-0 to level-3 pair at severity 1 against main's 3 at the 700 m to 220 m summit and the 1,200 m to 700 m grey stone.

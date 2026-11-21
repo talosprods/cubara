@@ -453,6 +453,10 @@ pub struct Flight {
     pub every: f32,
     pub size: (u32, u32),
     pub quality: FarQuality,
+    /// Whether the levels of detail morph into each other over distance
+    /// (issue #380's study, the game's default) or swap as before
+    /// (`--no-morph`), so one binary flies both.
+    pub morph: bool,
 }
 
 /// Where the eye is `t` seconds into `flight`.
@@ -1176,6 +1180,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
     use crate::game::{load_item_registry, load_recipe_book, Game};
     let mut game = Game::new();
     let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
+    renderer.set_morph(crate::streaming::morph_params());
     let layers = assets.layers;
     let registry = Arc::new(assets.registry);
     let items = load_item_registry();
@@ -1283,6 +1288,9 @@ impl Streamed {
         let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
         if !sky {
             renderer.set_clear_color(NOTHING);
+        }
+        if flight.morph {
+            renderer.set_morph(crate::streaming::morph_params());
         }
         let layers = assets.layers;
         let registry = Arc::new(assets.registry);
@@ -2163,6 +2171,7 @@ mod tests {
             every: 0.5,
             size: (64, 32),
             quality: FarQuality::High,
+            morph: true,
         }
     }
 
@@ -2468,6 +2477,7 @@ mod tests {
             every: 1.0,
             size: (1920, 1080),
             quality: FarQuality::High,
+            morph: true,
         };
         let mut runs = Vec::new();
         for _ in 0..3 {

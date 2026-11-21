@@ -990,7 +990,8 @@ pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TopRule {
     /// `WorldGen::cell_top`: the mean of the covered columns, and the
-    /// highest of them where the square holds a summit (#423).
+    /// highest mean of its four half-width squares where the square holds
+    /// a summit (#423).
     Exact,
     /// `WorldGen::cell_top_sampled` over an `n` x `n` grid of the covered
     /// columns: what a quad too large to visit every column of affords.

@@ -579,7 +579,7 @@ pub fn run(
         } else {
             cubara_render::Lighting::default()
         };
-        scene.set_camera(&device, &queue, vp, eye, anchor, lighting);
+        scene.set_camera(&device, &queue, vp, eye, anchor, lighting, None);
         // `lighting` is the same value every frame in one bench run, so
         // after the first frame's rebuild lands this is a free no-op; on
         // the first frame it keeps a cold pipeline-specialization compile

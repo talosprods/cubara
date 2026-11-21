@@ -192,12 +192,12 @@ pub fn load_tree_models(
     crate::trees::build_tree_models(device, queue, &assets.registry, &structures, &layer_of)
 }
 
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32];
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32];
 
 /// The GPU vertex layout for [`Vertex`], which is plain data in `cubara-voxel` and
 /// knows nothing about the GPU (`ARCHITECTURE.md` Rule 3/4). The layout lives here,
-/// with the code that owns pipelines. Three `u32` words, unpacked in the shader --
+/// with the code that owns pipelines. Four `u32` words, unpacked in the shader --
 /// see `docs/PHASE1_ARCHITECTURE.md` §5.2 for the bit layout.
 ///
 /// It must stay in step with the field order of [`Vertex`]; `vertex_layout_matches_vertex`
@@ -379,8 +379,50 @@ pub struct FrameUniform {
     /// [`crate::haze::Haze::uniform`].
     haze: [f32; 4],
     /// [`crate::anchor::anchor_f32`]: the render anchor, `.w` unused.
-    /// Appended last so every shader's prefix struct stays valid.
+    /// Appended after the lighting so every shader's prefix struct stays
+    /// valid.
     anchor: [f32; 4],
+    /// The distance morph's bands ([`MorphParams`]): `(start, end)` of
+    /// levels 0 and 1 in the first, 2 and 3 in the second. Only `mesh.wgsl`
+    /// reads past `anchor`.
+    morph_band: [[f32; 4]; 2],
+    /// The eye each level's morph metric is measured from, relative to the
+    /// anchor -- the camera's, except in a measurement that moves one
+    /// level's morph on its own. `[0].w` is the metric's vertical squash.
+    morph_eye: [[f32; 4]; 4],
+}
+
+/// A morph band no metric reaches: the level does not morph.
+const MORPH_NEVER: f32 = 1.0e30;
+
+/// The distance morph's parameters (issue #380's study; CDLOD geomorphing,
+/// `cubara_world::morph`): per level, the band of the morph metric over which
+/// that level's vertices move to their parent's height, and the metric's
+/// vertical squash. The caller works these out from its own ring schedule
+/// (Rule 3: this crate has none); [`MorphParams::OFF`] moves nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MorphParams {
+    /// `(start, end)` per level, in blocks of the metric; `None` for a
+    /// level that does not morph.
+    pub bands: [Option<(f32, f32)>; 4],
+    /// How many times vertical distance counts in the metric.
+    pub squash: f32,
+}
+
+impl MorphParams {
+    /// Nothing morphs: every vertex is drawn where it was meshed.
+    pub const OFF: Self = Self {
+        bands: [None; 4],
+        squash: 1.0,
+    };
+
+    fn band_uniform(&self) -> [[f32; 4]; 2] {
+        let b = |level: usize| self.bands[level].unwrap_or((MORPH_NEVER, MORPH_NEVER));
+        [
+            [b(0).0, b(0).1, b(1).0, b(1).1],
+            [b(2).0, b(2).1, b(3).0, b(3).1],
+        ]
+    }
 }
 
 impl FrameUniform {
@@ -421,7 +463,20 @@ impl FrameUniform {
             ],
             haze: lighting.haze.uniform(),
             anchor: anchor::anchor_f32(anchor),
+            morph_band: MorphParams::OFF.band_uniform(),
+            morph_eye: [[eye.x, eye.y, eye.z, 1.0]; 4],
         }
+    }
+
+    /// This frame with the distance morph `params` on, each level's metric
+    /// measured from `eyes` (relative to the anchor).
+    pub fn with_morph(mut self, params: &MorphParams, eyes: [glam::Vec3; 4]) -> Self {
+        self.morph_band = params.band_uniform();
+        for (slot, eye) in self.morph_eye.iter_mut().zip(eyes) {
+            *slot = [eye.x, eye.y, eye.z, 0.0];
+        }
+        self.morph_eye[0][3] = params.squash;
+        self
     }
 }
 
@@ -687,6 +742,12 @@ pub struct Renderer {
     /// the fog past where anything is, leaving the old hard edge exactly as
     /// visible as before this existed.
     render_radius_blocks: f32,
+    /// The distance morph's bands (issue #380's study), the caller's
+    /// ([`set_morph`](Self::set_morph)); off until it says otherwise.
+    morph: MorphParams,
+    /// Where each level's morph is measured from instead of the camera --
+    /// a measurement's ([`set_morph_eyes`](Self::set_morph_eyes)).
+    morph_eyes: Option<[glam::DVec3; 4]>,
 }
 
 impl Renderer {
@@ -939,6 +1000,8 @@ impl Renderer {
             // the first `render()` call tells this how far streaming
             // actually reaches.
             render_radius_blocks: 0.0,
+            morph: MorphParams::OFF,
+            morph_eyes: None,
         };
         (renderer, mesh_assets)
     }
@@ -1466,6 +1529,10 @@ impl Renderer {
         // call -- `cubara-app`'s idea of how far streaming actually reaches
         // (Rule 3: this crate has no schedule to derive it from itself).
         let (fog_start, fog_end) = Lighting::fog_range(self.render_radius_blocks);
+        let eyes = self
+            .morph_eyes
+            .unwrap_or([camera.eye; 4])
+            .map(|eye| anchor::relative_eye(self.anchor, eye));
         self.scene.set_camera(
             &self.device,
             &self.queue,
@@ -1477,7 +1544,22 @@ impl Renderer {
                 fog_end,
                 ..Default::default()
             },
+            Some((self.morph, eyes)),
         );
+    }
+
+    /// The distance morph's bands from now on (issue #380's study):
+    /// worked out by the caller from its ring schedule.
+    pub fn set_morph(&mut self, params: MorphParams) {
+        self.morph = params;
+    }
+
+    /// Measure each level's morph from these eyes instead of the camera's
+    /// (`None`: the camera's, which is every frame of the game). For a
+    /// measurement that moves one level's morph while the camera stands
+    /// still, or the reverse.
+    pub fn set_morph_eyes(&mut self, eyes: Option<[glam::DVec3; 4]>) {
+        self.morph_eyes = eyes;
     }
 
     /// Take whatever GPU timestamps have come back, and judge the backend on
@@ -1724,7 +1806,15 @@ pub fn build_mesh_pipeline_from_module(
             module: shader,
             entry_point: Some("vs_main"),
             buffers: &[Some(vertex_layout())],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            // The vertex stage reads `ao_floor` (R1c's AO, and the colour
+            // morph's parent light), so it takes the constants too. Until the
+            // colour morph it took none and lit every vertex with the
+            // shader's own defaults -- the same as `Lighting::default()`'s,
+            // which is why nothing showed (`the_ao_floor_reaches_the_vertex_stage`).
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
@@ -2454,12 +2544,16 @@ mod tests {
             layout.array_stride,
             std::mem::size_of::<Vertex>() as wgpu::BufferAddress
         );
-        assert_eq!(layout.array_stride, 12, "three packed u32 words");
-        assert_eq!(layout.attributes.len(), 3, "packed0, packed1, packed2");
+        assert_eq!(layout.array_stride, 16, "four packed u32 words");
+        assert_eq!(
+            layout.attributes.len(),
+            4,
+            "packed0, packed1, packed2, packed3"
+        );
 
         // Offsets must land on the real field boundaries.
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 4, 8]);
+        assert_eq!(offsets, vec![0, 4, 8, 12]);
     }
 
     #[test]
@@ -2501,7 +2595,7 @@ mod tests {
         assert_eq!(f.anchor, [4096.0, -8192.0, 1_048_576.0, 0.0]);
         // Eight vec4-sized fields after the matrix: what every shader's
         // `Frame` struct declares, in this order.
-        assert_eq!(std::mem::size_of::<FrameUniform>(), 64 + 8 * 16);
+        assert_eq!(std::mem::size_of::<FrameUniform>(), 64 + 14 * 16);
     }
 
     /// Issue #379: the view-projection a pose yields against its anchor is

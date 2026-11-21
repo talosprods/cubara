@@ -34,6 +34,15 @@ struct Frame {
     // The render anchor (issue #379): every position in this shader, `eye`
     // included, is relative to it; only the height haze wants it back.
     anchor: vec4<f32>,
+    // The distance morph (issue #380's study; CDLOD geomorphing,
+    // `cubara_world::morph`): per level, the band of the morph metric over
+    // which that level's vertices move to their parent's height -- (start,
+    // end) of levels 0 and 1 in [0], of 2 and 3 in [1]; a level that does
+    // not morph has a band no metric reaches -- and the eye each level's
+    // metric is measured from (the camera's but in a measurement), relative
+    // to the anchor. morph_eye[0].w is the metric's vertical squash.
+    morph_band: array<vec4<f32>, 2>,
+    morph_eye: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -93,6 +102,7 @@ struct VsIn {
     @location(0) packed0: u32,
     @location(1) packed1: u32,
     @location(2) packed2: u32,
+    @location(3) packed3: u32,
 };
 
 struct VsOut {
@@ -105,10 +115,15 @@ struct VsOut {
     // varying carrying the already-resolved vector (isolated A/B/C
     // diagnostic in the package-4 research).
     @location(0) @interpolate(flat) normal: vec3<f32>,
-    // x: baked AO (0..1), y: height haze (0..1), both per vertex.
-    @location(1) ao_haze: vec2<f32>,
+    // x: baked AO (0..1), y: height haze (0..1), z: how far the colour
+    // has blended to the parent layer's (the colour morph, 0 where the two
+    // layers are one), all per vertex.
+    @location(1) ao_haze: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) @interpolate(flat) layer: u32,
+    // The texture layer (low 16 bits) and the parent level's layer here
+    // (high 16; the colour morph, the layer itself where there is none),
+    // in one flat varying: the fragment stage reads one input fewer.
+    @location(3) @interpolate(flat) layers: u32,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -133,20 +148,37 @@ fn vs_main(in: VsIn) -> VsOut {
     let z = f32((in.packed0 >> 20u) & 0x3FFu);
     let ao_raw = (in.packed0 >> 30u) & 0x3u;
 
-    // word 1: tex_layer:12 face:3 u:8 v:8 (1 spare)
+    // word 1: tex_layer:12 face:3 u:8 v:8 latent:1
     let tex_layer = in.packed1 & 0xFFFu;
     let face = (in.packed1 >> 12u) & 0x7u;
     let u = f32((in.packed1 >> 15u) & 0xFFu);
     let v = f32((in.packed1 >> 23u) & 0xFFu);
 
-    // word 2: node_index:16 corner_u:1 corner_v:1 ao_width_log2:2 (12 spare)
+    // word 2: node_index:16 corner_u:1 corner_v:1 ao_width_log2:2
+    //         morph_level:2 morph_delta:10 (read below)
     let node_index = in.packed2 & 0xFFFFu;
     let corner = (in.packed2 >> 16u) & 3u;
     let ao_width_log2 = (in.packed2 >> 18u) & 3u;
 
     let local_pos = vec3<f32>(x, y, z);
     let node_origin = node_origins[node_index];
-    let on_grid = node_origin.xyz + local_pos * node_origin.w;
+    let on_lattice = node_origin.xyz + local_pos * node_origin.w;
+
+    // The distance morph (issue #380's study): word 2's bits 20-21 are the
+    // level whose band moves this vertex, bits 22-31 how far up it moves at
+    // full morph, signed, in quarter blocks (`Vertex::with_morph`) -- to its
+    // parent cell's height. The factor is `cubara_world::morph::morph_factor`
+    // of the selection's own distance (`morph_metric`), taken where the
+    // vertex was meshed, so every vertex at one place moves alike and no
+    // seam opens between the faces that share it.
+    let morph_level = (in.packed2 >> 20u) & 3u;
+    let morph_delta = f32(bitcast<i32>(in.packed2) >> 22u) * 0.25;
+    let band_pair = frame.morph_band[morph_level >> 1u];
+    let band = select(band_pair.xy, band_pair.zw, (morph_level & 1u) == 1u);
+    let morph_rel = on_lattice - frame.morph_eye[morph_level].xyz;
+    let morph_metric = max(length(morph_rel.xz), frame.morph_eye[0].w * abs(morph_rel.y));
+    let morph = clamp((morph_metric - band.x) / max(band.y - band.x, 1e-6), 0.0, 1.0);
+    let on_grid = on_lattice + vec3<f32>(0.0, morph_delta * morph, 0.0);
     // Seal the cracks a greedy mesh's T-junctions leave: where a long quad's
     // edge passes a corner of the shorter quads beside it, the corner lands a
     // rounding error off the projected edge, and now and then a pixel centre
@@ -167,7 +199,13 @@ fn vs_main(in: VsIn) -> VsOut {
         select(0.0, su, ua == 1u) + select(0.0, sv, va == 1u),
         select(0.0, su, ua == 2u) + select(0.0, sv, va == 2u),
     );
-    let world_pos = on_grid + outward * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
+    // A latent riser (word 1's top bit, `Vertex::with_latent`) has no
+    // height until the morph opens it: its vertical seal grows with the
+    // morph, so unmorphed it stays flat and morphed it overlaps the top face
+    // beside it like any riser.
+    let latent = (in.packed1 >> 31u) == 1u;
+    let seal = outward * vec3<f32>(1.0, select(1.0, morph, latent), 1.0);
+    let world_pos = on_grid + seal * (CRACK_SEAL * distance(on_grid, frame.eye.xyz));
 
     // AO (R1c, issue #327 decision 5): a coarse top face's corners carry
     // `ao_width_log2`, log2 of the cell's own width in blocks (`Vertex::
@@ -183,12 +221,30 @@ fn vs_main(in: VsIn) -> VsOut {
     let ao_floor_scaled = mix(ao_floor, 1.0, 1.0 - 1.0 / ao_width);
     let ao = mix(ao_floor_scaled, 1.0, ao_frac);
 
+    // The colour morph (word 3, `Vertex::with_parent`): the texture layer
+    // and the openness the parent level draws where this vertex goes at full
+    // morph. Its light and its colour blend toward them by the same factor
+    // that moves it, so at the end of its band a node shows its parent's
+    // colours as well as its parent's shape, and the swap changes neither.
+    // Bits as `Vertex::with_parent` packs them: layer 0-11, openness 12-19
+    // (in 255ths), has-parent 20.
+    let has_parent = (in.packed3 & (1u << 20u)) != 0u;
+    let parent_layer = select(tex_layer, in.packed3 & 0xFFFu, has_parent);
+    let parent_open = f32((in.packed3 >> 12u) & 0xFFu) / 255.0;
+    let colour_morph = select(0.0, morph, has_parent);
+    let lit_ao = mix(ao, mix(ao_floor, 1.0, parent_open), colour_morph);
+    // The texture blends over the second half of the band only: its cost is
+    // a second sample, and the first half is the near ground, most of the
+    // frame's pixels (`docs/PHASE3_ARCHITECTURE.md` §9.6). The light needs
+    // no sample and blends over the whole band.
+    let blend = select(0.0, clamp(2.0 * colour_morph - 1.0, 0.0, 1.0), parent_layer != tex_layer);
+
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
+    out.ao_haze = vec3<f32>(lit_ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y), blend);
     out.uv = vec2<f32>(u, v);
-    out.layer = tex_layer;
+    out.layers = tex_layer | (parent_layer << 16u);
     return out;
 }
 
@@ -207,7 +263,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // ever sees it -- see vs_main's `ao_floor_scaled`).
     let ao = in.ao_haze.x;
 
-    let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
+    // The texture's screen-space gradients, taken here in uniform control
+    // flow, so the parent layer can be sampled at the same mip under a
+    // branch that most fragments skip (`textureSampleGrad`).
+    let uv_dx = dpdx(in.uv);
+    let uv_dy = dpdy(in.uv);
+    let layer = in.layers & 0xFFFFu;
+    var tex = textureSample(block_textures, block_sampler, in.uv, layer);
+    if (in.ao_haze.z > 0.0) {
+        let parent = textureSampleGrad(block_textures, block_sampler, in.uv, in.layers >> 16u, uv_dx, uv_dy);
+        tex = mix(tex, parent, in.ao_haze.z);
+    }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
     let lit = tex.rgb * sun_color * brightness * ao;
 

@@ -506,9 +506,10 @@ pub fn ground_layer(depth: i32) -> GroundLayer; // Surface | Soil | Stone
 
 /// A cell's drawn top block over the columns [x0, x0 + w) x [z0, z0 + w):
 /// the MEAN of their surface_height, rounded to the nearest block (a half
-/// to the even one) -- and the HIGHEST of them where the cell holds a
-/// summit: where the first highest column of the nine cells around it is
-/// one of its own. cell_top(x, z, 1) is surface_height(x, z).
+/// to the even one) -- and, where the cell holds a summit (the first
+/// highest column of the nine cells around it is one of its own), the
+/// highest MEAN OF ITS FOUR HALF-WIDTH CELLS. cell_top(x, z, 1) is
+/// surface_height(x, z).
 pub fn cell_top(&self, x0: i32, z0: i32, w: i32) -> i32;
 
 /// The same over an n x n grid of the cell's columns, centred in the cell,
@@ -522,22 +523,33 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
 ```
 
 - **Height: the mean of the covered columns, to the block, with summits
-  kept; at every level.** A coarse cell's top, a far quad's top and a
+  lifted; at every level.** A coarse cell's top, a far quad's top and a
   level-0 column's top are `cell_top` at three widths. The mean is rounded
   to the nearest block, a half to the even one, so that rounding lifts
   nothing. A cell that **holds a summit** -- the first highest column (`z`,
-  then `x`) of the nine cells around it is one of its own -- stands at
-  that column instead. The reasons, in §9.4's study:
+  then `x`) of the nine cells around it is one of its own -- stands at the
+  **highest mean of the four half-width cells it splits into** instead
+  (the summit study below; until then it stood at that highest column).
+  The reasons, in §9.4's study and the summit study:
   - a swap replaces a cell by the four finer cells under it, so what
     changes on screen is the coarser top minus the finer ones. Under the
     mean that difference has no direction: as many columns stand above
     the coarser cell as below it, and a slope neither sinks nor rises as a
     ring edge passes over it;
   - the mean alone lowers what stands out, and a peak would grow back
-    edge by edge. A summit is kept exactly, **and it nests**: the finer
-    cell that holds the same column holds a summit too (its nine cells lie
-    inside the coarser cell's nine), down to the column itself
-    (`a_summit_stands_at_every_finer_level`).
+    edge by edge: six blocks under level 0 at level 3 on steep ground;
+  - the highest column keeps a peak exactly but turns one high column
+    into a tower the cell's width, and a crest into a row of them (the
+    lead's mountain zoom test, 2026-11-21: "pillars and spires along the
+    crests" at level 3 that level 1 does not show). The mean of the
+    highest half-width cell is what the next finer level would draw there
+    by the mean alone, so a coarse summit is never more than twice as wide
+    as ground that really stands that high -- at level 1 its halves are
+    single columns and it stands at the highest column, as before -- and a
+    peak erodes a step per level instead of jumping from its column to
+    the whole cell (`a_lone_high_column_raises_no_tower`,
+    `a_coarse_crest_grows_few_towers`,
+    `the_owners_mountain_keeps_its_peak`).
 
   **Decision 1 of #423 named the max.** PR 2 was first built on it and its
   review measured what it does: every slope stands higher the coarser the
@@ -596,10 +608,13 @@ quad's height or a far face's colour):
   columns and get the same number, so the 1,024 m join is exact (both are on
   the 8-block grid) -- and there is no row height left to get wrong.
 - above 8 blocks the exact form costs `q^2` heights a quad (and a look at
-  the quads around one that might hold a summit), so the far terrain samples
-  4 x 4 columns centred in the quad. Its mean is a sample of the quad's, it
-  can miss a peak narrower than the spacing, and its summits do not nest (a
-  quad half as wide looks at columns its parent skips); §9.6 measures it.
+  the quads around one that might hold a summit), so the far terrain calls
+  `cell_top_sampled` with `n = 4`: the same rule over 4 x 4 columns centred
+  in the quad (a summit at the highest mean of the grid's four 2 x 2
+  quarters). Its mean is a sample of the quad's, it can miss a peak
+  narrower than the spacing, and its summits do not nest (a quad half as
+  wide looks at columns its parent skips); the harness's `stepped` rows
+  measure it per quad width, below, and §9.8 measures it against level 0.
 - wall colour facing direction `d` = the `Materials` mixed by
   `ground_faces(x0, z0, q, n).sides[d]`, times the openness; top colour =
   `Materials.top` times `top_open`. Not `riser_colour` of the wall's own
@@ -609,19 +624,102 @@ quad's height or a far face's colour):
 (`stepped_top_rule_report`; drawn minus level 0 on steep ground, mean over
 columns, with the highest column -- the first version of #423 -- beside it):
 
-| cell width | `cell_top` | `cell_top_sampled`, `n = 4` | the highest column |
-|---|---|---|---|
-| 2 (level 1) | +0.01 | | +1.2 |
-| 4 (level 2) | +0.02 | | +3.5 |
-| 8 (level 3, far join) | +0.09 | +0.13 | +8.0 |
-| 16 | +0.6 | +0.6 | +16.6 |
-| 32 | +3.8 | +2.4 | +30.9 |
-| 64 | +24.7 | +16.0 | +50.1 |
+| cell width | `cell_top` | `cell_top_sampled`, `n = 4` | the highest column | `cell_top` with a summit at its highest column (#432) |
+|---|---|---|---|---|
+| 2 (level 1) | +0.01 | | +1.2 | +0.01 |
+| 4 (level 2) | +0.02 | | +3.5 | +0.02 |
+| 8 (level 3, far join) | +0.06 | +0.09 | +8.0 | +0.09 |
+| 16 | +0.3 | +0.3 | +16.6 | +0.6 |
+| 32 | +2.0 | +1.4 | +30.9 | +3.8 |
+| 64 | +11.4 | +10.2 | +50.1 | +24.7 |
 
 Up to 8 blocks the ground stands where level 0's does, to a tenth of a
-block. Past 16 blocks a quad that holds a summit stands tens of blocks above
-its own mean; whether the far terrain should keep that was measured in
-§9.6 and the answer is yes.
+block. **Past 16 blocks the summits take over**: one cell in nine is the
+highest of its nine at any width, and a cell 64 blocks wide that holds a
+summit stands at the mean of its highest 32-block half, which on steep
+ground lifts the columns 11 blocks over level 0 in the mean (25 when it
+stood at its highest column). That is the max's swelling again, in fewer
+cells. Whether a far
+quad that wide should keep its summit, or stand at its mean, was #422's to
+measure with these rows (§9.8: it keeps the rule); the voxel levels stop at 8.
+
+**How high a summit stands: the summit study** (2026-11-21, after #432).
+#432 stood a summit at its highest column. The lead's mountain zoom test
+(the far view cropped and enlarged against the near view) found "tall
+vertical pillars and spires along the crests" at level 3, 700 blocks out,
+that level 1 at 220 does not show: one high column at level 0 is a needle
+one block wide, and the cell that holds it drew a tower the cell's width.
+The candidates were each worked out from the height field alone (the
+default seed, 1,792 x 1,792 columns around the owner's mountain at about
+(-3072, -3232), its peak 239), and the best of them through the study of
+§9.4 as well:
+
+- **towers**: cells standing at least their own width above all four cells
+  beside them -- a block as tall as it is wide, or taller, standing alone;
+- **summit loss**: over the cells that hold a summit standing above their
+  mean, the highest column minus the drawn top, mean / most;
+- **the owner's peak**: the highest drawn top minus level 0's;
+- **step**: how far a column's drawn top moves from one width to the next
+  (what a ring swap changes, and what a height morph has to slide). Its
+  50th and 95th percentiles are 0 / 1, 0 / 2, 1 / 4 and 1 / 8 blocks from
+  width 1 to 2, 2 to 4, 4 to 8 and 8 to 16 under *every* rule: slopes set
+  them, not summits. The largest is what a rule decides;
+- **tip rise**: at each level-3 summit's highest column, the most its drawn
+  top rises at one swap on the way in (the highest column never moves);
+- **steep footprints**: §9.4's study, the summit at levels 1 / 2 / 3 against
+  level 0 in blocks, and the outline's mean change at the 160 / 288 /
+  512-block edges in pixels at 1080 rows.
+
+| summit stands at | towers, w = 2 / 4 / 8 / 16 | summit loss, w = 4; 8; 16 | owner's peak, w = 2 / 4 / 8 / 16 | largest step, 1→2 / 2→4 / 4→8 / 8→16 | tip rise, most | steep: summit L1 / L2 / L3 | steep: outline, px |
+|---|---|---|---|---|---|---|---|
+| its highest column (#432) | 170 / 87 / 53 / 34 | 0 | 0 / 0 / 0 / 0 | 5 / 14 / 28 / 56 | 0 | 0 / 0 / 0 | -0.9 / -0.8 / -0.8 |
+| its mean (no summit) | 34 / 4 / 3 / 1 | 1.4/8; 2.3/16; 4.9/35 | -1 / -2 / -4 / -12 | 4 / 7 / 13 / 22 | 11 | -0.8 / -2.0 / -6.0 | -1.6 / -1.7 / -2.3 |
+| highest, lift capped at w/2 | 134 / 43 / 18 / 10 | 0.2/6; 0.5/12; 1.3/27 | 0 / -1 / 0 / -4 | 4 / 9 / 16 / 29 | 9 | 0 / -0.4 / -3.8 | -1.0 / -1.2 / -1.6 |
+| highest, lift capped at w/4 | 34 / 15 / 9 / 5 | 0.4/7; 0.9/14; 2.2/31 | -1 / -2 / -2 / -8 | 4 / 8 / 14 / 25 | | | |
+| #432's rule over the four children's tops (recursive) | 170 / 89 / 52 / 35 | 0.0/2; 0.0/5; 0.0/3 | 0 / 0 / 0 / 0 | 5 / 14 / 29 / 56 | | | |
+| the 75th percentile of its columns | 64 / 19 / 13 / 5 | 0.9/5; 1.4/10; 2.9/21 | -1 / -2 / -2 / -6 | 4 / 10 / 21 / 35 | 6 | -0.6 / -1.0 / -3.0 | -1.3 / -1.4 / -1.5 |
+| the 90th percentile | 170 / 55 / 25 / 11 | 0.3/2; 0.7/5; 1.5/12 | 0 / -1 / -1 / -2 | 5 / 14 / 25 / 47 | | 0 / -0.4 / -1.6 | -0.9 / -1.0 / -1.3 |
+| the highest w/2 x w/2 block's lowest column | 170 / 15 / 8 / 3 | 0.9/5; 1.8/12; 4.2/34 | 0 / -2 / -4 / -11 | 5 / 11 / 16 / 25 | | | |
+| the highest mean of any w/2 x w/2 window in it | 170 / 41 / 18 / 9 | 0.5/3; 0.9/6; 2.0/14 | 0 / -1 / -2 / -4 | 5 / 13 / 23 / 43 | | | |
+| the mean of the half-width cell holding its highest column | 170 / 31 / 12 / 9 | 0.7/3; 1.2/8; 2.5/15 | 0 / -1 / -3 / -4 | 5 / 13 / 23 / 43 | 6 | | |
+| the highest mean of its w/4-wide cells | 170 / 87 / 42 / 19 | 0/0; 0.4/2; 1.0/6 | 0 / 0 / -1 / -2 | 5 / 14 / 27 / 52 | | | |
+| **the highest mean of its four half-width cells (chosen)** | **170 / 33 / 12 / 9** | **0.5/3; 1.0/6; 2.3/15** | **0 / -1 / -2 / -4** | 5 / 13 / 23 / 43 | **4** | **0 / -0.8 / -2.2** | -0.9 / -1.3 / -1.4 |
+
+The surface's mean change at every edge stays 0.0 to +0.1 pixel under
+every rule here: summits are one cell in nine, and the cells that hold
+none stand at their mean whatever the summit rule.
+
+What the table says:
+
+- **The tower count is set by how far one column can lift a cell.** The
+  highest column lifts it all the way; the recursive form of the same rule
+  ends at the same column (the child that holds it holds a summit too) and
+  changes nothing. A cap on the lift is blind to how wide the high ground
+  is: capped at w/2 it still leaves 18 towers at level 3, and drops a
+  summit 12 blocks where the high ground is a single column.
+- **A mean over part of the cell is what tells a needle from a peak.** One
+  column counts for a quarter, a sixteenth and a sixty-fourth of its height
+  at widths 4, 8 and 16 (`a_lone_high_column_raises_no_tower`), while a
+  peak whose high ground fills half the cell keeps nearly all of it. The
+  four half-width cells beat the 75th percentile on every count at level 3
+  (12 towers against 13, a summit 1.0 / 6 blocks under against 1.4 / 10)
+  and keep level 1's summit exact, which the percentile does not; the
+  stricter tests (a whole w/2 block, or the plain mean) lose the owner's
+  peak by 4 blocks at level 3, which is the old main the lead's zoom test
+  rated worst.
+- **On the way in a summit rises a step per swap.** Its tip rises at most
+  4 blocks at one swap (3 in 95 of 100), where the mean's grew by up to 11.
+  It sinks at some swap at 42 of 623 level-3 summits whose tip moves: a
+  sibling half-width cell can stand higher by its mean than every quarter
+  of the one that holds the highest column. The variant that takes the
+  half holding the highest column sinks at 7, but loses more (1.2 / 8 at
+  level 3, the owner's peak -3).
+- **What is left are wide high grounds.** Two towers stand at level 3 in
+  the 512 x 512 blocks around the owner's peak (`a_coarse_crest_grows_few_towers`
+  holds the count; #432 drew 12). Each stands at the mean of one of its
+  half-width cells, so level 2 draws that ground at least as high: it is
+  there on the way in, narrower, not a tower that melts.
+
 
 ### 9.4 The voxels on the rule (PR 2)
 
@@ -785,7 +883,9 @@ What the table says:
   is never below a child, so every swap is a drop. The mean nests in the
   mean: a parent is the mean of its children up to rounding, so a swap has
   no direction and about 33 / 39 / 45% of a steep slope's columns stand
-  above the coarser cell that covered them. A summit nests exactly.
+  above the coarser cell that covered them. A summit at its highest
+  column nested exactly; at the mean of its highest half (the summit
+  study, §9.3) it rises a step per swap on the way in.
 
 The four mountain images say the same (`mountain_level_0..3.png`; the
 outline is the first land pixel of each image column, against level 0's
@@ -805,7 +905,7 @@ footprints a kind with the worst single footprint in brackets; §9.2's
 | T3, tops (+Y), /255 | 1.09 (1.50), was 6.9 (7.9) | 0.33 (0.86), was 11.3 (12.6) | 0.68 (2.88), was 14.1 (15.1) |
 | T3, worst side direction, /255 | 0.85 (1.14), was 2.0 (4.3) | 0.74 (1.18), was 8.1 (13.9) | 1.08 (2.21), was 10.4 (15.7) |
 | mean column, drawn - level 0, blocks | +0.01 | +0.02 | +0.07 |
-| summit, blocks | 0 | 0 | 0 |
+| summit, blocks | 0 | 0 | 0 (at #432; since the summit study, 0 / -0.8 / -2.2 on steep ground, §9.3) |
 
 | | L1 | L2 | L3 |
 |---|---|---|---|
@@ -1096,7 +1196,146 @@ companions hold the second rule, and
 and `a_search_answer_holds_a_node_for_the_bare_node_it_sees_beside_it` hold
 it to the two places a node is let go (`release_held`, `leave_or_hold`: the
 streamer's bookkeeping, taken apart from the GPU for that).
-### 9.6 The far terrain on the rule (#422)
+
+### 9.6 The colour morph: a ring edge swaps no colour either
+
+The distance morph (#380, #436) slides a node's heights to its parent's over
+a band before its ring edge, so that the swap moves nothing. What the swap
+still changed was **colour and shade**. The transition study
+(`crates/app/src/transition_study.rs`, the toward-peak flight, the worst
+single frame of each edge, pixels over the goldens' tolerance) put it at
+16,398, 12,933 and 21,080 pixels at the 160, 288 and 512 m edges on main
+(`b2fc847`), and took it apart with switches in the shader, each run on the
+same flight (study binary of this branch's first commit, since removed):
+
+| what was held equal at the swap | 160 m | 288 m | 512 m |
+|---|---|---|---|
+| nothing (main) | 16,398 | 12,933 | 21,080 |
+| a riser's texture laid by world height (no stretch) | 11,075 | 10,218 | 16,201 |
+| ... and every wall one texture | 8,286 | 6,987 | 12,346 |
+| ... and walls unshaded instead | 10,052 | 9,869 | 15,649 |
+| ... and tops unshaded instead | 8,788 | 7,743 | 14,049 |
+| ... walls one texture and unshaded | 4,994 | 4,868 | 8,163 |
+| ... one wall texture, no shade at all (**the floor**) | 3,027 | 3,657 | 6,594 |
+
+Four things, then, each worth a quarter to a third: a morphed riser's
+texture **stretched** with it (one tile over the three blocks a riser grew
+to); its **material** was its own where the parent's riser wears another
+(the hash of §9.4 picks per cell); and the **shade** of tops and of walls
+was its own -- most visibly the band a riser casts on the top at its foot,
+which a coarse cell draws as one ramp over the cell. What is left at the
+floor is ground that does not morph (beside a cave, a pit or a tree, across
+a node's floor) and, at 512 m, the trees' switch to boxes (#433).
+
+**The rule: at the end of its band a node draws its parent's colours as
+well as its parent's shape.** Three parts:
+
+- **A riser's rows move with its top, one for one** (`Morph::target`,
+  `cubara_voxel`). They used to move on the straight line from the rows as
+  built to the parent's, so a riser that grew was stretched. Moved whole,
+  every row lands on one of the parent's rows, tile on tile; a row that
+  would pass below the new foot stops there and closes up, and where the
+  riser grows the room left at its foot is laid as a latent riser, flat as
+  built, one piece per run of parent rows, its tile one per block at full
+  morph. The shape is the same at every instant -- only where rows lie
+  inside the riser's plane differs -- and the closure tests of #436 hold it.
+- **Every face of a morphing column carries what its parent draws where the
+  morph takes it**: the parent face's texture layer and its openness there
+  (word 3 of the vertex, `Vertex::with_parent`; `mesh.wgsl` lights a vertex
+  by `mix(ao_floor, 1, openness)`). It is **read off the parent's own
+  mesh** (`cubara_voxel::ParentFaces`, built by `cubara_world::mesh`'s
+  `parent_faces` from the parent node generated and meshed by the game's
+  own generator and mesher): which quad covers the face's middle at full
+  morph, and that quad's openness at each corner, interpolated over the
+  triangle that holds the face, as the rasterizer does. Worked out again
+  from the parent's cells it would be a second copy of the shade rules
+  (Rule 5), and a wrong one: a coarse wall's shade band is one ramp over
+  the quad the mesher *merges* (§9.4), a property of no single cell. A face
+  that moves nowhere still carries it (its column morphs; its colour does),
+  and cells merge only where they show the same of their parent -- the same
+  quad, or two quads equally open all over.
+- **`mesh.wgsl` blends by the morph factor**: the light toward the parent's
+  openness over the whole band, and, where the parent's layer is another,
+  the colour toward that texture **over the band's second half**, sampled
+  with the gradients of the fragment's own (so at the same mip) under a
+  branch most fragments skip. The second half because a second sample is
+  the one real cost here and the first half is the near ground, most of
+  the frame: over the whole band the gate's ground eye lost 6.4% against
+  4.1% (below).
+- **A parent is made once for its children** (`cubara_world::mesh`'s
+  `ParentCache`, shared by the mesh pool's workers): its eight children
+  are requested together, and each needs the same parent generated and
+  meshed. An accelerator only (§3): keyed by the snapshot and the node,
+  and a node built with it is built exactly as without
+  (`a_parent_is_made_once_for_its_children_and_changes_nothing`).
+
+**The fourth vertex word was measured before it was built.** No spare bits
+were left in three words (#436 took the last); a padded 16-byte vertex
+against the 12-byte one on the M3, `--bench gate` twice each, alternating:
+ground 1,125 and 1,128 FPS against 1,130 and 1,125, hill 1,082 and 1,079
+against 1,089 and 1,082 -- nothing to measure. The arena's 8 million
+vertices take 128 MB instead of 96.
+
+**A coarse top wears what level 0 shows from above one of its columns**
+(`WorldGen::top_block`, `from_above`), picked by a hash of the cell as its
+riser rows are: the surface block over a whole column, the floor of the pit
+over one a cave has opened. A coarse level shows a pit only where all of a
+cell is one (§9.4), so on the default seed's mountains the pits that open
+6.1% of level 0's columns were 3.4% of level 2's ground and 1.3% of level
+3's: the grey patches a mountain lost from afar in the zoom pairs. Partly
+pit cells now wear the floor in the share their columns are pit
+(`a_coarse_top_shows_pit_floors_in_the_share_level_0_does`: 58 and 156
+such tops against 61.6 and 150.2 expected at widths 4 and 8). `from_above`
+is the one rule for a column's colour from above; the far terrain is to
+read the same (#422). The surface term of the consistency harness does not
+move: a cell over a pit is in the cave term (§9.2).
+
+**The vertex stage had no pipeline constants.** `mesh.wgsl` has resolved AO
+in the vertex stage since R1c, with `ao_floor`, but the mesh pipeline passed
+its constants to the fragment stage only, so the vertex stage lit with the
+shader's default floor whatever `Lighting` said; it matched only because
+the two defaults agree. The colour morph lights by `ao_floor` there too; the
+vertex stage now gets the constants (`the_ao_floor_reaches_the_vertex_stage`).
+
+**Measured** (the transition study, the same flight and harness, main
+`b2fc847` against this rule; the morph's worst single frame per edge,
+pixels over the tolerance, and its luminance in pixel-equivalents):
+
+| edge | main | the colour morph | luminance, main -> colour |
+|---|---|---|---|
+| 0<->1 (160 m) | 16,398 | **4,959** (-70%) | 2,368 -> 786 |
+| 1<->2 (288 m) | 12,933 | **4,735** (-63%) | 2,020 -> 1,003 |
+| 2<->3 (512 m) | 21,080 | **9,217** (-56%) | 3,982 -> 1,597 |
+
+The floor of the table above is 3,027, 3,657 and 6,594: what is left is
+what does not morph. At 512 m a little of it is new -- a cell partly over a
+pit wears the floor now, and its children beside the pit do not morph, so
+they swap from the floor's colour rather than the surface's (9,217 against
+8,641 with the colour morph alone). The holes the morph opens are those of
+#436, unchanged (210 of 450 frames checked, at most 34 pixels; the same
+count as main's). `a_fully_morphed_level_draws_its_parents_colours` (GPU)
+draws a mountain at levels 0, 1 and 2 fully morphed against the level above
+unmorphed: 20,558, 22,204 and 21,383 pixels of 921,600 over the tolerance
+with the parent's colours, 52,043, 50,104 and 47,546 without -- what is left
+is ground beside caves and pits and along the node floors that cut a slope
+(#436's limit), which neither colour nor shape can morph.
+
+**What it costs** (M3, not a quiet machine; alternating with main, two
+rounds each). `--bench gate` stays MET at Medium: ground 1,127 and 1,130 FPS
+on main against 1,078 and 1,079 (-4.4%), hill 1,082 and 1,083 against 1,059
+and 1,059 (-2.1%). About half of it is the second texture sample (light
+only, no texture blend: 1,084 and 1,060 in one round each), the rest the
+quads the parent's look cuts (+2.6% of the ground eye's vertices, +2.2% of
+the hill's) and the vertex stage's work. The flights keep HOLES at 0 (low:
+0 of 1,195 and 0 of 1,193; toward the mountain: 0 of 1,796 and 0 of 1,799)
+and their pops halve (p50 3,745 and 4,332 px on main against 1,665 and 1,512
+on the low flight). A child's parent is generated and meshed once for its
+siblings; the low flight's swap lag p50 / p90 / p99 is 100 / 151 / 251 and
+101 / 151 / 235 ms against main's 84 / 134 / 167 and 84 / 134 / 184 (119 /
+237 / 339 before the cache), the flight toward the mountain's 84 / 100 / 150
+against 84 / 100 / 134.
+
+### 9.8 The far terrain on the rule (#422)
 
 The far terrain is drawn as blocks: every quad a flat top at
 `quad_top`, a wall wherever two neighbouring tops differ, exactly as tall as
