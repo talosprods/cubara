@@ -205,6 +205,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-11 | Gate eye: hill at PR A (B), 3 runs, same conditions⁹⁰ | -- | -- | 1,139 / 1,140 / 1,141 | 0.422 / 0.422 / 0.422 ms | 1.009 / 1.004 / 1.004 ms | `cdc1d08` |
 | 2026-11-11 | Gate eye: flight at main (A), 3 runs, same conditions; 0 draws⁹⁰ | 0 | far only | 3,491 / 3,489 / 3,489 | 0.142 / 0.142 / 0.142 ms | 0.369 / 0.365 / 0.369 ms | `16d153f` |
 | 2026-11-11 | Gate eye: flight at PR A (B), 3 runs, same conditions⁹⁰ | 0 | far only | 3,489 / 3,484 / 3,491 | 0.142 / 0.142 / 0.142 ms | 0.370 / 0.371 / 0.367 ms | `cdc1d08` |
+| 2026-11-21 | **Gate eye: ground** at main, A of the A/B for #432 (one ground rule, #423), 2 runs (`GATE: MET at Medium` each), alternating A, B, A, B; AC power (charger attached, battery 80% and not charging), no thermal or performance warning recorded, built-in display only at brightness 0, external monitor unplugged, no agents running, 5 quiet minutes before the first run; 836 draws (464/1,568 nodes)⁹² | -- | -- | 1,163 / 1,162 | 0.417 / 0.419 ms | 0.965 / 0.990 ms | `df1aaf3` |
+| 2026-11-21 | Gate eye: ground at #432 (B), 2 runs, same conditions; 778 draws (437/1,439 nodes)⁹² | -- | -- | 1,150 / 1,150 (−1.1%) | 0.420 / 0.420 ms | 0.990 / 0.985 ms | `28f541a` |
+| 2026-11-21 | Gate eye: hill at main (A), 2 runs, same conditions; 446 draws (230/779 nodes)⁹² | -- | -- | 1,143 / 1,135 | 0.421 / 0.421 ms | 1.010 / 1.011 ms | `df1aaf3` |
+| 2026-11-21 | Gate eye: hill at #432 (B), 2 runs, same conditions; 388 draws (203/674 nodes)⁹² | -- | -- | 1,088 / 1,084 (−4.6%) | 0.442 / 0.442 ms | 1.042 / 1.034 ms | `28f541a` |
+| 2026-11-21 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹² | 0 | far only | 3,485 / 3,483 | 0.143 / 0.143 ms | 0.369 / 0.367 ms | `df1aaf3` |
+| 2026-11-21 | Gate eye: flight at #432 (B), 2 runs, same conditions; 0 draws⁹² | 0 | far only | 3,485 / 3,450 | 0.143 / 0.142 ms | 0.369 / 0.368 ms | `28f541a` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3254,3 +3260,18 @@ looking level at a side of the voxels' box, 121,660 of 129,600 pixels were far
 terrain on `main`; now 30,337 are, all of them skirts at and beyond the box's
 side, and none in the lowest two fifths of the frame where `main` filled all
 51,840.
+
+⁹² **#432 (one ground rule for every level, #423) against main on the M3, an A/B at `df1aaf3` and `28f541a`, 2026-11-21.** Release builds, `--bench gate` twice per binary alternating A, B, A, B, then each flight twice per binary, all in one window: AC power with a charger attached (battery 80% and not charging, before and after), no thermal or performance warning recorded by `pmset -g therm`, the built-in display only, at brightness 0, the external monitor unplugged, no agents or builds running, and 5 quiet minutes before the first run (a Time Machine backup was waited out). Both runs of each are in the rows as they came out.
+
+The gate holds at Medium on every eye. The hill eye is 4.6% slower and the ground eye 1.1%: #432 draws fewer nodes (388 against 446 on the hill) but its coarse cells are cut where the level-0 ground is, which costs triangles (the PR body has the census).
+
+The two 1920x1080 flights from `scripts/check-phase-gate.sh`, both runs, main then #432:
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 | silhouette px p99 | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|---|
+| low, main | 8 of 1,200; 0 of 1,200 | 12; 13 | 118; 117 | 5,898 / 49,300; 5,915 / 56,074 | 0; 0 | 83 / 100 / 117 / 117 (both) |
+| low, #432 | **0 of 1,199; 0 of 1,199** | 13; 14 | 173; 173 | 6,387 / 41,772; 6,503 / 38,018 | 0; 0 | 83 / 117 / 150 / 150 (both) |
+| toward a mountain, main | 0; 0 of 1,800 | 0; 0 | 108; 107 | 11,227 / 57,966; 13,212 / 52,952 | 0; 0 | 83 / 100 / 133 / 150; 83 / 100 / 117 / 133 |
+| toward a mountain, #432 | 0 of 1,798; 0 of 1,799 | 0; 0 | 186; 184 | **3,040** / 39,136; **3,712** / 43,942 | 1; 1 | 83 / 100 / 133 / 167; 83 / 117 / 133 / 167 |
+
+Main's first low flight shows the hole #432 closes (a pit's floor seen as sky while the node under it loads, `docs/PHASE3_ARCHITECTURE.md` §9.5); it is intermittent there, which is why the second run reads 0. The cost of closing it is the swap lag's tail on the low flight (p90 100 to 117 ms, p99 117 to 150 ms): a split node is now searched as open, so the first search after a crossing asks for about 23% more nodes, each generated, found hidden and dropped. That drop counts as a swap, which is why POPS has more swaps (173 against 118) and a higher p50 on the low flight while its p99 falls; toward a mountain the swap pixels' median falls from 11,227 to 3,040. STALE (13 to 14 against 12 to 13) predates this PR and is not changed by it.
