@@ -1759,6 +1759,8 @@ pub fn mesh_pipeline_constants(
         ("dbg_b4", dbg_bit(4)),
         ("dbg_b8", dbg_bit(8)),
         ("dbg_b16", dbg_bit(16)),
+        ("dbg_b32", dbg_bit(32)),
+        ("dbg_b64", dbg_bit(64)),
     ]
 }
 

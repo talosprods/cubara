@@ -53,6 +53,8 @@ override dbg_b2: f32 = 0.0;
 override dbg_b4: f32 = 0.0;
 override dbg_b8: f32 = 0.0;
 override dbg_b16: f32 = 0.0;
+override dbg_b32: f32 = 0.0;
+override dbg_b64: f32 = 0.0;
 override ambient_low: f32 = 0.28;
 override ambient_high: f32 = 0.42;
 override ao_floor: f32 = 0.4;
@@ -266,7 +268,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(select(ao, 1.0, dbg_b2 > 0.5), haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
+    out.ao_haze = vec2<f32>(select(ao, 1.0, dbg_b2 > 0.5 || (dbg_b32 > 0.5 && axis != 1u) || (dbg_b64 > 0.5 && axis == 1u)), haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
     out.uv = uvv;
     out.layer = layer_out;
     return out;
