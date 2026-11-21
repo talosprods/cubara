@@ -59,4 +59,7 @@ pub use scene::{
     SceneRenderer, TreeDraw,
 };
 pub use text::TextRenderer;
-pub use trees::{tree_instance_bounds, TreeArena, TreeModel};
+pub use trees::{
+    build_oak_mesh, build_silhouette_mesh, tree_model_meshes, TreeArena, TreeInstance, TreeModel,
+    TreeModelMesh, TreePlacement, TreeShapes, TreeVertex,
+};

@@ -1339,6 +1339,149 @@ siblings; the low flight's swap lag p50 / p90 / p99 is 100 / 151 / 251 and
 237 / 339 before the cache), the flight toward the mountain's 84 / 100 / 150
 against 84 / 100 / 134.
 
+### 9.7 One tree at every distance (#433, items 2 to 4)
+
+The ground was made the same at every level by §9.3 to §9.6; the trees on
+it were not. Level 0 draws a tree as blocks in its chunk's mesh, levels 1
+and 2 as an instance of one oak model, level 3 as two boxes (#332). An
+audit of the render path (2026-11-20) found what the owner sees change at
+a ring edge while flying toward a wood: every instance stood five blocks
+tall, whatever the tree's own trunk (four to six); instances were lit
+flat, without the shade level 0 bakes under the canopy and at the trunk's
+foot; and at 512 m a square box replaced the canopy's rounded outline.
+Trees past the voxel rings (#433 item 1) wait on the far terrain (#422)
+and are not part of this.
+
+**The measurement** (`crates/render/tests/lod_consistency/trees.rs`, no
+GPU): 48 trees the default world grows, drawn from a printed seed, sixteen
+each on level ground (the 25 columns under the canopy at one height),
+gentle (one or two blocks between them) and steep (three or more). Each is
+drawn as every representation draws it -- level 0 from the game's own
+chunk meshes, an instance from the game's own model where the game places
+it -- and compared tree by tree: the tree's top and foot in blocks; its
+outline from five views (three level, two from above) rasterised at an
+eighth of a block, as the area one drawing covers and the other does not;
+and its brightness, as the mean colour each view sees of it and per face
+direction (T3 per tree), /255 in linear light. Each ring edge is compared
+as it swaps: the near level at the end of its band against the far level.
+
+**Before** (main at `c5b37e6`; mean over the trees / the worst tree):
+
+| | top, blocks | outline, worst view, square blocks | seen colour, /255 | T3, worst direction |
+|---|---|---|---|---|
+| 160 m: level 1 against level 0 | 0.65 / 2 (27 of 48 move) | 9.8 / 25.8 | 4.0 / 6.7 | 3.8 / 6.3 |
+| 288 m: level 2 against level 1 at full morph | 0.40 / 2 (16 move) | 4.6 / 23.0 | 0.0 | 0.0 |
+| 512 m: level 3 against level 2 at full morph | 0.85 / 6 (25 move) | 18.5 / 61.2 | 1.5 / 1.6 | 1.5 / 1.5 |
+
+On level ground the 160 m edge moved 9 of 16 canopies a block (the height)
+and brightened every tree by 4/255 (the shade); the 512 m edge changed
+every outline by 14 square blocks (the box's corners). The 288 m edge
+changed only where the ground did: the distance morph moved the ground
+under a tree to its parent's height and left the tree where it was, and
+the swap put it back on its ground.
+
+**The rule: one tree shape, meshed once per height by the mesher level 0
+uses, riding the ground it stands on.** (`cubara_render::trees`,
+`cubara_world::mesh::node_trees`.)
+
+- **Its own height** (item 2). `TreeShapes` reads the oak's trunk heights
+  from `oak.ron`, and there is one model of each: the oak `h` blocks tall,
+  `tree_part_at` meshed by the voxel mesher (`build_oak_mesh`). An
+  instance carries its tree's height (`TreePlacement`), from the site the
+  world places (`WorldGen::node_trees`, which already had it), and the
+  arena files it under that height's model: one draw per model and
+  height with instances. No second generator (Rule 5): the shape is
+  `tree_part_at`, the height and the canopy are the site's.
+- **Its own shade** (item 3). The mesher bakes AO by the corner rule a
+  level-0 tree gets (`face_ao_of`), and the model keeps it, per vertex, as
+  `Vertex::openness`; `trees.wgsl` lights it by `mix(ao_floor, 1, open)`
+  as `mesh.wgsl` lights a block. The tree is meshed standing on a layer of
+  the block it grows on, whose faces are then left out, so the foot of its
+  trunk is shaded as level 0 shades it on level ground.
+- **Its own outline** (item 4). Level 3 draws the oak's **silhouette**
+  (`build_silhouette_mesh`): the oak's surface merged into as few quads as
+  it takes, the same faces and so the same outline from every side, each
+  face direction and texture one flat colour -- the texture's mean, shaded
+  by the area mean of the oak's openness there. `mix` is linear in the
+  openness, so per direction it is the oak's own colour. Two boxes the size
+  of the tree had a square canopy where the tree's is rounded.
+- **Riding the ground** (the 288 m and 512 m jumps). A coarse node's tree
+  takes the morph of the column its trunk stands on, read off the node's
+  own `MorphColumns` -- the ones its mesh is built with, worked out once
+  for both (`NodeTree::morph`) -- and `trees.wgsl` moves it by the factor
+  `mesh.wgsl` moves the ground by. That factor is now one WGSL function
+  both shaders include (`morph.wgsl`); `mesh.wgsl` calls it where it wrote
+  it out (two pixels of the goldens moved by one level). The instance packs
+  its node's slot, the morph's level and its lift into one word laid out as
+  a vertex's word 2, so it stays 16 bytes.
+
+**After** (this rule; the same 48 trees):
+
+| | top, blocks | outline, worst view | seen colour | T3, worst direction |
+|---|---|---|---|---|
+| 160 m: level 1 against level 0 | 0.25 / 1 (12 move) | 3.3 / 23.0 | 0.6 / 4.2 | 1.2 / 4.2 |
+| ... level ground, in one chunk (10 trees) | 0 | 0.0 | 0.0 | 0.0 |
+| 288 m: level 2 against level 1 at full morph | 0.02 / 1 (1 moves) | 0.2 / 11.5 | 0.0 | 0.0 |
+| 512 m: level 3 against level 2 at full morph | 0 | 0.0 | 0.8 / 0.9 | 0.0 |
+
+**On screen** (`golden.rs`'s `a_forest_swaps_nothing_at_its_ring_edges`,
+the M3): the densest wood near spawn (15 trees in one level-3 node), each
+edge's two frames, the trees' pixels found by drawing each again without
+trees. The share of the trees' pixels drawn by one side only, and their
+mean colour change on the image's 0-255 scale: 160 m 18.6% and 1.2 on main,
+9.1% and 0.8 now; 288 m 10.1% and 1.8, now 2 pixels and 0.0; 512 m 66.1%
+and 7.9, now 0.3% and 1.7 (the flat colours against the texture, at a view
+where each tree is tens of pixels; at 512 m it is a few, and the texture's
+mip is its mean). `forest_level_0..3.png` are the four images.
+
+**What is left, and why it is not here:**
+
+- **The ground under a tree at 160 m.** Level 0 stands a tree on its own
+  column, level 1 on its cell's mean, and nothing that stands on a column
+  morphs at level 0 (§9.6: "ground that does not morph (beside ... a
+  tree)"). On sloping ground a tree moves a block with its ground at the
+  swap: 12 of 48 trees, never more than one block, and the harness holds
+  the foot to exactly the ground's step (`check`). Moving level-0 trees
+  with their column is a change to the morph's rule, its own issue.
+- **Level 0's chunk floors.** The level-0 mesher bakes a chunk's AO
+  without looking into the next chunk (§9.3), so a tree whose blocks cross
+  a chunk's floor (15 of 48) is up to 4.2/255 more open there at level 0
+  than the corner rule says; the instance, meshed whole, follows the rule.
+  Reported and not held, as the ground harness reports its caves; fixing
+  it is the level-0 mesher's.
+- **A slope's own blocks.** On a slope level 0 leaves out the faces of a
+  tree that touch the ground beside it, and shades its trunk's foot by the
+  uphill column: up to 3.4/255 per direction, and outlines of 1 to 11
+  square blocks that the ground itself hides on screen. Held only on level
+  ground; the foot and the height are held everywhere, exactly.
+
+**What it costs.** Per tree, the oak models are 170, 178 and 186
+triangles (four, five and six blocks tall; 340 to 372 vertices) and the
+silhouette 110 for every height (220 vertices), which replaces the two boxes
+(24 triangles, 48 vertices). That is the one increase: at the gate's ground
+eye (M6, `lod_probe`) 247 level-3 trees are in view on average, so 27,200
+triangles (54,300 vertices) where the boxes were 5,900 (11,900), and at the
+hill eye 264 of them. Levels 1 and 2 draw 20 and 46 trees in view there,
+about 12,000 triangles, as before (the same oak, one model per height now:
+three draws where there was one). Six draws where there were two. CPU: one
+`MorphColumns` lookup per tree when a node is built (the columns were
+already worked out for the mesh); the instance stays 16 bytes. No FPS
+number is given here: the gate and flight rows are the lead's, on a quiet
+machine on AC power (`--bench gate` and `--bench flight`); the counts above
+are what they will show, and the direction to expect is a small cost at
+level 3.
+
+**Tests.** `a_tree_is_the_same_tree_at_every_distance` (the check over the
+48 trees, bounds in `trees.rs`'s `bounds`, each chosen) and
+`the_tree_harness_sees_a_wrong_tree` (one height for all, no shade, a
+block aside, a block up, the two boxes: each makes the check fail);
+`a_tree_rides_the_ground_under_it` (the tree's morph is the lift of the
+top face under its trunk in the game's own node mesh, at levels 1 and 2);
+`trees.rs`' unit tests (every model is its tree to the block; the
+silhouette has the oak's area and shade per direction in fewer
+triangles; the oak is shaded at its foot; the packed word round-trips);
+the forest goldens and `a_forest_swaps_nothing_at_its_ring_edges`.
+
 ### 9.8 The far terrain on the rule (#422)
 
 The far terrain is drawn as blocks: every quad a flat top at

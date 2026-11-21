@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 
 use cubara_voxel::{
     build_mesh_bounded_occluded_node_morph, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext,
-    NodeChunk, ParentFaces, ParentView,
+    MorphColumns, NodeChunk, ParentFaces, ParentView,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -74,7 +74,71 @@ pub struct BuiltNode {
     /// on their own drawn top -- empty at level 0 (real voxel trees already
     /// mesh into `geometry`) and whenever `geometry` is `None` (nothing is
     /// drawn here at all, so nothing stands on it either).
-    pub trees: Vec<TreeSite>,
+    pub trees: Vec<NodeTree>,
+}
+
+/// One tree a coarse node draws as an instance (issue #433): its site,
+/// standing on the cell of the node that draws the ground under its trunk
+/// ([`WorldGen::node_trees`](crate::WorldGen::node_trees): its own trunk
+/// height and canopy, its base on that cell's top), and how far the
+/// distance morph moves it at the end of the node's band, in blocks.
+///
+/// `morph` **is the move of the ground under its trunk**: the column of the
+/// node's [`MorphColumns`] that holds the trunk, its target minus its top --
+/// the number the mesher bakes into that column's top face. So the tree
+/// rides the ground it stands on through the band, and stands where the
+/// next level stands it when the ring edge swaps them; before #433 it stayed
+/// put while the ground moved, and jumped at the swap. Zero where the column
+/// does not morph, and at a level that does not ([`crate::morph::MORPH_LEVELS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeTree {
+    pub site: TreeSite,
+    pub morph: i32,
+}
+
+/// The trees `node` draws as instances ([`NodeTree`]), their morph read off
+/// `columns` -- the node's own [`MorphColumns`], the ones its mesh is built
+/// with -- or worked out here where `columns` is not given.
+pub fn node_trees(
+    world: &WorldSnapshot,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    columns: Option<&MorphColumns>,
+) -> Vec<NodeTree> {
+    let sites = world.node_trees(node, blocks);
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    let own;
+    let columns = match columns {
+        Some(c) => Some(c),
+        None => {
+            own = crate::morph::node_columns(world, node, blocks);
+            own.as_ref()
+        }
+    };
+    let w = node.extent_chunks();
+    let [ox, oy, oz] = node.world_origin();
+    sites
+        .into_iter()
+        .map(|site| {
+            let morph = columns.map_or(0, |c| {
+                let (cx, cz) = ((site.x - ox).div_euclid(w), (site.z - oz).div_euclid(w));
+                let [top, target, _, _] = c.at(cx, cz);
+                // The column's rows are the node's block rows: its top row
+                // is the tree's base, whatever node of the column asks.
+                debug_assert_eq!(
+                    top + oy,
+                    site.base,
+                    "the tree at ({}, {}) does not stand on its column's top",
+                    site.x,
+                    site.z
+                );
+                target - top
+            });
+            NodeTree { site, morph }
+        })
+        .collect()
 }
 
 /// Generate `node` once, and both mesh it and work out what it joins -- what a
@@ -122,9 +186,13 @@ fn build_node_with(
 ) -> BuiltNode {
     let chunk = world.node_at(node, blocks);
     let links = crate::visibility::node_links(chunk.as_ref(), registry);
-    let geometry = chunk
+    // Worked out once: the mesh bakes them, and the trees ride them.
+    let columns = chunk
         .as_ref()
-        .and_then(|c| mesh_chunk_with(world, registry, layer_of, node, blocks, c, Some(parents)));
+        .and_then(|_| morph_columns(world, node, blocks, parents));
+    let geometry = chunk.as_ref().and_then(|c| {
+        mesh_chunk_with(world, registry, layer_of, node, blocks, c, columns.as_ref())
+    });
     // Both halves of this guard are belt-and-braces, not load-bearing on
     // their own, which is why neither has a dedicated test here (found by
     // `check-tests-can-fail.sh`, recorded rather than chased): `node.level
@@ -134,7 +202,7 @@ fn build_node_with(
     // right along with a `None` geometry anyway, so computing it here for a
     // sky node would be silently thrown away, not wrong.
     let trees = if node.level >= 1 && geometry.is_some() {
-        world.node_trees(node, blocks)
+        node_trees(world, node, blocks, columns.as_ref())
     } else {
         Vec::new()
     };
@@ -189,7 +257,9 @@ pub fn mesh_node_with(
 ) -> Option<NodeGeometry> {
     let chunk = world.node_at(node, blocks)?;
     let parents = |parent| parent_faces(world, registry, layer_of, parent, blocks);
-    let parents: &Parents = &parents;
+    let columns = morph
+        .then(|| morph_columns(world, node, blocks, &parents))
+        .flatten();
     mesh_chunk_with(
         world,
         registry,
@@ -197,8 +267,26 @@ pub fn mesh_node_with(
         node,
         blocks,
         &chunk,
-        morph.then_some(parents),
+        columns.as_ref(),
     )
+}
+
+/// The distance morph's columns for `node` ([`crate::morph::node_columns`]),
+/// with its parent's faces for the colour morph; `None` at a level that
+/// does not morph.
+fn morph_columns(
+    world: &WorldSnapshot,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    parents: &Parents,
+) -> Option<MorphColumns> {
+    crate::morph::node_columns(world, node, blocks).map(|mut c| {
+        let parent = node.parent();
+        let (p, o) = (parent.world_origin(), node.world_origin());
+        c.parent = parents(parent)
+            .map(|faces| ParentView::new(faces, [o[0] - p[0], o[1] - p[1], o[2] - p[2]]));
+        c
+    })
 }
 
 /// Mesh `node` from its already generated blocks.
@@ -212,9 +300,9 @@ pub fn mesh_node_with(
 /// which a single scalar couldn't represent anyway, once the vertical cell
 /// stopped matching the horizontal one.
 ///
-/// The distance morph is baked in where `morph` gives the parent's faces (the
-/// colour morph's source, `docs/PHASE3_ARCHITECTURE.md` §9.6) and the node's
-/// level morphs ([`crate::morph::node_columns`]); `None` meshes it as built.
+/// The distance morph is baked in where `columns` gives it ([`morph_columns`]:
+/// the node's level morphs, and the parent's faces are the colour morph's
+/// source, `docs/PHASE3_ARCHITECTURE.md` §9.6); `None` meshes it as built.
 #[allow(clippy::too_many_arguments)]
 fn mesh_chunk_with(
     world: &WorldSnapshot,
@@ -223,18 +311,9 @@ fn mesh_chunk_with(
     node: NodeKey,
     blocks: TerrainBlocks,
     chunk: &NodeChunk,
-    morph: Option<&Parents>,
+    columns: Option<&MorphColumns>,
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
-    let columns = morph.and_then(|parents| {
-        crate::morph::node_columns(world, node, blocks).map(|mut c| {
-            let parent = node.parent();
-            let (p, o) = (parent.world_origin(), node.world_origin());
-            c.parent = parents(parent)
-                .map(|faces| ParentView::new(faces, [o[0] - p[0], o[1] - p[1], o[2] - p[2]]));
-            c
-        })
-    });
     let origin = node.world_origin();
     let scale = 1.0f32;
     let ground = std::cell::RefCell::new(BorderGround::default());
@@ -242,13 +321,8 @@ fn mesh_chunk_with(
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
     let may_be_solid =
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
-    let (mesh, local_aabb) = build_mesh_bounded_occluded_node_morph(
-        chunk,
-        &ctx,
-        covered,
-        may_be_solid,
-        columns.as_ref(),
-    )?;
+    let (mesh, local_aabb) =
+        build_mesh_bounded_occluded_node_morph(chunk, &ctx, covered, may_be_solid, columns)?;
     Some(NodeGeometry {
         mesh,
         local_aabb,

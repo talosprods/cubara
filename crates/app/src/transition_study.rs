@@ -223,7 +223,7 @@ struct Built {
     indices: Vec<u32>,
     face_indices: [u32; 6],
     local_aabb: Aabb,
-    trees: Vec<[i32; 3]>,
+    trees: Vec<cubara_render::TreePlacement>,
     model: TreeModel,
 }
 
@@ -256,7 +256,7 @@ impl Scene {
                 indices: g.mesh.indices,
                 face_indices: g.mesh.face_indices,
                 local_aabb: g.local_aabb,
-                trees: b.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
+                trees: crate::streaming::tree_placements(&b.trees),
                 model: tree_model_for(node.level),
             })
         });

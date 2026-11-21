@@ -232,7 +232,11 @@ fn rebase_cost_report() {
         // One tree per coarse node, on its own ground, so the tree arena's
         // boxes are part of what the rebase rewrites.
         let trees = if built.node.level >= 1 {
-            vec![[origin[0] + 1, origin[1] + 1, origin[2] + 1]]
+            vec![cubara_render::TreePlacement {
+                base: [origin[0] + 1, origin[1] + 1, origin[2] + 1],
+                height: 5,
+                morph: 0,
+            }]
         } else {
             Vec::new()
         };

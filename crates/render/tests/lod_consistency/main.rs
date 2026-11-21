@@ -27,6 +27,7 @@ mod far_rows;
 mod far_study;
 mod harness;
 mod study;
+mod trees;
 
 use cubara_render::aggregate::face_light;
 use glam::Vec3;
@@ -497,6 +498,208 @@ fn consistency_report() {
 /// keeps the ground where it is and a summit keeps most of its height; the
 /// highest column can only raise the ground. Measured, so the choice is not a
 /// guess; `height_rule_study_report` is the study the rule was chosen by.
+/// Trees a kind of ground in [`tree_consistency_report`].
+const TREES_PER_KIND: usize = 16;
+
+/// **A tree at every level against level 0, and at every ring edge**
+/// (issue #433): `trees.rs`'s table, over [`TREES_PER_KIND`] trees on each
+/// kind of ground drawn from [`trees::TREE_SEED`].
+///
+/// ```text
+/// cargo test -p cubara-render --test lod_consistency -- --ignored --nocapture tree_consistency_report
+/// ```
+#[test]
+#[ignore]
+fn tree_consistency_report() {
+    let setup = Setup::new();
+    let sample = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND);
+    let measured = trees::measure_trees(&setup, &sample);
+    println!(
+        "TREES (seed {:#x}, {} trees):\n{}",
+        trees::TREE_SEED,
+        sample.len(),
+        trees::tree_report(&measured)
+    );
+}
+
+/// **A tree is the same tree at every distance** (issue #433, items 2 to
+/// 4): [`trees::check`] over the report's sample -- each instance level
+/// against level 0, and each ring edge's two sides -- must find nothing.
+/// What it holds and why is `trees.rs`'s `bounds`;
+/// `the_tree_harness_sees_a_wrong_tree` holds the check to failing.
+#[test]
+fn a_tree_is_the_same_tree_at_every_distance() {
+    let setup = Setup::new();
+    let sample = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND);
+    assert_eq!(
+        sample.len(),
+        3 * TREES_PER_KIND,
+        "the seed drew too few trees"
+    );
+    let measured = trees::measure_trees(&setup, &sample);
+    let failures = trees::check(&setup, &measured);
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}\n\n{}",
+        failures.len(),
+        failures.join("\n"),
+        trees::tree_report(&measured)
+    );
+}
+
+/// **The tree check is seen to fail**: drawings of real trees that are
+/// wrong on purpose -- in the ways #433 found the instances wrong, and the
+/// ways a regression could make them -- each make [`trees::check`] report
+/// something.
+#[test]
+fn the_tree_harness_sees_a_wrong_tree() {
+    let setup = Setup::new();
+    let snapshot = setup.world.snapshot();
+    // Two flat trees level 0 meshes in one chunk: where everything is held
+    // exactly.
+    let sample: Vec<_> = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND)
+        .into_iter()
+        .filter(|(g, s)| *g == trees::TreeGround::Flat && !trees::crosses_a_chunk_floor(*s))
+        .take(2)
+        .collect();
+    assert_eq!(sample.len(), 2);
+    let names = trees::comparisons();
+    // Every comparison of `sample`, with `wrong` standing in for what the
+    // game draws at `level`.
+    let measure_with =
+        |wrong: &dyn Fn(cubara_world::TreeSite, trees::DrawnTree) -> trees::DrawnTree,
+         level: u32| {
+            let mut out = vec![Vec::new(); names.len()];
+            for &(g, site) in &sample {
+                let draw = |rep: trees::Rep| {
+                    let t = trees::draw(&setup, &snapshot, site, rep);
+                    match rep {
+                        trees::Rep::Instance { level: l, .. } if l == level => wrong(site, t),
+                        _ => t,
+                    }
+                };
+                for (k, (_, a, b)) in names.iter().enumerate() {
+                    out[k].push((g, trees::compare_trees(site, &draw(*a), &draw(*b))));
+                }
+            }
+            out
+        };
+    let place = |site: cubara_world::TreeSite, level: u32| {
+        let (at, _) = trees::placed(&setup, &snapshot, level, site);
+        Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32)
+    };
+    let layer_of = |name: &str| setup.layer_of(name);
+    let (oaks, _) = cubara_render::tree_model_meshes(&setup.registry, &setup.structures, &layer_of);
+    let shapes = cubara_render::TreeShapes::of(&setup.structures);
+    // The oak of another height: #433 item 2, one height for all.
+    let other_height = |site: cubara_world::TreeSite, _| {
+        let h = if site.height == 5 { 4 } else { 5 };
+        trees::model_tree(&setup, &oaks[shapes.index(h)], place(site, 1))
+    };
+    // The oak unshaded: #433 item 3.
+    let unshaded = |site: cubara_world::TreeSite, _| {
+        let mut m = oaks[shapes.index(site.height)].clone();
+        for v in &mut m.vertices {
+            v.open = 1.0;
+        }
+        trees::model_tree(&setup, &m, place(site, 1))
+    };
+    // A block to the side, and a block up.
+    let aside = |_, t: trees::DrawnTree| t.moved(Vec3::X);
+    let up = |_, t: trees::DrawnTree| t.moved(Vec3::Y);
+    // The two boxes level 3 drew before #433, in the oak's mean colours.
+    let boxes = |site: cubara_world::TreeSite, _| {
+        trees::model_tree(&setup, &trees::two_boxes(&setup, site), place(site, 3))
+    };
+    for (what, wrong, level) in [
+        (
+            "one height for every tree",
+            &other_height as &dyn Fn(cubara_world::TreeSite, trees::DrawnTree) -> trees::DrawnTree,
+            1,
+        ),
+        ("no AO", &unshaded, 1),
+        ("a block to the side", &aside, 2),
+        ("a block up", &up, 2),
+        ("two boxes at level 3", &boxes, 3),
+    ] {
+        let failures = trees::check(&setup, &measure_with(wrong, level));
+        eprintln!(
+            "{what}: {} failures, e.g. {:?}",
+            failures.len(),
+            failures.first()
+        );
+        assert!(!failures.is_empty(), "the check did not see {what}");
+    }
+}
+
+/// **A tree rides the ground under it through the morph band** (#433):
+/// for trees of the sample on sloping ground, at levels 1 and 2, the top
+/// face the game's own mesh of the node draws under the trunk (the
+/// distance morph baked in, `cubara_world::mesh::mesh_node`) stands at the
+/// tree's foot and moves by the tree's morph -- so `trees.wgsl`, moving the
+/// tree by the factor `mesh.wgsl` moves the ground by (`morph.wgsl`), keeps
+/// it standing on that face all the way to the swap. Goes red when the
+/// tree's morph is read off another column, the wrong row, or not at all.
+#[test]
+fn a_tree_rides_the_ground_under_it() {
+    let setup = Setup::new();
+    let snapshot = setup.world.snapshot();
+    let layer_of = |name: &str| setup.layer_of(name);
+    let blocks = setup.tree_blocks();
+    let sample: Vec<_> = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND)
+        .into_iter()
+        .filter(|(g, _)| *g != trees::TreeGround::Flat)
+        .collect();
+    let (mut checked, mut moving) = (0, 0);
+    for level in [1u32, 2] {
+        for &(_, site) in sample.iter().take(10) {
+            let node = trees::node_under(&setup, level, site);
+            let (at, morph) = trees::placed(&setup, &snapshot, level, site);
+            let geometry =
+                cubara_world::mesh::mesh_node(&snapshot, &setup.registry, &layer_of, node, blocks)
+                    .expect("the node under a tree draws its ground");
+            let o = geometry.origin;
+            let mesh = &geometry.mesh;
+            // The top face over the middle of the trunk's column.
+            let (x, z) = (at[0] as f32 + 0.5, at[2] as f32 + 0.5);
+            let under = mesh.indices.chunks(6).find_map(|six| {
+                let base = *six.iter().min().unwrap() as usize;
+                let q = &mesh.vertices[base..base + 4];
+                let xs = q.iter().map(|v| (o[0] + v.x() as i32) as f32);
+                let zs = q.iter().map(|v| (o[2] + v.z() as i32) as f32);
+                let (x0, x1) = xs.fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)));
+                let (z0, z1) = zs.fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)));
+                (q[0].face() == cubara_voxel::Face::PosY
+                    && (x0..x1).contains(&x)
+                    && (z0..z1).contains(&z)
+                    && o[1] + q[0].y() as i32 == at[1])
+                    .then_some(q[0])
+            });
+            let under = under.unwrap_or_else(|| {
+                panic!("no top face at the foot of the level-{level} tree at {at:?}")
+            });
+            assert_eq!(
+                under.morph_delta(),
+                morph as f32,
+                "level {level}: the tree at {at:?} moves {morph} with a ground that moves {}",
+                under.morph_delta()
+            );
+            // A face that moves is moved by its node's band (one that
+            // does not carries no band at all).
+            if morph != 0 {
+                assert_eq!(under.morph_level(), level);
+            }
+            checked += 1;
+            moving += usize::from(morph != 0);
+        }
+    }
+    eprintln!("{checked} trees on their ground, {moving} of them moving");
+    assert!(
+        moving >= 4,
+        "only {moving} of the trees checked move: this pins little"
+    );
+}
+
 #[test]
 #[ignore]
 fn stepped_top_rule_report() {

@@ -168,16 +168,12 @@ fn vs_main(in: VsIn) -> VsOut {
     // level whose band moves this vertex, bits 22-31 how far up it moves at
     // full morph, signed, in quarter blocks (`Vertex::with_morph`) -- to its
     // parent cell's height. The factor is `cubara_world::morph::morph_factor`
-    // of the selection's own distance (`morph_metric`), taken where the
-    // vertex was meshed, so every vertex at one place moves alike and no
-    // seam opens between the faces that share it.
+    // of the selection's own distance (`morph_metric`; `morph.wgsl`), taken
+    // where the vertex was meshed, so every vertex at one place moves alike
+    // and no seam opens between the faces that share it.
     let morph_level = (in.packed2 >> 20u) & 3u;
     let morph_delta = f32(bitcast<i32>(in.packed2) >> 22u) * 0.25;
-    let band_pair = frame.morph_band[morph_level >> 1u];
-    let band = select(band_pair.xy, band_pair.zw, (morph_level & 1u) == 1u);
-    let morph_rel = on_lattice - frame.morph_eye[morph_level].xyz;
-    let morph_metric = max(length(morph_rel.xz), frame.morph_eye[0].w * abs(morph_rel.y));
-    let morph = clamp((morph_metric - band.x) / max(band.y - band.x, 1e-6), 0.0, 1.0);
+    let morph = morph_factor(on_lattice, morph_level);
     let on_grid = on_lattice + vec3<f32>(0.0, morph_delta * morph, 0.0);
     // Seal the cracks a greedy mesh's T-junctions leave: where a long quad's
     // edge passes a corner of the shorter quads beside it, the corner lands a
