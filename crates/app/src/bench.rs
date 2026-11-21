@@ -743,6 +743,7 @@ pub fn run(
     let mut triangles_sum = 0u64;
     let mut far_patches_sum = 0u64;
     let mut far_triangles_sum = 0u64;
+    let mut far_vertices_sum = 0u64;
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
@@ -762,6 +763,7 @@ pub fn run(
         if let Some(f) = far_terrain.as_ref() {
             far_patches_sum += f.drawn() as u64;
             far_triangles_sum += f.drawn_triangles();
+            far_vertices_sum += f.drawn_cost().1;
         }
         let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
@@ -809,9 +811,10 @@ pub fn run(
     );
     if far_terrain.is_some() {
         log::info!(
-            "far terrain drawn: avg {:.0} patches, {:.0} triangles (skirts included)",
+            "far terrain drawn: avg {:.0} patches, {:.0} triangles issued, {:.0} vertices (shared corners)",
             far_patches_sum as f64 / MEASURE_FRAMES as f64,
-            far_triangles_sum as f64 / MEASURE_FRAMES as f64
+            far_triangles_sum as f64 / MEASURE_FRAMES as f64,
+            far_vertices_sum as f64 / MEASURE_FRAMES as f64
         );
     }
 
