@@ -166,11 +166,23 @@ impl Morph {
 /// are at full morph. `None` where it never has any height -- neither as
 /// built nor at full morph. Pure, and the only place the riser rule is
 /// written.
+///
+/// **Its foot never rises beside a neighbour that does not move.** A column
+/// keeps its height because it is not plain ground -- a pit, a cave mouth --
+/// or stands beside such a column, and a pit is drawn *under* the column's
+/// top: the foot of the riser beside it is where the pit's floor is, not
+/// where the top would be. Lifted toward that top, it opened a gap over the
+/// pit floor (single pixels of sky on the toward-peak flight, traced to a
+/// level-2 pit at a node border). Beside a neighbour that moves -- plain
+/// ground, drawn at its top -- the foot follows that neighbour's top.
 pub fn riser_map(own: [i32; 4], nb: [i32; 4]) -> Option<[i32; 4]> {
     let [top, target, _, _] = own;
-    let [_, _, floor, target_floor] = nb;
+    let [nb_top, nb_target, floor, target_floor] = nb;
     let s_bot = top.min(floor);
-    let t_bot = target.min(target_floor);
+    let mut t_bot = target.min(target_floor);
+    if nb_target == nb_top {
+        t_bot = t_bot.min(s_bot);
+    }
     (top > s_bot || target > t_bot).then_some([s_bot, top, t_bot, target])
 }
 
@@ -2244,7 +2256,10 @@ mod tests {
             assert!(q.iter().all(|v| v.is_latent() && v.y() == 2 && v.morph_level() == 1));
             let mut deltas: Vec<f32> = q.iter().map(|v| v.morph_delta()).collect();
             deltas.sort_by(|p, q| p.partial_cmp(q).unwrap());
-            assert_eq!(deltas, vec![1.0, 1.0, 2.0, 2.0]);
+            // Its top edge rises to a's parent's top (4); its foot stays at
+            // 2, since b does not move (`riser_map`: a foot never rises
+            // beside a still neighbour; the part under b's top is behind b).
+            assert_eq!(deltas, vec![0.0, 0.0, 2.0, 2.0]);
         }
         // b's riser as built (row 2..3, facing -x) folds down onto 3: its
         // foot rises one row, its top stays.
@@ -2274,6 +2289,45 @@ mod tests {
             assert_eq!(z.iter().max().unwrap() - z.iter().min().unwrap(), 1, "one cell");
         }
         assert!(still[0].iter().all(|v| v.morph_delta() == 0.0));
+    }
+
+    /// The riser rule's own properties, over every small case: it never
+    /// inverts (a top at or over its foot, as built and at full morph); its
+    /// top is its column's; beside a neighbour that does not move its foot
+    /// never rises; and between two columns that do not move it does not
+    /// move at all.
+    #[test]
+    fn a_riser_never_inverts_and_its_foot_never_rises_beside_a_still_neighbour() {
+        let r = 0..4;
+        for top in r.clone() {
+            for target in r.clone() {
+                for nb_top in r.clone() {
+                    for nb_target in r.clone() {
+                        for floor in 0..=nb_top {
+                            // A neighbour's floor at full morph is the
+                            // lowest of fewer levels than as built (no finer
+                            // one), so for one that does not move it is
+                            // never under its floor as built.
+                            let lowest = if nb_target == nb_top { floor } else { 0 };
+                            for tfloor in lowest..=nb_target {
+                                let (own, nb) = ([top, target, top, target], [nb_top, nb_target, floor, tfloor]);
+                                let Some([s0, s1, t0, t1]) = riser_map(own, nb) else {
+                                    continue;
+                                };
+                                assert!(s0 <= s1 && t0 <= t1, "{own:?} {nb:?}");
+                                assert_eq!((s1, t1), (top, target));
+                                if nb_target == nb_top {
+                                    assert!(t0 <= s0, "{own:?} {nb:?}: the foot rises");
+                                }
+                                if nb_target == nb_top && target == top {
+                                    assert_eq!((s0, s1), (t0, t1), "{own:?} {nb:?} moves");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

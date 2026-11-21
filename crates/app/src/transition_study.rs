@@ -1018,6 +1018,294 @@ mod tests {
         assert_eq!(back[1].0.len(), 8);
     }
 
+    /// Where a pixel of the toward-peak flight looks, and what the morphed
+    /// mesh draws around it: a debugging aid for a crack found on screen
+    /// (`CRACK_AT=frame,x,y`, default the one of the first flights).
+    #[test]
+    #[ignore = "a debugging aid: CRACK_AT=frame,x,y cargo test -p cubara --bin cubara locate_crack -- --ignored --nocapture"]
+    fn locate_crack() {
+        use cubara_world::morph::{morph_factor, morph_metric};
+        let at: Vec<f32> = std::env::var("CRACK_AT")
+            .unwrap_or_else(|_| "1,1720,848".into())
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        let (frame, px, py) = (at[0], at[1], at[2]);
+        let world = World::new();
+        let snapshot = world.snapshot();
+        let gen = WorldGen::new(world.seed());
+        let (start, look) = toward_peak(&gen);
+        let t = frame * FLY_SPEED / FPS;
+        let eye = glam::Vec3::from(start) + glam::Vec3::from(look) * t;
+        let aspect = SIZE.0 as f32 / SIZE.1 as f32;
+        let vp = CameraUniform::look_view_proj(aspect, eye, glam::Vec3::from(look).normalize());
+        let inv = vp.inverse();
+        let ndc = glam::vec2((px + 0.5) / SIZE.0 as f32 * 2.0 - 1.0, 1.0 - (py + 0.5) / SIZE.1 as f32 * 2.0);
+        let far = inv * glam::vec4(ndc.x, ndc.y, 0.5, 1.0);
+        let dir = (far.truncate() / far.w - eye).normalize();
+        let mut hit = None;
+        let mut d = 0.0f32;
+        while d < 3000.0 {
+            let p = eye + dir * d;
+            if p.y <= snapshot.surface_height(p.x.floor() as i32, p.z.floor() as i32) as f32 + 1.0 {
+                hit = Some(p);
+                break;
+            }
+            d += 0.02;
+        }
+        let hit = hit.expect("the ray meets the ground");
+        println!("eye {eye:?} dir {dir:?}: level 0's ground at {hit:?}, {d:.1} blocks out");
+        let schedule = DEFAULT_RING_SCHEDULE;
+        let bands = morph_bands(schedule, VERTICAL_LOD_SQUASH);
+        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye.to_array()), VERTICAL_LOD_SQUASH, schedule);
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&crate::game::load_structure_registry(), &registry)
+            .with_ores(&crate::game::load_ore_registry(), &registry);
+        let layer = |_: &str| 0u32;
+        let near = |n: &NodeKey| {
+            let o = n.world_origin();
+            let s = 16.0 * n.extent_chunks() as f32;
+            (0..3).all(|k| hit[k] >= o[k] as f32 - 8.0 && hit[k] <= o[k] as f32 + s + 8.0)
+        };
+        for n in nodes.iter().filter(|n| near(n)) {
+            let band = bands[n.level as usize];
+            println!("node {n:?} origin {:?} band {band:?}", n.world_origin());
+            if let Some(c) = cubara_world::morph::node_columns(&snapshot, *n, blocks) {
+                let w = 1 << n.level;
+                let o = n.world_origin();
+                let (cx, cz) = (
+                    ((hit.x as i32 - o[0]).div_euclid(w)),
+                    ((hit.z as i32 - o[2]).div_euclid(w)),
+                );
+                for dz in -1..=1 {
+                    let row: Vec<String> = (-1..=1)
+                        .map(|dx| {
+                            let (x, z) = (cx + dx, cz + dz);
+                            if (-1..=16).contains(&x) && (-1..=16).contains(&z) {
+                                let [t, g, f, tf] = c.at(x, z);
+                                format!("({x},{z}) top {} target {} floor {} tfloor {}", t + o[1], g + o[1], f + o[1], tf + o[1])
+                            } else {
+                                "--".to_string()
+                            }
+                        })
+                        .collect();
+                    println!("  columns: {}", row.join(" | "));
+                }
+            }
+            let Some(g) = cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks) else {
+                println!("  (nothing drawn)");
+                continue;
+            };
+            let o = g.origin;
+            for q in g.mesh.vertices.chunks(4) {
+                let w: Vec<[f32; 3]> = q
+                    .iter()
+                    .map(|v| [o[0] as f32 + v.x() as f32, o[1] as f32 + v.y() as f32, o[2] as f32 + v.z() as f32])
+                    .collect();
+                // The quad's extent comes within 1.5 blocks of the hit.
+                let lo = |k: usize| w.iter().map(|p| p[k]).fold(f32::MAX, f32::min);
+                let hi = |k: usize| w.iter().map(|p| p[k]).fold(f32::MIN, f32::max);
+                let close = (0..3).all(|k| {
+                    let r = if k == 1 { 6.0 } else { 1.5 };
+                    hit[k] >= lo(k) - r && hit[k] <= hi(k) + r
+                });
+                if !close {
+                    continue;
+                }
+                let moved: Vec<String> = q
+                    .iter()
+                    .zip(&w)
+                    .map(|(v, p)| {
+                        let f = band.map_or(0.0, |b| {
+                            morph_factor(morph_metric([p[0] - eye.x, p[1] - eye.y, p[2] - eye.z], VERTICAL_LOD_SQUASH), b)
+                        });
+                        format!(
+                            "({},{},{}){}{:+}*{f:.3}={:.3}",
+                            p[0], p[1], p[2],
+                            if v.is_latent() { "L" } else { "" },
+                            v.morph_delta(),
+                            p[1] + v.morph_delta() * f
+                        )
+                    })
+                    .collect();
+                println!("  {:?} {}", q[0].face(), moved.join(" "));
+            }
+        }
+    }
+
+    /// [`locate_crack`]'s exact form: the pixel's ray against the real
+    /// triangles of every node of the flight's selection that it passes
+    /// near, with and without the morph (each vertex moved by its own
+    /// factor, as `mesh.wgsl` does, crack seal left out), and the faces
+    /// around where the unmorphed ray lands.
+    #[test]
+    #[ignore = "a debugging aid: CRACK_AT=frame,x,y cargo test -p cubara --bin cubara trace_crack -- --ignored --nocapture"]
+    fn trace_crack() {
+        use cubara_world::morph::{morph_factor, morph_metric};
+        let at: Vec<f32> = std::env::var("CRACK_AT")
+            .unwrap_or_else(|_| "1,1720,848".into())
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        let (frame, px, py) = (at[0], at[1], at[2]);
+        let world = World::new();
+        let snapshot = world.snapshot();
+        let gen = WorldGen::new(world.seed());
+        let (start, look) = toward_peak(&gen);
+        let eye = glam::Vec3::from(start) + glam::Vec3::from(look) * (frame * FLY_SPEED / FPS);
+        let aspect = SIZE.0 as f32 / SIZE.1 as f32;
+        let vp = CameraUniform::look_view_proj(aspect, eye, glam::Vec3::from(look).normalize());
+        let inv = vp.inverse();
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&crate::game::load_structure_registry(), &registry)
+            .with_ores(&crate::game::load_ore_registry(), &registry);
+        let layer = |_: &str| 0u32;
+        let schedule = DEFAULT_RING_SCHEDULE;
+        let bands = morph_bands(schedule, VERTICAL_LOD_SQUASH);
+        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye.to_array()), VERTICAL_LOD_SQUASH, schedule);
+        // Triangles of one node, world space, morphed by `morph` (0 or 1 as
+        // a switch), each tagged with its quad's description.
+        let mut cache: HashMap<NodeKey, Option<cubara_world::mesh::NodeGeometry>> = HashMap::new();
+        let ray_hits = |dir: glam::Vec3, morph: bool, cache: &mut HashMap<NodeKey, Option<cubara_world::mesh::NodeGeometry>>| {
+            let mut best: Option<(f32, NodeKey, usize)> = None;
+            for n in &nodes {
+                let o = n.world_origin();
+                let size = 16.0 * n.extent_chunks() as f32;
+                let (lo, hi) = (
+                    glam::vec3(o[0] as f32, o[1] as f32 - 40.0, o[2] as f32),
+                    glam::vec3(o[0] as f32 + size, o[1] as f32 + size + 40.0, o[2] as f32 + size),
+                );
+                // Slab test.
+                let (mut t0, mut t1) = (0.0f32, 3000.0f32);
+                for k in 0..3 {
+                    let inv_d = 1.0 / dir[k];
+                    let (a, b) = ((lo[k] - eye[k]) * inv_d, (hi[k] - eye[k]) * inv_d);
+                    t0 = t0.max(a.min(b));
+                    t1 = t1.min(a.max(b));
+                }
+                if t0 > t1 {
+                    continue;
+                }
+                let g = cache
+                    .entry(*n)
+                    .or_insert_with(|| cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks));
+                let Some(g) = g else { continue };
+                let band = bands[n.level as usize];
+                let pos = |i: u32| {
+                    let v = g.mesh.vertices[i as usize];
+                    let mut p = glam::vec3(
+                        g.origin[0] as f32 + v.x() as f32,
+                        g.origin[1] as f32 + v.y() as f32,
+                        g.origin[2] as f32 + v.z() as f32,
+                    );
+                    if morph {
+                        let f = band.map_or(0.0, |b| {
+                            morph_factor(morph_metric((p - eye).to_array(), VERTICAL_LOD_SQUASH), b)
+                        });
+                        p.y += v.morph_delta() * f;
+                    }
+                    p
+                };
+                for (k, tri) in g.mesh.indices.chunks(3).enumerate() {
+                    let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+                    // Moller-Trumbore, both sides.
+                    let (e1, e2) = (b - a, c - a);
+                    let h = dir.cross(e2);
+                    let det = e1.dot(h);
+                    if det.abs() < 1e-9 {
+                        continue;
+                    }
+                    let inv_det = 1.0 / det;
+                    let s0 = eye - a;
+                    let u = s0.dot(h) * inv_det;
+                    if !(0.0..=1.0).contains(&u) {
+                        continue;
+                    }
+                    let q = s0.cross(e1);
+                    let v = dir.dot(q) * inv_det;
+                    if v < 0.0 || u + v > 1.0 {
+                        continue;
+                    }
+                    let t = e2.dot(q) * inv_det;
+                    if t > 0.1 && best.is_none_or(|(bt, _, _)| t < bt) {
+                        best = Some((t, *n, k));
+                    }
+                }
+            }
+            best
+        };
+        for (sx, sy) in [(0.5f32, 0.5f32), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            let ndc = glam::vec2((px + sx) / SIZE.0 as f32 * 2.0 - 1.0, 1.0 - (py + sy) / SIZE.1 as f32 * 2.0);
+            let far = inv * glam::vec4(ndc.x, ndc.y, 0.5, 1.0);
+            let dir = (far.truncate() / far.w - eye).normalize();
+            let fixed = ray_hits(dir, false, &mut cache);
+            let morphed = ray_hits(dir, true, &mut cache);
+            println!(
+                "sample ({sx},{sy}): as meshed {:?} at {:?}; morphed {:?} at {:?}",
+                fixed.map(|h| (h.0, h.1)),
+                fixed.map(|h| eye + dir * h.0),
+                morphed.map(|h| (h.0, h.1)),
+                morphed.map(|h| eye + dir * h.0)
+            );
+            if sx != 0.5 {
+                continue;
+            }
+            let Some((t, _, _)) = fixed else { continue };
+            let hit = eye + dir * t;
+            for n in &nodes {
+                let Some(Some(g)) = cache.get(n) else { continue };
+                let o = g.origin;
+                let band = bands[n.level as usize];
+                let mut lines = Vec::new();
+                for q in g.mesh.vertices.chunks(4) {
+                    let w: Vec<glam::Vec3> = q
+                        .iter()
+                        .map(|v| glam::vec3(o[0] as f32 + v.x() as f32, o[1] as f32 + v.y() as f32, o[2] as f32 + v.z() as f32))
+                        .collect();
+                    let lo = w.iter().fold(glam::Vec3::splat(f32::MAX), |a, b| a.min(*b));
+                    let hi = w.iter().fold(glam::Vec3::splat(f32::MIN), |a, b| a.max(*b));
+                    let r = glam::vec3(1.5, 4.0, 1.5);
+                    if (hit.cmplt(lo - r)).any() || (hit.cmpgt(hi + r)).any() {
+                        continue;
+                    }
+                    let desc: Vec<String> = q
+                        .iter()
+                        .zip(&w)
+                        .map(|(v, p)| {
+                            let f = band.map_or(0.0, |b| {
+                                morph_factor(morph_metric((*p - eye).to_array(), VERTICAL_LOD_SQUASH), b)
+                            });
+                            format!("({},{},{}){}{:+}->{:.2}", p.x, p.y, p.z, if v.is_latent() { "L" } else { "" }, v.morph_delta(), p.y + v.morph_delta() * f)
+                        })
+                        .collect();
+                    lines.push(format!("    {:?} {}", q[0].face(), desc.join(" ")));
+                }
+                if lines.is_empty() {
+                    continue;
+                }
+                println!("  node {n:?} origin {:?}", n.world_origin());
+                if let Some(c) = cubara_world::morph::node_columns(&snapshot, *n, blocks) {
+                    let w = 1 << n.level;
+                    let (cx, cz) = ((hit.x as i32 - o[0]).div_euclid(w), (hit.z.round() as i32 - o[2]).div_euclid(w));
+                    for dz in -1..=0 {
+                        for dx in -1..=1 {
+                            let (x, z) = (cx + dx, cz + dz);
+                            if (-1..=16).contains(&x) && (-1..=16).contains(&z) {
+                                let [tp, tg, fl, tf] = c.at(x, z);
+                                println!("    column ({x},{z}) top {} target {} floor {} tfloor {}", tp + o[1], tg + o[1], fl + o[1], tf + o[1]);
+                            }
+                        }
+                    }
+                }
+                for l in lines {
+                    println!("{l}");
+                }
+            }
+        }
+    }
+
     /// The study at the game's schedule and at every radius halved.
     #[test]
     #[ignore = "GPU, minutes: cargo test -p cubara --bin cubara transition_study -- --ignored --nocapture"]

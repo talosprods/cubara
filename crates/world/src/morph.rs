@@ -407,6 +407,16 @@ mod tests {
                                         "level {level} {node:?} ({cx},{cz})/({nx},{nz}) is not a \
                                          height field as drawn, yet morphs: {a:?} {b:?}"
                                     );
+                                    // ...and neither does the riser between them.
+                                    for (own, nb) in [(a, b), (b, a)] {
+                                        if let Some([s0, s1, t0, t1]) = riser_map(own, nb) {
+                                            assert!(
+                                                (s0, s1) == (t0, t1),
+                                                "level {level} {node:?} ({cx},{cz})/({nx},{nz}): a \
+                                                 riser beside a cave moves: {own:?} {nb:?}"
+                                            );
+                                        }
+                                    }
                                     skipped += 1;
                                     continue;
                                 }
@@ -722,6 +732,74 @@ mod tests {
             }
         }
         assert!(pairs > 1000, "only {pairs} pairs were checked");
+    }
+
+    /// **No corner that moves sits inside an edge that moves.** The factor
+    /// is not linear along an edge (the metric's `max` bends it where
+    /// horizontal and doubled vertical distance are equal), so a vertex in
+    /// the middle of another quad's edge -- a T-junction -- leaves that edge
+    /// when both move, by up to half a pixel at the 288 m band: single pixels
+    /// of sky, which the first flights with the morph showed. On real nodes
+    /// of every morphing level on the steep mountain: no vertex with a delta
+    /// lies strictly inside a horizontal edge of a quad that moves. Goes red
+    /// when moving faces may merge across cells again.
+    #[test]
+    fn no_moving_corner_sits_inside_a_moving_edge() {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        let mut edges_checked = 0usize;
+        for level in MORPH_LEVELS {
+            for node in mountain_nodes(&snapshot, level) {
+                let Some(geometry) =
+                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                else {
+                    continue;
+                };
+                let quads: Vec<&[cubara_voxel::Vertex]> = geometry.mesh.vertices.chunks(4).collect();
+                // Horizontal edges of quads that move, by height: (y, a, b)
+                // with a and b the (x, z) ends.
+                let mut edges: std::collections::HashMap<u32, Vec<([u32; 2], [u32; 2])>> =
+                    std::collections::HashMap::new();
+                for q in &quads {
+                    if q.iter().all(|v| v.morph_delta() == 0.0) {
+                        continue;
+                    }
+                    for k in 0..4 {
+                        let (a, b) = (q[k], q[(k + 1) % 4]);
+                        if a.y() == b.y() && (a.x(), a.z()) != (b.x(), b.z()) {
+                            edges
+                                .entry(a.y())
+                                .or_default()
+                                .push(([a.x(), a.z()], [b.x(), b.z()]));
+                        }
+                    }
+                }
+                for q in &quads {
+                    for v in q.iter().filter(|v| v.morph_delta() != 0.0) {
+                        let p = [v.x(), v.z()];
+                        for &(a, b) in edges.get(&v.y()).map_or(&[][..], |e| &e[..]) {
+                            edges_checked += 1;
+                            // Strictly inside an axis-aligned edge.
+                            let inside = if a[0] == b[0] {
+                                p[0] == a[0] && p[1] > a[1].min(b[1]) && p[1] < a[1].max(b[1])
+                            } else {
+                                p[1] == a[1] && p[0] > a[0].min(b[0]) && p[0] < a[0].max(b[0])
+                            };
+                            assert!(
+                                !inside,
+                                "level {level} {node:?}: a moving corner at {p:?}, row {}, sits \
+                                 inside the moving edge {a:?}-{b:?}",
+                                v.y()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(edges_checked > 10_000, "only {edges_checked} pairs checked");
     }
 
     /// **What the morph costs in geometry** (issue #380's study): the
