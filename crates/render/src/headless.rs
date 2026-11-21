@@ -143,6 +143,10 @@ pub struct Shot {
     /// explicitly rather than this crate guessing a render radius from
     /// `region_radius` -- a golden's whole point is a fixed, chosen scene.
     pub lighting: crate::render::Lighting,
+    /// The distance morph's bands (issue #380), or `None` for none: every
+    /// vertex is then drawn where it was meshed, as before the morph. `Some`
+    /// measures each level's metric from the shot's own eye.
+    pub morph: Option<crate::render::MorphParams>,
 }
 
 impl Default for Shot {
@@ -166,6 +170,7 @@ impl Default for Shot {
             icons: Vec::new(),
             menu: None,
             lighting: crate::render::Lighting::default(),
+            morph: None,
         }
     }
 }
@@ -407,6 +412,7 @@ fn render_arena(
         icons,
         menu,
         lighting,
+        morph,
     } = shot;
     // Slot 0 held: a fixed choice, so a golden reference has a stable
     // selection highlight to compare against.
@@ -496,7 +502,15 @@ fn render_arena(
     // to derive a fog range from anyway (`ARCHITECTURE.md` Rule 3 -- that's
     // `cubara-app`'s job, which is why `--screenshot`/the golden tests never
     // see it either).
-    scene.set_camera(&device, &queue, vp, eye_rel, anchor, lighting, None);
+    scene.set_camera(
+        &device,
+        &queue,
+        vp,
+        eye_rel,
+        anchor,
+        lighting,
+        morph.map(|params| (params, [eye_rel; 4])),
+    );
     // A one-shot capture (headless render/golden/`--screenshot`): the mesh
     // pipeline must match `lighting` in this exact frame, not a frame or two
     // later once a background rebuild lands.
