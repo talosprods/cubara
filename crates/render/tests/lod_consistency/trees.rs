@@ -235,22 +235,27 @@ pub fn model_tree(setup: &Setup, model: &cubara_render::TreeModelMesh, at: Vec3)
     DrawnTree { quads }
 }
 
-/// How much of its light `trees.wgsl` leaves a model vertex.
-fn model_shade(_setup: &Setup, _v: &cubara_render::TreeVertex) -> f64 {
-    // No AO on the instances (#332 decision 4).
-    1.0
+/// How much of its light `trees.wgsl` leaves a model vertex:
+/// `mix(ao_floor, 1, open)`, `ao_fraction` of a one-block cell written for
+/// an openness -- the same line `mesh.wgsl` lights a block by.
+fn model_shade(setup: &Setup, v: &cubara_render::TreeVertex) -> f64 {
+    let floor = setup.lighting.ao_floor as f64;
+    floor + (1.0 - floor) * v.open as f64
 }
 
-/// The model the game draws a tree of `site` with at `level`.
-pub fn model_for(setup: &Setup, level: u32, _site: TreeSite) -> cubara_render::TreeModelMesh {
+/// The model the game draws a tree of `site` with at `level`: the oak of
+/// its own trunk height at levels 1 and 2, its silhouette from level 3 --
+/// built by the game's own builder (`tree_model_meshes`).
+pub fn model_for(setup: &Setup, level: u32, site: TreeSite) -> cubara_render::TreeModelMesh {
     let layer_of = |name: &str| setup.layer_of(name);
+    let (oaks, silhouettes) =
+        cubara_render::tree_model_meshes(&setup.registry, &setup.structures, &layer_of);
+    let shapes = cubara_render::TreeShapes::of(&setup.structures);
+    let k = shapes.index(site.height);
     if level <= 2 {
-        cubara_render::build_oak_mesh(&setup.registry, &setup.structures, &layer_of)
-            .expect("oak.ron ships")
+        oaks[k].clone()
     } else {
-        let (height, r) = cubara_render::box_shape(&setup.structures);
-        let colour = |name| cubara_render::materials::mean_color(name).expect("a texture");
-        cubara_render::build_box_mesh(height, r, colour("oak_log_side"), colour("oak_leaves"))
+        silhouettes[k].clone()
     }
 }
 
@@ -274,15 +279,20 @@ pub fn node_under(setup: &Setup, level: u32, site: TreeSite) -> NodeKey {
 
 /// Where the game stands the instance of `site` at `level`: the trunk's
 /// base block, and how far the distance morph lifts it at the end of its
-/// band, in blocks.
+/// band, in blocks -- `cubara_world::mesh::node_trees`, what a built node
+/// carries, for the node that holds the ground under it.
 pub fn placed(setup: &Setup, snapshot: &WorldSnapshot, level: u32, site: TreeSite) -> ([i32; 3], i32) {
     let node = node_under(setup, level, site);
-    let found = snapshot
-        .node_trees(node, setup.tree_blocks())
+    let found = cubara_world::mesh::node_trees(snapshot, node, setup.tree_blocks(), None)
         .into_iter()
-        .find(|t| (t.x, t.z) == (site.x, site.z))
+        .find(|t| (t.site.x, t.site.z) == (site.x, site.z))
         .unwrap_or_else(|| panic!("the node {node:?} does not place the tree at {site:?}"));
-    ([found.x, found.base, found.z], 0)
+    assert_eq!(
+        found.site.height, site.height,
+        "a node placed the tree at ({}, {}) with another height",
+        site.x, site.z
+    );
+    ([found.site.x, found.site.base, found.site.z], found.morph)
 }
 
 /// One way of drawing a tree.
@@ -509,6 +519,16 @@ pub fn compare_trees(site: TreeSite, reference: &DrawnTree, other: &DrawnTree) -
     }
 }
 
+/// Whether level 0 meshes `site` in more than one chunk: the rows from the
+/// ground under it to its apex cross a chunk's floor. The level-0 mesher
+/// bakes a chunk's AO without looking into the next one
+/// (`docs/PHASE3_ARCHITECTURE.md` §9.3), so the faces just under such a
+/// floor come out more open there than the corner rule says -- than the
+/// instance, meshed whole, says.
+pub fn crosses_a_chunk_floor(site: TreeSite) -> bool {
+    (site.base - 1).div_euclid(16) != (site.base + site.height).div_euclid(16)
+}
+
 /// What the ground under a tree is like: how far its 5 x 5 columns' tops
 /// spread, in blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -623,12 +643,23 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
     );
     for (k, (name, _, _)) in comparisons().iter().enumerate() {
         let rows = &measured[k];
-        let mut kinds: Vec<Option<TreeGround>> = vec![None];
-        kinds.extend(TREE_GROUNDS.iter().map(|&g| Some(g)));
-        for kind in kinds {
+        let mut kinds: Vec<(String, Box<dyn Fn(TreeGround, &TreeCompare) -> bool>)> =
+            vec![("all".into(), Box::new(|_, _| true))];
+        for g in TREE_GROUNDS {
+            kinds.push((format!("{g:?}"), Box::new(move |k, _| k == g)));
+        }
+        kinds.push((
+            "all, in one chunk".into(),
+            Box::new(|_, c| !crosses_a_chunk_floor(c.site)),
+        ));
+        kinds.push((
+            "Flat, in one chunk".into(),
+            Box::new(|g, c| g == TreeGround::Flat && !crosses_a_chunk_floor(c.site)),
+        ));
+        for (kind, keep) in kinds {
             let these: Vec<&TreeCompare> = rows
                 .iter()
-                .filter(|(g, _)| kind.is_none_or(|k| k == *g))
+                .filter(|(g, c)| keep(*g, c))
                 .map(|(_, c)| c)
                 .collect();
             if these.is_empty() {
@@ -647,10 +678,267 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
                 "| {name} | {} | {} | {top_mean:.2} / {top_worst:.0}, {moved} | {foot_mean:.2} / {foot_worst:.0} | \
                  {xor_mean:.1} / {xor_worst:.1} | {area:.1} | {seen_mean:.1} / {seen_worst:.1} | \
                  {t3_mean:.1} / {t3_worst:.1} |\n",
-                kind.map_or("all".to_string(), |k| format!("{k:?}")),
+                kind,
                 these.len(),
             ));
         }
     }
+    s.push_str("\nThe worst trees (seen colour or T3 over 2/255, or the outline over 4 square blocks):\n");
+    for (k, (name, _, _)) in comparisons().iter().enumerate() {
+        for (g, c) in &measured[k] {
+            if c.worst_view_seen() > 2.0 || c.worst_t3() > 2.0 || c.worst_view_xor() > 4.0 {
+                let worst_dir = (0..6)
+                    .filter_map(|d| c.t3[d].map(|v| (d, v)))
+                    .fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+                s.push_str(&format!(
+                    "- {name}, {g:?} tree{} at ({}, {}, base {}, height {}): top {:+}, foot {:+}, \
+                     outline {:.1}, seen {:.1}, T3 {:.1} ({})\n",
+                    if crosses_a_chunk_floor(c.site) { " across a chunk floor" } else { "" },
+                    c.site.x,
+                    c.site.z,
+                    c.site.base,
+                    c.site.height,
+                    c.top,
+                    c.foot,
+                    c.worst_view_xor(),
+                    c.worst_view_seen(),
+                    worst_dir.1,
+                    tree_direction_name(worst_dir.0),
+                ));
+            }
+        }
+    }
     s
+}
+
+/// The bounds a tree is held to (#433's done-when). **All chosen, not
+/// derived**, each a little over what the build measures (the PR's table)
+/// and well under what any of the defects it was written against shows.
+pub mod bounds {
+    /// A drawing's outline in any view against the other's, where both
+    /// stand on the same foot on level ground, in square blocks: sixteen
+    /// samples of an eighth of a block, so a sample on an edge that rounds
+    /// the other way is not a failure. Measured 0.0. On a slope level 0
+    /// leaves out the faces of a tree that touch the ground beside it --
+    /// a trunk's foot against the uphill column, leaves inside it -- which
+    /// the ground hides on screen anyway: 1 to 11 square blocks there,
+    /// reported and not held (the foot and the height are, exactly).
+    pub const OUTLINE: f64 = 0.25;
+    /// Per face direction, and the mean colour each view sees, /255, on
+    /// level ground for a tree level 0 meshes in one chunk (elsewhere the
+    /// slope's own blocks and the chunk floor shade level 0's tree, and
+    /// the instance cannot know). Measured 0.0.
+    pub const FLAT_COLOUR: f64 = 0.5;
+    /// The same, over every tree level 0 meshes in one chunk, the mean of
+    /// the trees. Measured 0.4.
+    pub const MEAN_COLOUR: f64 = 1.0;
+    /// The worst single tree level 0 meshes in one chunk, any direction:
+    /// the trunk of a tree on a slope stands beside ground that shades it
+    /// at level 0. Measured 3.4 (T3) and 4.2 (seen; a tree whose foot also
+    /// moves a block with its ground).
+    pub const WORST_COLOUR: f64 = 5.0;
+    /// At the 512 m edge the silhouette against the oak: per direction it
+    /// is the oak's colour by construction (measured 0.0); what a view
+    /// sees differs where the oak's darker corners are the ones hidden
+    /// (measured 0.9 against the oak, 1.0 against level 0, mean and worst
+    /// alike). `SILHOUETTE_SEEN` stands in for `FLAT_COLOUR` and
+    /// `MEAN_COLOUR` for the seen colour of level 3.
+    pub const SILHOUETTE_T3: f64 = 0.1;
+    pub const SILHOUETTE_SEEN: f64 = 1.5;
+    /// At the 288 and 512 m edges, where the morph has taken the near
+    /// level's tree: the most a tree's foot may still move, in blocks, and
+    /// how many of the sample may move at all. A column beside a cave or
+    /// pit, or across a node's floor, does not morph (`cubara_world::morph`),
+    /// and its tree swaps with it. Measured 1 tree of 48, by 1.
+    pub const EDGE_STEP: f32 = 1.0;
+    pub const EDGE_MOVED: usize = 2;
+}
+
+/// The bound on the colour a view sees of `rep`'s tree: `otherwise`, or the
+/// silhouette's own at level 3.
+fn seen_bound(rep: Rep, otherwise: f64) -> f64 {
+    match rep {
+        Rep::Instance { level: 3.., .. } => bounds::SILHOUETTE_SEEN,
+        _ => otherwise,
+    }
+}
+
+/// Everything [`bounds`] holds `measured` (by [`comparisons`]) to, as the
+/// list of what fails: empty when the trees are the same at every distance.
+/// A function, so that a test can hand it a wrong drawing and see it fail.
+pub fn check(setup: &Setup, measured: &[Vec<(TreeGround, TreeCompare)>]) -> Vec<String> {
+    let mut failures = Vec::new();
+    let names = comparisons();
+    for (k, (name, a, b)) in names.iter().enumerate() {
+        let rows = &measured[k];
+        for (ground, c) in rows {
+            let at = format!(
+                "{name}: the {ground:?} tree at ({}, {}) (seed {TREE_SEED:#x})",
+                c.site.x, c.site.z
+            );
+            // Its own height, wherever it stands.
+            if c.top != c.foot {
+                failures.push(format!(
+                    "{at}: its top moved {:+} and its foot {:+} -- it is not its own height",
+                    c.top, c.foot
+                ));
+            }
+            // Standing where its ground is: the foot moves by what the
+            // ground under its trunk moves, and nothing else.
+            if *a == Rep::Level0 {
+                if let Rep::Instance { level, .. } = b {
+                    let w = 1 << level;
+                    let s = c.site;
+                    let step = setup.gen.cell_top(s.x.div_euclid(w) * w, s.z.div_euclid(w) * w, w)
+                        - setup.gen.surface_height(s.x, s.z);
+                    if c.foot != step as f32 {
+                        failures.push(format!(
+                            "{at}: its foot moved {:+}, its ground {step:+}",
+                            c.foot
+                        ));
+                    }
+                }
+            }
+            // On the same foot, the same outline from every side.
+            if *ground == TreeGround::Flat && c.foot == 0.0 && c.worst_view_xor() > bounds::OUTLINE
+            {
+                failures.push(format!(
+                    "{at}: on the same foot its outline differs by {:.2} square blocks",
+                    c.worst_view_xor()
+                ));
+            }
+            let one_chunk = !crosses_a_chunk_floor(c.site);
+            if *a == Rep::Level0 && one_chunk {
+                let flat = *ground == TreeGround::Flat && c.foot == 0.0;
+                if flat && c.worst_t3() > bounds::FLAT_COLOUR {
+                    failures.push(format!(
+                        "{at}: its colour per direction is {:.2}/255 off level 0's",
+                        c.worst_t3()
+                    ));
+                }
+                if flat && c.worst_view_seen() > seen_bound(*b, bounds::FLAT_COLOUR) {
+                    failures.push(format!(
+                        "{at}: the colour seen of it is {:.2}/255 off level 0's",
+                        c.worst_view_seen()
+                    ));
+                }
+                if c.worst_t3() > bounds::WORST_COLOUR {
+                    failures.push(format!(
+                        "{at}: its colour per direction is {:.2}/255 off level 0's",
+                        c.worst_t3()
+                    ));
+                }
+            }
+        }
+        if *a == Rep::Level0 {
+            let these: Vec<&TreeCompare> = rows
+                .iter()
+                .map(|(_, c)| c)
+                .filter(|c| !crosses_a_chunk_floor(c.site))
+                .collect();
+            for (what, value, bound) in [
+                (
+                    "T3",
+                    stats(these.iter().map(|c| c.worst_t3())).0,
+                    bounds::MEAN_COLOUR,
+                ),
+                (
+                    "seen colour",
+                    stats(these.iter().map(|c| c.worst_view_seen())).0,
+                    seen_bound(*b, bounds::MEAN_COLOUR),
+                ),
+            ] {
+                if value > bound {
+                    failures.push(format!(
+                        "{name}: the mean tree's {what} is {value:.2}/255 off level 0's"
+                    ));
+                }
+            }
+        }
+        if let Rep::Instance { morphed: true, .. } = a {
+            let moved: Vec<f32> = rows
+                .iter()
+                .map(|(_, c)| c.foot.abs())
+                .filter(|&m| m > 0.0)
+                .collect();
+            if moved.len() > bounds::EDGE_MOVED || moved.iter().any(|&m| m > bounds::EDGE_STEP) {
+                failures.push(format!(
+                    "{name}: {} of {} trees still move at the swap, by {moved:?}",
+                    moved.len(),
+                    rows.len()
+                ));
+            }
+            if matches!(b, Rep::Instance { level: 3, .. }) {
+                for (_, c) in rows {
+                    if c.worst_t3() > bounds::SILHOUETTE_T3
+                        || c.worst_view_seen() > bounds::SILHOUETTE_SEEN
+                    {
+                        failures.push(format!(
+                            "{name}: the silhouette at ({}, {}) is T3 {:.2}, seen {:.2}/255 off the oak",
+                            c.site.x,
+                            c.site.z,
+                            c.worst_t3(),
+                            c.worst_view_seen()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    failures
+}
+
+/// The two boxes level 3 drew a tree with before #433 (trunk and canopy,
+/// sized to the oak's bounds, in the log's and the leaves' mean colours,
+/// unshaded): rebuilt here only to show the check would see them.
+pub fn two_boxes(setup: &Setup, site: TreeSite) -> cubara_render::TreeModelMesh {
+    let colour = |name| cubara_render::materials::mean_color(name).expect("a texture");
+    let (top, r) = (site.height - 1, site.canopy_radius as f32);
+    let mut mesh = cubara_render::TreeModelMesh::default();
+    let mut push_box = |min: [f32; 3], max: [f32; 3], color: [f32; 3]| {
+        for axis in 0..3 {
+            for (side, plane) in [(1.0f32, max[axis]), (-1.0, min[axis])] {
+                let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+                let corner = |a: f32, b: f32| {
+                    let mut p = [0.0f32; 3];
+                    p[axis] = plane;
+                    p[u] = a;
+                    p[v] = b;
+                    p
+                };
+                let mut corners = [
+                    corner(min[u], min[v]),
+                    corner(max[u], min[v]),
+                    corner(max[u], max[v]),
+                    corner(min[u], max[v]),
+                ];
+                if side < 0.0 {
+                    corners.reverse();
+                }
+                let mut normal = [0.0f32; 3];
+                normal[axis] = side;
+                let base = mesh.vertices.len() as u32;
+                for position in corners {
+                    mesh.vertices.push(cubara_render::TreeVertex {
+                        position,
+                        normal,
+                        uv: [0.0, 0.0],
+                        layer: -1.0,
+                        color,
+                        open: 1.0,
+                    });
+                }
+                mesh.indices
+                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+    };
+    let _ = setup;
+    push_box([0.0, 0.0, 0.0], [1.0, site.height as f32, 1.0], colour("oak_log_side"));
+    push_box(
+        [-r, (top - site.canopy_radius) as f32, -r],
+        [r + 1.0, (top + 2) as f32, r + 1.0],
+        colour("oak_leaves"),
+    );
+    mesh
 }
