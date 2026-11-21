@@ -2184,7 +2184,12 @@ fn far_terrain(
     let edge = (region_radius * 16) as f64;
     let view = FarView {
         eye: [eye.x as f64, eye.y as f64, eye.z as f64],
-        // The settings the game ships (`cubara-app`'s `far_streaming`).
+        // Quads of 16 pixels, an error bound of 2 and a floor of 4: the
+        // sizes `cubara-app`'s `far_streaming` names for High, without its
+        // `FAR_QUAD_SCALE` -- so these pictures hold more of the mesher's
+        // cases (more levels, more joins between them) than the game draws
+        // at once, and do not move when that scale is tuned. This crate
+        // could not read the constant if it wanted to (Rule 3).
         split_ratio: split_ratio_for(16.0, shot.height as f64, fov),
         max_error: 2.0 * pixel,
         min_quad: 4.0 * pixel,
