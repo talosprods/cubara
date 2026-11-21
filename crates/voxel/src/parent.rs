@@ -20,10 +20,11 @@
 //! merged quad, not of any one cell.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::mesh::{Face, Mesh};
 
-/// One quad of the parent's mesh, in the child node's frame: its texture
+/// One quad of the parent's mesh, in the parent node's frame: its texture
 /// layer and its two triangles, each corner as `(a, b, openness)` with `a`,
 /// `b` the plane's two in-plane axes (`(d + 1) % 3` and `(d + 2) % 3` for a
 /// face along `d`, the mesher's sweep axes).
@@ -35,14 +36,29 @@ struct ParentQuad {
     uniform: Option<f32>,
 }
 
-/// The parent level's faces over a child node ([`ParentFaces::from_mesh`]).
+/// A parent node's faces, indexed for the colour morph
+/// ([`ParentFaces::from_mesh`]), in the parent's own frame: one per parent
+/// node, shared by the children that read it ([`ParentView`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParentFaces {
     quads: Vec<ParentQuad>,
-    /// `(face, plane, a, b)` -> quad, one entry per block of each quad's
-    /// area: the quad that covers the block `[a, a + 1) x [b, b + 1)` of the
-    /// plane `plane` (in blocks along the face's axis).
+    /// `(face, plane, a, b)` -> quad, one entry per lattice cell of each
+    /// quad's area: the quad that covers cell `(a, b)` of the plane `plane`
+    /// (in blocks along the face's axis), a cell being `cell` blocks along
+    /// each axis.
     cells: HashMap<(u8, i32, i32, i32), u32>,
+    /// The parent lattice's cell, in blocks per axis: every quad's corners
+    /// lie on it, so the index needs no finer grid.
+    cell: [i32; 3],
+}
+
+/// A child node's view of its parent's faces: the parent's index and where
+/// the child's frame lies in the parent's (child origin minus parent
+/// origin, in blocks). Points asked of it are in the child's frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParentView {
+    faces: Arc<ParentFaces>,
+    offset: [i32; 3],
 }
 
 /// What a child face shows of its parent ([`ParentFaces::look_up`]), the
@@ -75,17 +91,16 @@ fn plane_axes(d: usize) -> (usize, usize) {
 }
 
 impl ParentFaces {
-    /// The faces of `parent`, a mesh made by the same mesher, whose node
-    /// origin lies `offset` blocks from the child's (parent origin minus
-    /// child origin); only the blocks of the planes whose in-plane extent
-    /// overlaps `[lo, hi)` (child frame, in blocks, all three axes) are
-    /// indexed -- the child's own box, with whatever margin its faces may
-    /// reach at full morph.
+    /// The faces of `parent`, a node mesh made by the same mesher on a
+    /// lattice of `cell` blocks per axis (every quad corner on it).
     ///
     /// Quads with no area (a latent riser, which only the parent's own
     /// morph opens) are left out: at rest they show nothing.
-    pub fn from_mesh(parent: &Mesh, offset: [i32; 3], lo: [i32; 3], hi: [i32; 3]) -> Self {
-        let mut out = ParentFaces::default();
+    pub fn from_mesh(parent: &Mesh, cell: [i32; 3]) -> Self {
+        let mut out = ParentFaces {
+            cell,
+            ..ParentFaces::default()
+        };
         for quad in parent.indices.chunks(6) {
             let verts: Vec<_> = quad.iter().map(|&i| parent.vertices[i as usize]).collect();
             let face = verts[0].face();
@@ -93,8 +108,7 @@ impl ParentFaces {
             let (ua, va) = plane_axes(d);
             let pos = |k: usize| {
                 let v = verts[k];
-                let p = [v.x() as i32, v.y() as i32, v.z() as i32];
-                [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2]]
+                [v.x() as i32, v.y() as i32, v.z() as i32]
             };
             let plane = pos(0)[d];
             let corner = |k: usize| -> [f32; 3] {
@@ -116,9 +130,6 @@ impl ParentFaces {
             if a0 == a1 || b0 == b1 {
                 continue;
             }
-            if plane < lo[d] || plane > hi[d] {
-                continue;
-            }
             let opens: Vec<f32> = (0..6).map(|k| verts[k].openness()).collect();
             let uniform = opens
                 .iter()
@@ -130,8 +141,13 @@ impl ParentFaces {
                 tris,
                 uniform,
             });
-            for a in a0.max(lo[ua])..a1.min(hi[ua]) {
-                for b in b0.max(lo[va])..b1.min(hi[va]) {
+            let (ca, cb) = (cell[ua], cell[va]);
+            debug_assert!(
+                [a0, a1].iter().all(|a| a % ca == 0) && [b0, b1].iter().all(|b| b % cb == 0),
+                "a quad off its lattice: {a0}..{a1} x {b0}..{b1}, cell {ca} x {cb}"
+            );
+            for a in a0.div_euclid(ca)..a1.div_euclid(ca) {
+                for b in b0.div_euclid(cb)..b1.div_euclid(cb) {
                     out.cells.insert((face as u8, plane, a, b), id);
                 }
             }
@@ -139,7 +155,7 @@ impl ParentFaces {
         out
     }
 
-    /// The parent quad facing `face` that covers `inside` (child frame, in
+    /// The parent quad facing `face` that covers `inside` (parent frame, in
     /// blocks): a point in the interior of a child face at its fully morphed
     /// place, on the face's plane. `None` where the parent draws no such
     /// face there.
@@ -149,8 +165,8 @@ impl ParentFaces {
         let key = (
             face as u8,
             inside[d].round() as i32,
-            inside[ua].floor() as i32,
-            inside[va].floor() as i32,
+            (inside[ua] / self.cell[ua] as f32).floor() as i32,
+            (inside[va] / self.cell[va] as f32).floor() as i32,
         );
         let &id = self.cells.get(&key)?;
         let q = &self.quads[id as usize];
@@ -162,7 +178,7 @@ impl ParentFaces {
         })
     }
 
-    /// How open `look`'s quad is at `p` (child frame, in blocks, on its
+    /// How open `look`'s quad is at `p` (parent frame, in blocks, on its
     /// plane), interpolated over whichever of its two triangles holds
     /// `toward` -- a point a little inside the child face whose corner `p`
     /// is, which decides at the quad's diagonal and its edges.
@@ -202,6 +218,29 @@ impl ParentFaces {
     }
 }
 
+impl ParentView {
+    /// `faces` seen from a child whose origin lies `offset` blocks from the
+    /// parent's (child origin minus parent origin).
+    pub fn new(faces: Arc<ParentFaces>, offset: [i32; 3]) -> Self {
+        Self { faces, offset }
+    }
+
+    fn to_parent(&self, p: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|k| p[k] + self.offset[k] as f32)
+    }
+
+    /// [`ParentFaces::look_up`], asked in the child's frame.
+    pub fn look_up(&self, face: Face, inside: [f32; 3]) -> Option<ParentLook> {
+        self.faces.look_up(face, self.to_parent(inside))
+    }
+
+    /// [`ParentFaces::openness_at`], asked in the child's frame.
+    pub fn openness_at(&self, look: ParentLook, face: Face, p: [f32; 3], toward: [f32; 3]) -> f32 {
+        self.faces
+            .openness_at(look, face, self.to_parent(p), self.to_parent(toward))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +260,7 @@ mod tests {
         }
     }
 
-    const ALL: ([i32; 3], [i32; 3]) = ([-100, -100, -100], [100, 100, 100]);
+    const BLOCK: [i32; 3] = [1, 1, 1];
 
     /// A top four blocks square at y = 8, dark at its corner (0, 0) and open
     /// at the others: found under any point of it, and read as the
@@ -235,7 +274,7 @@ mod tests {
             [([0, 8, 0], 0), ([0, 8, 4], 3), ([4, 8, 4], 3), ([4, 8, 0], 3)],
             7,
         );
-        let faces = ParentFaces::from_mesh(&mesh, [0, 0, 0], ALL.0, ALL.1);
+        let faces = ParentFaces::from_mesh(&mesh, BLOCK);
         let look = faces.look_up(Face::PosY, [1.5, 8.0, 2.5]).expect("under the quad");
         assert_eq!(look, ParentLook::Quad(7, 0));
         assert_eq!(look.layer(), 7);
@@ -260,7 +299,7 @@ mod tests {
             [([0, 8, 0], 3), ([0, 8, 4], 0), ([4, 8, 4], 3), ([4, 8, 0], 0)],
             1,
         );
-        let faces = ParentFaces::from_mesh(&mesh, [0, 0, 0], ALL.0, ALL.1);
+        let faces = ParentFaces::from_mesh(&mesh, BLOCK);
         let look = faces.look_up(Face::PosY, [1.0, 8.0, 1.0]).unwrap();
         // (x, z) = (2, 2) is on the diagonal: both triangles say 1.
         // (x, z) = (1, 3) lies in triangle 0-1-2, (3, 1) in 0-2-3; the point
@@ -272,23 +311,27 @@ mod tests {
     }
 
     /// A quad equally open all over is read as its openness, so cells of
-    /// two such quads can merge; the offset moves the parent into the
-    /// child's frame; and only the window is indexed.
+    /// two such quads can merge; a child's view moves its points into the
+    /// parent's frame; and an index on a coarse lattice finds a point by
+    /// its cell.
     #[test]
-    fn a_uniform_quad_reads_as_its_openness_and_the_offset_and_window_hold() {
+    fn a_uniform_quad_reads_as_its_openness_and_a_view_and_a_lattice_hold() {
+        // A wall on the plane x = 16, rows 4 to 6, z 0 to 8.
         let mesh = one_quad(
             Face::PosX,
-            [([16, 0, 0], 3), ([16, 2, 0], 3), ([16, 2, 2], 3), ([16, 0, 2], 3)],
+            [([16, 4, 0], 3), ([16, 6, 0], 3), ([16, 6, 8], 3), ([16, 4, 8], 3)],
             3,
         );
-        let faces = ParentFaces::from_mesh(&mesh, [-16, 4, 0], ALL.0, ALL.1);
+        let faces = Arc::new(ParentFaces::from_mesh(&mesh, [8, 1, 8]));
         assert_eq!(
-            faces.look_up(Face::PosX, [0.0, 5.5, 1.5]),
+            faces.look_up(Face::PosX, [16.0, 5.5, 7.5]),
             Some(ParentLook::Uniform(3, 255))
         );
-        assert_eq!(faces.look_up(Face::PosX, [16.0, 1.5, 1.5]), None);
-        let window = ParentFaces::from_mesh(&mesh, [-16, 4, 0], [0, 0, 0], [16, 16, 1]);
-        assert!(window.look_up(Face::PosX, [0.0, 5.5, 0.5]).is_some());
-        assert_eq!(window.look_up(Face::PosX, [0.0, 5.5, 1.5]), None, "z 1 is out");
+        assert_eq!(faces.look_up(Face::PosX, [16.0, 5.5, 8.5]), None, "z 8 is past it");
+        assert_eq!(faces.look_up(Face::PosX, [16.0, 6.5, 1.5]), None, "row 6 is past it");
+        // A child whose origin is 16 blocks along x from the parent's.
+        let view = ParentView::new(faces, [16, 0, 0]);
+        assert!(view.look_up(Face::PosX, [0.0, 4.5, 0.5]).is_some());
+        assert_eq!(view.look_up(Face::PosX, [16.0, 4.5, 0.5]), None);
     }
 }

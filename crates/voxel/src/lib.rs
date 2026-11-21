@@ -40,7 +40,7 @@ pub use item::{
 };
 pub use mesh::{Face, Mesh, Vertex, MAX_MORPH_DELTA, MORPH_DELTA_STEP};
 pub use ore::{OreDef, OreError, OreRegistry};
-pub use parent::{ParentFaces, ParentLook};
+pub use parent::{ParentFaces, ParentLook, ParentView};
 pub use recipe::{Recipe, RecipeBook, RecipeDef, RecipeError, RecipeOutputDef, MAX_GRID};
 pub use registry::{
     BlockRegistry, DropRule, Faces, Interact, ItemDrop, Material, RegistryError, Shape,

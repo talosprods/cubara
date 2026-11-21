@@ -23,7 +23,7 @@ use std::thread::JoinHandle;
 
 use cubara_voxel::{
     build_mesh_bounded_occluded_node_morph, Aabb, BlockRegistry, ChunkCoord, Mesh, MeshContext,
-    NodeChunk,
+    NodeChunk, ParentFaces, ParentView,
 };
 
 use crate::node::{desired_nodes, NodeKey, RingSchedule};
@@ -86,11 +86,45 @@ pub fn build_node(
     node: NodeKey,
     blocks: TerrainBlocks,
 ) -> BuiltNode {
+    let parents = |parent| parent_faces(world, registry, layer_of, parent, blocks);
+    build_node_with(world, registry, layer_of, node, blocks, &parents)
+}
+
+/// [`build_node`], with its parent's faces (the colour morph) from a
+/// [`ParentCache`] its siblings share: what the [`MeshPool`]'s workers do.
+pub fn build_node_shared(
+    world: &Arc<WorldSnapshot>,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    cache: &ParentCache,
+) -> BuiltNode {
+    let parents = |parent| {
+        cache.get(world, parent, || {
+            parent_faces(world, registry, layer_of, parent, blocks)
+        })
+    };
+    build_node_with(world, registry, layer_of, node, blocks, &parents)
+}
+
+/// The faces of a parent node, indexed, for the colour morph: made by
+/// [`parent_faces`], or read from a [`ParentCache`].
+type Parents<'a> = dyn Fn(NodeKey) -> Option<Arc<cubara_voxel::ParentFaces>> + 'a;
+
+fn build_node_with(
+    world: &WorldSnapshot,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    parents: &Parents,
+) -> BuiltNode {
     let chunk = world.node_at(node, blocks);
     let links = crate::visibility::node_links(chunk.as_ref(), registry);
     let geometry = chunk
         .as_ref()
-        .and_then(|c| mesh_chunk(world, registry, layer_of, node, blocks, c));
+        .and_then(|c| mesh_chunk_with(world, registry, layer_of, node, blocks, c, Some(parents)));
     // Both halves of this guard are belt-and-braces, not load-bearing on
     // their own, which is why neither has a dedicated test here (found by
     // `check-tests-can-fail.sh`, recorded rather than chased): `node.level
@@ -154,7 +188,9 @@ pub fn mesh_node_with(
     morph: bool,
 ) -> Option<NodeGeometry> {
     let chunk = world.node_at(node, blocks)?;
-    mesh_chunk_with(world, registry, layer_of, node, blocks, &chunk, morph)
+    let parents = |parent| parent_faces(world, registry, layer_of, parent, blocks);
+    let parents: &Parents = &parents;
+    mesh_chunk_with(world, registry, layer_of, node, blocks, &chunk, morph.then_some(parents))
 }
 
 /// Mesh `node` from its already generated blocks.
@@ -167,19 +203,11 @@ pub fn mesh_node_with(
 /// leaving a single scalar for the GPU's `node_origins.w` to multiply by --
 /// which a single scalar couldn't represent anyway, once the vertical cell
 /// stopped matching the horizontal one.
-fn mesh_chunk(
-    world: &WorldSnapshot,
-    registry: &BlockRegistry,
-    layer_of: &dyn Fn(&str) -> u32,
-    node: NodeKey,
-    blocks: TerrainBlocks,
-    chunk: &NodeChunk,
-) -> Option<NodeGeometry> {
-    mesh_chunk_with(world, registry, layer_of, node, blocks, chunk, true)
-}
-
-/// [`mesh_chunk`], the distance morph baked in where `morph` is set and the
-/// node's level morphs ([`crate::morph::node_columns`]).
+///
+/// The distance morph is baked in where `morph` gives the parent's faces (the
+/// colour morph's source, `docs/PHASE3_ARCHITECTURE.md` §9.6) and the node's
+/// level morphs ([`crate::morph::node_columns`]); `None` meshes it as built.
+#[allow(clippy::too_many_arguments)]
 fn mesh_chunk_with(
     world: &WorldSnapshot,
     registry: &BlockRegistry,
@@ -187,17 +215,18 @@ fn mesh_chunk_with(
     node: NodeKey,
     blocks: TerrainBlocks,
     chunk: &NodeChunk,
-    morph: bool,
+    morph: Option<&Parents>,
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
-    let columns = if morph {
+    let columns = morph.and_then(|parents| {
         crate::morph::node_columns(world, node, blocks).map(|mut c| {
-            c.parent = parent_faces(world, registry, layer_of, node, blocks);
+            let parent = node.parent();
+            let (p, o) = (parent.world_origin(), node.world_origin());
+            c.parent = parents(parent)
+                .map(|faces| ParentView::new(faces, [o[0] - p[0], o[1] - p[1], o[2] - p[2]]));
             c
         })
-    } else {
-        None
-    };
+    });
     let origin = node.world_origin();
     let scale = 1.0f32;
     let ground = std::cell::RefCell::new(BorderGround::default());
@@ -226,39 +255,85 @@ fn mesh_chunk_with(
 ///
 /// Without the neighbours, digging out a block at the edge of a chunk leaves
 /// the next chunk still hiding the face that now looks into the hole.
-/// What the next coarser level draws over `node`, for the colour morph
+/// The faces of `parent`, indexed for the colour morph of its children
 /// (`cubara_voxel::ParentFaces`, `docs/PHASE3_ARCHITECTURE.md` §9.6): the
-/// parent node's own mesh, made by the same generator and mesher as the
-/// game's, indexed over `node`'s footprint.
+/// parent node generated and meshed by the game's own generator and mesher.
 ///
-/// **Made without a morph of its own.** The game draws the parent with its
+/// **Meshed without a morph of its own.** The game draws the parent with its
 /// own morph keyed in, which cuts its quads at its cells and lays latent
 /// risers; neither changes what it shows at rest -- a quad is only ever cut
 /// where every cell of it is alike, and a latent riser has no area -- and
-/// the parent is at rest wherever this node is swapped for it (its own band
-/// starts past this node's ring). Keyed in, the parent would ask for its own
-/// parent in turn.
+/// the parent is at rest wherever its child is swapped for it (its own band
+/// starts past its child's ring). Keyed in, it would ask for its own parent
+/// in turn.
 ///
-/// `None` where the parent draws nothing (a node of sky), and then this
-/// node keeps its own colours.
+/// `None` where the parent draws nothing (a node of sky); its children then
+/// keep their own colours.
 fn parent_faces(
     world: &WorldSnapshot,
     registry: &BlockRegistry,
     layer_of: &dyn Fn(&str) -> u32,
-    node: NodeKey,
+    parent: NodeKey,
     blocks: TerrainBlocks,
-) -> Option<cubara_voxel::ParentFaces> {
-    let parent = node.parent();
+) -> Option<Arc<ParentFaces>> {
     let chunk = world.node_at(parent, blocks)?;
-    let geometry = mesh_chunk_with(world, registry, layer_of, parent, blocks, &chunk, false)?;
-    let (p, c) = (parent.world_origin(), node.world_origin());
-    let size = 16 * node.extent_chunks();
-    Some(cubara_voxel::ParentFaces::from_mesh(
-        &geometry.mesh,
-        [p[0] - c[0], p[1] - c[1], p[2] - c[2]],
-        [0, i32::MIN / 2, 0],
-        [size, i32::MAX / 2, size],
-    ))
+    let geometry = mesh_chunk_with(world, registry, layer_of, parent, blocks, &chunk, None)?;
+    let w = parent.extent_chunks();
+    Some(Arc::new(ParentFaces::from_mesh(&geometry.mesh, [w, 1, w])))
+}
+
+/// How many parent nodes a [`ParentCache`] keeps. Chosen, not derived: a
+/// node splits into eight children requested together, and a streaming
+/// update splits a few parents at once; past this the oldest is made again
+/// if asked for.
+const PARENT_CACHE: usize = 32;
+
+/// Parent nodes' faces already made ([`parent_faces`]), shared by the
+/// workers meshing their children: a node splits into eight, and each child
+/// of it needs the same parent generated and meshed. **An accelerator only**
+/// (`docs/PHASE3_ARCHITECTURE.md` §3): what it holds is a pure function of
+/// the snapshot and the node, so a job finds what it would have made. Keyed
+/// by the snapshot itself (held, so no other can take its address) and the
+/// node; a worker asking for a parent another is making waits for it rather
+/// than making it twice.
+#[derive(Default)]
+pub struct ParentCache {
+    entries: Mutex<std::collections::VecDeque<ParentEntry>>,
+}
+
+type ParentEntry = (
+    Arc<WorldSnapshot>,
+    NodeKey,
+    Arc<std::sync::OnceLock<Option<Arc<ParentFaces>>>>,
+);
+
+impl ParentCache {
+    /// `parent`'s faces in `world`, made by `make` unless already made.
+    pub fn get(
+        &self,
+        world: &Arc<WorldSnapshot>,
+        parent: NodeKey,
+        make: impl FnOnce() -> Option<Arc<ParentFaces>>,
+    ) -> Option<Arc<ParentFaces>> {
+        let slot = {
+            let mut entries = self.entries.lock().expect("parent cache lock");
+            match entries
+                .iter()
+                .find(|(w, n, _)| Arc::ptr_eq(w, world) && *n == parent)
+            {
+                Some((_, _, slot)) => Arc::clone(slot),
+                None => {
+                    let slot = Arc::new(std::sync::OnceLock::new());
+                    entries.push_back((Arc::clone(world), parent, Arc::clone(&slot)));
+                    if entries.len() > PARENT_CACHE {
+                        entries.pop_front();
+                    }
+                    slot
+                }
+            }
+        };
+        slot.get_or_init(make).clone()
+    }
 }
 
 pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
@@ -533,9 +608,11 @@ impl MeshPool {
         // then releases it and meshes in parallel with the others.
         let job_rx = Arc::new(Mutex::new(job_rx));
 
+        let cache = Arc::new(ParentCache::default());
         let _workers = (0..workers)
             .map(|_| {
                 let jobs = Arc::clone(&job_rx);
+                let cache = Arc::clone(&cache);
                 let results = result_tx.clone();
                 std::thread::Builder::new()
                     .name("cubara-mesher".into())
@@ -548,7 +625,14 @@ impl MeshPool {
                                 Err(_) => break,
                             }
                         };
-                        let built = build_node(&world, &registry, &*layer_of, node, blocks);
+                        let built = build_node_shared(
+                            &world,
+                            &registry,
+                            &*layer_of,
+                            node,
+                            blocks,
+                            &cache,
+                        );
                         if results.send((ticket, built)).is_err() {
                             break; // caller gone
                         }
@@ -1174,5 +1258,56 @@ mod tests {
             sorted,
             "already in ascending NodeKey order"
         );
+    }
+
+    /// **The parent cache is an accelerator only**: a node built with its
+    /// siblings' shared parent is built exactly as alone, and a parent is
+    /// made once for all the children that ask with the same snapshot --
+    /// again for another snapshot, and again once it has aged out.
+    #[test]
+    fn a_parent_is_made_once_for_its_children_and_changes_nothing() {
+        let registry = test_registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = Arc::new(World::new().snapshot());
+        let layer = |_: &str| 0u32;
+        let cache = ParentCache::default();
+        // The level-0 nodes under a level-1 node holding the surface.
+        let y = world.surface_height(8, 8);
+        let parent = NodeKey::new(1, [0, y.div_euclid(32), 0]);
+        let mut built = 0;
+        for k in 0..8 {
+            let child = NodeKey::new(
+                0,
+                [
+                    parent.pos[0] * 2 + (k & 1),
+                    parent.pos[1] * 2 + ((k >> 1) & 1),
+                    parent.pos[2] * 2 + (k >> 2),
+                ],
+            );
+            assert_eq!(child.parent(), parent);
+            let alone = build_node(&world, &registry, &layer, child, blocks);
+            let shared = build_node_shared(&world, &registry, &layer, child, blocks, &cache);
+            let vertices = |b: &BuiltNode| b.geometry.as_ref().map(|g| g.mesh.vertices.clone());
+            assert_eq!(vertices(&alone), vertices(&shared), "{child:?}");
+            built += alone.geometry.is_some() as usize;
+        }
+        assert!(built > 0, "no child of {parent:?} draws anything");
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            None
+        };
+        // The cache holds the parent the children made: asking again makes
+        // nothing.
+        let _ = cache.get(&world, parent, make);
+        assert_eq!(made.get(), 0, "made again for the same snapshot");
+        let other = Arc::new(World::new().snapshot());
+        let _ = cache.get(&other, parent, make);
+        assert_eq!(made.get(), 1, "another snapshot is another world");
+        for k in 0..PARENT_CACHE as i32 {
+            let _ = cache.get(&other, NodeKey::new(1, [k, 100, 0]), || None);
+        }
+        let _ = cache.get(&world, parent, make);
+        assert_eq!(made.get(), 2, "the oldest ages out");
     }
 }

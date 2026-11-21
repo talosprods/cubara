@@ -120,10 +120,10 @@ struct VsOut {
     // layers are one), all per vertex.
     @location(1) ao_haze: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) @interpolate(flat) layer: u32,
-    // The parent level's texture layer here (the colour morph); `layer`
-    // itself where the vertex has none.
-    @location(4) @interpolate(flat) parent_layer: u32,
+    // The texture layer (low 16 bits) and the parent level's layer here
+    // (high 16; the colour morph, the layer itself where there is none),
+    // in one flat varying: the fragment stage reads one input fewer.
+    @location(3) @interpolate(flat) layers: u32,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -257,15 +257,18 @@ fn vs_main(in: VsIn) -> VsOut {
     let parent_open = f32((in.packed3 >> 12u) & 0xFFu) / 255.0;
     let colour_morph = select(0.0, morph, has_parent);
     let lit_ao = mix(ao, mix(ao_floor, 1.0, parent_open), colour_morph);
-    let blend = select(0.0, colour_morph, parent_layer != tex_layer);
+    // The texture blends over the second half of the band only: its cost is
+    // a second sample, and the first half is the near ground, most of the
+    // frame's pixels (BENCHMARKS / §9.6). The light needs no sample and
+    // blends over the whole band.
+    let blend = select(0.0, clamp(2.0 * colour_morph - 1.0, 0.0, 1.0), parent_layer != tex_layer);
 
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
     out.ao_haze = vec3<f32>(lit_ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y), blend);
     out.uv = vec2<f32>(u, v);
-    out.layer = tex_layer;
-    out.parent_layer = parent_layer;
+    out.layers = tex_layer | (parent_layer << 16u);
     return out;
 }
 
@@ -291,9 +294,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // branch that most fragments skip (`textureSampleGrad`).
     let uv_dx = dpdx(in.uv);
     let uv_dy = dpdy(in.uv);
-    var tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
+    let layer = in.layers & 0xFFFFu;
+    var tex = textureSample(block_textures, block_sampler, in.uv, layer);
     if (in.ao_haze.z > 0.0) {
-        let parent = textureSampleGrad(block_textures, block_sampler, in.uv, in.parent_layer, uv_dx, uv_dy);
+        let parent = textureSampleGrad(block_textures, block_sampler, in.uv, in.layers >> 16u, uv_dx, uv_dy);
         tex = mix(tex, parent, in.ao_haze.z);
     }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);

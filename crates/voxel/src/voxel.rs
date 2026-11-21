@@ -10,7 +10,7 @@
 
 use crate::block::BlockId;
 use crate::mesh::{Face, Mesh, Vertex};
-use crate::parent::{ParentFaces, ParentLook};
+use crate::parent::{ParentLook, ParentView};
 use crate::registry::BlockRegistry;
 use crate::storage::{ChunkPayloadError, ChunkStorage};
 
@@ -52,7 +52,7 @@ struct MaskCell {
     /// node's greedy quads at its parent's cell boundaries.
     morph: Morph,
     /// What the parent level draws where the morph takes this face (the
-    /// colour morph, [`ParentFaces`]); `None` for a face that does not
+    /// colour morph, [`ParentFaces`](crate::ParentFaces)); `None` for a face that does not
     /// morph. Cells merge only where they show the same of their parent.
     parent: Option<ParentLook>,
 }
@@ -107,7 +107,7 @@ pub struct MorphColumns {
     pub morphs: Vec<bool>,
     /// What the parent level draws over this node, for the colour morph;
     /// `None` leaves every face its own colour.
-    pub parent: Option<ParentFaces>,
+    pub parent: Option<ParentView>,
 }
 
 impl MorphColumns {
@@ -176,7 +176,7 @@ impl Morph {
     /// showed one tile stretched over three blocks, and one row of its own
     /// material over three of the parent's. Moved whole, each row lands on
     /// one of the parent's rows, tile on tile, and can carry that row's
-    /// material and shade ([`ParentFaces`]). The shape is the same at every
+    /// material and shade ([`ParentFaces`](crate::ParentFaces)). The shape is the same at every
     /// instant: only where the rows lie inside the riser's plane differs.
     fn target(self, y: i32) -> i32 {
         match self {
@@ -833,7 +833,7 @@ struct LatentRiser {
 /// The point in the middle of a face's cell at full morph, in node-local
 /// blocks: lattice cell `(i, j)` of a slice along `d` on lattice plane
 /// `plane`, with the cell's rows at full morph `[y0, y1]` on a wall (a top's
-/// row is its plane). What [`ParentFaces::look_up`] is asked.
+/// row is its plane). What [`ParentView::look_up`] is asked.
 fn cell_centre(d: usize, plane: i32, horizontal: i32, (y0, y1): (i32, i32), scale: [i32; 3]) -> [f32; 3] {
     let mid = (y0 + y1) as f32 / 2.0;
     let h = (horizontal as f32 + 0.5) * scale[if d == 0 { 2 } else { 0 }] as f32;
@@ -1318,7 +1318,7 @@ fn push_quad(
     ctx: &MeshContext,
     scale: [i32; 3],
     (morph, morph_level): (Morph, u32),
-    parent: Option<(ParentLook, &ParentFaces)>,
+    parent: Option<(ParentLook, &ParentView)>,
 ) {
     let mut base = [0i32; 3];
     base[d] = plane;
@@ -1606,7 +1606,7 @@ fn push_skirt(
 /// edge to `l.t_top` and its foot to `l.t_bot`.
 ///
 /// **It wears what its parent draws there** (the colour morph): one piece
-/// per run of rows the parent draws alike ([`ParentFaces::look_up`]), each
+/// per run of rows the parent draws alike ([`ParentView::look_up`]), each
 /// in the parent's layer, its texture one tile a block at full morph -- the
 /// tile coordinate runs `0` at the top edge to the piece's height at its
 /// foot -- and carrying the parent's openness at its corners. With no
@@ -1629,7 +1629,7 @@ fn push_latent_riser(
     ctx: &MeshContext,
     scale: [i32; 3],
     morph_level: u32,
-    parent: Option<&ParentFaces>,
+    parent: Option<&ParentView>,
 ) {
     let face = Face::from_axis_sign(d, l.sign);
     // The runs of target rows the parent draws alike.
@@ -2432,7 +2432,7 @@ mod tests {
         a: [i32; 2],
         b: [i32; 2],
         a_morphs: bool,
-        parent: Option<ParentFaces>,
+        parent: Option<ParentView>,
     ) -> (Mesh, MorphColumns) {
         let registry = registry();
         let entry = |c: [i32; 2]| [c[0], c[1], c[0], c[1]];
@@ -2626,7 +2626,12 @@ mod tests {
             indices: vec![0, 1, 2, 0, 2, 3],
             face_indices: [0; 6],
         };
-        let parent = || ParentFaces::from_mesh(&parent_mesh, [0; 3], [-8; 3], [8; 3]);
+        let parent = || {
+            ParentView::new(
+                std::sync::Arc::new(crate::ParentFaces::from_mesh(&parent_mesh, [1; 3])),
+                [0; 3],
+            )
+        };
         // Top-face corners at rest row `y`: `a`'s at 2, `b`'s at 1.
         let tops = |mesh: &Mesh, y: u32| -> Vec<Vertex> {
             mesh.vertices
