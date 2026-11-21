@@ -37,16 +37,11 @@ const FAR_PLANE: f32 = 1.0e7;
 /// Far-terrain patches the window holds at once. The measured selection at
 /// 262 km is about 1,800 (`crates/world/src/far.rs`'s measurement), plus the
 /// ones kept drawn while their replacements generate: room for twice that.
+///
+/// A patch is `far::FAR_SLOT_WORDS` words, 16 KiB, wherever the land is and
+/// whatever it holds (issue #422, shared corners): 64 MiB for the lot. Where
+/// it was a list of faces, about 2,700 of them a patch on rough ground.
 const FAR_PATCH_CAPACITY: u32 = 4096;
-
-/// Far-terrain faces the window holds at once, eight bytes each
-/// (`far::FarFace::pack`): 32 MiB. Drawn as blocks (issue #422) a patch is
-/// about 2,700 faces wherever the land is not level, and High holds about
-/// 1,100 patches at the gate eyes: 3 million faces, with a third as much
-/// again for the ones kept drawn while their replacements generate. Chosen
-/// from that measurement, not derived; a patch that does not fit is not
-/// drawn, and `far_streaming` says so once.
-const FAR_FACE_CAPACITY: u32 = 4_000_000;
 
 /// What an offscreen [`Renderer`] draws into: the format the headless
 /// screenshots and golden images use, so its pixels read back the same way.
@@ -887,7 +882,7 @@ impl Renderer {
         let far = crate::far::FarTerrain::new(
             &device,
             &queue,
-            (FAR_PATCH_CAPACITY, FAR_FACE_CAPACITY),
+            FAR_PATCH_CAPACITY,
             anchor,
         );
 
@@ -2058,12 +2053,13 @@ pub fn build_tree_pipeline(
 }
 
 /// `@group(1)` in `far.wgsl`: the far terrain's patch records, its
-/// parameters, its faces and the runs of them drawn this frame
-/// (`crate::far::FarTerrain` owns all four).
+/// parameters, its quads and the patches drawn this frame
+/// (`crate::far::FarTerrain` owns all four). The fragment stage reads the
+/// parameters and the quads: what a face is made of is decided per pixel.
 pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |binding| wgpu::BindGroupLayoutEntry {
+    let storage = |binding, visibility| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::VERTEX,
+        visibility,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,
@@ -2074,12 +2070,12 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("far-bind-group-layout"),
         entries: &[
-            storage(0),
-            storage(2),
-            storage(3),
+            storage(0, wgpu::ShaderStages::VERTEX),
+            storage(2, wgpu::ShaderStages::VERTEX_FRAGMENT),
+            storage(3, wgpu::ShaderStages::VERTEX),
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -2092,7 +2088,7 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 /// The far terrain's pipeline (`far.wgsl`): no vertex buffer, one instance
-/// per run of faces, depth-tested against the voxels drawn before it.
+/// per patch in view, depth-tested against the voxels drawn before it.
 pub fn build_far_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -2130,11 +2126,12 @@ pub fn build_far_pipeline(
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                // Tops face up and walls face out (`far::FarFace::corners`
-                // winds both counter-clockwise from outside), so what faces
-                // away is the underside of the ground and the far side of a
-                // step: measured on the M3 for the smooth surface this
-                // replaced, +13-28% FPS at the gate eyes for nothing visible.
+                // Tops face up, and a riser is wound so that it faces the
+                // lower of the two quads it stands between whichever that
+                // is (`far::patch_indices`), so what faces away is the
+                // underside of the ground and the far side of a step:
+                // measured on the M3 for the smooth surface this replaced,
+                // +13-28% FPS at the gate eyes for nothing visible.
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },

@@ -331,10 +331,6 @@ impl SlabAllocator {
         }
     }
 
-    pub(crate) fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
     /// Reserve `n` contiguous units, returning the start offset, or `None` if no
     /// free range is large enough.
     pub(crate) fn alloc(&mut self, n: u32) -> Option<u32> {
