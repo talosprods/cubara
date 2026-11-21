@@ -59,7 +59,7 @@ fn tree_model_for(level: u32) -> TreeModel {
     if level <= 2 {
         TreeModel::Oak
     } else {
-        TreeModel::Box
+        TreeModel::Silhouette
     }
 }
 
@@ -78,7 +78,15 @@ fn to_meshed_node(built: cubara_world::mesh::BuiltNode) -> Option<MeshedNode> {
         scale: geometry.scale,
         mesh: geometry.mesh,
         local_aabb: geometry.local_aabb,
-        trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
+        trees: built
+            .trees
+            .iter()
+            .map(|t| cubara_render::TreePlacement {
+                base: [t.site.x, t.site.base, t.site.z],
+                height: t.site.height,
+                morph: t.morph,
+            })
+            .collect(),
         tree_model,
     })
 }
@@ -974,7 +982,7 @@ const MORPH_MIN_MOVED_PIXELS: usize = 20_000;
 /// `trees` cleared -- same terrain, same auto-framed camera either way, so
 /// the only thing that can differ between the two renders is whether R2's
 /// instances were drawn. Shared by [`trees_continue_past_the_first_ring`]
-/// and [`level_three_trees_draw_as_boxes`], which differ only in which
+/// and [`level_three_trees_draw_as_silhouettes`], which differ only in which
 /// level they isolate.
 fn render_with_and_without_trees(schedule: &[(u32, i32)]) -> Option<(Frame, Frame)> {
     let world = World::new();
@@ -1064,16 +1072,17 @@ fn trees_continue_past_the_first_ring() {
     );
 }
 
-/// Decision 3's other half: level 3 draws two boxes, not the real oak --
-/// its own instanced draw, so "the real oak model landed but the boxes
-/// didn't" is a distinct failure T7 alone cannot see (T7 never reaches
-/// level 3). Same method as T7 (`render_with_and_without_trees`), isolated
-/// to a level-3-only schedule instead.
+/// Decision 3's other half: level 3 draws the oak's silhouette (#433; two
+/// boxes before it), not the real oak -- its own instanced draw, so "the
+/// real oak model landed but the silhouette didn't" is a distinct failure
+/// T7 alone cannot see (T7 never reaches level 3). Same method as T7
+/// (`render_with_and_without_trees`), isolated to a level-3-only schedule
+/// instead.
 #[test]
-fn level_three_trees_draw_as_boxes() {
+fn level_three_trees_draw_as_silhouettes() {
     let schedule = [(3u32, 16i32)];
     let Some((with_frame, without_frame)) = render_with_and_without_trees(&schedule) else {
-        headless::skip_or_require_gpu("level_three_trees_draw_as_boxes");
+        headless::skip_or_require_gpu("level_three_trees_draw_as_silhouettes");
         return;
     };
     assert_eq!(
@@ -1082,7 +1091,7 @@ fn level_three_trees_draw_as_boxes() {
     );
     let diff = headless::compare(&with_frame.pixels, &without_frame.pixels, TOLERANCE);
     eprintln!(
-        "level_three_trees_draw_as_boxes: {:.4}% of pixels differ with trees on vs off \
+        "level_three_trees_draw_as_silhouettes: {:.4}% of pixels differ with trees on vs off \
          (max channel delta {})",
         diff.differing_fraction * 100.0,
         diff.max_channel_delta
@@ -1090,7 +1099,7 @@ fn level_three_trees_draw_as_boxes() {
     assert!(
         diff.differing_fraction > MAX_DIFFERING,
         "turning trees on at level 3 changed only {:.4}% of pixels -- the \
-         box model is not actually visible",
+         silhouette model is not actually visible",
         diff.differing_fraction * 100.0
     );
 }
@@ -2652,7 +2661,11 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
             .iter_mut()
             .find(|n| n.id.level == 0 && n.id.pos == [chunk.x, chunk.y, chunk.z])
         {
-            node.trees.push([x, base, z]);
+            node.trees.push(cubara_render::TreePlacement {
+                base: [x, base, z],
+                height: 5,
+                morph: 0,
+            });
             node.tree_model = TreeModel::Oak;
             planted += 1;
         }
@@ -2701,7 +2714,7 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
         }
         for t in &mut node.trees {
             for a in 0..3 {
-                t[a] += s32[a];
+                t.base[a] += s32[a];
             }
         }
     }

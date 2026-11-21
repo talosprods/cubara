@@ -265,9 +265,9 @@ pub(crate) fn to_node_id(node: NodeKey) -> NodeId {
     }
 }
 
-/// Which static model (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R2, issue #332
-/// decision 3) a node at `level` would draw its trees with: the real oak at
-/// levels 1-2, two boxes from level 3 up. Level 0 never matters -- it has no
+/// Which model (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3 R2, issue #332
+/// decision 3, #433) a node at `level` would draw its trees with: the real
+/// oak at levels 1-2, its silhouette from level 3 up. Level 0 never matters -- it has no
 /// trees to convert (`cubara_world::mesh::build_node` only populates
 /// `BuiltNode::trees` at `level >= 1`) -- so this is total rather than an
 /// `Option`, for the simplicity of always having an answer to plug into
@@ -276,8 +276,24 @@ pub(crate) fn tree_model_for(level: u32) -> cubara_render::TreeModel {
     if level <= 2 {
         cubara_render::TreeModel::Oak
     } else {
-        cubara_render::TreeModel::Box
+        cubara_render::TreeModel::Silhouette
     }
+}
+
+/// A node's trees as `cubara-render` draws them: where each trunk stands,
+/// its height and its morph (`cubara_world::mesh::NodeTree`, #433). The one
+/// conversion, for the live path, `--bench` and the transition study alike.
+pub(crate) fn tree_placements(
+    trees: &[cubara_world::mesh::NodeTree],
+) -> Vec<cubara_render::TreePlacement> {
+    trees
+        .iter()
+        .map(|t| cubara_render::TreePlacement {
+            base: [t.site.x, t.site.base, t.site.z],
+            height: t.site.height,
+            morph: t.morph,
+        })
+        .collect()
 }
 
 /// A finished `cubara_world::mesh` job, converted to what `cubara-render`
@@ -293,7 +309,7 @@ pub(crate) fn to_meshed_node(built: BuiltNode) -> Option<MeshedNode> {
         scale: geometry.scale,
         mesh: geometry.mesh,
         local_aabb: geometry.local_aabb,
-        trees: built.trees.iter().map(|t| [t.x, t.base, t.z]).collect(),
+        trees: tree_placements(&built.trees),
         tree_model,
     })
 }
@@ -1206,8 +1222,8 @@ mod tests {
     fn tree_model_for_splits_at_level_three() {
         assert_eq!(tree_model_for(1), cubara_render::TreeModel::Oak);
         assert_eq!(tree_model_for(2), cubara_render::TreeModel::Oak);
-        assert_eq!(tree_model_for(3), cubara_render::TreeModel::Box);
-        assert_eq!(tree_model_for(4), cubara_render::TreeModel::Box);
+        assert_eq!(tree_model_for(3), cubara_render::TreeModel::Silhouette);
+        assert_eq!(tree_model_for(4), cubara_render::TreeModel::Silhouette);
     }
 
     /// New World replaces every block: nothing streamed from the old world may

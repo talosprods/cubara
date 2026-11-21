@@ -8,7 +8,9 @@
 //! the thing being proven is what ends up in the uploaded instance buffer,
 //! which `trees.rs`'s own (GPU-free) unit tests cannot read back.
 
-use cubara_render::{Aabb, CameraUniform, Frustum, NodeId, TreeArena, TreeModel};
+use cubara_render::{
+    Aabb, CameraUniform, Frustum, NodeId, TreeArena, TreeModel, TreePlacement, TreeShapes,
+};
 
 /// Serialises instance/device creation and teardown across this binary's
 /// test threads (issues #265 and #412; see the module's own doc comment).
@@ -44,11 +46,29 @@ fn forward_frustum() -> Frustum {
     Frustum::from_view_proj(vp)
 }
 
-/// No reach beyond a node's own AABB -- for tests that only care about the
-/// frustum re-test itself, not the AABB union (issue #332 decision 2's
-/// follow-up, its own test below).
-fn no_reach() -> (glam::Vec3, glam::Vec3) {
-    (glam::Vec3::ZERO, glam::Vec3::ZERO)
+/// The oak's shapes -- for tests that only care about the frustum re-test
+/// itself, not the AABB union (issue #332 decision 2's follow-up, its own
+/// test below): a tree's few blocks of reach are nothing against the
+/// hundred-block margins these nodes stand in or out of the frustum by.
+fn oak_shapes() -> TreeShapes {
+    TreeShapes {
+        heights: 4..=6,
+        canopy_radius: 2,
+    }
+}
+
+/// A tree of the oak's middle height standing at `base`, unmorphed.
+fn tree(base: [i32; 3]) -> TreePlacement {
+    TreePlacement {
+        base,
+        height: 5,
+        morph: 0,
+    }
+}
+
+/// How many instances a kind draws, over every height; `None` with none.
+fn drawn(instances: Option<(&wgpu::Buffer, &[std::ops::Range<u32>])>) -> Option<u32> {
+    instances.map(|(_, ranges)| ranges.iter().map(|r| r.len() as u32).sum())
 }
 
 #[test]
@@ -63,7 +83,7 @@ fn only_nodes_in_the_frustum_contribute_instances() {
     };
     let frustum = forward_frustum();
 
-    let mut arena = TreeArena::new(no_reach(), cubara_render::anchor::ORIGIN);
+    let mut arena = TreeArena::new(oak_shapes(), cubara_render::anchor::ORIGIN);
     let ahead = NodeId {
         level: 1,
         pos: [0, 0, 0],
@@ -78,7 +98,7 @@ fn only_nodes_in_the_frustum_contribute_instances() {
         0,
         [0; 3],
         TreeModel::Oak,
-        vec![[100, 0, 0]],
+        vec![tree([100, 0, 0])],
         Aabb::new(glam::vec3(90.0, -5.0, -5.0), glam::vec3(110.0, 5.0, 5.0)),
     );
     // Directly behind the camera -- resident, but nothing the camera can see.
@@ -87,13 +107,12 @@ fn only_nodes_in_the_frustum_contribute_instances() {
         1,
         [0; 3],
         TreeModel::Oak,
-        vec![[-100, 0, 0]],
+        vec![tree([-100, 0, 0])],
         Aabb::new(glam::vec3(-110.0, -5.0, -5.0), glam::vec3(-90.0, 5.0, 5.0)),
     );
 
     arena.prepare(&device, &queue, &frustum);
-    let (_, count) = arena
-        .oak_instances()
+    let count = drawn(arena.oak_instances())
         .expect("the node ahead of the camera must contribute an instance");
     assert_eq!(
         count, 1,
@@ -116,7 +135,7 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
         );
         return;
     };
-    let mut arena = TreeArena::new(no_reach(), cubara_render::anchor::ORIGIN);
+    let mut arena = TreeArena::new(oak_shapes(), cubara_render::anchor::ORIGIN);
     let node = NodeId {
         level: 1,
         pos: [0, 0, 0],
@@ -125,13 +144,13 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
         node,
         0,
         [0; 3],
-        TreeModel::Box,
-        vec![[100, 0, 0]],
+        TreeModel::Silhouette,
+        vec![tree([100, 0, 0])],
         Aabb::new(glam::vec3(90.0, -5.0, -5.0), glam::vec3(110.0, 5.0, 5.0)),
     );
 
     arena.prepare(&device, &queue, &forward_frustum());
-    assert_eq!(arena.box_instances().map(|(_, n)| n), Some(1));
+    assert_eq!(drawn(arena.silhouette_instances()), Some(1));
 
     // Look the other way: the same node, same AABB, same `by_node` entry --
     // only the frustum changed.
@@ -142,7 +161,7 @@ fn a_node_leaving_the_frustum_stops_contributing_without_being_removed() {
     ));
     arena.prepare(&device, &queue, &away);
     assert_eq!(
-        arena.box_instances(),
+        drawn(arena.silhouette_instances()),
         None,
         "turning away must stop drawing the node's trees, with no insert/remove call"
     );
@@ -178,14 +197,23 @@ fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does
         glam::vec3(95.0, -110.0, -5.0),
         glam::vec3(105.0, -100.0, 5.0),
     );
-    // One tree standing right at the top of that ground, with a reach tall
-    // enough (local_bounds' upper bound) that its canopy's top lands at
-    // y = -100 + 200 = 100 -- comfortably inside the frustum vertically,
-    // against the same ~58 boundary.
-    let local_bounds = (glam::vec3(-3.0, 0.0, -3.0), glam::vec3(3.0, 200.0, 3.0));
-    let tree_position = [100, -100, 0];
+    // One tree standing right at the top of that ground, tall enough (a
+    // trunk of 199 blocks, whose canopy's apex is the block at 199 and its
+    // top face at 200: `TreeShapes::local_bounds`' upper bound) that its canopy's top
+    // lands at y = -100 + 200 = 100 -- comfortably inside the frustum
+    // vertically, against the same ~58 boundary.
+    let shapes = TreeShapes {
+        heights: 199..=199,
+        canopy_radius: 3,
+    };
+    assert_eq!(shapes.local_bounds().1.y, 200.0);
+    let tree_position = TreePlacement {
+        base: [100, -100, 0],
+        height: 199,
+        morph: 0,
+    };
 
-    let mut arena = TreeArena::new(local_bounds, cubara_render::anchor::ORIGIN);
+    let mut arena = TreeArena::new(shapes, cubara_render::anchor::ORIGIN);
     let node = NodeId {
         level: 1,
         pos: [0, 0, 0],
@@ -201,7 +229,7 @@ fn a_canopy_above_the_frustum_line_still_contributes_even_though_the_ground_does
 
     arena.prepare(&device, &queue, &frustum);
     assert_eq!(
-        arena.oak_instances().map(|(_, n)| n),
+        drawn(arena.oak_instances()),
         Some(1),
         "the canopy reaches into the frustum even though the node's own \
          ground is well below it -- the culling box must cover both"

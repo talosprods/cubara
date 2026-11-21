@@ -25,6 +25,7 @@
 
 mod harness;
 mod study;
+mod trees;
 
 use cubara_render::aggregate::face_light;
 use glam::Vec3;
@@ -492,6 +493,30 @@ fn consistency_report() {
 /// keeps the ground where it is and a summit keeps most of its height; the
 /// highest column can only raise the ground. Measured, so the choice is not a
 /// guess; `height_rule_study_report` is the study the rule was chosen by.
+/// Trees a kind of ground in [`tree_consistency_report`].
+const TREES_PER_KIND: usize = 16;
+
+/// **A tree at every level against level 0, and at every ring edge**
+/// (issue #433): `trees.rs`'s table, over [`TREES_PER_KIND`] trees on each
+/// kind of ground drawn from [`trees::TREE_SEED`].
+///
+/// ```text
+/// cargo test -p cubara-render --test lod_consistency -- --ignored --nocapture tree_consistency_report
+/// ```
+#[test]
+#[ignore]
+fn tree_consistency_report() {
+    let setup = Setup::new();
+    let sample = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND);
+    let measured = trees::measure_trees(&setup, &sample);
+    println!(
+        "TREES (seed {:#x}, {} trees):\n{}",
+        trees::TREE_SEED,
+        sample.len(),
+        trees::tree_report(&measured)
+    );
+}
+
 #[test]
 #[ignore]
 fn stepped_top_rule_report() {

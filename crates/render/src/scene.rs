@@ -25,7 +25,7 @@ use crate::render::{
 };
 use crate::text::font;
 use crate::text::TextRenderer;
-use crate::trees::TreeModels;
+use crate::trees::{TreeModel, TreeModels};
 
 /// The sky colour a frame clears to.
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -125,14 +125,16 @@ pub struct GpuTimestamps<'a> {
     pub end: u32,
 }
 
-/// The two tree-instance buffers to draw this frame -- `(buffer, instance
-/// count)` per model, or `None` where that model has nothing to draw
-/// (issue #332, R2 decision 2: "one draw per model", so an empty model
-/// draws zero times rather than once with zero instances).
+/// The tree-instance buffers to draw this frame -- per model kind, the
+/// buffer and, per trunk height (in [`crate::TreeShapes::heights`] order),
+/// the range of it that height's model draws; `None` where that kind has
+/// nothing to draw (issue #332, R2 decision 2: an empty model draws zero
+/// times rather than once with zero instances; #433: one draw per height
+/// with instances, so each tree is drawn at its own height).
 #[derive(Clone, Copy)]
 pub struct TreeDraw<'a> {
-    pub oak: Option<(&'a wgpu::Buffer, u32)>,
-    pub boxed: Option<(&'a wgpu::Buffer, u32)>,
+    pub oak: Option<(&'a wgpu::Buffer, &'a [std::ops::Range<u32>])>,
+    pub silhouette: Option<(&'a wgpu::Buffer, &'a [std::ops::Range<u32>])>,
     /// The anchor the tree arena's culling boxes are relative to
     /// ([`crate::TreeArena::anchor`]), checked against
     /// [`SceneFrame::anchor`] in the pass.
@@ -775,7 +777,7 @@ impl SceneRenderer {
             // bind-group binds for zero draws. Measured: the state changes
             // alone cost CPU/frame even with zero instances, which is
             // exactly the fixed cost this skips.
-            if let Some(trees) = trees.filter(|t| t.oak.is_some() || t.boxed.is_some()) {
+            if let Some(trees) = trees.filter(|t| t.oak.is_some() || t.silhouette.is_some()) {
                 // An instance is relative to its node and indexes the
                 // arena's origins (issue #379 decision 2), so the tree
                 // arena's culling boxes must be against the same anchor as
@@ -789,18 +791,35 @@ impl SceneRenderer {
                 // The arena's origins: this is where an instance's node is.
                 pass.set_bind_group(1, arena.origins_bind_group(), &[]);
                 pass.set_bind_group(2, &self.texture_bind_group, &[]);
-                if let (Some(oak), Some((instances, count))) = (&self.tree_models.oak, trees.oak) {
-                    pass.set_vertex_buffer(0, oak.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, instances.slice(..));
-                    pass.set_index_buffer(oak.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..oak.index_count, 0, 0..count);
-                }
-                if let Some((instances, count)) = trees.boxed {
-                    let boxed = &self.tree_models.boxed;
-                    pass.set_vertex_buffer(0, boxed.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, instances.slice(..));
-                    pass.set_index_buffer(boxed.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..boxed.index_count, 0, 0..count);
+                for (kind, drawn) in [
+                    (TreeModel::Oak, trees.oak),
+                    (TreeModel::Silhouette, trees.silhouette),
+                ] {
+                    let Some((instances, ranges)) = drawn else {
+                        continue;
+                    };
+                    let models = self.tree_models.of(kind);
+                    debug_assert_eq!(
+                        ranges.len(),
+                        models.len(),
+                        "the tree arena's heights are not the models' heights"
+                    );
+                    let stride = std::mem::size_of::<crate::trees::TreeInstance>() as u64;
+                    for (model, range) in models.iter().zip(ranges) {
+                        if range.is_empty() {
+                            continue;
+                        }
+                        pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+                        // This height's instances, as a slice of the
+                        // buffer rather than a first instance: a base
+                        // instance is not on every backend's direct draw.
+                        pass.set_vertex_buffer(
+                            1,
+                            instances.slice(range.start as u64 * stride..range.end as u64 * stride),
+                        );
+                        pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..model.index_count, 0, 0..range.len() as u32);
+                    }
                 }
             }
 

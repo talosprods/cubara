@@ -328,7 +328,7 @@ pub struct NodeTrees {
     pub id: NodeId,
     pub origin: [i32; 3],
     pub model: crate::trees::TreeModel,
-    pub trees: Vec<[i32; 3]>,
+    pub trees: Vec<crate::trees::TreePlacement>,
     /// The node's bounds relative to `origin` ([`MeshedNode::local_aabb`]).
     pub local_aabb: crate::culling::Aabb,
 }
@@ -439,7 +439,7 @@ fn render_arena(
     let bounds = arena.bounds();
 
     let mut trees = TreeArena::new(
-        crate::trees::tree_instance_bounds(&load_structures()),
+        crate::trees::TreeShapes::of(&load_structures()),
         anchor::ORIGIN,
     );
     for node in tree_data {
@@ -558,7 +558,7 @@ fn render_arena(
             far: far_terrain.as_ref(),
             trees: Some(TreeDraw {
                 oak: trees.oak_instances(),
-                boxed: trees.box_instances(),
+                silhouette: trees.silhouette_instances(),
                 anchor: trees.anchor(),
             }),
             overlay: menu.as_deref(),
