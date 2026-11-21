@@ -3219,3 +3219,187 @@ fn the_mountains_mean_colour_holds_across_levels() {
         }
     }
 }
+
+/// The densest woodland near spawn (issue #433): 15 trees on gentle hills
+/// in one level-3 node, `[-512, -384) x [-1408, -1280)` (the most trees of
+/// any 128-block node within 3,072 blocks of the origin, found by a scan of
+/// `tree_site`, and the flattest of those). The world grows one tree in
+/// twelve chunk columns at most, so this is what a forest is here.
+const FOREST: (i32, i32, i32) = (-512, -1408, 128);
+
+/// The real palette without the oak: the same ground and ore, no trees.
+fn real_blocks_without_trees() -> TerrainBlocks {
+    let r = real_registry();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ores = cubara_voxel::OreRegistry::load(&root.join("assets/ores")).expect("assets/ores");
+    TerrainBlocks::from_registry(&r).with_ores(&ores, &r)
+}
+
+/// [`FOREST`], every node of it at `level`, with `morph`'s bands, from a
+/// fixed eye off one corner -- with its trees, or (`trees` false) the same
+/// ground with none: at level 0 a world without the oak, above it the same
+/// nodes with their instances cleared. **The same view at every level**, as
+/// the mountain images: the level is what is under test.
+fn render_forest(
+    level: u32,
+    morph: Option<cubara_render::MorphParams>,
+    trees: bool,
+) -> Option<Frame> {
+    use cubara_world::node::NodeKey;
+    let world = World::new();
+    let registry = real_registry();
+    let blocks = if trees {
+        real_blocks()
+    } else {
+        real_blocks_without_trees()
+    };
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let (x0, z0, side) = FOREST;
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for z in (z0..z0 + side).step_by(4) {
+        for x in (x0..x0 + side).step_by(4) {
+            let h = world.surface_height(x, z);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+    }
+    let size = 16 << level;
+    let mut nodes = Vec::new();
+    for ny in (lo - 16).div_euclid(size)..=(hi + 16).div_euclid(size) {
+        for nz in z0.div_euclid(size)..(z0 + side).div_euclid(size) {
+            for nx in x0.div_euclid(size)..(x0 + side).div_euclid(size) {
+                nodes.push(NodeKey::new(level, [nx, ny, nz]));
+            }
+        }
+    }
+    let meshed = mesh_nodes(&world, &registry, &layer_of, nodes, blocks)
+        .into_iter()
+        .filter_map(to_meshed_node)
+        .map(|mut node| {
+            if !trees {
+                node.trees.clear();
+            }
+            node
+        });
+    // Above the low corner, looking across the wood and down at it.
+    let eye = glam::DVec3::new((x0 - 12) as f64, (hi + 22) as f64, (z0 - 12) as f64);
+    let shot = Shot {
+        camera: Some((eye, glam::Vec3::new(1.0, -0.38, 1.0))),
+        morph,
+        ..Shot::default()
+    };
+    let _gpu = gpu_lifecycle::lock();
+    headless::render(meshed, shot)
+}
+
+/// **Every level draws the same forest** (issue #433):
+/// `forest_level_0..3.png`, [`FOREST`] drawn whole at each level of detail
+/// from one eye -- level 0's blocks, the oak instances of levels 1 and 2,
+/// level 3's silhouettes, each tree at its own height and shaded as level 0
+/// shades it. The images either side of a ring edge are the two the edge
+/// swaps (with the morph's band between them, which
+/// [`a_forest_swaps_nothing_at_its_ring_edges`] measures); these are for
+/// looking at, and they pin the look against the next change.
+#[test]
+fn a_forest_is_the_same_forest_at_every_level() {
+    for level in 0..=3u32 {
+        let name = format!("forest_level_{level}");
+        let Some(frame) = render_forest(level, None, true) else {
+            headless::skip_or_require_gpu(&name);
+            return;
+        };
+        assert_frame_golden(&name, Some(frame));
+    }
+}
+
+/// The pixels turning `with`'s trees on changes against `without`: where
+/// the trees are seen, or where they shade or hide the ground.
+fn tree_pixels(with: &Frame, without: &Frame) -> Vec<bool> {
+    let mut mask = vec![false; (with.width * with.height) as usize];
+    for p in differing_pixels(with, without) {
+        if p.delta > TOLERANCE {
+            mask[p.y * with.width as usize + p.x] = true;
+        }
+    }
+    mask
+}
+
+/// The mean colour of `frame` over `mask`, on the image's 0-255 scale.
+fn mean_over(frame: &Frame, mask: &[bool]) -> [f64; 3] {
+    let (mut sum, mut n) = ([0f64; 3], 0f64);
+    for (px, &m) in frame.pixels.as_chunks::<4>().0.iter().zip(mask) {
+        if m {
+            for c in 0..3 {
+                sum[c] += px[c] as f64;
+            }
+            n += 1.0;
+        }
+    }
+    sum.map(|s| s / n.max(1.0))
+}
+
+/// **A forest swaps nothing at its ring edges** (issue #433), on screen:
+/// at each edge, [`FOREST`] drawn by the near level at the end of its band
+/// (fully morphed; level 0's trees do not morph) against the far level
+/// unmorphed -- the two frames the edge swaps one for the other. The
+/// trees' pixels are found by drawing each frame again without trees
+/// ([`tree_pixels`]), so the ground's own change at the swap (the colour
+/// morph's business, `a_fully_morphed_level_draws_its_parents_colours`)
+/// is not counted. What is held: the share of the trees' pixels drawn by
+/// one side and not the other, and their mean colour.
+///
+/// What is left at 160 m is the ground under the trees: level 0's trees
+/// stand on their own column, which does not morph (`cubara_world::morph`:
+/// nothing that stands on a column morphs), and level 1's on the cell's
+/// mean, so on sloping ground a tree moves a block with its ground.
+#[test]
+fn a_forest_swaps_nothing_at_its_ring_edges() {
+    let full = |level: usize| cubara_render::MorphParams {
+        bands: std::array::from_fn(|l| (l == level).then_some((-2.0, -1.0))),
+        squash: 2.0,
+    };
+    for near in 0..=2u32 {
+        let morph = Some(full(near as usize));
+        let Some(near_with) = render_forest(near, morph, true) else {
+            headless::skip_or_require_gpu("a_forest_swaps_nothing_at_its_ring_edges");
+            return;
+        };
+        let near_without = render_forest(near, morph, false).expect("a GPU");
+        let far_with = render_forest(near + 1, None, true).expect("a GPU");
+        let far_without = render_forest(near + 1, None, false).expect("a GPU");
+        let a = tree_pixels(&near_with, &near_without);
+        let b = tree_pixels(&far_with, &far_without);
+        let trees = a.iter().filter(|&&m| m).count();
+        let moved = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        let (ca, cb) = (mean_over(&near_with, &a), mean_over(&far_with, &b));
+        let colour = (0..3).map(|c| (ca[c] - cb[c]).abs()).fold(0.0, f64::max);
+        let share = moved as f64 / trees.max(1) as f64;
+        eprintln!(
+            "forest, level {near} at full morph against level {}: {trees} tree pixels, \
+             {moved} drawn by one side only ({:.1}%), mean colour {ca:.1?} against {cb:.1?}",
+            near + 1,
+            100.0 * share
+        );
+        assert!(trees > 5_000, "level {near}: the forest is not in view ({trees} pixels)");
+        let (most_moved, most_colour) = FOREST_EDGE[near as usize];
+        assert!(
+            share <= most_moved,
+            "level {near} -> {}: {:.1}% of the trees' pixels change at the swap",
+            near + 1,
+            100.0 * share
+        );
+        assert!(
+            colour <= most_colour,
+            "level {near} -> {}: the trees' mean colour changes by {colour:.1} at the swap",
+            near + 1
+        );
+    }
+}
+
+/// Per edge (160, 288, 512 m), the most [`a_forest_swaps_nothing_at_its_ring_edges`]
+/// lets change: the share of the trees' pixels drawn by one side only, and
+/// their mean colour on the image's 0-255 scale. **Chosen, not derived**:
+/// a little over what this build measures on the M3 (in the PR, with what
+/// main and each injected defect measure).
+const FOREST_EDGE: [(f64, f64); 3] = [(1.0, 255.0), (1.0, 255.0), (1.0, 255.0)];
