@@ -2726,8 +2726,8 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
             node.origin[a] += s32[a];
         }
         for t in &mut node.trees {
-            for a in 0..3 {
-                t.base[a] += s32[a];
+            for (b, s) in t.base.iter_mut().zip(s32) {
+                *b += s;
             }
         }
     }
@@ -3381,7 +3381,10 @@ fn a_forest_swaps_nothing_at_its_ring_edges() {
             near + 1,
             100.0 * share
         );
-        assert!(trees > 5_000, "level {near}: the forest is not in view ({trees} pixels)");
+        assert!(
+            trees > 5_000,
+            "level {near}: the forest is not in view ({trees} pixels)"
+        );
         let (most_moved, most_colour) = FOREST_EDGE[near as usize];
         assert!(
             share <= most_moved,

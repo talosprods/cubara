@@ -114,8 +114,8 @@ impl DrawnTree {
         for q in &self.quads {
             let a = q.area();
             area[q.dir] += a;
-            for c in 0..3 {
-                lit[q.dir][c] += q.lit[c] as f64 * a;
+            for (l, c) in lit[q.dir].iter_mut().zip(q.lit.to_array()) {
+                *l += c as f64 * a;
             }
         }
         (area, lit)
@@ -281,7 +281,12 @@ pub fn node_under(setup: &Setup, level: u32, site: TreeSite) -> NodeKey {
 /// base block, and how far the distance morph lifts it at the end of its
 /// band, in blocks -- `cubara_world::mesh::node_trees`, what a built node
 /// carries, for the node that holds the ground under it.
-pub fn placed(setup: &Setup, snapshot: &WorldSnapshot, level: u32, site: TreeSite) -> ([i32; 3], i32) {
+pub fn placed(
+    setup: &Setup,
+    snapshot: &WorldSnapshot,
+    level: u32,
+    site: TreeSite,
+) -> ([i32; 3], i32) {
     let node = node_under(setup, level, site);
     let found = cubara_world::mesh::node_trees(snapshot, node, setup.tree_blocks(), None)
         .into_iter()
@@ -300,23 +305,10 @@ pub fn placed(setup: &Setup, snapshot: &WorldSnapshot, level: u32, site: TreeSit
 pub enum Rep {
     Level0,
     /// The instance at `level`; `morphed` at the end of its band.
-    Instance { level: u32, morphed: bool },
-}
-
-impl Rep {
-    pub fn name(self) -> String {
-        match self {
-            Rep::Level0 => "L0".into(),
-            Rep::Instance {
-                level,
-                morphed: false,
-            } => format!("L{level}"),
-            Rep::Instance {
-                level,
-                morphed: true,
-            } => format!("L{level} at full morph"),
-        }
-    }
+    Instance {
+        level: u32,
+        morphed: bool,
+    },
 }
 
 /// `site` drawn as `rep` draws it.
@@ -375,7 +367,11 @@ impl Image {
 
 fn basis(look: Vec3) -> (Vec3, Vec3) {
     let look = look.normalize();
-    let up = if look.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let up = if look.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
     let right = look.cross(up).normalize();
     (right, right.cross(look).normalize())
 }
@@ -396,8 +392,12 @@ pub fn image(tree: &DrawnTree, centre: Vec3, look: Vec3) -> Image {
         let p: [(f32, f32); 4] = q
             .corners
             .map(|c| ((c - centre).dot(right), (c - centre).dot(up)));
-        let (umin, umax) = p.iter().fold((f32::MAX, f32::MIN), |(a, b), &(u, _)| (a.min(u), b.max(u)));
-        let (vmin, vmax) = p.iter().fold((f32::MAX, f32::MIN), |(a, b), &(_, v)| (a.min(v), b.max(v)));
+        let (umin, umax) = p
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &(u, _)| (a.min(u), b.max(u)));
+        let (vmin, vmax) = p
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &(_, v)| (a.min(v), b.max(v)));
         for j in cell(vmin).max(0)..=last(vmax).min(SIDE as i64 - 1) {
             let v = (j as f32 + 0.5) / RES - HALF;
             for i in cell(umin).max(0)..=last(umax).min(SIDE as i64 - 1) {
@@ -596,13 +596,24 @@ pub fn comparisons() -> Vec<(String, Rep, Rep)> {
         ("L2 vs L0".into(), Rep::Level0, inst(2, false)),
         ("L3 vs L0".into(), Rep::Level0, inst(3, false)),
         ("edge 160 m: L1 vs L0".into(), Rep::Level0, inst(1, false)),
-        ("edge 288 m: L2 vs L1 at full morph".into(), inst(1, true), inst(2, false)),
-        ("edge 512 m: L3 vs L2 at full morph".into(), inst(2, true), inst(3, false)),
+        (
+            "edge 288 m: L2 vs L1 at full morph".into(),
+            inst(1, true),
+            inst(2, false),
+        ),
+        (
+            "edge 512 m: L3 vs L2 at full morph".into(),
+            inst(2, true),
+            inst(3, false),
+        ),
     ]
 }
 
 /// Every comparison of every tree: per comparison, per tree.
-pub fn measure_trees(setup: &Setup, trees: &[(TreeGround, TreeSite)]) -> Vec<Vec<(TreeGround, TreeCompare)>> {
+pub fn measure_trees(
+    setup: &Setup,
+    trees: &[(TreeGround, TreeSite)],
+) -> Vec<Vec<(TreeGround, TreeCompare)>> {
     let snapshot = setup.world.snapshot();
     let comparisons = comparisons();
     let mut out: Vec<Vec<(TreeGround, TreeCompare)>> = vec![Vec::new(); comparisons.len()];
@@ -643,8 +654,8 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
     );
     for (k, (name, _, _)) in comparisons().iter().enumerate() {
         let rows = &measured[k];
-        let mut kinds: Vec<(String, Box<dyn Fn(TreeGround, &TreeCompare) -> bool>)> =
-            vec![("all".into(), Box::new(|_, _| true))];
+        type Keep = Box<dyn Fn(TreeGround, &TreeCompare) -> bool>;
+        let mut kinds: Vec<(String, Keep)> = vec![("all".into(), Box::new(|_, _| true))];
         for g in TREE_GROUNDS {
             kinds.push((format!("{g:?}"), Box::new(move |k, _| k == g)));
         }
@@ -669,9 +680,11 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
             let moved = these.iter().filter(|c| c.top != 0.0).count();
             let (foot_mean, foot_worst) = stats(these.iter().map(|c| c.foot.abs() as f64));
             let (xor_mean, xor_worst) = stats(these.iter().map(|c| c.worst_view_xor()));
-            let (area, _) = stats(these.iter().map(|c| {
-                c.views.iter().map(|v| v.area).sum::<f64>() / VIEWS.len() as f64
-            }));
+            let (area, _) = stats(
+                these
+                    .iter()
+                    .map(|c| c.views.iter().map(|v| v.area).sum::<f64>() / VIEWS.len() as f64),
+            );
             let (seen_mean, seen_worst) = stats(these.iter().map(|c| c.worst_view_seen()));
             let (t3_mean, t3_worst) = stats(these.iter().map(|c| c.worst_t3()));
             s.push_str(&format!(
@@ -683,7 +696,9 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
             ));
         }
     }
-    s.push_str("\nThe worst trees (seen colour or T3 over 2/255, or the outline over 4 square blocks):\n");
+    s.push_str(
+        "\nThe worst trees (seen colour or T3 over 2/255, or the outline over 4 square blocks):\n",
+    );
     for (k, (name, _, _)) in comparisons().iter().enumerate() {
         for (g, c) in &measured[k] {
             if c.worst_view_seen() > 2.0 || c.worst_t3() > 2.0 || c.worst_view_xor() > 4.0 {
@@ -693,7 +708,11 @@ pub fn tree_report(measured: &[Vec<(TreeGround, TreeCompare)>]) -> String {
                 s.push_str(&format!(
                     "- {name}, {g:?} tree{} at ({}, {}, base {}, height {}): top {:+}, foot {:+}, \
                      outline {:.1}, seen {:.1}, T3 {:.1} ({})\n",
-                    if crosses_a_chunk_floor(c.site) { " across a chunk floor" } else { "" },
+                    if crosses_a_chunk_floor(c.site) {
+                        " across a chunk floor"
+                    } else {
+                        ""
+                    },
                     c.site.x,
                     c.site.z,
                     c.site.base,
@@ -789,7 +808,9 @@ pub fn check(setup: &Setup, measured: &[Vec<(TreeGround, TreeCompare)>]) -> Vec<
                 if let Rep::Instance { level, .. } = b {
                     let w = 1 << level;
                     let s = c.site;
-                    let step = setup.gen.cell_top(s.x.div_euclid(w) * w, s.z.div_euclid(w) * w, w)
+                    let step = setup
+                        .gen
+                        .cell_top(s.x.div_euclid(w) * w, s.z.div_euclid(w) * w, w)
                         - setup.gen.surface_height(s.x, s.z);
                     if c.foot != step as f32 {
                         failures.push(format!(
@@ -928,13 +949,23 @@ pub fn two_boxes(setup: &Setup, site: TreeSite) -> cubara_render::TreeModelMesh 
                         open: 1.0,
                     });
                 }
-                mesh.indices
-                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                mesh.indices.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                ]);
             }
         }
     };
     let _ = setup;
-    push_box([0.0, 0.0, 0.0], [1.0, site.height as f32, 1.0], colour("oak_log_side"));
+    push_box(
+        [0.0, 0.0, 0.0],
+        [1.0, site.height as f32, 1.0],
+        colour("oak_log_side"),
+    );
     push_box(
         [-r, (top - site.canopy_radius) as f32, -r],
         [r + 1.0, (top + 2) as f32, r + 1.0],

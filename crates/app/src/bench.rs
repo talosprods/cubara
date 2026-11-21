@@ -378,10 +378,7 @@ pub fn run(
     // (an orbit around a region near a grid line can).
     let mut anchor = cubara_render::anchor::anchor_for(glam::Vec3::from(eyes[0]).as_dvec3());
     let mut arena = ChunkArena::from_meshed(&device, &queue, multi_draw, anchor, visible_meshed);
-    let mut trees = TreeArena::new(
-        cubara_render::TreeShapes::of(&load_structures()),
-        anchor,
-    );
+    let mut trees = TreeArena::new(cubara_render::TreeShapes::of(&load_structures()), anchor);
     for node in tree_data {
         node.insert_into(&mut trees, &arena);
     }

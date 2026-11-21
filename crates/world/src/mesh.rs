@@ -321,13 +321,8 @@ fn mesh_chunk_with(
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
     let may_be_solid =
         |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
-    let (mesh, local_aabb) = build_mesh_bounded_occluded_node_morph(
-        chunk,
-        &ctx,
-        covered,
-        may_be_solid,
-        columns,
-    )?;
+    let (mesh, local_aabb) =
+        build_mesh_bounded_occluded_node_morph(chunk, &ctx, covered, may_be_solid, columns)?;
     Some(NodeGeometry {
         mesh,
         local_aabb,

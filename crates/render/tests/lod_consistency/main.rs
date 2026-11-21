@@ -526,7 +526,11 @@ fn tree_consistency_report() {
 fn a_tree_is_the_same_tree_at_every_distance() {
     let setup = Setup::new();
     let sample = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND);
-    assert_eq!(sample.len(), 3 * TREES_PER_KIND, "the seed drew too few trees");
+    assert_eq!(
+        sample.len(),
+        3 * TREES_PER_KIND,
+        "the seed drew too few trees"
+    );
     let measured = trees::measure_trees(&setup, &sample);
     let failures = trees::check(&setup, &measured);
     assert!(
@@ -557,23 +561,24 @@ fn the_tree_harness_sees_a_wrong_tree() {
     let names = trees::comparisons();
     // Every comparison of `sample`, with `wrong` standing in for what the
     // game draws at `level`.
-    let measure_with = |wrong: &dyn Fn(cubara_world::TreeSite, trees::DrawnTree) -> trees::DrawnTree,
-                        level: u32| {
-        let mut out = vec![Vec::new(); names.len()];
-        for &(g, site) in &sample {
-            let draw = |rep: trees::Rep| {
-                let t = trees::draw(&setup, &snapshot, site, rep);
-                match rep {
-                    trees::Rep::Instance { level: l, .. } if l == level => wrong(site, t),
-                    _ => t,
+    let measure_with =
+        |wrong: &dyn Fn(cubara_world::TreeSite, trees::DrawnTree) -> trees::DrawnTree,
+         level: u32| {
+            let mut out = vec![Vec::new(); names.len()];
+            for &(g, site) in &sample {
+                let draw = |rep: trees::Rep| {
+                    let t = trees::draw(&setup, &snapshot, site, rep);
+                    match rep {
+                        trees::Rep::Instance { level: l, .. } if l == level => wrong(site, t),
+                        _ => t,
+                    }
+                };
+                for (k, (_, a, b)) in names.iter().enumerate() {
+                    out[k].push((g, trees::compare_trees(site, &draw(*a), &draw(*b))));
                 }
-            };
-            for (k, (_, a, b)) in names.iter().enumerate() {
-                out[k].push((g, trees::compare_trees(site, &draw(*a), &draw(*b))));
             }
-        }
-        out
-    };
+            out
+        };
     let place = |site: cubara_world::TreeSite, level: u32| {
         let (at, _) = trees::placed(&setup, &snapshot, level, site);
         Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32)
@@ -613,7 +618,11 @@ fn the_tree_harness_sees_a_wrong_tree() {
         ("two boxes at level 3", &boxes, 3),
     ] {
         let failures = trees::check(&setup, &measure_with(wrong, level));
-        eprintln!("{what}: {} failures, e.g. {:?}", failures.len(), failures.first());
+        eprintln!(
+            "{what}: {} failures, e.g. {:?}",
+            failures.len(),
+            failures.first()
+        );
         assert!(!failures.is_empty(), "the check did not see {what}");
     }
 }
@@ -680,7 +689,10 @@ fn a_tree_rides_the_ground_under_it() {
         }
     }
     eprintln!("{checked} trees on their ground, {moving} of them moving");
-    assert!(moving >= 4, "only {moving} of the trees checked move: this pins little");
+    assert!(
+        moving >= 4,
+        "only {moving} of the trees checked move: this pins little"
+    );
 }
 
 #[test]

@@ -817,7 +817,10 @@ impl SceneRenderer {
                             1,
                             instances.slice(range.start as u64 * stride..range.end as u64 * stride),
                         );
-                        pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.set_index_buffer(
+                            model.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
                         pass.draw_indexed(0..model.index_count, 0, 0..range.len() as u32);
                     }
                 }

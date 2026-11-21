@@ -72,6 +72,8 @@ impl TreeShapes {
     pub fn of(structures: &StructureRegistry) -> Self {
         structures.get("cubara:oak").map_or(
             Self {
+                // Empty on purpose: no oak, no heights, no models.
+                #[allow(clippy::reversed_empty_ranges)]
                 heights: 1..=0,
                 canopy_radius: 0,
             },
@@ -240,7 +242,11 @@ fn push_quad(
     open: f32,
 ) {
     let v = corners.map(glam::Vec3::from);
-    if (v[1] - v[0]).cross(v[2] - v[0]).dot(glam::Vec3::from(normal)) < 0.0 {
+    if (v[1] - v[0])
+        .cross(v[2] - v[0])
+        .dot(glam::Vec3::from(normal))
+        < 0.0
+    {
         corners.reverse();
     }
     let base = mesh.vertices.len() as u32;
@@ -326,10 +332,7 @@ pub fn build_oak_mesh(
         let base = *six.iter().min().expect("six indices") as usize;
         let corners = &mesh.vertices[base..base + 4];
         // The ground's faces: its top, under the tree's foot, and its sides.
-        if corners
-            .iter()
-            .all(|v| v.y() as i32 + floor <= min[1])
-        {
+        if corners.iter().all(|v| v.y() as i32 + floor <= min[1]) {
             continue;
         }
         let first = out.vertices.len() as u32;
@@ -385,8 +388,18 @@ pub fn build_silhouette_mesh(
         let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
         let plane = vs[0].position[axis].round() as i32;
         let layer = vs[0].layer as u32;
-        let lo = |a: usize| vs.iter().map(|p| p.position[a]).fold(f32::MAX, f32::min).round() as i32;
-        let hi = |a: usize| vs.iter().map(|p| p.position[a]).fold(f32::MIN, f32::max).round() as i32;
+        let lo = |a: usize| {
+            vs.iter()
+                .map(|p| p.position[a])
+                .fold(f32::MAX, f32::min)
+                .round() as i32
+        };
+        let hi = |a: usize| {
+            vs.iter()
+                .map(|p| p.position[a])
+                .fold(f32::MIN, f32::max)
+                .round() as i32
+        };
         let set = cells.entry((dir, plane, layer)).or_default();
         for a in lo(u)..hi(u) {
             for b in lo(v)..hi(v) {
@@ -440,7 +453,12 @@ pub fn build_silhouette_mesh(
             };
             push_quad(
                 &mut out,
-                [corner(a0, b0), corner(a1, b0), corner(a1, b1), corner(a0, b1)],
+                [
+                    corner(a0, b0),
+                    corner(a1, b0),
+                    corner(a1, b1),
+                    corner(a0, b1),
+                ],
                 normal,
                 colour,
                 open,
@@ -547,7 +565,10 @@ pub fn build_tree_models(
 ) -> TreeModels {
     let (oaks, silhouettes) = tree_model_meshes(registry, structures, layer_of);
     TreeModels {
-        oak: oaks.iter().map(|m| upload_model(device, queue, m)).collect(),
+        oak: oaks
+            .iter()
+            .map(|m| upload_model(device, queue, m))
+            .collect(),
         silhouette: silhouettes
             .iter()
             .map(|m| upload_model(device, queue, m))
@@ -933,7 +954,11 @@ fn flatten(
 mod tests {
     use super::*;
 
-    fn real_assets() -> (BlockRegistry, StructureRegistry, crate::materials::TextureLayers) {
+    fn real_assets() -> (
+        BlockRegistry,
+        StructureRegistry,
+        crate::materials::TextureLayers,
+    ) {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let registry = cubara_voxel::BlockRegistry::load(&repo_root.join("assets/blocks"))
             .expect("assets/blocks must load");
@@ -1077,7 +1102,10 @@ mod tests {
             assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
             for (dir, (area, open)) in &a {
                 let (s_area, s_open) = b[dir];
-                assert!((area - s_area).abs() < 1e-6, "{dir:?}: area {area} against {s_area}");
+                assert!(
+                    (area - s_area).abs() < 1e-6,
+                    "{dir:?}: area {area} against {s_area}"
+                );
                 assert!(
                     (open / area - s_open / s_area).abs() < 1e-5,
                     "{dir:?}: openness {} against {}",
@@ -1087,8 +1115,14 @@ mod tests {
             }
             let (t_oak, t_sil) = (oak.indices.len() / 3, silhouette.indices.len() / 3);
             eprintln!("TREE MODEL: oak {t_oak} triangles, silhouette {t_sil}");
-            assert!(2 * t_sil < t_oak, "silhouette {t_sil} against the oak's {t_oak}");
-            assert!(silhouette.vertices.iter().all(|v| v.layer < 0.0), "flat colours");
+            assert!(
+                2 * t_sil < t_oak,
+                "silhouette {t_sil} against the oak's {t_oak}"
+            );
+            assert!(
+                silhouette.vertices.iter().all(|v| v.layer < 0.0),
+                "flat colours"
+            );
         }
     }
 
