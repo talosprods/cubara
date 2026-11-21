@@ -262,7 +262,7 @@ fn rebase_cost_report() {
             top: surface - 4,
             rise: 0,
             border: false,
-            mix: [0, 0],
+            mix: [255, 0],
             open: 255,
         })
         .collect();

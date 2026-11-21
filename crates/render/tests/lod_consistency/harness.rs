@@ -911,11 +911,9 @@ pub fn measure_far(setup: &Setup, fp: Footprint, level: u32) -> Measure {
             let lit = face_colour(&setup.far_materials, &face)
                 * face_open(&face, setup.lighting.ao_floor)
                 * face_light(normal, &setup.lighting);
-            // What the face is made of: stone, soil, the surface block.
-            let (surface, soil) = match face.dir {
-                FarDir::Top => (1.0, 0.0),
-                _ => (face.mix[0] as f64 / 255.0, face.mix[1] as f64 / 255.0),
-            };
+            // What the face is made of: stone, soil, the surface block (a
+            // top over a pit wears the pit's floor).
+            let (surface, soil) = (face.mix[0] as f64 / 255.0, face.mix[1] as f64 / 255.0);
             let made_of = [1.0 - surface - soil, soil, surface];
             debug_assert_eq!((STONE, SOIL, SURFACE), (0, 1, 2));
             // The area of this face the sky sees: on the surface, and on or

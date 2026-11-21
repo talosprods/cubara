@@ -19,6 +19,12 @@
 //! `the_chosen_far_rule_is_the_games` holds the chosen one to
 //! `WorldGen::cell_top_sampled`.
 //!
+//! The study was first run when a summit stood at its highest column (#432)
+//! and chose the voxels' rule unchanged. #437 then moved the voxels' summit
+//! to the highest mean of a cell's four half-width cells; the far terrain
+//! follows, because it has no rule of its own, and the study was run again
+//! with the old rule as a candidate beside it (`FarRule::Highest`).
+//!
 //! ```text
 //! cargo test -p cubara-render --test lod_consistency -- --ignored --nocapture far_height_rule_study_report
 //! ```
@@ -56,17 +62,33 @@ fn px_per_block(rows: u32, distance: i32) -> f64 {
     1.0 / distance as f64 / pixel_angle
 }
 
+/// Where a quad that holds a summit stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Summit {
+    /// At its mean, like any other quad.
+    No,
+    /// At its highest sample (#432's rule, the voxels' until #437).
+    Highest,
+    /// At the highest mean of the four quarters of its sample grid (#437).
+    BestHalf,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FarRule {
     /// What `WorldGen::cell_top_sampled` is today: the mean of the samples,
-    /// the highest of them where the quad holds a summit among its eight
-    /// neighbours.
+    /// and where the quad holds a summit among its eight neighbours the
+    /// highest mean of the four quarters of its sample grid (#437).
     TopRule,
+    /// The same with the summit at its highest sample: the rule this study
+    /// first chose, when it was the voxels' too (#432).
+    Highest,
     /// The mean of the samples, half to even: no summits.
     Mean,
-    /// Summit judged among the 24 cells within two cells.
+    /// A summit at its highest sample, judged among the 24 cells within two
+    /// cells.
     Summit5,
-    /// TopRule, the lift of a summit over the mean at most `w / 4` blocks.
+    /// A summit at its highest sample, its lift over the mean at most
+    /// `w / 4` blocks.
     CapQuarter,
     /// The same at most `w / 8` blocks.
     CapEighth,
@@ -76,8 +98,9 @@ pub enum FarRule {
     TopRule8,
 }
 
-pub const FAR_RULES: [FarRule; 7] = [
+pub const FAR_RULES: [FarRule; 8] = [
     FarRule::TopRule,
+    FarRule::Highest,
     FarRule::Mean,
     FarRule::Summit5,
     FarRule::CapQuarter,
@@ -89,26 +112,28 @@ pub const FAR_RULES: [FarRule; 7] = [
 impl FarRule {
     fn name(self) -> &'static str {
         match self {
-            FarRule::TopRule => "TopRule (today)",
+            FarRule::TopRule => "TopRule (today, #437)",
+            FarRule::Highest => "summit at its highest sample (#432)",
             FarRule::Mean => "plain mean",
-            FarRule::Summit5 => "summit among 24 cells",
-            FarRule::CapQuarter => "summit lift <= w/4",
-            FarRule::CapEighth => "summit lift <= w/8",
-            FarRule::Summit5CapQuarter => "summit among 24, lift <= w/4",
+            FarRule::Summit5 => "highest, summit among 24 cells",
+            FarRule::CapQuarter => "highest, lift <= w/4",
+            FarRule::CapEighth => "highest, lift <= w/8",
+            FarRule::Summit5CapQuarter => "highest among 24, lift <= w/4",
             FarRule::TopRule8 => "TopRule, 8 x 8 samples",
         }
     }
-    /// How many cells either side a summit is judged among, and the cap on
-    /// its lift as a fraction of the width (0: none).
-    fn parts(self) -> (i32, i32, bool) {
+    /// How many cells either side a summit is judged among, the cap on its
+    /// lift as a fraction of the width (0: none), and where it stands.
+    fn parts(self) -> (i32, i32, Summit) {
         match self {
-            FarRule::TopRule => (1, 0, true),
-            FarRule::Mean => (1, 0, false),
-            FarRule::Summit5 => (2, 0, true),
-            FarRule::CapQuarter => (1, 4, true),
-            FarRule::CapEighth => (1, 8, true),
-            FarRule::Summit5CapQuarter => (2, 4, true),
-            FarRule::TopRule8 => (1, 0, true),
+            FarRule::TopRule => (1, 0, Summit::BestHalf),
+            FarRule::Highest => (1, 0, Summit::Highest),
+            FarRule::Mean => (1, 0, Summit::No),
+            FarRule::Summit5 => (2, 0, Summit::Highest),
+            FarRule::CapQuarter => (1, 4, Summit::Highest),
+            FarRule::CapEighth => (1, 8, Summit::Highest),
+            FarRule::Summit5CapQuarter => (2, 4, Summit::Highest),
+            FarRule::TopRule8 => (1, 0, Summit::BestHalf),
         }
     }
 }
@@ -126,7 +151,7 @@ fn div_round_half_even(a: i64, b: i64) -> i64 {
 /// side, from the height field `height`. Up to 8 blocks the voxel levels'
 /// rule (`n` is then `w`, and the rule is `TopRule`'s whatever `rule` is).
 pub fn far_top(height: &impl Fn(i32, i32) -> i32, rule: FarRule, x0: i32, z0: i32, w: i32) -> i32 {
-    let (reach, cap_div, summits) = if w <= 8 {
+    let (reach, cap_div, summit) = if w <= 8 {
         FarRule::TopRule.parts()
     } else {
         rule.parts()
@@ -145,17 +170,23 @@ pub fn far_top(height: &impl Fn(i32, i32) -> i32, rule: FarRule, x0: i32, z0: i3
         height(x0 + ci * w + lead + a * step, z0 + cj * w + lead + b * step)
     };
     let (mut sum, mut high, mut first) = (0i64, i32::MIN, (0, 0));
+    // The four quarters of the sample grid: each one's sum and count.
+    let half = count / 2;
+    let (mut quarter, mut quarter_count) = ([0i64; 4], [0i64; 4]);
     for b in 0..count {
         for a in 0..count {
             let h = sample(0, 0, a, b);
             sum += h as i64;
+            let q = (a >= half) as usize + 2 * (b >= half) as usize;
+            quarter[q] += h as i64;
+            quarter_count[q] += 1;
             if h > high {
                 (high, first) = (h, (a, b));
             }
         }
     }
     let mean = div_round_half_even(sum, (count * count) as i64) as i32;
-    if mean == high || !summits {
+    if mean == high || summit == Summit::No {
         return mean;
     }
     for cj in -reach..=reach {
@@ -174,10 +205,13 @@ pub fn far_top(height: &impl Fn(i32, i32) -> i32, rule: FarRule, x0: i32, z0: i3
             }
         }
     }
-    if cap_div > 0 && w > 8 {
-        mean + (high - mean).min(w / cap_div)
-    } else {
-        high
+    match summit {
+        Summit::BestHalf => (0..4)
+            .map(|q| div_round_half_even(quarter[q], quarter_count[q]) as i32)
+            .max()
+            .expect("four quarters"),
+        _ if cap_div > 0 && w > 8 => mean + (high - mean).min(w / cap_div),
+        _ => high,
     }
 }
 

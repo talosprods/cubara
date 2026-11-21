@@ -2500,11 +2500,12 @@ fn the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground() {
 /// form of `mesh.wgsl`'s lighting, which `far.wgsl` shares through
 /// `face.wgsl`).
 ///
-/// The cases are a top, and walls facing each of the four ways -- the sun's
-/// side and the shadow's -- from a one-block step (the surface block's side)
-/// through soil to a cliff that is mostly stone. This is what pins the face
-/// record's layout on the GPU: read the direction or the rise from the wrong
-/// bits and a case comes out another colour.
+/// The cases are a top, a top that shows a pit's floor (stone), and walls
+/// facing each of the four ways -- the sun's side and the shadow's -- from a
+/// one-block step (the surface block's side) through soil to a cliff that
+/// is mostly stone. This is what pins the face record's layout on the GPU:
+/// read the direction, the rise or the mix from the wrong bits and a case
+/// comes out another colour.
 #[test]
 fn far_shading_is_the_face_reference() {
     use cubara_render::aggregate::face_light;
@@ -2529,7 +2530,9 @@ fn far_shading_is_the_face_reference() {
         },
         ..Lighting::default()
     };
-    let cases: [(FarDir, u32); 8] = [
+    // The last: a top over a pit, wearing its floor.
+    const PIT: usize = 8;
+    let cases: [(FarDir, u32); 9] = [
         (FarDir::Top, 0),
         (FarDir::PosX, 1),
         (FarDir::PosX, 3),
@@ -2538,14 +2541,17 @@ fn far_shading_is_the_face_reference() {
         (FarDir::PosZ, 3),
         (FarDir::NegZ, 3),
         (FarDir::NegZ, 24),
+        (FarDir::Top, 0),
     ];
     let mut colours = Vec::new();
-    for (dir, rise) in cases {
+    for (case, (dir, rise)) in cases.into_iter().enumerate() {
         // What the face carries, by case: a wall of one block the surface
         // block's side, of three mostly soil, of 24 mostly stone and half
-        // shut in; the top a little shut in.
+        // shut in; the top the surface block's top and a little shut in, or
+        // a pit's floor of stone.
         let (mix, open) = match (dir, rise) {
-            (FarDir::Top, _) => ([0, 0], 140),
+            (FarDir::Top, _) if case == PIT => ([0, 0], 140),
+            (FarDir::Top, _) => ([255, 0], 140),
             (_, 1) => ([255, 0], 255),
             (_, 3) => ([60, 150], 255),
             _ => ([10, 30], 90),
@@ -2641,6 +2647,7 @@ fn far_shading_is_the_face_reference() {
     // direction or the rise would fail one of them.
     let apart = |a: usize, b: usize| (0..3).any(|c| (colours[a][c] - colours[b][c]).abs() > 6);
     assert!(apart(0, 2), "a top and a wall: {colours:?}");
+    assert!(apart(0, PIT), "a top and a pit's floor: {colours:?}");
     assert!(apart(2, 4), "+x and -x: {colours:?}");
     assert!(apart(5, 6), "+z and -z: {colours:?}");
     assert!(apart(1, 3), "a step of 1 and of 24: {colours:?}");
@@ -2667,7 +2674,7 @@ fn a_far_runs_padding_draws_nothing() {
         top: 40,
         rise: 0,
         border: false,
-        mix: [0, 0],
+        mix: [255, 0],
         open: 255,
     };
     // One face in a corner; and fifteen that cover the middle, a hundred

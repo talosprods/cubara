@@ -94,33 +94,67 @@ const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 /// inside one of them.
 const RESELECT_BLOCKS: f64 = 32.0;
 
+/// **How large the far terrain's quads are on screen**, as a factor on the
+/// pixel sizes a quality names ([`FarQuality::detail`]): its quads, its
+/// error bound and its floor are all this many times as wide as the sizes
+/// `PROPOSAL_FAR_VIEW.md` §3.2 measured for the smooth surface (at Medium,
+/// quads of at most 16 pixels). The one number for it: the window, the
+/// benchmarks, the flights and the screenshot all draw at this unless
+/// `--far-quad-scale F` says otherwise ([`far_view`]).
+///
+/// Above 1 because the far terrain is blocks now (issue #422): a block
+/// surface costs about nine vertices a quad where the smooth one shared one
+/// among four, and the M3 shades the far terrain's vertices at about 0.4 ns
+/// each whatever the shader does (`docs/PHASE3_ARCHITECTURE.md` §9.8), so at
+/// 1 the gate is not met at any quality. **Chosen, not derived**: 2.5 is the
+/// first size measured to hold 1,000 FPS at Medium on the M3; the owner left
+/// the size to the engine ("as long as it is good", 2026-11-21), and the
+/// candidates' numbers are in §9.8.
+pub const FAR_QUAD_SCALE: f64 = 2.5;
+
+/// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
+/// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from
+/// 0.5 to 8 -- a typo is refused, not measured as the scale that was asked
+/// for.
+pub fn parse_quad_scale(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && (0.5..=8.0).contains(f))
+}
+
 /// The view the far terrain is selected for at `quality`, scaled to a screen
-/// `screen_height` pixels tall, leaving `hole` to the voxels. `None` when the
-/// quality is `Off`.
+/// `screen_height` pixels tall, leaving `hole` to the voxels: the game's, at
+/// [`FAR_QUAD_SCALE`]. `None` when the quality is `Off`.
+///
+/// Only tests ask this way: the window's plan, the benchmarks, the flights
+/// and the screenshot each carry the scale they were started with (the
+/// constant, or `--far-quad-scale`) to [`far_view_scaled`].
+#[cfg(test)]
 pub fn far_view(
     eye: [f64; 3],
     screen_height: u32,
     hole: Option<Hole>,
     quality: FarQuality,
 ) -> Option<FarView> {
-    far_view_scaled(eye, screen_height, hole, quality, 1.0)
+    far_view_scaled(eye, screen_height, hole, quality, FAR_QUAD_SCALE)
 }
 
 /// [`far_view`] with every pixel size of the quality -- its quads, its error
-/// bound and its floor -- `coarser` times as large. The game draws at 1;
-/// `far_census` asks what the others would cost.
+/// bound and its floor -- `scale` times as large as the quality names them.
+/// The game draws at [`FAR_QUAD_SCALE`]; `--far-quad-scale` and `far_census`
+/// ask what the others would cost.
 pub fn far_view_scaled(
     eye: [f64; 3],
     screen_height: u32,
     hole: Option<Hole>,
     quality: FarQuality,
-    coarser: f64,
+    scale: f64,
 ) -> Option<FarView> {
     let d = quality.detail()?;
-    let pixel = FOV_Y / screen_height.max(1) as f64 * coarser;
+    let pixel = FOV_Y / screen_height.max(1) as f64 * scale;
     Some(FarView {
         eye,
-        split_ratio: far::split_ratio_for(d.quad_px * coarser, screen_height.max(1) as f64, FOV_Y),
+        split_ratio: far::split_ratio_for(d.quad_px * scale, screen_height.max(1) as f64, FOV_Y),
         max_error: d.error_px * pixel,
         min_quad: d.floor_px * pixel,
         radius: FAR_VIEW_RADIUS,
@@ -338,6 +372,9 @@ struct FarPlan {
     quality: FarQuality,
     /// [`FAR_VIEW_RADIUS`] in the game; tests use less.
     radius: f64,
+    /// The quality's pixel sizes times this ([`far_view_scaled`]):
+    /// [`FAR_QUAD_SCALE`] unless `--far-quad-scale` says otherwise.
+    quad_scale: f64,
     /// Every patch generated and still of use: the ones drawn, and the ones
     /// whose error decides whether their area is split.
     heights: HashMap<PatchKey, PatchHeights>,
@@ -360,6 +397,7 @@ impl FarPlan {
         Self {
             quality,
             radius,
+            quad_scale: FAR_QUAD_SCALE,
             heights: HashMap::new(),
             in_flight: HashSet::new(),
             selected_at: None,
@@ -432,7 +470,13 @@ impl FarPlan {
         self.arrived = false;
         let drawn = drawn();
 
-        let Some(view) = far_view(eye, screen_height, Some(hole), self.quality) else {
+        let Some(view) = far_view_scaled(
+            eye,
+            screen_height,
+            Some(hole),
+            self.quality,
+            self.quad_scale,
+        ) else {
             // Off: nothing beyond the voxels.
             let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
             leave.sort();
@@ -500,6 +544,15 @@ impl FarStreaming {
             materials: far_materials(),
             warned_full: false,
         }
+    }
+
+    /// Draw with the quality's quads, error bound and floor `scale` times as
+    /// wide on screen as it names them, in place of [`FAR_QUAD_SCALE`]
+    /// (`--far-quad-scale`). Before the first frame: patches already drawn
+    /// are not selected again.
+    pub fn with_quad_scale(mut self, scale: f64) -> Self {
+        self.plan.quad_scale = scale;
+        self
     }
 
     /// The seed the far terrain is generated from.
@@ -716,21 +769,30 @@ mod tests {
         assert!(hole.min[0] < -1000.0 && hole.max[0] > 1000.0, "{hole:?}");
     }
 
-    /// The same numbers the far terrain module measured (`far.rs`, §3.2).
+    /// The same numbers the far terrain module measured (`far.rs`, §3.2),
+    /// every one of them [`FAR_QUAD_SCALE`] times as wide -- and the scale
+    /// asked for where one is: the quads, the error bound and the floor all
+    /// follow it.
     #[test]
     fn the_view_uses_the_measured_settings() {
         let pixel = FOV_Y / 1080.0;
         for q in FarQuality::BEST_FIRST {
-            let Some(v) = far_view([0.0; 3], 1080, None, q) else {
+            let Some(game) = far_view([0.0; 3], 1080, None, q) else {
                 assert_eq!(q, FarQuality::Off, "only Off draws nothing");
                 continue;
             };
             let d = q.detail().unwrap();
-            assert!((v.max_error / pixel - d.error_px).abs() < 1e-9);
-            assert!((v.min_quad / pixel - d.floor_px).abs() < 1e-9);
-            let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
-            assert!((quad_angle / pixel - d.quad_px).abs() < 1e-6);
-            assert_eq!(v.radius, FAR_VIEW_RADIUS);
+            for (v, scale) in [
+                (game, FAR_QUAD_SCALE),
+                (far_view_scaled([0.0; 3], 1080, None, q, 1.0).unwrap(), 1.0),
+                (far_view_scaled([0.0; 3], 1080, None, q, 3.5).unwrap(), 3.5),
+            ] {
+                assert!((v.max_error / pixel - d.error_px * scale).abs() < 1e-9);
+                assert!((v.min_quad / pixel - d.floor_px * scale).abs() < 1e-9);
+                let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
+                assert!((quad_angle / pixel - d.quad_px * scale).abs() < 1e-6);
+                assert_eq!(v.radius, FAR_VIEW_RADIUS);
+            }
         }
         // High is what `PROPOSAL_FAR_VIEW.md` §3.2 measured.
         let high = FarQuality::High.detail().unwrap();
@@ -1151,6 +1213,51 @@ mod tests {
         assert_eq!(sim.plan.selects, n + 3, "a new hole did nothing");
         sim.plan.step(start, 720, hole, || shown.clone());
         assert_eq!(sim.plan.selects, n + 3, "nothing changed but it selected");
+    }
+
+    /// **The plan selects at the quad scale it is given** -- the game's
+    /// ([`FAR_QUAD_SCALE`]) unless told another (`--far-quad-scale`, through
+    /// [`FarStreaming::with_quad_scale`]): what it first asks for is what
+    /// [`far_view_scaled`] at that scale selects, and a finer scale asks for
+    /// more.
+    #[test]
+    fn the_plan_selects_at_its_quad_scale() {
+        let eye = [8.0, 120.0, 8.0];
+        let hole = voxel_hole(eye.map(|v| v as f32));
+        let asked = |scale: Option<f64>| -> HashSet<PatchKey> {
+            let mut plan = FarPlan::new(FarQuality::Medium, TEST_RADIUS);
+            if let Some(scale) = scale {
+                plan.quad_scale = scale;
+            }
+            let step = plan.step(eye, 1080, hole, HashSet::new);
+            step.request.into_iter().collect()
+        };
+        let selected = |scale: f64| -> HashSet<PatchKey> {
+            let view = FarView {
+                radius: TEST_RADIUS,
+                ..far_view_scaled(eye, 1080, Some(hole), FarQuality::Medium, scale).unwrap()
+            };
+            far::select(&view, |_| None).into_iter().collect()
+        };
+        assert_eq!(asked(None), selected(FAR_QUAD_SCALE), "the game's scale");
+        assert_eq!(asked(Some(1.0)), selected(1.0), "a scale asked for");
+        assert!(
+            selected(1.0).len() > selected(FAR_QUAD_SCALE).len(),
+            "the two scales select alike, and the test tells nothing"
+        );
+    }
+
+    /// `--far-quad-scale` takes a number from 0.5 to 8 and refuses the rest:
+    /// a typo must not be measured as some other scale.
+    #[test]
+    fn a_quad_scale_is_a_number_in_range_or_refused() {
+        assert_eq!(parse_quad_scale("2.5"), Some(2.5));
+        assert_eq!(parse_quad_scale("3"), Some(3.0));
+        assert_eq!(parse_quad_scale("0.5"), Some(0.5));
+        assert_eq!(parse_quad_scale("8"), Some(8.0));
+        for wrong in ["", "x3", "3x", "0", "0.4", "8.5", "-2", "nan", "inf"] {
+            assert_eq!(parse_quad_scale(wrong), None, "{wrong:?}");
+        }
     }
 
     /// `Off` draws nothing beyond the voxels: everything shown leaves, and

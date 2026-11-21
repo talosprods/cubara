@@ -80,8 +80,9 @@ pub struct FarFace {
     /// A wall: the blocks of step it shows. Zero for a top.
     pub rise: u32,
     pub border: bool,
-    /// A wall: the share of it, in 255ths, that is the surface block's side
-    /// and that is soil; the rest is stone. Zero for a top.
+    /// The share of the face, in 255ths, that is the surface block (its side
+    /// on a wall, its top on a top) and that is soil; the rest is stone. A
+    /// top is all surface block, but where it shows a pit's floor.
     pub mix: [u8; 2],
     /// How open the face is to the sky, in 255ths: what ambient occlusion
     /// leaves of its light ([`face_open`]).
@@ -252,18 +253,21 @@ pub const QUAD_INDICES: [u16; 6] = [0, 2, 1, 1, 2, 3];
 
 /// **The one place a face's colour is decided** (the seam issue #422 asks
 /// for; `far.wgsl`'s `face_colour` is this, and a golden test holds the two
-/// together): a top wears the top of the surface block, and a wall the mix
-/// of the surface block's side, soil and stone it carries -- which is what
-/// level 0's own risers facing that way are made of over the wall's quad
-/// (`cubara_world::far::QuadGround`, issue #423 decision 2), not what the
-/// wall's height would suggest.
+/// together): the mix of the surface block, soil and stone the face carries
+/// -- the surface block's side on a wall, its top on a top. A wall's mix is
+/// what level 0's own risers facing that way are made of over the wall's
+/// quad (`cubara_world::far::QuadGround`, issue #423 decision 2), not what
+/// the wall's height would suggest; a top's is the surface block, or the
+/// floor of a pit level 0 shows from above there (`WorldGen::top_layer`).
 pub fn face_colour(materials: &Materials, face: &FarFace) -> Vec3 {
-    if face.dir == FarDir::Top {
-        return materials.top;
-    }
+    let shown = if face.dir == FarDir::Top {
+        materials.top
+    } else {
+        materials.side
+    };
     let surface = face.mix[0] as f32 / 255.0;
     let soil = face.mix[1] as f32 / 255.0;
-    materials.side * surface + materials.soil * soil + materials.stone * (1.0 - surface - soil)
+    shown * surface + materials.soil * soil + materials.stone * (1.0 - surface - soil)
 }
 
 /// How much of its light a face keeps: `mesh.wgsl`'s ambient occlusion for
@@ -1506,8 +1510,8 @@ mod tests {
         }
     }
 
-    /// A top is the surface block's top; a wall is the mix it carries, and
-    /// either keeps as much light as it is open.
+    /// A face is the mix it carries -- of the surface block's top on a top,
+    /// of its side on a wall -- and keeps as much light as it is open.
     #[test]
     fn a_face_wears_the_mix_it_carries() {
         let m = Materials {
@@ -1519,6 +1523,10 @@ mod tests {
         };
         let top = unit_top(3, 4, 20);
         assert_eq!(face_colour(&m, &top), m.top);
+        // A top over a pit wears the pit's floor: soil, or stone.
+        let floor = |mix: [u8; 2]| FarFace { mix, ..top };
+        assert_eq!(face_colour(&m, &floor([0, 255])), m.soil);
+        assert_eq!(face_colour(&m, &floor([0, 0])), m.stone);
         for dir in [FarDir::PosX, FarDir::NegX, FarDir::PosZ, FarDir::NegZ] {
             let wall = |mix: [u8; 2]| FarFace {
                 dir,
@@ -1556,7 +1564,7 @@ mod tests {
             top,
             rise: 0,
             border: false,
-            mix: [0, 0],
+            mix: [255, 0],
             open: 255,
         }
     }

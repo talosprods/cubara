@@ -244,16 +244,16 @@ fn vs_main(
 // ---------------------------------------------------------------------------
 
 // **The one place a face's colour is decided** (the seam issue #422 asks
-// for): a top wears the top of the surface block, a wall the mix of the
-// surface block's side, soil and stone its third word carries -- what level
-// 0's risers facing its way are made of (issue #423 decision 2).
+// for): the mix of the surface block, soil and stone its third word carries
+// -- the surface block's side on a wall, its top on a top. A wall's mix is
+// what level 0's risers facing its way are made of (issue #423 decision 2);
+// a top's is the surface block, or the floor of a pit level 0 shows from
+// above there (`WorldGen::top_layer`).
 fn face_colour(dir: u32, word2: u32) -> vec3<f32> {
-    if dir == DIR_TOP {
-        return params.top_color.rgb;
-    }
     let surface = f32(word2 & 0xFFu) / 255.0;
     let soil = f32((word2 >> 8u) & 0xFFu) / 255.0;
-    return params.side_color.rgb * surface + params.soil_color.rgb * soil
+    let shown = select(params.side_color.rgb, params.top_color.rgb, dir == DIR_TOP);
+    return shown * surface + params.soil_color.rgb * soil
         + params.stone_color.rgb * (1.0 - surface - soil);
 }
 

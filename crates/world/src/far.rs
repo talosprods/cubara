@@ -405,8 +405,7 @@ impl QuadGround {
         let [ox, oz] = key.origin();
         let (x0, z0) = (ox + i as i64 * q, oz + j as i64 * q);
         // `top - 1`: the top block, which the top face is one above.
-        let wears = match gen.top_layer(x0 as i32, z0 as i32, q as i32, top_samples(key), top - 1)
-        {
+        let wears = match gen.top_layer(x0 as i32, z0 as i32, q as i32, top_samples(key), top - 1) {
             GroundLayer::Surface => [255, 0],
             GroundLayer::Soil => [0, 255],
             GroundLayer::Stone => [0, 0],
