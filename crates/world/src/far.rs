@@ -186,8 +186,9 @@ pub fn select(view: &FarView, error_of: impl Fn(PatchKey) -> Option<f32>) -> Vec
 }
 
 /// The coarsest level whose patches are at least `radius` wide, so a 3 x 3
-/// block of them always covers the view.
-fn root_level_for(radius: f64) -> u32 {
+/// block of them always covers the view: the level [`select`] starts its
+/// walk from, and so the coarsest patch whose error can decide a split.
+pub fn root_level_for(radius: f64) -> u32 {
     let mut level = 0;
     while ((PATCH_QUADS as i64) << level) < radius.ceil() as i64 {
         level += 1;
@@ -1710,6 +1711,53 @@ mod block_tests {
             assert_eq!(
                 top,
                 gen.cell_top_sampled(x0 as i32, z0 as i32, 64, TOP_SAMPLES) + 1
+            );
+        }
+    }
+
+    /// **A far crest grows few towers** (#422 on #437's summit rule). The
+    /// zoom pairs of 2026-11-21 saw "thin vertical spires on peak tops and
+    /// ridges" in the far terrain at 1,200 blocks: quads that held a summit
+    /// stood at their highest column while their neighbours stood at their
+    /// means. A quad's top is the voxel cell's ([`quad_top`]), so the far
+    /// terrain follows the voxels' rule to the highest half's mean with
+    /// nothing changed here -- and this holds it there, at the far terrain's
+    /// own widths, the sampled ones included: over 1,792 blocks square
+    /// around the default seed's highest peak, the quads that stand at
+    /// least their own width above all four quads beside them.
+    ///
+    /// Measured: 12, 8 and 5 at quads of 8, 16 and 32. Under the highest
+    /// column (#432's rule, which this is red on) they were 53, 24 and 9.
+    #[test]
+    fn a_far_crest_grows_few_towers() {
+        /// Per far level, the most towers allowed. **Chosen, not derived**:
+        /// the measured counts with a little room.
+        const MOST: [(u32, usize); 3] = [(3, 14), (4, 10), (5, 6)];
+        const SPAN: i32 = 1792;
+        let gen = WorldGen::new(SEED);
+        let (x_lo, z_lo) = (-3072 - 1024, -3232 - 1120);
+        for (level, most) in MOST {
+            let key = PatchKey::new(level, 0, 0);
+            let q = key.quad() as i32;
+            let n = SPAN / q;
+            // Any quad of the level's grid, counted from the patch at the
+            // origin: `quad_top` takes them all.
+            let tops: Vec<i32> = (0..n * n)
+                .map(|k| quad_top(&gen, key, x_lo / q + k % n, z_lo / q + k / n))
+                .collect();
+            let at = |i: i32, j: i32| tops[(j * n + i) as usize];
+            let towers = (1..n - 1)
+                .flat_map(|j| (1..n - 1).map(move |i| (i, j)))
+                .filter(|&(i, j)| {
+                    [at(i - 1, j), at(i + 1, j), at(i, j - 1), at(i, j + 1)]
+                        .iter()
+                        .all(|&beside| at(i, j) - beside >= q)
+                })
+                .count();
+            println!("quads of {q}: {towers} towers");
+            assert!(
+                towers <= most,
+                "quads of {q}: {towers} quads stand alone at least {q} blocks above all four beside them, allowed {most}"
             );
         }
     }

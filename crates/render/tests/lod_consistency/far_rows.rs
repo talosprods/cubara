@@ -285,21 +285,31 @@ fn the_far_terrain_shows_level_0s_colours() {
 
 /// **The far terrain keeps level 0's shape** (#423 decision 4 on the far
 /// quads), in every single footprint: every column drawn; at quads of 8 --
-/// the same function as level 3's cells -- **a summit keeps its height
-/// exactly** and the ground leans neither way nor off the skyline more than
-/// level 3 allows (`SHAPE`'s third row); at quads of 16, sampled four to a
-/// side, within the bounds below.
+/// the same function as level 3's cells -- **a summit stands where level 3's
+/// does**: never above level 0's, and under it by no more than level 3's
+/// bounds on a footprint and in the mean (`a_coarse_level_keeps_level_0s_shape`'s
+/// `SUMMIT`: a coarse summit stands at the mean of its highest half-width
+/// cell since #437, where its highest column drew towers), and the ground
+/// leans neither way nor off the skyline more than level 3 allows (`SHAPE`'s
+/// third row); at quads of 16, sampled four to a side, within the bounds
+/// below.
 ///
 /// **Chosen, not derived**, just over the worst footprint measured on this
-/// seed: at 16 the mean column stands -1.31 to +2.16 blocks off level 0's
-/// and the skyline's mean distance reaches 17.3 (cliffs); the swap that
-/// matters, between far quad widths, is `far_study`'s, in pixels.
+/// seed: at 16 the mean column stands -1.31 to +1.91 blocks off level 0's
+/// and the skyline's mean distance reaches 17.3 (cliffs); at 8 the fifteen
+/// footprints that hold a summit stand 2.13 blocks under level 0's in the
+/// mean. The swap that matters, between far quad widths, is `far_study`'s,
+/// in pixels.
 #[test]
 fn the_far_terrain_keeps_level_0s_shape() {
     /// Per far level held: the most the mean column may stand off level 0,
     /// and the most the skyline's mean distance may be.
     const SHAPE: [(u32, f64, f64); 2] = [(3, 0.3, 7.5), (4, 2.5, 18.0)];
-    let mut summits = 0;
+    /// At quads of 8: the most a summit may stand under level 0's on any one
+    /// footprint, and in the mean over the footprints that hold one --
+    /// level 3's bounds, to the number.
+    const SUMMIT: (f64, f64) = (6.0, 2.5);
+    let (mut summits, mut summit_sum) = (0, 0.0);
     for one in far_footprints() {
         let Some(&(_, lean_bound, skyline_bound)) = SHAPE.iter().find(|s| s.0 == one.level) else {
             continue;
@@ -312,9 +322,11 @@ fn the_far_terrain_keeps_level_0s_shape() {
         let (peak, ..) = spread(&one.shape.peak);
         if one.summit && one.level == 3 {
             summits += 1;
-            assert_eq!(
-                peak, 0.0,
-                "{at}: the summit stands {peak:+.2} blocks off level 0's"
+            summit_sum += peak;
+            assert!(
+                (-SUMMIT.0..=0.0).contains(&peak),
+                "{at}: the summit stands {peak:+.2} blocks off level 0's, allowed {} under and none over",
+                SUMMIT.0
             );
         }
         let (lean, ..) = spread(&one.shape.column);
@@ -329,4 +341,11 @@ fn the_far_terrain_keeps_level_0s_shape() {
         );
     }
     assert!(summits >= 8, "{summits} footprints hold a summit");
+    let mean = summit_sum / summits as f64;
+    println!("far quads of 8: {summits} summits, {mean:+.2} blocks off level 0's in the mean");
+    assert!(
+        mean >= -SUMMIT.1,
+        "far quads of 8: the summits stand {mean:+.2} blocks off level 0's in the mean, allowed {} under",
+        SUMMIT.1
+    );
 }

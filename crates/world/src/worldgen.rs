@@ -3157,6 +3157,58 @@ mod tests {
         }
     }
 
+    /// **A pit's floor is level 0's**: [`WorldGen::pit_floor`] is the first
+    /// solid block under a surface block a cave has carved away -- every
+    /// block above it, up to the surface, is air at level 0 -- and there is
+    /// none where the surface block stands. And what shows from above there
+    /// ([`WorldGen::from_above`], the voxels' form; [`WorldGen::top_layer`]
+    /// reads the same floor) is what level 0's block at the floor is. Over
+    /// the pitted mountains; soil floors and stone floors must both turn up,
+    /// or a floor always one block down would pass.
+    #[test]
+    fn a_pits_floor_is_the_first_ground_under_the_carved_surface() {
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let blocks = test_blocks();
+        let (mx, mz): (i32, i32) = (-848, 4832);
+        let (mut whole, mut soil, mut stone) = (0, 0, 0);
+        for z in mz - 128..mz + 128 {
+            for x in mx - 128..mx + 128 {
+                let surface = gen.surface_height(x, z);
+                let Some(floor) = gen.pit_floor(x, z, surface) else {
+                    assert!(
+                        gen.is_solid(x, surface, z),
+                        "({x}, {z}): no pit, no surface"
+                    );
+                    assert_eq!(gen.from_above(x, z, surface, blocks), None);
+                    whole += 1;
+                    continue;
+                };
+                assert!(floor < surface, "({x}, {z}): the floor at {floor}");
+                for y in floor + 1..=surface {
+                    assert!(!gen.is_solid(x, y, z), "({x}, {y}, {z}) above the floor");
+                }
+                assert!(
+                    gen.is_solid(x, floor, z) || floor == surface - PIT_FLOOR_SEARCH,
+                    "({x}, {floor}, {z}): the floor is air"
+                );
+                let shows = gen.from_above(x, z, surface, blocks).expect("a pit");
+                if gen.is_solid(x, floor, z) {
+                    assert_eq!(Some(shows), gen.block_at(x, floor, z, blocks), "({x}, {z})");
+                }
+                if shows == blocks.soil {
+                    soil += 1;
+                } else {
+                    assert_eq!(shows, blocks.stone, "({x}, {z}): {shows:?}");
+                    stone += 1;
+                }
+            }
+        }
+        assert!(
+            whole > 10_000 && soil > 50 && stone > 500,
+            "{whole} whole columns, {soil} soil floors, {stone} stone floors"
+        );
+    }
+
     #[test]
     fn a_coarse_riser_is_made_of_level_0s_faces() {
         /// **Chosen, not derived**: a hash picks one face per cell, so the

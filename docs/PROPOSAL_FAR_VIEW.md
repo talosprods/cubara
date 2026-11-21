@@ -214,12 +214,12 @@ a flat top at a whole number of blocks (`far::quad_top`), with a vertical wall
 wherever two neighbouring tops differ, exactly as tall as the step
 (`far::mesh`), on the block grid and so on the grid of the voxel rings'
 coarse cells. The top is the rule that one ground serves every level (issue
-#423, `WorldGen::cell_top_sampled`): the highest level-0 surface among the
-quad's columns, on the rows of the voxel level of the same cell width -- so
-a level-3 quad and a level-3 voxel cell over the same eight columns have the
-same top. Vertical precision is a block (a row of four from level 3), not
-the quad's width: the flattening of table A does not come back. What that
-changes below:
+#423, `WorldGen::cell_top_sampled`): the mean of the level-0 surfaces of the
+quad's columns, and the mean of its highest half where it holds a summit --
+so a level-3 quad and a level-3 voxel cell over the same 64 columns have the
+same top, to the block. Vertical precision is a block, not the quad's
+width: the flattening of table A does not come back. What that changes
+below:
 
 - **Skirts are walls.** A patch's edge carries a wall for every quad, down to
   the neighbouring patch's quad as the patch's own level sees it and the old
@@ -227,7 +227,9 @@ changes below:
   seeded views, 66,752 stretches of edge between patches of different levels
   all close; without the skirt the worst is open by 108 blocks.
 - **3.3's block-aggregate shading is no longer what the far terrain is drawn
-  with.** A top wears the top material, and a wall the mix of surface
+  with.** A top wears what a voxel cell's top wears over the same columns
+  (`WorldGen::top_layer`: the surface block, or the floor of a pit level 0
+  shows from above there), and a wall the mix of surface
   block, soil and stone that level 0's own risers facing its way are over
   the same ground (`WorldGen::ground_faces`: by depth below each column's
   own surface, not by the wall's height). Each is lit as `mesh.wgsl` lights
@@ -251,8 +253,10 @@ changes below:
   out the walls that face away from the eye; drawn 1.5 times as coarse it
   costs what the smooth surface did.
   The counts per gate eye and quality are in the PR of #422
-  (`far_census.rs` prints them); the trade between quad size and triangle
-  count is the owner's.
+  (`far_census.rs` prints them). The owner left the trade between quad
+  size and frame rate to the engine (2026-11-21); it is one number,
+  `far_streaming::FAR_QUAD_SCALE`, and `docs/PHASE3_ARCHITECTURE.md` §9.8
+  has what each size measured.
 
 ### 3.3 Block-aggregate shading: making it look like every block
 

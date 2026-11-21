@@ -554,11 +554,15 @@ fn sampled_mean(height: &impl Fn(i32, i32) -> i32, x0: i32, z0: i32, w: i32, n: 
 /// mean capped -- and what each cap costs a summit in height.
 ///
 /// A spire is the summit's lift, and it is the rule's at every width: a
-/// cell that holds a summit stands at its highest column while the cells
-/// around it stand at their means. At 8 blocks that is level 3's cell and
-/// the far terrain's finest quad alike (one number, `far::quad_top`), so
-/// there is no far rule to bring into line; capping the lift is a change to
-/// the rule of `docs/PHASE3_ARCHITECTURE.md` section 9.3 for the voxels too.
+/// cell that holds a summit stands above its mean while the cells around
+/// it stand at theirs. At 8 blocks that is level 3's cell and the far
+/// terrain's finest quad alike (one number, `far::quad_top`), so there was
+/// no far rule to bring into line: when this was first run a summit stood
+/// at its highest column (#432) and the rule left 87, 53, 24 and 9 such
+/// cells at widths 4 to 32; #437 moved the voxels' summit to the mean of
+/// its highest half, the far terrain with it, and this prints 33, 12, 8
+/// and 5 (`far::block_tests::a_far_crest_grows_few_towers` holds the last
+/// three). The caps are of the lift that is left.
 ///
 /// ```text
 /// cargo test --release -p cubara-render --test lod_consistency -- --ignored --nocapture summit_lift_report

@@ -298,8 +298,17 @@ fn swap(drawn: &HashSet<PatchKey>, draw: &HashSet<PatchKey>) -> (Vec<PatchKey>, 
 /// knows why its ground was split, merges it back, and then splits it again
 /// once the ancestor is regenerated: a selection that never settles (review
 /// of #284).
-fn to_keep(wanted: &[PatchKey], draw: HashSet<PatchKey>) -> HashSet<PatchKey> {
-    let top = top_level(wanted);
+///
+/// Every ancestor up to `root_level`, the level the selection walks down
+/// from ([`far::root_level_for`]) -- not only up to the coarsest patch
+/// wanted. A root split for its roughness alone, too far away to be split
+/// by distance, is no wanted patch's level once all of them are split, and
+/// was dropped: the plan then asked for it, split it and dropped it again,
+/// for ever. Quads of 16 pixels split every root by distance, so it took
+/// the wider quads of [`FAR_QUAD_SCALE`] to show it (at the tests' radius;
+/// the game's roots are too large to be rough at their distance).
+fn to_keep(wanted: &[PatchKey], draw: HashSet<PatchKey>, root_level: u32) -> HashSet<PatchKey> {
+    let top = top_level(wanted).max(root_level);
     let mut keep = draw;
     for &k in wanted {
         keep.insert(k);
@@ -508,7 +517,7 @@ impl FarPlan {
         // Swap the drawn set, never leaving ground uncovered.
         let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
         let (leave, arrive) = swap(&drawn, &draw);
-        let keep = to_keep(&wanted, draw);
+        let keep = to_keep(&wanted, draw, far::root_level_for(view.radius));
         self.heights.retain(|k, _| keep.contains(k));
         Step {
             request,
@@ -843,7 +852,11 @@ mod tests {
             far::select(&here, |k| h.get(&k).map(|p| p.error))
         };
 
-        let keep = to_keep(&wanted, wanted.iter().copied().collect());
+        let keep = to_keep(
+            &wanted,
+            wanted.iter().copied().collect(),
+            far::root_level_for(here.radius),
+        );
         let mut kept = heights.clone();
         kept.retain(|k, _| keep.contains(k));
         assert!(
@@ -862,6 +875,28 @@ mod tests {
             select(&bare),
             wanted,
             "without the ancestors it should have moved"
+        );
+    }
+
+    /// **A root split for its roughness alone keeps its heights.** Its
+    /// children are all that is wanted, so no wanted patch is of its level;
+    /// kept only up to the coarsest wanted patch, it was dropped, selected
+    /// again unsplit (its error unknown), generated, split and dropped
+    /// again: `standing_still_selects_nothing` and six more never settled
+    /// at [`FAR_QUAD_SCALE`], where a root can be too far to be split by
+    /// distance.
+    #[test]
+    fn a_root_all_of_whose_ground_is_split_is_kept() {
+        let root = PatchKey::new(7, 0, -1);
+        let wanted: Vec<PatchKey> = root.children().to_vec();
+        let keep = to_keep(&wanted, wanted.iter().copied().collect(), root.level);
+        assert!(keep.contains(&root), "the root was dropped: {keep:?}");
+        // Two levels down as well: every ancestor on the way up.
+        let deeper: Vec<PatchKey> = wanted[0].children().to_vec();
+        let keep = to_keep(&deeper, HashSet::new(), root.level);
+        assert!(
+            keep.contains(&root) && keep.contains(&wanted[0]),
+            "{keep:?}"
         );
     }
 
@@ -1013,9 +1048,22 @@ mod tests {
         gen: WorldGen,
         hole: Hole,
         radius: f64,
+        /// The quad scale the plan and the reference ([`Sim::exact`]) both
+        /// select at.
+        scale: f64,
         /// `fly` asserts that drawn, still-wanted ground stays covered.
         check_coverage: bool,
     }
+
+    /// The quad scale the plan's mechanics are tried at: quads of 16 pixels,
+    /// the scenario these tests were written on. What they pin -- what is
+    /// asked for, kept, swapped and dropped, and when -- does not depend on
+    /// the scale; whether anything happens in three seconds of flight inside
+    /// [`TEST_RADIUS`] does, and at [`FAR_QUAD_SCALE`] nothing would (the
+    /// tests' own guards against proving nothing say so).
+    /// `a_plan_at_the_games_quad_scale_settles_on_the_exact_selection` is the
+    /// one that flies the game's.
+    const SIM_QUAD_SCALE: f64 = 1.0;
 
     /// Is the ground of `key` covered by `shown`: by `key` itself, by a
     /// coarser patch holding it, or by finer patches that together fill it?
@@ -1027,15 +1075,22 @@ mod tests {
 
     impl Sim {
         fn new(radius: f64, hole: Hole, pool: PoolModel) -> Self {
+            Self::at_scale(radius, hole, pool, SIM_QUAD_SCALE)
+        }
+
+        fn at_scale(radius: f64, hole: Hole, pool: PoolModel, scale: f64) -> Self {
             let seed = cubara_world::World::new().seed();
+            let mut plan = FarPlan::new(FarQuality::High, radius);
+            plan.quad_scale = scale;
             Self {
-                plan: FarPlan::new(FarQuality::High, radius),
+                plan,
                 pool,
                 shown: HashSet::new(),
                 memo: RefCell::new(HashMap::new()),
                 gen: WorldGen::new(seed),
                 hole,
                 radius,
+                scale,
                 check_coverage: false,
             }
         }
@@ -1054,7 +1109,7 @@ mod tests {
         fn exact(&self, eye: [f64; 3]) -> HashSet<PatchKey> {
             let view = FarView {
                 radius: self.radius,
-                ..far_view(eye, 1080, Some(self.hole), FarQuality::High).unwrap()
+                ..far_view_scaled(eye, 1080, Some(self.hole), FarQuality::High, self.scale).unwrap()
             };
             loop {
                 let wanted = far::select(&view, |k| self.memo.borrow().get(&k).map(|p| p.error));
@@ -1177,6 +1232,34 @@ mod tests {
         sim.settle(start);
         assert_eq!(sim.shown, sim.exact(start));
         assert!(sim.shown.len() > 100, "{} patches", sim.shown.len());
+    }
+
+    /// **At the game's quad scale the plan settles, on the exact
+    /// selection.** With quads this wide a root of the test's radius is too
+    /// far to be split by distance and is split for its roughness alone;
+    /// its heights were then dropped (`to_keep` kept ancestors only up to
+    /// the coarsest wanted patch), and the plan asked for it, split it and
+    /// dropped it again without end -- "the plan never settled", which this
+    /// was red with. Not vacuous: some root here is split, all of it.
+    #[test]
+    fn a_plan_at_the_games_quad_scale_settles_on_the_exact_selection() {
+        let start = low_flight(1)[0];
+        let hole = voxel_hole(start.map(|v| v as f32));
+        let mut sim = Sim::at_scale(TEST_RADIUS, hole, PoolModel::new(4, 2), FAR_QUAD_SCALE);
+        sim.settle(start);
+        assert_eq!(sim.shown, sim.exact(start));
+        let root_level = far::root_level_for(TEST_RADIUS);
+        assert!(
+            sim.shown.iter().all(|k| k.level < root_level),
+            "a root is drawn whole, so no root's heights were needed"
+        );
+        // And it stays settled: nothing more is selected, asked for or moved.
+        let selects = sim.plan.selects;
+        for _ in 0..20 {
+            let done = sim.pool.tick();
+            assert_eq!(sim.frame(start, done), Step::default());
+        }
+        assert_eq!(sim.plan.selects, selects);
     }
 
     /// A settled plan at a standing eye costs nothing: no step, no select.

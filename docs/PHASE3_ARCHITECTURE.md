@@ -616,9 +616,12 @@ quad's height or a far face's colour):
   wide looks at columns its parent skips); the harness's `stepped` rows
   measure it per quad width, below, and §9.8 measures it against level 0.
 - wall colour facing direction `d` = the `Materials` mixed by
-  `ground_faces(x0, z0, q, n).sides[d]`, times the openness; top colour =
-  `Materials.top` times `top_open`. Not `riser_colour` of the wall's own
-  height, which is divergence 2 again.
+  `ground_faces(x0, z0, q, n).sides[d]`, times the openness. Not
+  `riser_colour` of the wall's own height, which is divergence 2 again.
+- top colour = what a voxel cell's top wears over the same columns
+  (`top_layer(x0, z0, q, n, top)`, the far terrain's form of `top_block`;
+  §9.6, §9.8): `Materials.top`, or the soil or stone of a pit's floor,
+  times `top_open`.
 
 **What the rule does to the shape, per cell width** -- measured, not guessed
 (`stepped_top_rule_report`; drawn minus level 0 on steep ground, mean over
@@ -1286,9 +1289,10 @@ cell is one (§9.4), so on the default seed's mountains the pits that open
 pit cells now wear the floor in the share their columns are pit
 (`a_coarse_top_shows_pit_floors_in_the_share_level_0_does`: 58 and 156
 such tops against 61.6 and 150.2 expected at widths 4 and 8). `from_above`
-is the one rule for a column's colour from above; the far terrain is to
-read the same (#422). The surface term of the consistency harness does not
-move: a cell over a pit is in the cave term (§9.2).
+is the one rule for a column's colour from above; the far terrain reads the
+same floor through `top_layer` (#422, §9.8). The surface term of the
+consistency harness does not move: a cell over a pit is in the cave term
+(§9.2).
 
 **The vertex stage had no pipeline constants.** `mesh.wgsl` has resolved AO
 in the vertex stage since R1c, with `ao_floor`, but the mesh pipeline passed
