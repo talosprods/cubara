@@ -602,11 +602,11 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
 **The far-terrain interface** (#422 calls these; nothing else decides a far
 quad's height or a far face's colour):
 
-- quad top face = `cell_top(x0, z0, q) + 1` for `q <= 8`. At `q = 8` a far
-  quad and a level-3 cell cover the same 64 columns and get the same number,
-  so the 1,024 m join is exact (both are on the 8-block grid) -- and there
-  is no row height left to get wrong: until PR 2 the join needed the far
-  quad to round to level 3's rows of four as well.
+- quad top face = `cell_top_sampled(x0, z0, q, n) + 1` (`far::quad_top`,
+  the one place a quad's height is decided), with `n = q` up to 8 blocks and
+  `n = 4` above. At `q = 8` a far quad and a level-3 cell cover the same 64
+  columns and get the same number, so the 1,024 m join is exact (both are on
+  the 8-block grid) -- and there is no row height left to get wrong.
 - above 8 blocks the exact form costs `q^2` heights a quad (and a look at
   the quads around one that might hold a summit), so the far terrain calls
   `cell_top_sampled` with `n = 4`: the same rule over 4 x 4 columns centred
@@ -614,11 +614,14 @@ quad's height or a far face's colour):
   quarters). Its mean is a sample of the quad's, it can miss a peak
   narrower than the spacing, and its summits do not nest (a quad half as
   wide looks at columns its parent skips); the harness's `stepped` rows
-  measure it per quad width, below.
+  measure it per quad width, below, and §9.8 measures it against level 0.
 - wall colour facing direction `d` = the `Materials` mixed by
-  `ground_faces(x0, z0, q, n).sides[d]`, times the openness; top colour =
-  `Materials.top` times `top_open`. Not `riser_colour` of the wall's own
-  height, which is divergence 2 again.
+  `ground_faces(x0, z0, q, n).sides[d]`, times the openness. Not
+  `riser_colour` of the wall's own height, which is divergence 2 again.
+- top colour = what a voxel cell's top wears over the same columns
+  (`top_layer(x0, z0, q, n, top)`, the far terrain's form of `top_block`;
+  §9.6, §9.8): `Materials.top`, or the soil or stone of a pit's floor,
+  times `top_open`.
 
 **What the rule does to the shape, per cell width** -- measured, not guessed
 (`stepped_top_rule_report`; drawn minus level 0 on steep ground, mean over
@@ -640,8 +643,8 @@ summit stands at the mean of its highest 32-block half, which on steep
 ground lifts the columns 11 blocks over level 0 in the mean (25 when it
 stood at its highest column). That is the max's swelling again, in fewer
 cells. Whether a far
-quad that wide should keep its summit, or stand at its mean, is #422's to
-measure with these rows; the voxel levels stop at 8.
+quad that wide should keep its summit, or stand at its mean, was #422's to
+measure with these rows (§9.8: it keeps the rule); the voxel levels stop at 8.
 
 **How high a summit stands: the summit study** (2026-11-21, after #432).
 #432 stood a summit at its highest column. The lead's mountain zoom test
@@ -1286,9 +1289,10 @@ cell is one (§9.4), so on the default seed's mountains the pits that open
 pit cells now wear the floor in the share their columns are pit
 (`a_coarse_top_shows_pit_floors_in_the_share_level_0_does`: 58 and 156
 such tops against 61.6 and 150.2 expected at widths 4 and 8). `from_above`
-is the one rule for a column's colour from above; the far terrain is to
-read the same (#422). The surface term of the consistency harness does not
-move: a cell over a pit is in the cave term (§9.2).
+is the one rule for a column's colour from above; the far terrain reads the
+same floor through `top_layer` (#422, §9.8). The surface term of the
+consistency harness does not move: a cell over a pit is in the cave term
+(§9.2).
 
 **The vertex stage had no pipeline constants.** `mesh.wgsl` has resolved AO
 in the vertex stage since R1c, with `ao_floor`, but the mesh pipeline passed
@@ -1477,3 +1481,251 @@ top face under its trunk in the game's own node mesh, at levels 1 and 2);
 silhouette has the oak's area and shade per direction in fewer
 triangles; the oak is shaded at its foot; the packed word round-trips);
 the forest goldens and `a_forest_swaps_nothing_at_its_ring_edges`.
+
+### 9.8 The far terrain on the rule (#422)
+
+The far terrain is drawn as blocks: every quad a flat top at
+`quad_top`, a wall wherever two neighbouring tops differ, exactly as tall as
+the step, coloured from `ground_faces` and `top_layer`. No second height
+function exists and no second colour rule (Rule 5);
+`far_study::the_chosen_far_rule_is_the_games` holds the study's copy of the
+height rule to `WorldGen::cell_top_sampled`.
+
+**The far height rule is the voxels' rule, whatever that is** (`TopRule`:
+the mean, and a summit at the mean of its highest half since #437). Studied
+by the swap: coarser minus finer top, per level-0 column, in pixels at the
+distance each quad width is first drawn at with quads of 16 pixels at 1080
+rows (8 to 16 at 1,032 blocks, then 2,064, 4,128, 8,256; the pixels scale
+with `FAR_QUAD_SCALE`, below), on this seed's 40 footprints of four kinds of
+terrain (`far_height_rule_study_report`). Pooled over the kinds, per edge:
+
+| rule | surface mean, px | outline mean, px | outline p95, px | peak against level 0, steep ground, blocks (w 8 / 16 / 32 / 64) |
+|---|---|---|---|---|
+| **TopRule (built; #437's summit)** | +0.1 / +0.1 / +0.2 / +0.2 | -1.9 / -1.2 / -1.4 / -1.2 | 10 / 10.5 / 8.5 / 6.6 | -2.5 / -5.5 / -16 / -40 |
+| a summit at its highest sample (#432; built until #437) | +0.1 / +0.2 / +0.4 / +0.4 | -1.1 / -0.6 / -0.6 / -1.0 | 11 / 12.5 / 11.7 / 8.6 | -2.5 / +0.0 / -2.5 / -29 |
+| plain mean | -0.0 / -0.0 / +0.0 / +0.0 | -3.0 / -2.2 / -2.0 / -1.4 | 11 / 9.5 / 7.2 / 5.5 | -2.5 / -16.5 / -33 / -48.5 |
+| highest, summit among 24 cells | +0.0 / +0.2 / +0.2 / +0.2 | -1.7 / -0.8 / -1.2 / -1.4 | 11 / 11.5 / 11.7 / 9.9 | -2.5 / +0.0 / -2.5 / -29 |
+| highest, lift capped at w/4 | +0.0 / +0.1 / +0.1 / +0.3 | -2.3 / -1.6 / -1.5 / -0.9 | 11 / 9.5 / 7.5 / 6.1 | -2.5 / -16.5 / -25 / -40.5 |
+| highest, lift capped at w/8 | +0.0 / +0.1 / +0.1 / +0.1 | -2.6 / -1.9 / -1.8 / -1.2 | 11 / 9.5 / 7.2 / 5.5 | -2.5 / -16.5 / -29 / -44.5 |
+| TopRule over 8 x 8 samples | +0.1 / +0.1 / +0.2 / +0.2 | -2.0 / -1.2 / -1.3 / -1.2 | 10 / 10 / 8.2 / 5.9 | -2.5 / -6.5 / -19 / -33 |
+
+(Up to 8 blocks every row is the voxels' rule, so the first column of the
+peaks is one number.) Every rule keeps the systematic part of the swap under
+a pixel; the 95th percentile of the surface's change is 5 to 10 pixels for
+all of them and is the slope's own steps, not the rule. The study first
+chose the voxels' rule unchanged when that stood a summit at its highest
+column: best outline, peaks kept. #437 then lowered the voxels' summit to
+the mean of its highest half -- the highest column drew towers the cell's
+width on every crest (§9.3) -- and the far terrain follows, because a far
+quad of 8 *is* level 3's cell and a second rule above 8 would be a seam at
+16. What that costs the far terrain, from the table: a far outline rises
+1.2 to 1.9 pixels a swap on the way in where it rose 0.6 to 1.1, and a
+sharp peak stands 5.5, 16 and 40 blocks low at quads of 16, 32 and 64
+(2 to 5 pixels at the distances those are drawn), growing back a step per
+swap. What it buys: the far crests' towers. Around this seed's highest peak
+(1,792 blocks square, `summit_lift_report`) the quads standing their own
+width or more above all four neighbours were 53, 24 and 9 at quads of 8, 16
+and 32 and are 12, 8 and 5 (`a_far_crest_grows_few_towers`); the outline's
+95th percentile falls at every edge. The plain mean and the caps still lose
+more of a summit than the rule does. The thresholds in the study (region
+256, crest margin 32, every 8th line of sight) are chosen, not derived.
+
+**The join.** `far::FINEST_LEVEL` (the coarsest voxel level, 3: cells of 8)
+is the finest far patch level at any screen height and quality: on a 1664-row
+display the pixel floor let quads of 4 reach out to 1,589 blocks, a fine band
+between two coarse ones. `the_far_terrain_is_never_finer_than_the_join`.
+
+**What a top wears.** The voxels' rule for it (`top_block`, §9.6), read
+through `WorldGen::top_layer`: what level 0 shows from above one of the
+quad's columns, the column picked by the cell's hash (`top_pick`, the one
+pick for both) -- the surface block, or the floor of a pit a cave has opened
+(`pit_floor`, the one place a floor is found), soil or stone by its depth.
+A far quad of 8 visits the 64 columns the level-3 cell does, in the same
+order, with the same hash: **it wears what that cell wears, cell for cell**
+(`a_far_top_wears_what_the_voxel_cell_wears`, against the node the game
+generates), so the hand-over to level 3 changes no top's colour. Wider
+quads pick among their 4 x 4 sample columns, as their tops are sampled:
+1,010, 261 and 66 quads of 8, 16 and 32 show a floor where the ground's
+6.17% of pit columns says 1,010.5, 252.6 and 63.2
+(`a_far_top_shows_pit_floors_in_the_share_level_0_does`). Before this the
+far terrain drew every top as the surface block, and a mountain's grey
+patches appeared at the join. A quad is one pick, not a blend of its
+samples: a quad of 32 that shows a floor is grey over all 32 blocks where
+level 3 will show four or five grey cells of 8, so the share is right at
+every width and the grain is the quad's. A wall is still the blend of its
+footprint's risers (below). An ore is stone to every far face.
+
+**What is guaranteed** (every claim is a test; the numbers are this seed's
+worst footprint, `far_rows_report`):
+
+| | far quads of 8 (= level 3's cells) | far quads of 16 |
+|---|---|---|
+| top = level 0's ground by the rule | exactly `cell_top + 1` | `cell_top_sampled(.., 4) + 1` |
+| a summit | level 3's bounds: never above level 0's, at most 6 blocks under on a footprint and 2.5 in the mean (measured 2.13 over 15; `the_far_terrain_keeps_level_0s_shape`) | not guaranteed: sampled, 3 to 37 blocks under on mountain footprints |
+| mean column against level 0 | within 0.3 block | within 2.5 (measured -1.3 to +1.9) |
+| skyline mean distance | within 7.5 blocks | within 18 (measured 17.3, cliffs) |
+| colour T3, tops / sides | 2.4 / 1.1 of 255 | 2.6 / 2.4 (bounds 3.0 / 3.25, level 3's) |
+| stone share of the walls, per footprint | within 0.3 points | within 1.1 (bound 1.25) |
+| soil share, per kind | within 2.1 points | within 3.8 (bound 5) |
+| what a top wears | the level-3 cell's, cell for cell | a floor in the share the ground is pit, within a fifth |
+
+**Approximated, and how far.** A wall's colour is one mix per quad and
+direction from 4 x 4 sample columns (2 x 2 above 16 blocks), by depth below
+each column's own surface (#423 decision 2), so a tall far wall is not banded
+as the blocks behind it are. At quads of 32 the stone and soil share of the
+walls are up to 5 points off on mountain footprints, and the quads of 64 have
+too few walls in a footprint to measure; both are indications, not
+guarantees. A quad of 16 can leave a direction level 0 has without a wall of
+its own (one cliff footprint of forty). Far quads of 2 and 4 exist only in
+tests: the join clamp never draws them. The consistency harness's surface
+term does not see the tops over pits (a quad over a carved column is in the
+cave term, §9.2); the two tests above are what hold them.
+
+**What the far terrain costs, and why** (M3, 1920x1080, Medium, the gate's
+eyes; single runs on a machine that was not quiet, so the differences count
+and the absolute numbers do not -- the formal rows are `BENCHMARKS.md`'s).
+The blocks cost 0.99 ms a frame at the ground eye and 1.15 ms at the hill
+eye, where the smooth surface they replace cost about 0.29 ms. Found by
+switching parts of the pass off, since this backend's GPU timestamps are
+invalid:
+
+| the far pass, changed | ground eye, ms | hill eye, ms |
+|---|--:|--:|
+| as built | 0.99 | 1.15 |
+| every vertex sent off screen (full vertex shader, nothing rasterised) | 0.82 | |
+| the vertex shader returning at once (no buffer read, no light, no fog) | 0.84 | 0.86 |
+| the same, one vertex a face (the index buffer pointing all six at it) | 0.25 at the flight eye, of 0.55 | |
+| half the pixels (960x540, the same patches) | unchanged at the flight eye | |
+| a shared-corner mesh of the same quads, trivial shader (below) | 0.51 | 0.52 |
+
+So it is **the number of vertices the GPU is asked to shade, at about 0.4 ns
+each whatever the shader does** -- not the storage-buffer fetch, not the
+light or the fog, not overdraw or fill (0.15 to 0.29 ms is all the
+rasteriser's), not the draws (five to seven). A face is four vertices of its
+own, a quad has about two faces that can face the eye, and a run is padded
+to its class: about 9 vertices a quad, 1.96 million a frame, where the
+smooth surface shared one vertex among four quads. Vertices are reused only within
+some 64 of the index stream (measured: the second triangle of each face
+pointed 16 faces back costs next to nothing, 32 faces back half again).
+
+**What was done about it: one number, `far_streaming::FAR_QUAD_SCALE`.**
+The owner left the size of a far quad to the engine (2026-11-21: "as long
+as it is good"). The constant multiplies every pixel size a quality names
+-- its quads, its error bound and its floor -- so Medium's quads of 16
+pixels are quads of 48 at 3; `--far-quad-scale F` overrides it for the
+window, `--bench`, a flight and `--screenshot`, which is how the sizes below
+were measured. It is the only lever of the three found that both holds the
+gate and is watertight:
+
+| scale | Medium, ground / hill FPS | High, ground / hill FPS | the gate | patches selected / in view (Medium, ground eye) | far triangles | far vertices issued | holes, low flight / toward the mountain |
+|---|--:|--:|---|--:|--:|--:|---|
+| x1 (the quality's own sizes; as first built) | 636 / 577 | | not met at any quality | | | 1.96 M | |
+| x2.5 | 1,080 / 1,035 | 988 / 944 | met at Medium | 163 / 56 | 244,604 | 591,064 | 0 of 1,195 / 0 of 1,798 |
+| **x3 (the default)** | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
+| x3.5 | not run: the gate stops at High | 1,059 / 1,013 | met at High | 181 / 61 at High | 263,342 at High | 637,284 at High | 0 of 1,195 / 0 of 1,799 |
+
+(M3 on battery, the machine in use and other sessions running: **not
+quiet**, single runs, so the patch, triangle and vertex counts are exact and
+the frame rates are not `BENCHMARKS.md` rows. The flights fly High. At 2.5
+the hill eye held the gate by 3.5% there.)
+
+**The quiet bench chose 3** (`BENCHMARKS.md` footnote 96: AC power, no
+agents, five quiet minutes, two runs of each, alternating; Medium, ground /
+hill FPS). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
+1,036 / 1,034 -- it holds, by 3.5% at the hill eye, and stands below main
+there. At 3: 1,153 / 1,161 and 1,121 / 1,130, 7% over main at the hill eye.
+Both fly with no hole and with 1 or 2 stale frames where main has 16.
+
+A shared-vertex mesh (`feat/422-far-mesh-cost`, not landed) issued fewer
+vertices at 1.5 than this mesh at 2.5 (488,357 against 595,612 at the hill
+eye, Medium) but twice the indices (1.88 million against 0.89), and measured
+860 / 860 FPS at the hill eye against 1,036 / 1,034 in the same quiet window:
+the far pass's cost follows the triangles it draws, not the vertices it
+shades. A finer far terrain needs fewer triangles.
+
+- **Shared corners** (four vertices a quad in one fixed index list, each
+  face's colour carried flat from a corner of its own) were built on a
+  branch after the prototype above (`wip/435-shared-corners`): 1.96 to 0.93
+  million vertices a frame, the gate's ground / hill eyes from 636 / 577 to
+  739 / 691 FPS at x1. Not landed: risers of different heights that share
+  a column's corners leave T-junctions, and the low flight showed holes in
+  22 to 27 of 1,200 frames where the mesh here shows none. Four vertices a
+  quad is the least blocks can have, and it still needs quads twice as wide
+  to hold the gate.
+- **Not drawing what is hidden** helps one eye only: from the ground eye 11
+  to 21% of the patches the frustum passes leave a pixel on screen (two
+  directions, at High), from the hill eye 83 to 92% -- and the hill eye is
+  the one the gate turns on.
+
+What a wider quad changes besides the count: the quads of 8 that equal
+level 3's cells are drawn only where the error bound splits that far (a
+quad of 8 is 8 pixels wide at the join at 1080 rows; at 2.5 the distance
+rule alone draws quads of 32 there), so the hand-over to level 3 is from
+quads two levels coarser over smooth ground. The exactness of a quad of 8
+is a property of the rule and stands; how much ground is drawn with it is
+what the scale trades.
+
+**The plan kept too little at a wider quad.** `far_streaming::to_keep` holds
+on to every ancestor of a wanted patch, since an ancestor's error is what
+split it -- but only up to the coarsest *wanted* level. A root too far to be
+split by distance and split for its roughness alone is no wanted patch's
+level once all the roots are split; it was dropped, selected again unsplit,
+generated, split and dropped, without end. Quads of 16 pixels split every
+root of the tests' radius by distance, so it took the wider quads to show
+it; the game's own roots (262 km) are too large to be rough at their
+distance at any scale tried. Ancestors are now kept up to the level the
+selection walks from (`far::root_level_for`);
+`a_plan_at_the_games_quad_scale_settles_on_the_exact_selection` was red
+with "the plan never settled".
+
+**Blocks turned the far selection's lag into holes, and the selection is
+now worked out every block.** The plan worked its selection out again only
+when the eye had moved `RESELECT_BLOCKS` = 32 blocks (1.3 s of flight), so
+for up to that long a far mountain could stand a level coarser than the
+selection at the eye asks for. That lag is #398's, measured there as STALE
+on main's smooth far terrain (10 to 13 kept frames on the low flight) and
+never as a hole: a smooth surface a level coarser moves its outline by less
+than the error bound. A block surface a level coarser has quads twice as
+wide, and where a far mountain's foot meets the ground behind it a pixel
+that was land shows sky until the finer patch comes: the flight's HOLES.
+Measured on the low flight (`--bench flight --eye 8,120,8 --look
+1,-0.15,0.3 --seconds 20`, M3, not quiet):
+
+| far quad scale | every 32 blocks: frames with a hole / stale kept frames | every block |
+|---|---|---|
+| x2.5 | 26 of 1,194 / 8 | 0 of 1,195 / 1 |
+| x3 | 7 of 1,194 / 7 | 0 of 1,194 / 1 |
+| x3.5 | 0 of 1,194 / 5 | 0 of 1,195 / 2 |
+
+The 26 are one event of 0.4 s, a pixel or two at the foot of one mountain;
+the flight toward the mountain shows none at either distance.
+
+So `RESELECT_BLOCKS` is 1 (chosen, not derived: #398's "tiny" variant; the
+eye flies 0.4 block a frame). It is not #398's fix -- its plan replaces the
+constant with the slack `select` can report, and generates ahead -- and it
+does not make the live selection exact: a patch asked for still takes its
+frames to generate. What the plan costs the main thread
+(`far_plan_cost_report`, 600 frames of the low flight at the game's radius
+and quad scale, 232 patches shown): 200 selections where 32 blocks made 25,
+0.013 ms a frame in the mean, 0.041 ms at the 99th percentile and 0.046 at
+most. A standing eye selects nothing, as before.
+
+**What the zoom test found in the far terrain, and what became of it**
+(2026-11-21; `far_study.rs`'s `summit_lift_report` and
+`pits_by_cell_width_report`):
+
+- *Spires on peaks and ridges* were the summit's lift to its highest
+  column, the rule's own at every width -- a cell of 8 is level 3's and the
+  far terrain's alike, so the far terrain had no rule of its own to correct.
+  #437 changed the rule for the voxels and with it for the far terrain (the
+  counts are above).
+- *Grey patches on slopes* are not a riser's material: level 0's risers
+  there are 79% surface block, 21% soil and 0.08% stone. They are the floors
+  of pits a cave has opened -- 6.1% of the columns, stone under 5.0% -- and a
+  coarse cell was a cave only where all its ground is, so they thinned out
+  with the cell and the far terrain drew none. #438 gave a coarse top the
+  floor in the share its columns are pit, and the far tops read the same
+  rule (above). A wall keeps the blend of its footprint's risers: one layer
+  a wall, picked by a hash as a voxel cell must, was tried and puts a
+  footprint's walls 4.4/255 off level 0's colour at quads of 16, where the
+  bound is 3.25 and the blend measures 2.4.

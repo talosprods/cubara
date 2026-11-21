@@ -474,11 +474,7 @@ fn render_arena(
         // Built against the origin and rebased, like the arenas above: the
         // one-shot path then runs the same `FarTerrain::rebase` the window
         // runs at a grid line, so a shot far from the origin tests it.
-        let mut terrain =
-            crate::far::FarTerrain::new(&device, &queue, far.len() as u32, anchor::ORIGIN);
-        for patch in far {
-            terrain.insert(&queue, *patch);
-        }
+        let mut terrain = crate::far::FarTerrain::holding(&device, &queue, far, anchor::ORIGIN);
         if let Some(params) = far_params {
             terrain.set_params(&queue, params);
         }

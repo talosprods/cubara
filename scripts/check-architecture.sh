@@ -138,7 +138,8 @@ grep -rn --include='*.rs' --exclude='instance.rs' -E "wgpu::Instance::new|Instan
 # draw -- `prepare_draw` -- and only rewrites indirect ones when validation is
 # on.) So: indirect draws are issued in exactly one file, arena.rs, whose shader
 # is mesh.wgsl, and mesh.wgsl reads neither. far.wgsl does read both -- its
-# patches find their slot by instance_index -- which is sound only while the far
+# runs of faces find their patch by instance_index and their faces by
+# vertex_index (issue #422) -- which is sound only while the far
 # terrain's draw stays direct; the first check keeps it that way.
 grep -rn --include='*.rs' --exclude='arena.rs' -E "\.(multi_)?draw(_indexed)?_indirect(_count)?\(" crates \
     | report "Rule 5" "an indirect draw outside arena.rs -- its shader must not read vertex_index/instance_index (D3D12, instance.rs); check it, then extend this rule to it"

@@ -2206,7 +2206,12 @@ fn far_terrain(
     let edge = (region_radius * 16) as f64;
     let view = FarView {
         eye: [eye.x as f64, eye.y as f64, eye.z as f64],
-        // The settings the game ships (`cubara-app`'s `far_streaming`).
+        // Quads of 16 pixels, an error bound of 2 and a floor of 4: the
+        // sizes `cubara-app`'s `far_streaming` names for High, without its
+        // `FAR_QUAD_SCALE` -- so these pictures hold more of the mesher's
+        // cases (more levels, more joins between them) than the game draws
+        // at once, and do not move when that scale is tuned. This crate
+        // could not read the constant if it wanted to (Rule 3).
         split_ratio: split_ratio_for(16.0, shot.height as f64, fov),
         max_error: 2.0 * pixel,
         min_quad: 4.0 * pixel,
@@ -2217,6 +2222,43 @@ fn far_terrain(
         }),
     };
     build(&cubara_world::WorldGen::new(world.seed()), &view)
+}
+
+/// The renderer's form of a world patch's faces (`cubara-app`'s
+/// `far_streaming::to_far_faces`), shared with `lod_consistency`.
+#[path = "common/far_faces.rs"]
+mod far_faces_of;
+use far_faces_of::far_faces;
+
+/// A hand-made patch as blocks: the faces the world's mesher makes of quads
+/// whose tops are `top(i, j)` (`-1` and `32` being the neighbours').
+fn stepped_faces(top: impl Fn(i32, i32) -> i32) -> Vec<cubara_render::FarFace> {
+    use cubara_world::far::{mesh, PatchKey, PATCH_QUADS};
+    let mut tops = Vec::new();
+    for j in -1..=PATCH_QUADS as i32 {
+        for i in -1..=PATCH_QUADS as i32 {
+            tops.push(top(i, j));
+        }
+    }
+    let plain = [cubara_world::far::QuadGround::PLAIN; PATCH_QUADS * PATCH_QUADS];
+    far_faces(&mesh(PatchKey::new(4, 0, 0), &tops, &plain))
+}
+
+/// Every patch of `far` in the renderer's form, borrowing `faces`
+/// ([`far_faces`] of each).
+fn far_patches<'a>(
+    far: &[cubara_world::far::PatchHeights],
+    faces: &'a [Vec<cubara_render::FarFace>],
+) -> Vec<cubara_render::far::FarPatch<'a>> {
+    far.iter()
+        .zip(faces)
+        .map(|(p, faces)| cubara_render::far::FarPatch {
+            origin: p.key.origin(),
+            quad: p.key.quad() as f32,
+            faces,
+            skirt: p.skirt_blocks() as f32,
+        })
+        .collect()
 }
 
 /// The far terrain's materials as the game sets them (`cubara-app`'s
@@ -2230,7 +2272,7 @@ fn render_world_with_far(
     shot: Shot,
     far: &[cubara_world::far::PatchHeights],
 ) -> Option<Frame> {
-    use cubara_render::far::{FarParams, FarPatch};
+    use cubara_render::far::FarParams;
     let registry = real_registry();
     let layers = TextureLayers::from_registry(&registry);
     let layer_of = |name: &str| layers.layer_of(name);
@@ -2246,15 +2288,8 @@ fn render_world_with_far(
     )
     .into_iter()
     .filter_map(to_meshed_node);
-    let patches: Vec<FarPatch> = far
-        .iter()
-        .map(|p| FarPatch {
-            origin: p.key.origin(),
-            quad: p.key.quad() as f32,
-            heights: &p.heights,
-            skirt: p.skirt(),
-        })
-        .collect();
+    let faces: Vec<_> = far.iter().map(|p| far_faces(&p.faces)).collect();
+    let patches = far_patches(far, &faces);
     let edge = shot.region_radius * 16;
     let params = FarParams {
         hole: Some(([-edge, 0, -edge], [edge + 16, 48, edge + 16])),
@@ -2294,6 +2329,29 @@ fn the_far_terrain_reaches_the_horizon() {
     assert_frame_golden("far_terrain_to_the_horizon", with);
 }
 
+/// **A far mountain range, as blocks** (issue #422): the range around
+/// (-848, 4832) from a kilometre and a half away and a little above its
+/// peaks, far from the voxels, so every pixel of land is the far terrain's.
+/// What the golden holds is what the owner asked for -- stepped silhouettes
+/// and stepped slopes, flat tops and walls lit by face -- where the smooth
+/// surface drew curves and gradients.
+#[test]
+fn a_far_mountain_range_is_made_of_blocks() {
+    let world = World::new();
+    let eye = glam::Vec3::new(-1748.0, 420.0, 3432.0);
+    let shot = Shot {
+        region_radius: 4,
+        camera: Some((eye.as_dvec3(), glam::Vec3::new(0.535, -0.143, 0.832))),
+        ..Shot::default()
+    };
+    let far = far_terrain(&world, eye, shot.region_radius, &shot, 12_000.0);
+    assert!(far.len() > 50, "only {} patches", far.len());
+    assert_frame_golden(
+        "far_mountain_range",
+        render_world_with_far(&world, shot, &far),
+    );
+}
+
 /// How many pixels of a frame with the far terrain alone -- no voxels at all
 /// -- are not sky, in the whole frame and in its lowest two fifths, for an eye at `eye` inside a voxel box reaching `REACH`
 /// blocks from the origin every way, as the game's reaches 1,024: the real far
@@ -2303,7 +2361,7 @@ fn far_pixels_from_inside_the_box(
     eye: glam::Vec3,
     looks: &[glam::Vec3],
 ) -> Option<Vec<(usize, usize)>> {
-    use cubara_render::far::{FarParams, FarPatch};
+    use cubara_render::far::FarParams;
     use cubara_world::far::{build, split_ratio_for, FarView, Hole};
     const REACH: i32 = 384;
     let world = World::new();
@@ -2359,15 +2417,8 @@ fn far_pixels_from_inside_the_box(
         crossing > 0,
         "no patch crosses the box, so this proves nothing"
     );
-    let patches: Vec<FarPatch> = far
-        .iter()
-        .map(|p| FarPatch {
-            origin: p.key.origin(),
-            quad: p.key.quad() as f32,
-            heights: &p.heights,
-            skirt: p.skirt(),
-        })
-        .collect();
+    let faces: Vec<_> = far.iter().map(|p| far_faces(&p.faces)).collect();
+    let patches = far_patches(&far, &faces);
     let params = FarParams {
         hole: Some((min, max)),
         materials: far_materials(),
@@ -2469,23 +2520,24 @@ fn the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground() {
     }
 }
 
-/// **The far terrain's shader is the CPU reference** (`aggregate.rs`, block
-/// F4). A patch that is a plane of known gradient is rendered from a known
-/// direction, and the pixel at the centre of the image, whose ray is exactly
-/// the look direction, must be the colour `aggregate_colour` computes for that
-/// slope and view.
+/// **The far terrain's shader is the CPU reference** (issue #422): a face is
+/// rendered alone, seen from in front, and the pixel at the centre of the
+/// image must be its colour ([`cubara_render::far::face_colour`]) in the
+/// light a voxel face of its normal gets (`aggregate::face_light`, the CPU's
+/// form of `mesh.wgsl`'s lighting, which `far.wgsl` shares through
+/// `face.wgsl`).
 ///
-/// The cases cover every branch of `far.wgsl`'s `visible_weights` (risers
-/// facing, none facing, and one axis hiding the other, both ways round, which
-/// goes through the masking-table texture), and `riser_colour` from a
-/// one-block step to a stone cliff. This is what pins the texture's layout and
-/// the hand-blended fourth axis: get either wrong and the table cases come out
-/// a different colour.
+/// The cases are a top, a top that shows a pit's floor (stone), and walls
+/// facing each of the four ways -- the sun's side and the shadow's -- from a
+/// one-block step (the surface block's side) through soil to a cliff that
+/// is mostly stone. This is what pins the face record's layout on the GPU:
+/// read the direction, the rise or the mix from the wrong bits and a case
+/// comes out another colour.
 #[test]
-fn far_shading_is_the_aggregate_reference() {
-    use cubara_render::aggregate::{aggregate_colour, face_light, MaskingTable};
-    use cubara_render::far::{FarParams, FarPatch, FAR_VERTS};
-    use cubara_render::Lighting;
+fn far_shading_is_the_face_reference() {
+    use cubara_render::aggregate::face_light;
+    use cubara_render::far::{face_colour, face_open, FarParams, FarPatch};
+    use cubara_render::{FarDir, FarFace, Lighting};
 
     let srgb = |c: f32| {
         let v = if c <= 0.0031308 {
@@ -2495,14 +2547,9 @@ fn far_shading_is_the_aggregate_reference() {
         };
         (v.clamp(0.0, 1.0) * 255.0).round() as i32
     };
-    let view = |elevation: f32, azimuth: f32| {
-        let (e, a) = (elevation.to_radians(), azimuth.to_radians());
-        glam::Vec3::new(e.cos() * a.cos(), e.sin(), e.cos() * a.sin())
-    };
-    let table = MaskingTable::committed();
     let materials = far_materials();
-    // The shading function alone: the shot stands 40 blocks away, and the
-    // haze (which `aggregate_colour` does not model) would tint it by a step.
+    // The shading function alone: no haze, which a face's colour does not
+    // model.
     let lighting = Lighting {
         haze: cubara_render::haze::Haze {
             density: 0.0,
@@ -2510,60 +2557,87 @@ fn far_shading_is_the_aggregate_reference() {
         },
         ..Lighting::default()
     };
-    // (gradient, elevation, azimuth): what each exercises.
-    let cases: [([f32; 2], f32, f32); 11] = [
-        // x-risers face the eye, nothing hides.
-        ([0.4, 0.0], 10.0, 180.0),
-        // No riser faces the eye: tops only.
-        ([0.3, 0.2], 40.0, 30.0),
-        // x faces, z hides: the table.
-        ([0.5, 0.35], 8.0, 150.0),
-        // z faces, x hides: the table, the other way round.
-        ([0.3, -0.7], 12.0, 60.0),
-        // Both face, on a cliff: soil in the risers.
-        ([2.5, 0.2], 5.0, 190.0),
-        // Steeper than the soil is deep: stone.
-        ([6.0, 0.0], 20.0, 180.0),
-        // Grazing, gentle, one axis hiding: the far terrain's commonest view.
-        ([0.12, 0.08], 2.0, 115.0),
-        // More of the table, where it changes fastest: slopes seen nearly
-        // edge-on, and in between its samples on every axis.
-        ([0.5, 0.5], 5.0, 130.0),
-        ([1.2, 0.6], 15.0, 160.0),
-        ([0.2, 0.6], 45.0, 110.0),
-        ([-0.9, 0.25], 30.0, 20.0),
+    // The last: a top over a pit, wearing its floor.
+    const PIT: usize = 8;
+    let cases: [(FarDir, u32); 9] = [
+        (FarDir::Top, 0),
+        (FarDir::PosX, 1),
+        (FarDir::PosX, 3),
+        (FarDir::PosX, 24),
+        (FarDir::NegX, 3),
+        (FarDir::PosZ, 3),
+        (FarDir::NegZ, 3),
+        (FarDir::NegZ, 24),
+        (FarDir::Top, 0),
     ];
-    let mut plain_would_fail = false;
-    for (g, elevation, azimuth) in cases {
-        let v = view(elevation, azimuth);
-        let expected = aggregate_colour(&table, g, v, &lighting, &materials)
-            .expect("every case faces the eye");
-        // One patch, a plane with its corner on the origin (a patch origin
-        // is an integer block, like every real one), aimed at through its
-        // centre vertex. `far.wgsl` shades per vertex, so the quads are made
-        // tiny: the four vertices around the centre pixel then see it from
-        // the same direction, and the pixel is the shading function itself
-        // rather than a blend of its neighbours.
-        let quad = 0.05;
-        let heights: Vec<f32> = (0..FAR_VERTS * FAR_VERTS)
-            .map(|k| {
-                let (i, j) = ((k % FAR_VERTS) as f32, (k / FAR_VERTS) as f32);
-                g[0] * (i * quad) + g[1] * (j * quad)
-            })
-            .collect();
+    let mut colours = Vec::new();
+    for (case, (dir, rise)) in cases.into_iter().enumerate() {
+        // What the face carries, by case: a wall of one block the surface
+        // block's side, of three mostly soil, of 24 mostly stone and half
+        // shut in; the top the surface block's top and a little shut in, or
+        // a pit's floor of stone.
+        let (mix, open) = match (dir, rise) {
+            (FarDir::Top, _) if case == PIT => ([0, 0], 140),
+            (FarDir::Top, _) => ([255, 0], 140),
+            (_, 1) => ([255, 0], 255),
+            (_, 3) => ([60, 150], 255),
+            _ => ([10, 30], 90),
+        };
+        // One face in the middle of a patch of one-block quads.
+        let face = match dir {
+            FarDir::Top => FarFace {
+                dir,
+                i0: 8,
+                j0: 8,
+                i1: 24,
+                j1: 24,
+                top: 40,
+                rise: 0,
+                border: false,
+                mix,
+                open,
+            },
+            FarDir::PosX | FarDir::NegX => FarFace {
+                dir,
+                i0: 16,
+                j0: 8,
+                i1: 16,
+                j1: 24,
+                top: 40,
+                rise,
+                border: false,
+                mix,
+                open,
+            },
+            FarDir::PosZ | FarDir::NegZ => FarFace {
+                dir,
+                i0: 8,
+                j0: 16,
+                i1: 24,
+                j1: 16,
+                top: 40,
+                rise,
+                border: false,
+                mix,
+                open,
+            },
+        };
         let patch = FarPatch {
             origin: [0, 0],
-            quad,
-            heights: &heights,
+            quad: 1.0,
+            faces: &[face],
             skirt: 0.0,
         };
-        // The centre vertex (16, 16), where the look direction lands.
-        let centre = glam::vec3(16.0 * quad, (g[0] + g[1]) * 16.0 * quad, 16.0 * quad);
+        let centre = glam::vec3(16.0, 40.0 - rise as f32 / 2.0, 16.0);
+        // From in front and a little to one side, so no axis of the view is
+        // degenerate.
+        let n = dir.normal();
+        let v = (n + glam::vec3(0.15, 0.25, 0.1) * (glam::Vec3::ONE - n.abs())).normalize();
         let shot = Shot {
             // Odd, so the centre pixel's ray is the look direction itself.
             width: 65,
             height: 65,
-            camera: Some(((centre + v * 40.0).as_dvec3(), -v)),
+            camera: Some(((centre + v * 10.0).as_dvec3(), -v)),
             lighting,
             ..Shot::default()
         };
@@ -2576,34 +2650,197 @@ fn far_shading_is_the_aggregate_reference() {
             headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
         };
         let Some(frame) = frame else {
-            headless::skip_or_require_gpu("far_shading_is_the_aggregate_reference");
+            headless::skip_or_require_gpu("far_shading_is_the_face_reference");
             return;
         };
         let at = ((32 * frame.width + 32) * 4) as usize;
         let got = &frame.pixels[at..at + 3];
-        let want = expected.to_array().map(srgb);
-        // Exact on the machine this was written on; one step of slack for
-        // another GPU's filtering precision. A wrong texture layout or blend
-        // is off by more (the PR's mutation table).
+        let want = (face_colour(&materials, &face)
+            * face_open(&face, lighting.ao_floor)
+            * face_light(n, &lighting))
+        .to_array()
+        .map(srgb);
+        // One step of slack for another GPU's rounding.
         for c in 0..3 {
             assert!(
                 (got[c] as i32 - want[c]).abs() <= 1,
-                "g {g:?}, {elevation}° up, {azimuth}°: rendered {got:?}, reference {want:?}"
+                "{dir:?}, a step of {rise}: rendered {got:?}, reference {want:?}"
             );
         }
-        // The plain shading F3 drew: the top colour lit by the smooth normal.
-        let n = glam::Vec3::new(-g[0], 1.0, -g[1]).normalize();
-        let plain = (materials.top * face_light(n, &lighting))
-            .to_array()
-            .map(srgb);
-        if (0..3).any(|c| (plain[c] - want[c]).abs() > 12) {
-            plain_would_fail = true;
-        }
+        colours.push(want);
     }
-    assert!(
-        plain_would_fail,
-        "no case tells the aggregate shading from plain shading"
+    // And the cases can be told apart: the top from a wall, the sun's side
+    // from the shadow's, soil from stone. A shader that ignored the
+    // direction or the rise would fail one of them.
+    let apart = |a: usize, b: usize| (0..3).any(|c| (colours[a][c] - colours[b][c]).abs() > 6);
+    assert!(apart(0, 2), "a top and a wall: {colours:?}");
+    assert!(apart(0, PIT), "a top and a pit's floor: {colours:?}");
+    assert!(apart(2, 4), "+x and -x: {colours:?}");
+    assert!(apart(5, 6), "+z and -z: {colours:?}");
+    assert!(apart(1, 3), "a step of 1 and of 24: {colours:?}");
+    assert!(apart(6, 7), "a step of 3 and of 24: {colours:?}");
+}
+
+/// **A run's padding draws nothing.** Runs of faces are drawn by size class,
+/// each padded to its class's size (`far::CLASS_FACES`), and the padding's
+/// vertex indices run on into whatever faces come next in the buffer --
+/// another patch's. Here a patch of one small face is followed in the buffer
+/// by a patch, far out of sight, whose faces would cover the middle of the
+/// first patch if they were drawn in its place. The middle must be sky.
+#[test]
+fn a_far_runs_padding_draws_nothing() {
+    use cubara_render::far::{FarParams, FarPatch};
+    use cubara_render::{FarDir, FarFace};
+
+    let top = |i0: u8, i1: u8| FarFace {
+        dir: FarDir::Top,
+        i0,
+        j0: i0,
+        i1,
+        j1: i1,
+        top: 40,
+        rise: 0,
+        border: false,
+        mix: [255, 0],
+        open: 255,
+    };
+    // One face in a corner; and fifteen that cover the middle, a hundred
+    // kilometres away.
+    let small = [top(0, 2)];
+    let elsewhere = [top(4, 28); 15];
+    let patches = [
+        FarPatch {
+            origin: [0, 0],
+            quad: 1.0,
+            faces: &small,
+            skirt: 0.0,
+        },
+        FarPatch {
+            origin: [100_000, 100_000],
+            quad: 1.0,
+            faces: &elsewhere,
+            skirt: 0.0,
+        },
+    ];
+    let v = glam::vec3(0.15, 1.0, 0.1).normalize();
+    let shot = |at: glam::Vec3| Shot {
+        width: 65,
+        height: 65,
+        camera: Some(((at + v * 10.0).as_dvec3(), -v)),
+        ..Shot::default()
+    };
+    let params = FarParams {
+        hole: None,
+        materials: far_materials(),
+    };
+    let centre = |at: glam::Vec3| {
+        let _gpu = gpu_lifecycle::lock();
+        let frame = headless::render_with_far(Vec::new(), &patches, Some(params), shot(at))?;
+        let i = ((32 * frame.width + 32) * 4) as usize;
+        Some([frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]])
+    };
+    let (Some(middle), Some(face), Some(sky)) = (
+        centre(glam::vec3(16.0, 40.0, 16.0)),
+        centre(glam::vec3(1.0, 40.0, 1.0)),
+        centre(glam::vec3(16.0, 4000.0, 16.0)),
+    ) else {
+        headless::skip_or_require_gpu("a_far_runs_padding_draws_nothing");
+        return;
+    };
+    assert_ne!(
+        face, sky,
+        "the one real face is not drawn, so this proves nothing"
     );
+    assert_eq!(
+        middle, sky,
+        "something is drawn where the patch has no face"
+    );
+}
+
+/// **The far terrain is behind the same haze as everything else** (F5): a
+/// cliff twelve kilometres away comes out its lit colour mixed with the
+/// haze's by `Haze::amount`, the CPU's form of `haze.wgsl` -- and visibly
+/// not its lit colour alone, so a far shader that forgot the haze fails.
+#[test]
+fn far_faces_are_hazed_by_distance() {
+    use cubara_render::aggregate::face_light;
+    use cubara_render::far::{face_colour, face_open, FarParams, FarPatch};
+    use cubara_render::{FarDir, FarFace, Lighting};
+
+    let srgb = |c: f32| {
+        let v = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (v.clamp(0.0, 1.0) * 255.0).round() as i32
+    };
+    let materials = far_materials();
+    let lighting = Lighting::default();
+    assert!(lighting.haze.density > 0.0, "no haze by default");
+    // One wall, 1,024 blocks long and 550 tall, seen from 12 km, low
+    // through the thick of the air.
+    let (dir, rise) = (FarDir::PosX, 550);
+    let face = FarFace {
+        dir,
+        i0: 16,
+        j0: 8,
+        i1: 16,
+        j1: 24,
+        top: 600,
+        rise,
+        border: false,
+        mix: [0, 0],
+        open: 255,
+    };
+    let patch = FarPatch {
+        origin: [0, 0],
+        quad: 64.0,
+        faces: &[face],
+        skirt: 0.0,
+    };
+    let centre = glam::vec3(1024.0, 325.0, 1024.0);
+    let v = glam::vec3(1.0, 0.02, 0.1).normalize();
+    let eye = centre + v * 12_000.0;
+    let shot = Shot {
+        width: 65,
+        height: 65,
+        camera: Some((eye.as_dvec3(), -v)),
+        lighting,
+        ..Shot::default()
+    };
+    let params = FarParams {
+        hole: None,
+        materials,
+    };
+    let frame = {
+        let _gpu = gpu_lifecycle::lock();
+        headless::render_with_far(Vec::new(), &[patch], Some(params), shot)
+    };
+    let Some(frame) = frame else {
+        headless::skip_or_require_gpu("far_faces_are_hazed_by_distance");
+        return;
+    };
+    let at = ((32 * frame.width + 32) * 4) as usize;
+    let got = &frame.pixels[at..at + 3];
+    let lit = face_colour(&materials, &face)
+        * face_open(&face, lighting.ao_floor)
+        * face_light(dir.normal(), &lighting);
+    let amount = lighting.haze.amount(eye, centre);
+    let want = lit.lerp(lighting.fog_color, amount).to_array().map(srgb);
+    let clear = lit.to_array().map(srgb);
+    assert!(
+        (0..3).any(|c| (want[c] - clear[c]).abs() > 8),
+        "12 km of haze changes nothing ({amount}): {want:?} against {clear:?}"
+    );
+    // The haze is worked out at the face's corners and interpolated, and the
+    // corners are not where its middle is: two steps.
+    for c in 0..3 {
+        assert!(
+            (got[c] as i32 - want[c]).abs() <= 2,
+            "rendered {got:?}, hazed reference {want:?}, unhazed {clear:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2621,7 +2858,7 @@ fn far_shading_is_the_aggregate_reference() {
 struct AnchoredScene {
     nodes: Vec<MeshedNode>,
     far_origin: [i64; 2],
-    far_heights: Vec<f32>,
+    far_faces: Vec<cubara_render::FarFace>,
     hole: ([i32; 3], [i32; 3]),
     shot: Shot,
 }
@@ -2697,15 +2934,8 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     // under the surface here, 128 blocks a side.
     let far_origin = [-192i64, -192i64];
     let far_quad = 4.0f32;
-    let far_heights: Vec<f32> = (0..cubara_render::FAR_VERTS * cubara_render::FAR_VERTS)
-        .map(|k| {
-            let (i, j) = (
-                (k % cubara_render::FAR_VERTS) as f32,
-                (k / cubara_render::FAR_VERTS) as f32,
-            );
-            h0 as f32 - 6.0 + 0.15 * i + 0.4 * j
-        })
-        .collect();
+    let far_faces =
+        stepped_faces(|i, j| (h0 as f32 - 6.0 + 0.15 * i as f32 + 0.4 * j as f32).round() as i32);
     let edge = region_radius * 16;
     let hole = ([-edge, 0, -edge], [edge + 16, 48, edge + 16]);
 
@@ -2732,9 +2962,12 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
         }
     }
     let far_origin = [far_origin[0] + shift[0], far_origin[1] + shift[2]];
-    let far_heights = far_heights
+    let far_faces = far_faces
         .into_iter()
-        .map(|h| h + shift[1] as f32)
+        .map(|f| cubara_render::FarFace {
+            top: f.top + shift[1] as i32,
+            ..f
+        })
         .collect();
     let add3 = |p: [i32; 3]| [p[0] + s32[0], p[1] + s32[1], p[2] + s32[2]];
     let hole = (add3(hole.0), add3(hole.1));
@@ -2767,7 +3000,7 @@ fn anchored_scene(shift: [i64; 3]) -> AnchoredScene {
     AnchoredScene {
         nodes,
         far_origin,
-        far_heights,
+        far_faces,
         hole,
         shot,
     }
@@ -2784,7 +3017,7 @@ fn render_anchored(
     let patch = FarPatch {
         origin: scene.far_origin,
         quad: 4.0,
-        heights: &scene.far_heights,
+        faces: &scene.far_faces,
         skirt: 8.0,
     };
     let params = FarParams {

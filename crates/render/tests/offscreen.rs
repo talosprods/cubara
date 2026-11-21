@@ -200,6 +200,7 @@ fn a_teleport_across_the_anchor_grid_leaves_the_frame_unchanged() {
 #[ignore = "a measurement, not a check: prints what a rebase costs with a gate-sized scene"]
 fn rebase_cost_report() {
     use cubara_render::far::{FarParams, FarPatch};
+    use cubara_render::{FarDir, FarFace};
     const SHIFT: i32 = 1_048_576;
     let world = World::new();
     let surface = world.surface_height(8, 8);
@@ -254,7 +255,21 @@ fn rebase_cost_report() {
     let with_trees = nodes.iter().filter(|n| !n.trees.is_empty()).count();
     renderer.apply_node_updates([], nodes);
     // The far terrain to capacity: flat patches tiled outward.
-    let flat = vec![surface as f32 - 4.0; cubara_render::FAR_VERTS * cubara_render::FAR_VERTS];
+    let flat: Vec<FarFace> = (0..32u8)
+        .flat_map(|j| (0..32u8).map(move |i| (i, j)))
+        .map(|(i, j)| FarFace {
+            dir: FarDir::Top,
+            i0: i,
+            j0: j,
+            i1: i + 1,
+            j1: j + 1,
+            top: surface - 4,
+            rise: 0,
+            border: false,
+            mix: [255, 0],
+            open: 255,
+        })
+        .collect();
     let mut far_patches = 0usize;
     'far: for ring in 1..200i64 {
         for i in -ring..=ring {
@@ -265,7 +280,7 @@ fn rebase_cost_report() {
                 let patch = FarPatch {
                     origin: [i * 128, j * 128],
                     quad: 4.0,
-                    heights: &flat,
+                    faces: &flat,
                     skirt: 8.0,
                 };
                 if renderer.far_insert(patch).is_none() {

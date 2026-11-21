@@ -139,6 +139,10 @@ struct App {
     bench: Option<WindowBench>,
     /// `--no-tune`: never start the start-up `--bench tune` child.
     no_tune: bool,
+    /// The far terrain's quads this many times as wide on screen as its
+    /// quality names them: `far_streaming::FAR_QUAD_SCALE`, or what
+    /// `--far-quad-scale` asked for.
+    far_quad_scale: f64,
     /// `--no-morph`: draw every level of detail where it was meshed -- the
     /// swap as it was before the distance morph (issue #380's study), for
     /// looking at the two side by side.
@@ -616,10 +620,10 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.far = Some(far_streaming::FarStreaming::new(
-            self.game.world().seed(),
-            self.settings.far,
-        ));
+        self.far = Some(
+            far_streaming::FarStreaming::new(self.game.world().seed(), self.settings.far)
+                .with_quad_scale(self.far_quad_scale),
+        );
         let mut renderer = renderer;
         renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
@@ -1144,6 +1148,22 @@ fn main() {
     });
     let no_tune = args.iter().any(|a| a == "--no-tune");
     let no_morph = args.iter().any(|a| a == "--no-morph");
+    // `--far-quad-scale F`: the far terrain's quads, error bound and floor F
+    // times as wide on screen as its quality names them, in place of the
+    // game's `FAR_QUAD_SCALE` -- for the window, a benchmark, a flight or a
+    // screenshot, to measure what another size costs and looks like (issue
+    // #422). Refused rather than defaulted, like `--size`.
+    let far_quad_scale = args.iter().position(|a| a == "--far-quad-scale").map_or(
+        far_streaming::FAR_QUAD_SCALE,
+        |i| {
+            args.get(i + 1)
+                .and_then(|t| far_streaming::parse_quad_scale(t))
+                .unwrap_or_else(|| {
+                    eprintln!("--far-quad-scale needs a number from 0.5 to 8, e.g. 2.5");
+                    std::process::exit(2);
+                })
+        },
+    );
     let present = args.iter().position(|a| a == "--present").map(|i| {
         args.get(i + 1)
             .and_then(|m| present::parse_present(m))
@@ -1291,7 +1311,8 @@ fn main() {
         let radius = match target {
             bench::Target::Radius(radius) => radius,
             bench::Target::Gate => {
-                let tries = bench::try_qualities(1000.0, size, overlay, gpu_timing, fog);
+                let tries =
+                    bench::try_qualities(1000.0, size, overlay, gpu_timing, fog, far_quad_scale);
                 let (_, line) = bench::gate_line(&tries, 1000.0);
                 log::info!("{line}");
                 return;
@@ -1365,6 +1386,7 @@ fn main() {
                     every: number("--every", 0.25),
                     size,
                     quality: far_streaming::FarQuality::High,
+                    far_quad_scale,
                     morph: !args.iter().any(|a| a == "--no-morph"),
                 };
                 // `--frames-every N`: also write every Nth rendered frame to
@@ -1396,7 +1418,14 @@ fn main() {
                 let target_fps = flag("--target")
                     .and_then(|t| t.parse::<u32>().ok())
                     .unwrap_or(60);
-                let tries = bench::try_qualities(target_fps as f64, size, overlay, gpu_timing, fog);
+                let tries = bench::try_qualities(
+                    target_fps as f64,
+                    size,
+                    overlay,
+                    gpu_timing,
+                    fog,
+                    far_quad_scale,
+                );
                 let far = bench::best_quality(&tries, target_fps as f64)
                     .unwrap_or(far_streaming::FarQuality::Off);
                 let chosen = settings::Settings {
@@ -1443,6 +1472,7 @@ fn main() {
                     .iter()
                     .any(|a| a == "--far")
                     .then_some(far_streaming::FarQuality::High),
+                far_quad_scale,
             },
             overlay,
             gpu_timing,
@@ -1475,6 +1505,7 @@ fn main() {
                 size: value("--size")
                     .and_then(bench::parse_size)
                     .unwrap_or((1920, 1080)),
+                far_quad_scale,
             });
         // Static overlay text -- the pause menu or console, for a review
         // screenshot of `Hud::menu` with no window (`--screenshot menu.png
@@ -1508,6 +1539,7 @@ fn main() {
         paths,
         bench,
         no_tune,
+        far_quad_scale,
         no_morph,
         present,
         ..App::default()
