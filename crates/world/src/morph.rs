@@ -1282,6 +1282,32 @@ mod tests {
                     }
                 }
             }
+            // The ring of neighbours outside the node: each may be drawn a
+            // level coarser, so its floor is the lower of its own top and its
+            // parent's, and at full morph the lower of its target and its
+            // parent's. Counted over the whole ring, since a flat spot would
+            // not tell the right floor from the wrong one.
+            let mut lowered = 0;
+            for k in -1..=16 {
+                for (x, z) in [(k, -1), (k, 16), (-1, k), (16, k)] {
+                    let [top, target, floor, target_floor] = columns.at(x, z);
+                    let (cx, cz) = (o[0] + x * w, o[2] + z * w);
+                    let pw = 2 * w;
+                    let parent = snapshot.cell_surface_height(
+                        cx.div_euclid(pw) * pw,
+                        cz.div_euclid(pw) * pw,
+                        pw,
+                    ) + 1
+                        - o[1];
+                    if level == 0 {
+                        assert_eq!(floor, top.min(parent), "ring ({x}, {z})");
+                        assert_eq!(target_floor, target.min(parent), "ring ({x}, {z})");
+                    }
+                    assert!(floor <= top && target_floor <= target);
+                    lowered += (floor < top) as i32;
+                }
+            }
+            println!("level {level}: {lowered} of 68 ring columns draw lower than their own top");
         }
     }
 }
