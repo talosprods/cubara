@@ -356,6 +356,18 @@ const CAVE_SEED_MIX: u64 = 0xD6E8_FEB8_6659_FD93;
 /// trees cannot move it. Arbitrary, as every mix constant is.
 const COARSE_FACE_SEED_MIX: u64 = 0x423B_10C5_A11E_7E15;
 
+/// Which of a coarse cell's columns its top shows from above
+/// ([`WorldGen::top_block`]): its own hash stream, apart from the sides'.
+/// Arbitrary, as every mix constant is.
+const COARSE_TOP_SEED_MIX: u64 = 0x7E0F_5A6B_2C19_D4E3;
+
+/// How far [`WorldGen::from_above`] looks down a pit for its floor, in
+/// blocks. Measured on the default seed's mountains, pit floors lie 13 to
+/// 27 blocks under the surface; this is past the deepest with room to
+/// spare. Chosen, not derived: a pit deeper than this shows the block it
+/// stops at.
+const PIT_FLOOR_SEARCH: i32 = 48;
+
 /// One level-0 column under a coarse cell ([`NodeGround`]): the `y` of its
 /// surface block, and of its four neighbours' -- which is where it shows a
 /// side at level 0, every row above a neighbour's surface and at or under
@@ -859,7 +871,7 @@ impl WorldGen {
         }
         // The cell that holds the top.
         if top < y + v {
-            return Some(self.material_at(x, top, z, top, blocks));
+            return Some(self.top_block(x, z, top, covered, blocks));
         }
         // The level-0 side faces at this cell's rows: one for every
         // neighbour a column stands above, at each row it reaches.
@@ -929,6 +941,85 @@ impl WorldGen {
             .partition_point(|c| c.surface < row)
             .min(covered.len() - 1);
         Some(self.material_at(x, row, z, covered[at].surface, blocks))
+    }
+
+    /// The block a coarse cell's top wears, its top face being most of what
+    /// is seen of it: **what level 0 shows from above over one of its
+    /// columns, picked by a hash of the cell** ([`from_above`]) -- so over
+    /// many cells each thing level 0 shows from above shows in the share it
+    /// has there, as the cell's riser rows do for the sides.
+    ///
+    /// Until the colour morph every top cell wore the surface block (#296),
+    /// and a coarse level showed a pit only where every column of a cell is
+    /// one (`row_is_cave`, the nesting rule): on the default seed's
+    /// mountains pits open 6.1% of level 0's columns, and the coarse levels
+    /// showed 5.1, 3.4 and 1.3% of their ground as pit at cell widths 2, 4
+    /// and 8 -- the grey patches a mountain lost from afar (the zoom pairs of
+    /// 2026-11-21). A cell that is partly pit now wears the pit's floor in the
+    /// share its columns are pit.
+    ///
+    /// [`from_above`]: Self::from_above
+    fn top_block(
+        &self,
+        x: i32,
+        z: i32,
+        top: i32,
+        covered: &[Covered],
+        blocks: TerrainBlocks,
+    ) -> BlockId {
+        let k =
+            crate::noise::hash(self.seed ^ COARSE_TOP_SEED_MIX, x, top, z) % covered.len() as u64;
+        let c = covered[k as usize];
+        match self.from_above(x + c.at[0] as i32, z + c.at[1] as i32, c.surface, blocks) {
+            Some(floor) => floor,
+            None => self.material_at(x, top, z, top, blocks),
+        }
+    }
+
+    /// What level 0 shows from directly above the column `(x, z)` whose
+    /// surface block is at `surface`, where that is not the surface block:
+    /// the floor of the pit a cave has opened there (the first block of
+    /// ground under the carved surface, within [`PIT_FLOOR_SEARCH`]), made of
+    /// what that depth is made of. `None` where the column's surface block
+    /// stands (no cave carves it): it shows the surface block.
+    ///
+    /// The one rule a coarser representation reads a column's top colour
+    /// from; the far terrain is to read the same (#422).
+    pub fn from_above(
+        &self,
+        x: i32,
+        z: i32,
+        surface: i32,
+        blocks: TerrainBlocks,
+    ) -> Option<BlockId> {
+        if !self.cave_at(x, surface, z) {
+            return None;
+        }
+        let floor = (1..=PIT_FLOOR_SEARCH)
+            .map(|d| surface - d)
+            .find(|&y| !self.cave_at(x, y, z))
+            .unwrap_or(surface - PIT_FLOOR_SEARCH);
+        Some(self.material_at(x, floor, z, surface, blocks))
+    }
+
+    /// Whether `block` is what level 0 shows from above one of the columns
+    /// `[x0, x0 + w) x [z0, z0 + w)` that a cave has opened ([`from_above`]):
+    /// the other thing a coarse top may wear besides the surface block.
+    ///
+    /// [`from_above`]: Self::from_above
+    #[cfg(test)]
+    pub(crate) fn a_pit_under_shows(
+        &self,
+        x0: i32,
+        z0: i32,
+        w: i32,
+        block: BlockId,
+        blocks: TerrainBlocks,
+    ) -> bool {
+        (0..w * w).any(|k| {
+            let (x, z) = (x0 + k % w, z0 + k / w);
+            self.from_above(x, z, self.surface_height(x, z), blocks) == Some(block)
+        })
     }
 
     /// Whether a cave has carved away the row of `v` blocks from `y` of a
@@ -2870,7 +2961,9 @@ mod tests {
     /// real column is. Seen from far away, those tops are most of what the
     /// ground is; when a third of them wore soil (the cell's own top block
     /// sits under the surface), the distant fields came out patched with
-    /// brown.
+    /// brown. **Or the floor of a pit under it** (the colour morph,
+    /// [`WorldGen::top_block`]): what level 0 shows from above one of the
+    /// cell's columns that a cave has opened, and nothing else.
     ///
     /// (This also held "and only the top: the cell under it is soil or
     /// stone" until issue #423. That was the bug: on a slope the cells under
@@ -2908,7 +3001,9 @@ mod tests {
                             continue;
                         }
                         tops += 1;
-                        if block != blocks.grass {
+                        if block != blocks.grass
+                            && !gen.a_pit_under_shows(x, z, step, block, blocks)
+                        {
                             soil += 1;
                         }
                     }
@@ -2943,6 +3038,75 @@ mod tests {
     /// of level 0's faces are soil. Depth below the cell's own top gave
     /// mostly stone here, and the least depth any covered column offers gave
     /// nine tenths surface block; this test is red on both.
+    /// **A coarse top shows a pit's floor in the share its columns are pit**
+    /// (the colour morph, [`WorldGen::top_block`]): over the default seed's
+    /// mountains, at cell widths 4 and 8 (levels 2 and 3, where the zoom
+    /// pairs lost the grey patches), the tops that wear something other
+    /// than the surface block number what the pit share of their cells'
+    /// columns says they should -- within [`PIT_SHARE`] of it. Before the
+    /// rule none did, which is red here.
+    #[test]
+    fn a_coarse_top_shows_pit_floors_in_the_share_level_0_does() {
+        /// Chosen, not derived: the pick is a hash per cell, so the count is
+        /// a sample of the expectation; a few hundred cells land within a
+        /// fifth of it.
+        const PIT_SHARE: f64 = 0.25;
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let blocks = test_blocks();
+        let (mx, mz): (i32, i32) = (-848, 4832);
+        for (step, v) in [(4, 1), (8, 4)] {
+            let size = 16 * step;
+            let (mut expected, mut shown, mut tops) = (0f64, 0u32, 0u32);
+            let mut nodes = std::collections::BTreeMap::new();
+            for nz in -2..2 {
+                for nx in -2..2 {
+                    let (ox, oz) = (
+                        mx.div_euclid(size) * size + nx * size,
+                        mz.div_euclid(size) * size + nz * size,
+                    );
+                    for lz in 0..Chunk::SIZE as i32 {
+                        for lx in 0..Chunk::SIZE as i32 {
+                            let (x0, z0) = (ox + lx * step, oz + lz * step);
+                            let top = gen.cell_surface_height(x0, z0, step);
+                            let oy = top.div_euclid(size) * size;
+                            let node = nodes.entry((ox, oy, oz)).or_insert_with(|| {
+                                gen.generate_aniso([ox, oy, oz], step, v, blocks)
+                            });
+                            let ly = ((top - oy) / v) as usize;
+                            let block = node.get(lx as usize, ly, lz as usize);
+                            if block == BlockId::AIR {
+                                continue; // the whole cell is pit
+                            }
+                            tops += 1;
+                            let pit = (0..step * step)
+                                .filter(|k| {
+                                    let (x, z) = (x0 + k % step, z0 + k / step);
+                                    gen.from_above(x, z, gen.surface_height(x, z), blocks)
+                                        .is_some()
+                                })
+                                .count();
+                            expected += pit as f64 / (step * step) as f64;
+                            if block != blocks.grass {
+                                shown += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "width {step}: {shown} of {tops} tops show a pit's floor, {expected:.1} expected"
+            );
+            assert!(
+                expected > 30.0,
+                "width {step}: too few pits to measure ({expected:.1})"
+            );
+            assert!(
+                (shown as f64 - expected).abs() <= PIT_SHARE * expected,
+                "width {step}: {shown} tops show a pit's floor, {expected:.1} expected"
+            );
+        }
+    }
+
     #[test]
     fn a_coarse_riser_is_made_of_level_0s_faces() {
         /// **Chosen, not derived**: a hash picks one face per cell, so the
@@ -3013,7 +3177,9 @@ mod tests {
                             let wears = layer_of(block);
                             let at = format!("step {step} cell ({x0}, {y}, {z0})");
                             if top < y + v {
-                                assert_eq!(wears, GroundLayer::Surface, "{at}: the top cell");
+                                if !gen.a_pit_under_shows(x0, z0, step, block, blocks) {
+                                    assert_eq!(wears, GroundLayer::Surface, "{at}: the top cell");
+                                }
                                 tops += 1;
                                 continue;
                             }

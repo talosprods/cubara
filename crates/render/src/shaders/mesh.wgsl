@@ -102,6 +102,7 @@ struct VsIn {
     @location(0) packed0: u32,
     @location(1) packed1: u32,
     @location(2) packed2: u32,
+    @location(3) packed3: u32,
 };
 
 struct VsOut {
@@ -114,10 +115,15 @@ struct VsOut {
     // varying carrying the already-resolved vector (isolated A/B/C
     // diagnostic in the package-4 research).
     @location(0) @interpolate(flat) normal: vec3<f32>,
-    // x: baked AO (0..1), y: height haze (0..1), both per vertex.
-    @location(1) ao_haze: vec2<f32>,
+    // x: baked AO (0..1), y: height haze (0..1), z: how far the colour
+    // has blended to the parent layer's (the colour morph, 0 where the two
+    // layers are one), all per vertex.
+    @location(1) ao_haze: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) @interpolate(flat) layer: u32,
+    // The texture layer (low 16 bits) and the parent level's layer here
+    // (high 16; the colour morph, the layer itself where there is none),
+    // in one flat varying: the fragment stage reads one input fewer.
+    @location(3) @interpolate(flat) layers: u32,
 };
 
 // Indexed by the packed `face` field (3 bits) -- always one of the six axis
@@ -241,12 +247,30 @@ fn vs_main(in: VsIn) -> VsOut {
     let ao_floor_scaled = mix(ao_floor, 1.0, 1.0 - 1.0 / ao_width);
     let ao = mix(ao_floor_scaled, 1.0, ao_frac);
 
+    // The colour morph (word 3, `Vertex::with_parent`): the texture layer
+    // and the openness the parent level draws where this vertex goes at full
+    // morph. Its light and its colour blend toward them by the same factor
+    // that moves it, so at the end of its band a node shows its parent's
+    // colours as well as its parent's shape, and the swap changes neither.
+    // Bits as `Vertex::with_parent` packs them: layer 0-11, openness 12-19
+    // (in 255ths), has-parent 20.
+    let has_parent = (in.packed3 & (1u << 20u)) != 0u;
+    let parent_layer = select(tex_layer, in.packed3 & 0xFFFu, has_parent);
+    let parent_open = f32((in.packed3 >> 12u) & 0xFFu) / 255.0;
+    let colour_morph = select(0.0, morph, has_parent);
+    let lit_ao = mix(ao, mix(ao_floor, 1.0, parent_open), colour_morph);
+    // The texture blends over the second half of the band only: its cost is
+    // a second sample, and the first half is the near ground, most of the
+    // frame's pixels (`docs/PHASE3_ARCHITECTURE.md` §9.6). The light needs
+    // no sample and blends over the whole band.
+    let blend = select(0.0, clamp(2.0 * colour_morph - 1.0, 0.0, 1.0), parent_layer != tex_layer);
+
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(world_pos, 1.0);
     out.normal = FACE_NORMALS[face];
-    out.ao_haze = vec2<f32>(ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y));
+    out.ao_haze = vec3<f32>(lit_ao, haze_amount(frame.eye.xyz, world_pos, frame.haze, frame.anchor.y), blend);
     out.uv = vec2<f32>(u, v);
-    out.layer = tex_layer;
+    out.layers = tex_layer | (parent_layer << 16u);
     return out;
 }
 
@@ -267,7 +291,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // ever sees it -- see vs_main's `ao_floor_scaled`).
     let ao = in.ao_haze.x;
 
-    let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
+    // The texture's screen-space gradients, taken here in uniform control
+    // flow, so the parent layer can be sampled at the same mip under a
+    // branch that most fragments skip (`textureSampleGrad`).
+    let uv_dx = dpdx(in.uv);
+    let uv_dy = dpdy(in.uv);
+    let layer = in.layers & 0xFFFFu;
+    var tex = textureSample(block_textures, block_sampler, in.uv, layer);
+    if (in.ao_haze.z > 0.0) {
+        let parent = textureSampleGrad(block_textures, block_sampler, in.uv, in.layers >> 16u, uv_dx, uv_dy);
+        tex = mix(tex, parent, in.ao_haze.z);
+    }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
     let lit = tex.rgb * sun_color * (ambient + diffuse) * ao;
 

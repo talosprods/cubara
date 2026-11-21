@@ -286,12 +286,16 @@ space**. Two problems, one immediate and one structural:
   origin. Radius 64 is fine; a world you can walk across is not. And a vertex
   format change means re-meshing everything, so it is done once, now.
 
-Phase 1 format — three `u32`, **12 bytes**, positions local to the node:
+Phase 1 format — three `u32`, **12 bytes**, positions local to the node
+(**16 bytes, four words, since the colour morph**:
+`docs/PHASE3_ARCHITECTURE.md` §9.6; word 2's spare bits went to the distance
+morph, #380, and word 1's to its latent risers):
 
 ```
 word 0:  x:10  y:10  z:10  ao:2          // node-local lattice coords
 word 1:  tex_layer:12  face:3  u_len:8  v_len:8  (1 spare)
 word 2:  node_index:16  corner_u:1  corner_v:1  ao_width_log2:2  (12 spare)
+word 3:  parent_layer:12  parent_open:8  has_parent:1  (11 spare)   // §9.6
 ```
 
 `face` is 3 bits because greedy-meshed voxel faces are always one of six axis

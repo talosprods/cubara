@@ -33,7 +33,7 @@ pub enum TreeModel {
 /// negative value, meaning "untextured, use `color` instead" (the box
 /// model's mean colours, decision 3) -- and that colour.
 ///
-/// Unpacked floats rather than `cubara_voxel::Vertex`'s packed 12 bytes:
+/// Unpacked floats rather than `cubara_voxel::Vertex`'s packed 16 bytes:
 /// a tree model is a few hundred vertices built once at startup, not a
 /// greedy-meshed arena of millions, so there is nothing to amortise a packed
 /// format against, and a flat layout keeps this module independent of the

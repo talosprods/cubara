@@ -183,12 +183,12 @@ pub fn load_tree_models(
     crate::trees::build_tree_models(device, queue, &assets.registry, &structures, &layer_of)
 }
 
-const VERTEX_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32];
+const VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32];
 
 /// The GPU vertex layout for [`Vertex`], which is plain data in `cubara-voxel` and
 /// knows nothing about the GPU (`ARCHITECTURE.md` Rule 3/4). The layout lives here,
-/// with the code that owns pipelines. Three `u32` words, unpacked in the shader --
+/// with the code that owns pipelines. Four `u32` words, unpacked in the shader --
 /// see `docs/PHASE1_ARCHITECTURE.md` §5.2 for the bit layout.
 ///
 /// It must stay in step with the field order of [`Vertex`]; `vertex_layout_matches_vertex`
@@ -1792,7 +1792,15 @@ pub fn build_mesh_pipeline_from_module(
             module: shader,
             entry_point: Some("vs_main"),
             buffers: &[Some(vertex_layout())],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            // The vertex stage reads `ao_floor` (R1c's AO, and the colour
+            // morph's parent light), so it takes the constants too. Until the
+            // colour morph it took none and lit every vertex with the
+            // shader's own defaults -- the same as `Lighting::default()`'s,
+            // which is why nothing showed (`the_ao_floor_reaches_the_vertex_stage`).
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
@@ -2539,12 +2547,16 @@ mod tests {
             layout.array_stride,
             std::mem::size_of::<Vertex>() as wgpu::BufferAddress
         );
-        assert_eq!(layout.array_stride, 12, "three packed u32 words");
-        assert_eq!(layout.attributes.len(), 3, "packed0, packed1, packed2");
+        assert_eq!(layout.array_stride, 16, "four packed u32 words");
+        assert_eq!(
+            layout.attributes.len(),
+            4,
+            "packed0, packed1, packed2, packed3"
+        );
 
         // Offsets must land on the real field boundaries.
         let offsets: Vec<u64> = layout.attributes.iter().map(|a| a.offset).collect();
-        assert_eq!(offsets, vec![0, 4, 8]);
+        assert_eq!(offsets, vec![0, 4, 8, 12]);
     }
 
     #[test]

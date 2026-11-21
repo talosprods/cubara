@@ -577,6 +577,36 @@ fn terrain_renders_as_expected() {
     assert_golden("terrain", &World::new(), Shot::default());
 }
 
+/// `Lighting::ao_floor` reaches the vertex stage, where `mesh.wgsl` resolves
+/// AO: the terrain with no AO floor at all (fully open everywhere) differs
+/// from the default over every shaded corner. Until the colour morph the
+/// mesh pipeline passed its constants to the fragment stage only, so the
+/// vertex stage used the shader's default floor whatever `Lighting` said --
+/// and this frame came out the same as the default one.
+#[test]
+fn the_ao_floor_reaches_the_vertex_stage() {
+    let Some(lit) = render_world(&World::new(), Shot::default()) else {
+        headless::skip_or_require_gpu("the_ao_floor_reaches_the_vertex_stage");
+        return;
+    };
+    let open = Shot {
+        lighting: cubara_render::Lighting {
+            ao_floor: 1.0,
+            ..cubara_render::Lighting::default()
+        },
+        ..Shot::default()
+    };
+    let open = render_world(&World::new(), open).expect("a GPU");
+    let changed = differing_pixels(&open, &lit)
+        .iter()
+        .filter(|p| p.delta > TOLERANCE)
+        .count();
+    assert!(
+        changed > 10_000,
+        "an AO floor of 1 changed only {changed} pixels"
+    );
+}
+
 #[test]
 fn distance_fog_fades_the_far_ring_into_the_sky() {
     // Package 2 (cross-session engine review): distance fog dissolves the
@@ -2980,6 +3010,17 @@ fn without_the_anchor_the_shifted_scene_falls_apart() {
 /// is under test, and one view makes the four images comparable side by
 /// side, which is how the owner looks at them.
 fn render_mountain_at_level(level: u32) -> Option<Frame> {
+    render_mountain(level, None, true)
+}
+
+/// [`render_mountain_at_level`], with `morph`'s bands, and -- unless
+/// `colour` -- every vertex's parent colour stripped (`Vertex::without_parent`):
+/// the mountain as the height morph alone would draw it.
+fn render_mountain(
+    level: u32,
+    morph: Option<cubara_render::MorphParams>,
+    colour: bool,
+) -> Option<Frame> {
     use cubara_world::node::NodeKey;
     let world = World::new();
     let registry = real_registry();
@@ -3007,16 +3048,83 @@ fn render_mountain_at_level(level: u32) -> Option<Frame> {
     }
     let meshed = mesh_nodes(&world, &registry, &layer_of, nodes, blocks)
         .into_iter()
-        .filter_map(to_meshed_node);
+        .filter_map(to_meshed_node)
+        .map(|mut node| {
+            if !colour {
+                for v in &mut node.mesh.vertices {
+                    *v = v.without_parent();
+                }
+            }
+            node
+        });
     // Level with the upper slopes, off one corner, looking across the face.
     let eye = glam::DVec3::new((x0 - 70) as f64, (hi + 20) as f64, (z0 - 70) as f64);
     let shot = Shot {
         camera: Some((eye, glam::Vec3::new(1.0, -0.42, 1.0))),
+        morph,
         ..Shot::default()
     };
     let _gpu = gpu_lifecycle::lock();
     headless::render(meshed, shot)
 }
+
+/// **At the end of its band a level draws its parent's colours** (the
+/// colour morph, `docs/PHASE3_ARCHITECTURE.md` §9.6). The mountain of
+/// [`render_mountain_at_level`] at levels 0, 1 and 2 with every vertex fully
+/// morphed (a band that ends before the eye), against the level above it
+/// unmorphed: the two must draw nearly the same picture, since that is the
+/// frame the ring edge swaps one for the other. Measured with and without
+/// the vertices' parent colour (`Vertex::without_parent`, the height morph
+/// alone): the colour morph must at least halve what the swap changes, and
+/// leave under [`FULL_MORPH_MAX_CHANGED`] of the frame's pixels over the
+/// goldens' tolerance.
+///
+/// What is left is ground that does not morph -- a column beside a cave or
+/// a pit, or across a node's floor -- which swaps as it did. Goes red when
+/// the shader stops blending (layer or light), the parent is read wrong, or
+/// the vertex word stops reaching the GPU.
+#[test]
+fn a_fully_morphed_level_draws_its_parents_colours() {
+    for level in 0..=2u32 {
+        let full = cubara_render::MorphParams {
+            bands: std::array::from_fn(|l| (l == level as usize).then_some((-2.0, -1.0))),
+            squash: 2.0,
+        };
+        let Some(parent) = render_mountain(level + 1, None, true) else {
+            headless::skip_or_require_gpu("a_fully_morphed_level_draws_its_parents_colours");
+            return;
+        };
+        let changed = |frame: &Frame| {
+            differing_pixels(frame, &parent)
+                .iter()
+                .filter(|p| p.delta > TOLERANCE)
+                .count()
+        };
+        let with_frame = render_mountain(level, Some(full), true).expect("a GPU");
+        let without_frame = render_mountain(level, Some(full), false).expect("a GPU");
+        let with = changed(&with_frame);
+        let without = changed(&without_frame);
+        let pixels = (parent.width * parent.height) as f64;
+        eprintln!(
+            "level {level} fully morphed against level {}: {with} pixels over tolerance with \
+             its parent's colours, {without} without",
+            level + 1
+        );
+        assert!(
+            2 * with <= without,
+            "level {level}: the colour morph left {with} of {without} pixels changed"
+        );
+        assert!(
+            (with as f64) < FULL_MORPH_MAX_CHANGED * pixels,
+            "level {level}: {with} pixels over tolerance at the swap"
+        );
+    }
+}
+
+/// The most of the frame a fully morphed level may differ from its parent
+/// in ([`a_fully_morphed_level_draws_its_parents_colours`]). Chosen, not
+/// derived: just over the worst level measured on the M3 (in the PR).
+const FULL_MORPH_MAX_CHANGED: f64 = 0.05;
 
 /// **Every level shows the same mountain** (issue #423, the owner's
 /// play-test of 2026-11-14): `mountain_level_0..3.png`, one mountain face
