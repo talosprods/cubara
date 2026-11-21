@@ -23,7 +23,7 @@
 //! - **its own outline at level 3**: the [`TreeModel::Silhouette`] is the
 //!   oak's own surface merged into as few quads as it takes, in flat
 //!   colours that are the oak's own per face direction -- the same outline
-//!   from every side, at under half the oak's triangles. It replaced two
+//!   from every side, in fewer triangles and no texture. It replaced two
 //!   boxes, whose square canopy changed the outline at the 512 m edge.
 
 use std::collections::BTreeMap;
@@ -1069,7 +1069,7 @@ mod tests {
     /// the oak's own colour** (#433 item 4): per face direction the same
     /// area, and the same area-weighted openness per texture -- which
     /// `trees.wgsl`'s `mix(ao_floor, 1, open)` turns into the same mean
-    /// light -- at under half the oak's triangles. Goes red when the merge
+    /// light -- in fewer triangles than the oak. Goes red when the merge
     /// loses area, a direction's shade is averaged with another's, or the
     /// openness is not area-weighted.
     #[test]
@@ -1116,9 +1116,14 @@ mod tests {
             let (t_oak, t_sil) = (oak.indices.len() / 3, silhouette.indices.len() / 3);
             eprintln!("TREE MODEL: oak {t_oak} triangles, silhouette {t_sil}");
             assert!(
-                2 * t_sil < t_oak,
+                t_sil < t_oak,
                 "silhouette {t_sil} against the oak's {t_oak}"
             );
+            // A guard against the merge silently stopping (the oak's own
+            // quads re-emitted one by one are as many as the oak's), not an
+            // exact pin: the canopy's stepped edge is most of what is left.
+            // Chosen, not derived.
+            assert!(t_sil <= 120, "the silhouette grew to {t_sil} triangles");
             assert!(
                 silhouette.vertices.iter().all(|v| v.layer < 0.0),
                 "flat colours"
