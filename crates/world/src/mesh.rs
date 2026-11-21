@@ -191,7 +191,10 @@ fn mesh_chunk_with(
 ) -> Option<NodeGeometry> {
     let ctx = MeshContext { registry, layer_of };
     let columns = if morph {
-        crate::morph::node_columns(world, node, blocks)
+        crate::morph::node_columns(world, node, blocks).map(|mut c| {
+            c.parent = parent_faces(world, registry, layer_of, node, blocks);
+            c
+        })
     } else {
         None
     };
@@ -223,6 +226,41 @@ fn mesh_chunk_with(
 ///
 /// Without the neighbours, digging out a block at the edge of a chunk leaves
 /// the next chunk still hiding the face that now looks into the hole.
+/// What the next coarser level draws over `node`, for the colour morph
+/// (`cubara_voxel::ParentFaces`, `docs/PHASE3_ARCHITECTURE.md` §9.6): the
+/// parent node's own mesh, made by the same generator and mesher as the
+/// game's, indexed over `node`'s footprint.
+///
+/// **Made without a morph of its own.** The game draws the parent with its
+/// own morph keyed in, which cuts its quads at its cells and lays latent
+/// risers; neither changes what it shows at rest -- a quad is only ever cut
+/// where every cell of it is alike, and a latent riser has no area -- and
+/// the parent is at rest wherever this node is swapped for it (its own band
+/// starts past this node's ring). Keyed in, the parent would ask for its own
+/// parent in turn.
+///
+/// `None` where the parent draws nothing (a node of sky), and then this
+/// node keeps its own colours.
+fn parent_faces(
+    world: &WorldSnapshot,
+    registry: &BlockRegistry,
+    layer_of: &dyn Fn(&str) -> u32,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+) -> Option<cubara_voxel::ParentFaces> {
+    let parent = node.parent();
+    let chunk = world.node_at(parent, blocks)?;
+    let geometry = mesh_chunk_with(world, registry, layer_of, parent, blocks, &chunk, false)?;
+    let (p, c) = (parent.world_origin(), node.world_origin());
+    let size = 16 * node.extent_chunks();
+    Some(cubara_voxel::ParentFaces::from_mesh(
+        &geometry.mesh,
+        [p[0] - c[0], p[1] - c[1], p[2] - c[2]],
+        [0, i32::MIN / 2, 0],
+        [size, i32::MAX / 2, size],
+    ))
+}
+
 pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
     let size = cubara_voxel::Chunk::SIZE as i32;
     let own = ChunkCoord::new(

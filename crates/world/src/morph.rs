@@ -234,10 +234,12 @@ pub fn node_columns(
         parent.clamp(k * parent_rows - 1, (k + 1) * parent_rows - 1)
     };
     let mut columns = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
+    let mut morphing = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
     for cz in -1..=n {
         for cx in -1..=n {
             let top = tops[at(cx, cz)];
             let parent = parent_top(cx, cz);
+            morphing.push(morphs(cx, cz));
             let target = if morphs(cx, cz) {
                 morph_target(top, parent)
             } else {
@@ -272,7 +274,13 @@ pub fn node_columns(
             columns.push([row(top), row(target), row(floor), row(target_floor)]);
         }
     }
-    Some(MorphColumns { n, level, columns })
+    Some(MorphColumns {
+        n,
+        level,
+        columns,
+        morphs: morphing,
+        parent: None,
+    })
 }
 
 #[cfg(test)]

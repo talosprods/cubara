@@ -10,6 +10,7 @@
 
 use crate::block::BlockId;
 use crate::mesh::{Face, Mesh, Vertex};
+use crate::parent::{ParentFaces, ParentLook};
 use crate::registry::BlockRegistry;
 use crate::storage::{ChunkPayloadError, ChunkStorage};
 
@@ -50,6 +51,10 @@ struct MaskCell {
     /// faces that move differently never merge, which is what cuts a
     /// node's greedy quads at its parent's cell boundaries.
     morph: Morph,
+    /// What the parent level draws where the morph takes this face (the
+    /// colour morph, [`ParentFaces`]); `None` for a face that does not
+    /// morph. Cells merge only where they show the same of their parent.
+    parent: Option<ParentLook>,
 }
 
 const NO_CELL: MaskCell = MaskCell {
@@ -58,6 +63,7 @@ const NO_CELL: MaskCell = MaskCell {
     ao_width: [0; 4],
     block: BlockId::AIR,
     morph: Morph::Static,
+    parent: None,
 };
 
 /// What a node's mesh needs to morph toward the next coarser level of detail
@@ -78,10 +84,14 @@ const NO_CELL: MaskCell = MaskCell {
 ///
 /// A riser of column `a` toward neighbour `b` spans rows `[min(top_a,
 /// floor_b), top_a)` and at full morph `[min(target_a, target_floor_b),
-/// target_a]`; every point moves on the straight line between the two, so
-/// the morphed surface is the staircase of the morphed tops, closed at every
-/// instant, and at full morph it is the parent's.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// target_a]`. Its rows move up or down the wall with its top, one for one
+/// ([`Morph::target`]): a row that would pass below the new foot stops there,
+/// and where the riser grows the room left at its foot is filled by a riser
+/// laid down with no height (a latent one). So the morphed surface is the
+/// staircase of the morphed tops, closed at every instant, and at full morph
+/// it is the parent's -- with every row of it on one of the parent's rows,
+/// which is what lets its colour be the parent's too (`parent`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct MorphColumns {
     /// Lattice columns along x and z, the ring left out (16 for a node).
     pub n: i32,
@@ -91,6 +101,13 @@ pub struct MorphColumns {
     /// `[top, target, floor, target_floor]` per column, at
     /// `(z + 1) * (n + 2) + (x + 1)` for `x`, `z` in `-1..=n`.
     pub columns: Vec<[i32; 4]>,
+    /// Per column, as `columns`: whether it morphs -- plain ground that
+    /// takes its parent's height, whether or not that height differs from
+    /// its own. Only such a column's faces take their parent's colour.
+    pub morphs: Vec<bool>,
+    /// What the parent level draws over this node, for the colour morph;
+    /// `None` leaves every face its own colour.
+    pub parent: Option<ParentFaces>,
 }
 
 impl MorphColumns {
@@ -98,6 +115,15 @@ impl MorphColumns {
     pub fn at(&self, x: i32, z: i32) -> [i32; 4] {
         debug_assert!((-1..=self.n).contains(&x) && (-1..=self.n).contains(&z));
         self.columns[((z + 1) * (self.n + 2) + (x + 1)) as usize]
+    }
+
+    /// Whether the column at lattice `(x, z)` morphs ([`MorphColumns::morphs`]).
+    pub fn morphs_at(&self, x: i32, z: i32) -> bool {
+        debug_assert!((-1..=self.n).contains(&x) && (-1..=self.n).contains(&z));
+        self.morphs
+            .get(((z + 1) * (self.n + 2) + (x + 1)) as usize)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -125,9 +151,11 @@ enum Morph {
     /// A column's top face, moving to row `target`; `cell` keeps it apart
     /// from its neighbours'.
     Top { target: i32, cell: i32 },
-    /// A riser: rows `[s_bot, s_top)` move onto `[t_bot, t_top]`, every
-    /// point on the straight line between the two; `seg` keeps it apart
-    /// from the next segment's.
+    /// A riser: rows `[s_bot, s_top)` move with its top, by `t_top - s_top`,
+    /// onto `[t_bot, t_top]` -- one for one, so each lands on one row of the
+    /// parent's riser and its texture is never stretched; a row that would
+    /// pass below `t_bot` stops there. Where the riser grows, a latent riser
+    /// fills its foot. `seg` keeps it apart from the next segment's.
     Riser {
         s_bot: i32,
         s_top: i32,
@@ -138,24 +166,25 @@ enum Morph {
 }
 
 impl Morph {
-    /// Where row `y` is at full morph. A riser's map is extended past its
-    /// own rows, so a skirt hung below it moves with its foot.
-    fn target(self, y: i32) -> f32 {
+    /// Where row `y` is at full morph: a whole row, always. A riser's map is
+    /// extended past its own rows, so a skirt hung below it moves with its
+    /// foot.
+    ///
+    /// **A riser's rows move with its top, one for one** (the colour morph):
+    /// until then every point of a riser moved on the straight line from its
+    /// rows to the parent's, so a riser one block tall that grew to three
+    /// showed one tile stretched over three blocks, and one row of its own
+    /// material over three of the parent's. Moved whole, each row lands on
+    /// one of the parent's rows, tile on tile, and can carry that row's
+    /// material and shade ([`ParentFaces`]). The shape is the same at every
+    /// instant: only where the rows lie inside the riser's plane differs.
+    fn target(self, y: i32) -> i32 {
         match self {
-            Morph::Static => y as f32,
-            Morph::Top { target, .. } => target as f32,
+            Morph::Static => y,
+            Morph::Top { target, .. } => target,
             Morph::Riser {
-                s_bot,
-                s_top,
-                t_bot,
-                t_top,
-                ..
-            } => {
-                if s_top == s_bot {
-                    return if y >= s_top { t_top } else { t_bot } as f32;
-                }
-                t_bot as f32 + (y - s_bot) as f32 * (t_top - t_bot) as f32 / (s_top - s_bot) as f32
-            }
+                s_top, t_bot, t_top, ..
+            } => (y + t_top - s_top).max(t_bot),
         }
     }
 }
@@ -654,6 +683,7 @@ pub(crate) fn greedy_mesh_morph(
                             ao_width,
                             block,
                             morph: Morph::Static,
+                            parent: None,
                         }
                     };
                     covered_cell[idx] = covered;
@@ -671,6 +701,7 @@ pub(crate) fn greedy_mesh_morph(
                     columns,
                     (d, nu, nv),
                     pos[d],
+                    scale,
                     &|x, y, z| block_at(x, y, z),
                     ctx.registry,
                 ),
@@ -729,6 +760,7 @@ pub(crate) fn greedy_mesh_morph(
                         ctx,
                         scale,
                         (m.morph, morph_level),
+                        m.parent.zip(morph.and_then(|c| c.parent.as_ref())),
                     );
                     push_skirt(
                         &mut mesh,
@@ -761,7 +793,16 @@ pub(crate) fn greedy_mesh_morph(
                 j += 1;
             }
             for l in latent {
-                push_latent_riser(&mut mesh, (d, u, v), pos[d], l, ctx, scale, morph_level);
+                push_latent_riser(
+                    &mut mesh,
+                    (d, u, v),
+                    pos[d],
+                    l,
+                    ctx,
+                    scale,
+                    morph_level,
+                    morph.and_then(|c| c.parent.as_ref()),
+                );
             }
         }
     }
@@ -771,9 +812,10 @@ pub(crate) fn greedy_mesh_morph(
 
 /// A riser the morph opens where the mesh as built has none: column `a`
 /// stands no higher than its neighbour, but its parent stands higher than
-/// the neighbour's ([`riser_map`]). Laid down with no height at row `y`
-/// (`a`'s top face), on the face plane, one cell long; the morph lifts its
-/// top edge to `t_top` and its foot to `t_bot`.
+/// the neighbour's ([`riser_map`]) -- or the foot of a riser that grows,
+/// where its rows, moving with its top, leave room ([`Morph::target`]).
+/// Laid down with no height at row `y`, on the face plane, one cell long;
+/// the morph lifts its top edge to `t_top` and its foot to `t_bot`.
 #[derive(Clone, Copy, Debug)]
 struct LatentRiser {
     /// The cell along the plane's horizontal axis (`v` for an x slice, `u`
@@ -784,32 +826,56 @@ struct LatentRiser {
     t_bot: i32,
     t_top: i32,
     block: BlockId,
+    /// Whether its column morphs, so takes its parent's colour.
+    morphs: bool,
+}
+
+/// The point in the middle of a face's cell at full morph, in node-local
+/// blocks: lattice cell `(i, j)` of a slice along `d` on lattice plane
+/// `plane`, with the cell's rows at full morph `[y0, y1]` on a wall (a top's
+/// row is its plane). What [`ParentFaces::look_up`] is asked.
+fn cell_centre(d: usize, plane: i32, horizontal: i32, (y0, y1): (i32, i32), scale: [i32; 3]) -> [f32; 3] {
+    let mid = (y0 + y1) as f32 / 2.0;
+    let h = (horizontal as f32 + 0.5) * scale[if d == 0 { 2 } else { 0 }] as f32;
+    match d {
+        0 => [(plane * scale[0]) as f32, mid, h],
+        2 => [h, mid, (plane * scale[2]) as f32],
+        _ => unreachable!("a wall is along x or z"),
+    }
 }
 
 /// Key every face of one slice's `mask` by how the distance morph moves it
-/// ([`Morph`]), and return the risers only the morph opens. `(d, nu, nv)`
-/// is the slice's sweep axis and its two extents, `plane` the face plane's
-/// lattice coordinate along `d`; `block_at(x, y, z)` is the lattice's own
-/// block (out of range is air).
+/// ([`Morph`]) and by what its parent draws where it goes
+/// ([`MaskCell::parent`]), and return the risers only the morph opens.
+/// `(d, nu, nv)` is the slice's sweep axis and its two extents, `plane` the
+/// face plane's lattice coordinate along `d`; `block_at(x, y, z)` is the
+/// lattice's own block (out of range is air).
 ///
 /// - A top face (`d == 1`, facing up) on the plane of its column's `top`
 ///   moves to the column's `target`.
 /// - A side face of column `a` toward its neighbour `b`, in the rows
 ///   `[s_bot, s_top)` of `a`'s riser toward `b` ([`riser_map`]), moves on
 ///   that riser's map; anything else (a cave's walls, an overhang) stays.
-/// - A riser with no rows as built but some at full morph is returned.
+/// - A riser with no rows as built but some at full morph is returned, and
+///   so is the foot of a riser that grows ([`Morph::target`]).
 ///
 /// A face that would move nowhere is keyed [`Morph::Static`], so a column
-/// that does not morph merges as it does without a morph.
+/// that does not morph merges as it does without a morph. A face of a
+/// column that morphs is given its parent's look wherever the parent draws
+/// a face of the same direction under its cell's middle at full morph,
+/// moving or not; a riser row that closes up at full morph gets none.
+#[allow(clippy::too_many_arguments)]
 fn key_morph(
     mask: &mut [MaskCell],
     columns: &MorphColumns,
     (d, nu, nv): (usize, i32, i32),
     plane: i32,
+    scale: [i32; 3],
     block_at: &dyn Fn(i32, i32, i32) -> BlockId,
     registry: &BlockRegistry,
 ) -> Vec<LatentRiser> {
     let mut latent = Vec::new();
+    let parent = columns.parent.as_ref();
     if d == 1 {
         // u = z, v = x: `mask[x * nz + z]`.
         for x in 0..nv {
@@ -819,11 +885,22 @@ fn key_morph(
                     continue;
                 }
                 let [top, target, _, _] = columns.at(x, z);
-                if top == plane && target != top {
+                if top != plane {
+                    continue;
+                }
+                if target != top {
                     cell.morph = Morph::Top {
                         target,
                         cell: x * columns.n + z,
                     };
+                }
+                if let (Some(p), true) = (parent, columns.morphs_at(x, z)) {
+                    let centre = [
+                        (x as f32 + 0.5) * scale[0] as f32,
+                        target as f32,
+                        (z as f32 + 0.5) * scale[2] as f32,
+                    ];
+                    cell.parent = p.look_up(Face::PosY, centre);
                 }
             }
         }
@@ -851,13 +928,16 @@ fn key_morph(
             if !(0..n).contains(&own) {
                 continue;
             }
+            let morphs = if d == 0 {
+                columns.morphs_at(own, seg)
+            } else {
+                columns.morphs_at(seg, own)
+            };
             let Some(riser) = riser_map(column(own), column(other)) else {
                 continue;
             };
             let [s_bot, s_top, t_bot, t_top] = riser_in_rows(riser, ny);
-            if s_bot == t_bot && s_top == t_top {
-                continue; // moves nowhere
-            }
+            let moves = s_bot != t_bot || s_top != t_top;
             let key = Morph::Riser {
                 s_bot,
                 s_top,
@@ -865,22 +945,48 @@ fn key_morph(
                 t_top,
                 seg,
             };
+            let face = Face::from_axis_sign(d, sign);
             for y in s_bot.max(0)..s_top.min(ny) {
                 let idx = if d == 0 { seg * nu + y } else { y * nu + seg };
                 let cell = &mut mask[idx as usize];
-                if cell.sign == sign {
+                if cell.sign != sign {
+                    continue;
+                }
+                if moves {
                     cell.morph = key;
+                }
+                let rows = (key.target(y), key.target(y + 1));
+                if let (Some(p), true, true) = (parent, morphs, rows.1 > rows.0) {
+                    cell.parent = p.look_up(face, cell_centre(d, plane, seg, rows, scale));
+                }
+            }
+            let at = |y: i32| {
+                if d == 0 {
+                    (own, y, seg)
+                } else {
+                    (seg, y, own)
+                }
+            };
+            // The foot a growing riser leaves as its rows move up with its
+            // top ([`Morph::target`]).
+            let foot = s_bot + t_top - s_top;
+            if moves && s_bot < s_top && foot > t_bot && (0..ny).contains(&s_bot) {
+                let (x, y, z) = at(s_bot);
+                let block = block_at(x, y, z);
+                if registry.is_solid(block) {
+                    latent.push(LatentRiser {
+                        seg,
+                        sign,
+                        y: s_bot,
+                        t_bot,
+                        t_top: foot,
+                        block,
+                        morphs,
+                    });
                 }
             }
             let [s_bot, s_top, t_bot, t_top] = riser;
             if s_bot == s_top && (0..ny).contains(&(s_top - 1)) {
-                let at = |y: i32| {
-                    if d == 0 {
-                        (own, y, seg)
-                    } else {
-                        (seg, y, own)
-                    }
-                };
                 let (x, y, z) = at(s_top - 1);
                 let block = block_at(x, y, z);
                 if registry.is_solid(block) {
@@ -891,6 +997,7 @@ fn key_morph(
                         t_bot,
                         t_top,
                         block,
+                        morphs,
                     });
                 }
             }
@@ -1211,6 +1318,7 @@ fn push_quad(
     ctx: &MeshContext,
     scale: [i32; 3],
     (morph, morph_level): (Morph, u32),
+    parent: Option<(ParentLook, &ParentFaces)>,
 ) {
     let mut base = [0i32; 3];
     base[d] = plane;
@@ -1291,6 +1399,19 @@ fn push_quad(
     };
 
     let start = mesh.vertices.len() as u32;
+    // Where each corner is at full morph, in node-local blocks, and the
+    // middle of the quad there: what the parent is read at (the colour
+    // morph), each corner from a point just inside the quad.
+    let at_full = |c: &[i32; 3]| -> [f32; 3] {
+        [
+            (c[0] * scale[0]) as f32,
+            morph.target(c[1] * scale[1]) as f32,
+            (c[2] * scale[2]) as f32,
+        ]
+    };
+    let centre = verts.iter().map(at_full).fold([0.0f32; 3], |a, c| {
+        [a[0] + c[0] / 4.0, a[1] + c[1] / 4.0, a[2] + c[2] / 4.0]
+    });
     for ((((c, (cu, cv)), a), width), (u_max, v_max)) in
         verts.iter().zip(uvs).zip(vao).zip(widths).zip(sides)
     {
@@ -1307,9 +1428,19 @@ fn push_quad(
         )
         .with_corner(u_max, v_max)
         .with_ao_width(width as u32);
-        mesh.vertices.push(match morph {
-            Morph::Static => vertex,
-            _ => vertex.with_morph(morph_level, morph.target(y) - y as f32),
+        // A face with a parent reads its morph factor from its node's band
+        // even where it does not move: that factor blends its colour.
+        let vertex = match (morph, parent) {
+            (Morph::Static, None) => vertex,
+            _ => vertex.with_morph(morph_level, (morph.target(y) - y) as f32),
+        };
+        mesh.vertices.push(match parent {
+            Some((look, faces)) => {
+                let p = at_full(c);
+                let toward = std::array::from_fn(|k| p[k] + 0.01 * (centre[k] - p[k]));
+                vertex.with_parent(look.layer(), faces.openness_at(look, face, p, toward))
+            }
+            None => vertex,
         });
     }
 
@@ -1464,15 +1595,23 @@ fn push_skirt(
             ctx,
             scale,
             (m.morph, morph_level),
+            None,
         );
     }
 }
 
 /// Lay down `l`, a riser only the morph opens ([`LatentRiser`]): one cell
-/// long, open (no shade), wearing its column's top block's side, and with
-/// no height as built -- all four corners at row `l.y` -- so that unmorphed
-/// it covers nothing. The morph lifts its top edge to `l.t_top` and its foot
-/// to `l.t_bot`.
+/// long, open (no shade), and with no height as built -- all four corners at
+/// row `l.y` -- so that unmorphed it covers nothing. The morph lifts its top
+/// edge to `l.t_top` and its foot to `l.t_bot`.
+///
+/// **It wears what its parent draws there** (the colour morph): one piece
+/// per run of rows the parent draws alike ([`ParentFaces::look_up`]), each
+/// in the parent's layer, its texture one tile a block at full morph -- the
+/// tile coordinate runs `0` at the top edge to the piece's height at its
+/// foot -- and carrying the parent's openness at its corners. With no
+/// parent (or where the parent draws no such face) it wears its column's
+/// block's side, in one piece, as before.
 ///
 /// Its corners are marked latent (`Vertex::with_latent`): `mesh.wgsl`'s
 /// crack seal pushes each corner a fraction of a pixel out of its quad, and
@@ -1481,6 +1620,7 @@ fn push_skirt(
 /// morphed its top edge overlaps the top face beside it as every riser's
 /// does. (Pushing it the other way left a gap under the top face that rays
 /// fell through: single pixels of sky in the first run of the study.)
+#[allow(clippy::too_many_arguments)]
 fn push_latent_riser(
     mesh: &mut Mesh,
     (d, u, v): (usize, usize, usize),
@@ -1489,41 +1629,77 @@ fn push_latent_riser(
     ctx: &MeshContext,
     scale: [i32; 3],
     morph_level: u32,
+    parent: Option<&ParentFaces>,
 ) {
-    // One row, `[l.y - 1, l.y)`, then folded onto its top: in an x slice the
+    let face = Face::from_axis_sign(d, l.sign);
+    // The runs of target rows the parent draws alike.
+    let mut runs: Vec<(i32, i32, Option<ParentLook>)> = Vec::new();
+    for t in l.t_bot..l.t_top.max(l.t_bot + 1) {
+        let look = parent
+            .filter(|_| l.morphs && l.t_top > l.t_bot)
+            .and_then(|p| p.look_up(face, cell_centre(d, plane, l.seg, (t, t + 1), scale)));
+        match runs.last_mut() {
+            Some((_, end, last)) if *last == look => *end = t + 1,
+            _ => runs.push((t, t + 1, look)),
+        }
+    }
+    if l.t_top <= l.t_bot {
+        runs = vec![(l.t_bot, l.t_top, None)];
+    }
+    // One row, then folded onto `l.y`: `[l.y - 1, l.y)` folded onto its top,
+    // or on a node's floor `[0, 1)` folded onto its foot. In an x slice the
     // rows run along u, in a z slice along v.
-    let (i, j) = if d == 0 {
-        (l.y - 1, l.seg)
-    } else {
-        (l.seg, l.y - 1)
-    };
-    let start = mesh.vertices.len();
-    push_quad(
-        mesh,
-        d,
-        u,
-        v,
-        plane,
-        i,
-        j,
-        1,
-        1,
-        l.sign,
-        [3; 4],
-        [0; 4],
-        l.block,
-        ctx,
-        scale,
-        (Morph::Static, morph_level),
-    );
-    let y = (l.y * scale[1]) as u32;
-    for vertex in &mut mesh.vertices[start..] {
-        let top = vertex.y() == y;
-        let delta = if top { l.t_top } else { l.t_bot } as f32 - l.y as f32;
-        *vertex = vertex
-            .with_y(y)
-            .with_latent(true)
-            .with_morph(morph_level, delta);
+    let row = if l.y >= 1 { l.y - 1 } else { l.y };
+    let (i, j) = if d == 0 { (row, l.seg) } else { (l.seg, row) };
+    for (bot, top, look) in runs {
+        let start = mesh.vertices.len();
+        push_quad(
+            mesh,
+            d,
+            u,
+            v,
+            plane,
+            i,
+            j,
+            1,
+            1,
+            l.sign,
+            [3; 4],
+            [0; 4],
+            l.block,
+            ctx,
+            scale,
+            (Morph::Static, morph_level),
+            None,
+        );
+        let y = (l.y * scale[1]) as u32;
+        let upper = ((row + 1) * scale[1]) as u32;
+        let corners: Vec<[f32; 3]> = mesh.vertices[start..]
+            .iter()
+            .map(|vx| {
+                let t = if vx.y() == upper { top } else { bot };
+                [vx.x() as f32, t as f32, vx.z() as f32]
+            })
+            .collect();
+        let centre = corners
+            .iter()
+            .fold([0.0f32; 3], |a, c| [a[0] + c[0] / 4.0, a[1] + c[1] / 4.0, a[2] + c[2] / 4.0]);
+        for (vertex, at) in mesh.vertices[start..].iter_mut().zip(&corners) {
+            let is_top = vertex.y() == upper;
+            let delta = if is_top { top } else { bot } as f32 - l.y as f32;
+            let mut out = vertex
+                .with_y(y)
+                .with_latent(true)
+                .with_morph(morph_level, delta)
+                .with_tile_v(if is_top { 0 } else { (top - bot).max(0) as u32 });
+            if let (Some(look), Some(p)) = (look, parent) {
+                let toward = std::array::from_fn(|k| at[k] + 0.01 * (centre[k] - at[k]));
+                out = out
+                    .with_tex_layer(look.layer())
+                    .with_parent(look.layer(), p.openness_at(look, face, *at, toward));
+            }
+            *vertex = out;
+        }
     }
 }
 
@@ -2258,7 +2434,9 @@ mod tests {
         let morph = MorphColumns {
             n: 2,
             level: 1,
+            morphs: vec![true; columns.len()],
             columns,
+            parent: None,
         };
         let top = |x: i32| if x == 0 { a[0] } else { b[0] };
         let mesh = greedy_mesh_morph(

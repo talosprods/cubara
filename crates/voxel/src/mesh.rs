@@ -380,6 +380,26 @@ impl Vertex {
         })
     }
 
+    /// Returns a copy of this vertex with its second tile coordinate set
+    /// (on a wall, the one measured down from the quad's top edge) -- for a
+    /// latent riser, whose tile runs over the rows it has at full morph.
+    pub fn with_tile_v(self, v: u32) -> Self {
+        debug_assert!(v <= EXTENT_MASK, "v out of range");
+        Self {
+            packed1: (self.packed1 & !(EXTENT_MASK << V_SHIFT)) | (v << V_SHIFT),
+            ..self
+        }
+    }
+
+    /// Returns a copy of this vertex drawn from texture layer `layer`.
+    pub fn with_tex_layer(self, layer: u32) -> Self {
+        debug_assert!(layer <= TEX_LAYER_MASK, "texture layer out of range");
+        Self {
+            packed1: (self.packed1 & !TEX_LAYER_MASK) | layer,
+            ..self
+        }
+    }
+
     pub fn node_index(self) -> u32 {
         self.packed2 & NODE_INDEX_MASK
     }
