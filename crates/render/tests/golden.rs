@@ -2404,9 +2404,72 @@ fn the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground() {
     }
 }
 
+/// A patch of one face in the middle of a whole patch, as the far terrain
+/// holds one now (issue #422, shared corners): every quad is under a top, and
+/// a wall stands between two of them. A top is the whole patch at its height;
+/// a wall (`face` standing on a quad line, whatever run it names) is the line
+/// across the whole patch, between the higher ground it belongs to and
+/// ground `face.rise` lower.
+fn far_faces_around(face: cubara_render::FarFace) -> Vec<cubara_render::FarFace> {
+    use cubara_render::{FarDir, FarFace};
+    let n = cubara_render::FAR_QUADS as u8;
+    let rect = |i0: u8, j0: u8, i1: u8, j1: u8, top: i32| FarFace {
+        dir: FarDir::Top,
+        i0,
+        j0,
+        i1,
+        j1,
+        top,
+        rise: 0,
+        border: false,
+        mix: [0, 0],
+        open: face.open,
+    };
+    let low = face.top - face.rise as i32;
+    match face.dir {
+        FarDir::Top => vec![rect(0, 0, n, n, face.top)],
+        FarDir::PosX | FarDir::NegX => {
+            let line = face.i0;
+            // The wall belongs to the higher side: the low x side for a wall
+            // that faces +x, the high one for a wall that faces -x.
+            let (left, right) = if face.dir == FarDir::PosX {
+                (face.top, low)
+            } else {
+                (low, face.top)
+            };
+            vec![
+                rect(0, 0, line, n, left),
+                rect(line, 0, n, n, right),
+                FarFace {
+                    j0: 0,
+                    j1: n,
+                    ..face
+                },
+            ]
+        }
+        FarDir::PosZ | FarDir::NegZ => {
+            let line = face.j0;
+            let (near, far) = if face.dir == FarDir::PosZ {
+                (face.top, low)
+            } else {
+                (low, face.top)
+            };
+            vec![
+                rect(0, 0, n, line, near),
+                rect(0, line, n, n, far),
+                FarFace {
+                    i0: 0,
+                    i1: n,
+                    ..face
+                },
+            ]
+        }
+    }
+}
+
 /// **The far terrain's shader is the CPU reference** (issue #422): a face is
-/// rendered alone, seen from in front, and the pixel at the centre of the
-/// image must be its colour ([`cubara_render::far::face_colour`]) in the
+/// rendered in a patch of its own (`far_faces_around`), seen from in front,
+/// and the pixel at the centre of the image must be its colour ([`cubara_render::far::face_colour`]) in the
 /// light a voxel face of its normal gets (`aggregate::face_light`, the CPU's
 /// form of `mesh.wgsl`'s lighting, which `far.wgsl` shares through
 /// `face.wgsl`).
@@ -2500,10 +2563,11 @@ fn far_shading_is_the_face_reference() {
                 open,
             },
         };
+        let faces = far_faces_around(face);
         let patch = FarPatch {
             origin: [0, 0],
             quad: 1.0,
-            faces: &[face],
+            faces: &faces,
             skirt: 0.0,
         };
         let centre = glam::vec3(16.0, 40.0 - rise as f32 / 2.0, 16.0);
@@ -2558,47 +2622,45 @@ fn far_shading_is_the_face_reference() {
     assert!(apart(6, 7), "a step of 3 and of 24: {colours:?}");
 }
 
-/// **A run's padding draws nothing.** Runs of faces are drawn by size class,
-/// each padded to its class's size (`far::CLASS_FACES`), and the padding's
-/// vertex indices run on into whatever faces come next in the buffer --
-/// another patch's. Here a patch of one small face is followed in the buffer
-/// by a patch, far out of sight, whose faces would cover the middle of the
-/// first patch if they were drawn in its place. The middle must be sky.
+/// **A patch draws its own quads and nothing else.** Every patch is drawn
+/// from one fixed index list over the vertices of its own slot of the cells
+/// buffer; the slots are indexed by the instance. Here a small patch (quads of
+/// one block, flat) is held beside one a hundred kilometres away whose ground
+/// is at another height, in either order: the middle of the small patch is
+/// its ground, a point beyond its edge is sky, and the other order draws the
+/// same pixels.
 #[test]
-fn a_far_runs_padding_draws_nothing() {
+fn a_far_patch_draws_its_own_quads_and_no_more() {
     use cubara_render::far::{FarParams, FarPatch};
     use cubara_render::{FarDir, FarFace};
 
-    let top = |i0: u8, i1: u8| FarFace {
-        dir: FarDir::Top,
-        i0,
-        j0: i0,
-        i1,
-        j1: i1,
-        top: 40,
-        rise: 0,
-        border: false,
-        mix: [0, 0],
-        open: 255,
+    let flat = |top: i32| {
+        vec![FarFace {
+            dir: FarDir::Top,
+            i0: 0,
+            j0: 0,
+            i1: 32,
+            j1: 32,
+            top,
+            rise: 0,
+            border: false,
+            mix: [0, 0],
+            open: 255,
+        }]
     };
-    // One face in a corner; and fifteen that cover the middle, a hundred
-    // kilometres away.
-    let small = [top(0, 2)];
-    let elsewhere = [top(4, 28); 15];
-    let patches = [
-        FarPatch {
-            origin: [0, 0],
-            quad: 1.0,
-            faces: &small,
-            skirt: 0.0,
-        },
-        FarPatch {
-            origin: [100_000, 100_000],
-            quad: 1.0,
-            faces: &elsewhere,
-            skirt: 0.0,
-        },
-    ];
+    let (small, elsewhere) = (flat(40), flat(400));
+    let near = FarPatch {
+        origin: [0, 0],
+        quad: 1.0,
+        faces: &small,
+        skirt: 0.0,
+    };
+    let distant = FarPatch {
+        origin: [100_000, 100_000],
+        quad: 1.0,
+        faces: &elsewhere,
+        skirt: 0.0,
+    };
     let v = glam::vec3(0.15, 1.0, 0.1).normalize();
     let shot = |at: glam::Vec3| Shot {
         width: 65,
@@ -2610,28 +2672,31 @@ fn a_far_runs_padding_draws_nothing() {
         hole: None,
         materials: far_materials(),
     };
-    let centre = |at: glam::Vec3| {
+    let centre = |patches: &[FarPatch<'_>], at: glam::Vec3| {
         let _gpu = gpu_lifecycle::lock();
-        let frame = headless::render_with_far(Vec::new(), &patches, Some(params), shot(at))?;
+        let frame = headless::render_with_far(Vec::new(), patches, Some(params), shot(at))?;
         let i = ((32 * frame.width + 32) * 4) as usize;
         Some([frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2]])
     };
-    let (Some(middle), Some(face), Some(sky)) = (
-        centre(glam::vec3(16.0, 40.0, 16.0)),
-        centre(glam::vec3(1.0, 40.0, 1.0)),
-        centre(glam::vec3(16.0, 4000.0, 16.0)),
+    let both = [near, distant];
+    let reversed = [distant, near];
+    let (Some(middle), Some(beyond), Some(swapped)) = (
+        centre(&both, glam::vec3(16.0, 40.0, 16.0)),
+        centre(&both, glam::vec3(100.0, 40.0, 100.0)),
+        centre(&reversed, glam::vec3(16.0, 40.0, 16.0)),
     ) else {
-        headless::skip_or_require_gpu("a_far_runs_padding_draws_nothing");
+        headless::skip_or_require_gpu("a_far_patch_draws_its_own_quads_and_no_more");
+        return;
+    };
+    let Some(sky) = centre(&both, glam::vec3(16.0, 4000.0, 16.0)) else {
         return;
     };
     assert_ne!(
-        face, sky,
-        "the one real face is not drawn, so this proves nothing"
-    );
-    assert_eq!(
         middle, sky,
-        "something is drawn where the patch has no face"
+        "the small patch's ground is not drawn, so this proves nothing"
     );
+    assert_eq!(beyond, sky, "something is drawn beyond the patch's edge");
+    assert_eq!(middle, swapped, "the order the patches were held in shows");
 }
 
 /// **The far terrain is behind the same haze as everything else** (F5): a
@@ -2670,10 +2735,11 @@ fn far_faces_are_hazed_by_distance() {
         mix: [0, 0],
         open: 255,
     };
+    let faces = far_faces_around(face);
     let patch = FarPatch {
         origin: [0, 0],
         quad: 64.0,
-        faces: &[face],
+        faces: &faces,
         skirt: 0.0,
     };
     let centre = glam::vec3(1024.0, 325.0, 1024.0);
