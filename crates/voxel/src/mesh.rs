@@ -368,6 +368,12 @@ impl Vertex {
         }
     }
 
+    /// Returns a copy of this vertex with no parent (word 3 cleared): drawn
+    /// in its own colours whatever its morph.
+    pub fn without_parent(self) -> Self {
+        Self { packed3: 0, ..self }
+    }
+
     /// What [`with_parent`](Self::with_parent) set: `(layer, openness)`,
     /// the openness as stored; `None` for a vertex with no parent.
     pub fn parent(self) -> Option<(u32, f32)> {
@@ -496,6 +502,38 @@ mod tests {
     /// The distance morph's bits (issue #380's study) round-trip -- a
     /// negative delta through the arithmetic shift, a too-large one clamped,
     /// the latent flag -- and leave every other field as it was.
+    /// Word 3 carries the parent's layer and openness (to 1/255) and
+    /// leaves the other three words alone; a vertex without it has none.
+    #[test]
+    fn a_vertex_carries_its_parent_and_keeps_the_rest() {
+        let base = Vertex::new(1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
+            .with_corner(true, false)
+            .with_ao_width(3)
+            .with_node_index(0xBEEF)
+            .with_morph(2, -3.25);
+        assert_eq!(base.parent(), None);
+        for (layer, open) in [(0, 0.0), (17, 0.5), (4095, 1.0), (3, 0.123)] {
+            let v = base.with_parent(layer, open);
+            let (l, o) = v.parent().expect("a parent");
+            assert_eq!(l, layer);
+            assert!((o - open).abs() <= 0.5 / PARENT_OPEN_STEPS + 1e-6, "{o} for {open}");
+            assert_eq!((v.packed0, v.packed1, v.packed2), (base.packed0, base.packed1, base.packed2));
+        }
+    }
+
+    /// The openness `mesh.wgsl` lights a vertex by: its AO in thirds, the
+    /// shade a `2^width`-th as deep -- 0 for a dark corner of a block, 1 for
+    /// an open one, and a dark corner of an 8-wide cell 7/8 open.
+    #[test]
+    fn openness_is_the_shaders_ao_without_the_floor() {
+        let v = |ao, width| Vertex::new(0, 0, 0, ao, Face::PosY, 0, 0, 0).with_ao_width(width);
+        assert_eq!(v(0, 0).openness(), 0.0);
+        assert_eq!(v(3, 0).openness(), 1.0);
+        assert!((v(1, 0).openness() - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(v(0, 3).openness(), 0.875);
+        assert_eq!(v(3, 3).openness(), 1.0);
+    }
+
     #[test]
     fn a_vertex_carries_its_morph_and_keeps_the_rest() {
         let base = Vertex::new(1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)

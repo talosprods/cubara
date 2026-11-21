@@ -201,3 +201,94 @@ impl ParentFaces {
         (w[0] * tri[0][2] + w[1] * tri[1][2] + w[2] * tri[2][2]).clamp(0.0, 1.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::Vertex;
+
+    /// A mesh of one quad facing `face`, corners in the mesher's order (two
+    /// triangles 0-1-2 and 0-2-3), each `(position, ao)`, in `layer`.
+    fn one_quad(face: Face, corners: [([u32; 3], u32); 4], layer: u32) -> Mesh {
+        let vertices = corners
+            .iter()
+            .map(|&([x, y, z], ao)| Vertex::new(x, y, z, ao, face, layer, 0, 0))
+            .collect();
+        Mesh {
+            vertices,
+            indices: vec![0, 1, 2, 0, 2, 3],
+            face_indices: [0; 6],
+        }
+    }
+
+    const ALL: ([i32; 3], [i32; 3]) = ([-100, -100, -100], [100, 100, 100]);
+
+    /// A top four blocks square at y = 8, dark at its corner (0, 0) and open
+    /// at the others: found under any point of it, and read as the
+    /// rasterizer reads it -- the corners' own openness, and on the
+    /// diagonal from (0, 0) to (4, 4) the mean of its two ends.
+    #[test]
+    fn a_parent_quad_is_found_under_its_points_and_read_as_drawn() {
+        // Top faces sweep (u, v) = (z, x).
+        let mesh = one_quad(
+            Face::PosY,
+            [([0, 8, 0], 0), ([0, 8, 4], 3), ([4, 8, 4], 3), ([4, 8, 0], 3)],
+            7,
+        );
+        let faces = ParentFaces::from_mesh(&mesh, [0, 0, 0], ALL.0, ALL.1);
+        let look = faces.look_up(Face::PosY, [1.5, 8.0, 2.5]).expect("under the quad");
+        assert_eq!(look, ParentLook::Quad(7, 0));
+        assert_eq!(look.layer(), 7);
+        let at = |p: [f32; 3], toward: [f32; 3]| faces.openness_at(look, Face::PosY, p, toward);
+        let inside = [2.0, 8.0, 1.0];
+        assert_eq!(at([0.0, 8.0, 0.0], inside), 0.0);
+        assert_eq!(at([4.0, 8.0, 4.0], inside), 1.0);
+        assert!((at([2.0, 8.0, 2.0], inside) - 0.5).abs() < 1e-6);
+        // Off the quad, the other way up, or another plane: nothing.
+        assert_eq!(faces.look_up(Face::PosY, [4.5, 8.0, 1.0]), None);
+        assert_eq!(faces.look_up(Face::NegY, [1.5, 8.0, 2.5]), None);
+        assert_eq!(faces.look_up(Face::PosY, [1.5, 9.0, 2.5]), None);
+    }
+
+    /// Which triangle holds a corner is decided by the point `toward`: at
+    /// the corner (4, 0), shared by both triangles' edges but a vertex of
+    /// only one, the openness is read off the one `toward` lies in.
+    #[test]
+    fn the_triangle_that_holds_the_child_face_is_the_one_read() {
+        let mesh = one_quad(
+            Face::PosY,
+            [([0, 8, 0], 3), ([0, 8, 4], 0), ([4, 8, 4], 3), ([4, 8, 0], 0)],
+            1,
+        );
+        let faces = ParentFaces::from_mesh(&mesh, [0, 0, 0], ALL.0, ALL.1);
+        let look = faces.look_up(Face::PosY, [1.0, 8.0, 1.0]).unwrap();
+        // (x, z) = (2, 2) is on the diagonal: both triangles say 1.
+        // (x, z) = (1, 3) lies in triangle 0-1-2, (3, 1) in 0-2-3; the point
+        // (2, 1) read toward each is that triangle's plane extended.
+        let p = [2.0, 8.0, 1.0];
+        let a = faces.openness_at(look, Face::PosY, p, [1.0, 8.0, 3.0]);
+        let b = faces.openness_at(look, Face::PosY, p, [3.0, 8.0, 1.0]);
+        assert!((a - b).abs() > 0.2, "both read one triangle: {a} {b}");
+    }
+
+    /// A quad equally open all over is read as its openness, so cells of
+    /// two such quads can merge; the offset moves the parent into the
+    /// child's frame; and only the window is indexed.
+    #[test]
+    fn a_uniform_quad_reads_as_its_openness_and_the_offset_and_window_hold() {
+        let mesh = one_quad(
+            Face::PosX,
+            [([16, 0, 0], 3), ([16, 2, 0], 3), ([16, 2, 2], 3), ([16, 0, 2], 3)],
+            3,
+        );
+        let faces = ParentFaces::from_mesh(&mesh, [-16, 4, 0], ALL.0, ALL.1);
+        assert_eq!(
+            faces.look_up(Face::PosX, [0.0, 5.5, 1.5]),
+            Some(ParentLook::Uniform(3, 255))
+        );
+        assert_eq!(faces.look_up(Face::PosX, [16.0, 1.5, 1.5]), None);
+        let window = ParentFaces::from_mesh(&mesh, [-16, 4, 0], [0, 0, 0], [16, 16, 1]);
+        assert!(window.look_up(Face::PosX, [0.0, 5.5, 0.5]).is_some());
+        assert_eq!(window.look_up(Face::PosX, [0.0, 5.5, 1.5]), None, "z 1 is out");
+    }
+}

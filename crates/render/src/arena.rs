@@ -44,8 +44,9 @@ pub struct NodeId {
     pub pos: [i32; 3],
 }
 
-/// Vertex-arena capacity, in vertices (12 bytes/vertex, the packed format
-/// since #43): what every resident node's mesh has to fit in together. Past
+/// Vertex-arena capacity, in vertices (16 bytes/vertex since the colour
+/// morph, `docs/PHASE3_ARCHITECTURE.md` §9.6; 12 in the packed format of
+/// #43): what every resident node's mesh has to fit in together. Past
 /// it [`ChunkArena::insert`] skips the node -- a hole in the world -- so it
 /// is sized from the game's own selection where that is largest, not from
 /// the scene around the origin.

@@ -2424,6 +2424,16 @@ mod tests {
     /// `b` -- a riser the mesh lays down with no height (issue #380's
     /// study). Both rows of z are alike.
     fn two_columns(a: [i32; 2], b: [i32; 2]) -> (Mesh, MorphColumns) {
+        two_columns_under(a, b, true, None)
+    }
+
+    /// [`two_columns`], with `a`'s columns morphing or not, under `parent`.
+    fn two_columns_under(
+        a: [i32; 2],
+        b: [i32; 2],
+        a_morphs: bool,
+        parent: Option<ParentFaces>,
+    ) -> (Mesh, MorphColumns) {
         let registry = registry();
         let entry = |c: [i32; 2]| [c[0], c[1], c[0], c[1]];
         let mut columns = Vec::new();
@@ -2431,12 +2441,15 @@ mod tests {
             // x = -1 and x = 2 stand as the column beside them.
             columns.extend([entry(a), entry(a), entry(b), entry(b)]);
         }
+        let morphs = (0..columns.len())
+            .map(|k| a_morphs || k % 4 >= 2)
+            .collect();
         let morph = MorphColumns {
             n: 2,
             level: 1,
-            morphs: vec![true; columns.len()],
+            morphs,
             columns,
-            parent: None,
+            parent,
         };
         let top = |x: i32| if x == 0 { a[0] } else { b[0] };
         let mesh = greedy_mesh_morph(
@@ -2557,6 +2570,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A riser's rows move with its top, one for one** (the colour
+    /// morph): `a` stands at row 2 and its parent at 5, `b` at 1 and still,
+    /// so `a`'s riser toward `b` (row 1) grows from one row to four. Its row
+    /// rises whole, three rows, onto the parent riser's top row -- not
+    /// stretched over all four -- and a latent riser, flat at row 1, opens
+    /// under it to the three rows left at the foot, its texture one tile a
+    /// row at full morph.
+    #[test]
+    fn a_growing_riser_moves_its_rows_whole_and_lays_its_foot() {
+        let (mesh, _) = two_columns([2, 5], [1, 1]);
+        let quads: Vec<&[Vertex]> = mesh.vertices.chunks(4).collect();
+        let riser: Vec<&&[Vertex]> = quads
+            .iter()
+            .filter(|q| q[0].face() == Face::PosX && q[0].x() == 1)
+            .collect();
+        let (latent, rows): (Vec<&[Vertex]>, Vec<&[Vertex]>) =
+            riser.iter().map(|q| **q).partition(|q| q[0].is_latent());
+        assert_eq!(rows.len(), 2, "one per row of z: {rows:?}");
+        for q in rows {
+            assert!(
+                q.iter().all(|v| v.morph_delta() == 3.0),
+                "the row moves whole: {q:?}"
+            );
+        }
+        assert_eq!(latent.len(), 2, "a foot per row of z: {latent:?}");
+        for q in latent {
+            for v in q {
+                assert_eq!(v.y(), 1, "{v:?}");
+                let top = v.morph_delta() == 3.0;
+                assert!(top || v.morph_delta() == 0.0, "{v:?}");
+                assert_eq!(v.v(), if top { 0 } else { 3 }, "one tile a row: {v:?}");
+            }
+        }
+    }
+
+    /// **A face of a morphing column carries what its parent draws where it
+    /// goes** (the colour morph): `a` rises from row 2 to 5 under a parent
+    /// top at 5 in layer 9, dark at its corner (0, 0). `a`'s tops carry
+    /// layer 9 and the parent's openness at their corners at full morph --
+    /// none at (0, 0), half on the parent's diagonal -- while `b`, whose top
+    /// the parent draws nothing over, carries none; and with `a` not
+    /// morphing (a pit beside it, say) neither does `a`.
+    #[test]
+    fn a_morphing_columns_faces_carry_what_the_parent_draws() {
+        let corners = [([0, 5, 0], 0), ([0, 5, 2], 3), ([2, 5, 2], 3), ([2, 5, 0], 3)];
+        let vertices = corners
+            .iter()
+            .map(|&([x, y, z], ao)| Vertex::new(x, y, z, ao, Face::PosY, 9, 0, 0))
+            .collect();
+        let parent_mesh = Mesh {
+            vertices,
+            indices: vec![0, 1, 2, 0, 2, 3],
+            face_indices: [0; 6],
+        };
+        let parent = || ParentFaces::from_mesh(&parent_mesh, [0; 3], [-8; 3], [8; 3]);
+        // Top-face corners at rest row `y`: `a`'s at 2, `b`'s at 1.
+        let tops = |mesh: &Mesh, y: u32| -> Vec<Vertex> {
+            mesh.vertices
+                .iter()
+                .copied()
+                .filter(|v| v.face() == Face::PosY && v.y() == y)
+                .collect()
+        };
+        let (mesh, _) = two_columns_under([2, 5], [1, 1], true, Some(parent()));
+        let a = tops(&mesh, 2);
+        assert!(!a.is_empty());
+        for v in &a {
+            let (layer, open) = v.parent().unwrap_or_else(|| panic!("no parent: {v:?}"));
+            assert_eq!(layer, 9, "{v:?}");
+            if (v.x(), v.z()) == (0, 0) {
+                assert_eq!(open, 0.0, "{v:?}");
+            }
+            if (v.x(), v.z()) == (1, 1) {
+                assert!((open - 0.5).abs() < 0.01, "{v:?}");
+            }
+        }
+        let b = tops(&mesh, 1);
+        assert!(!b.is_empty() && b.iter().all(|v| v.parent().is_none()));
+        let (still, _) = two_columns_under([2, 5], [1, 1], false, Some(parent()));
+        let a = tops(&still, 2);
+        assert!(!a.is_empty() && a.iter().all(|v| v.parent().is_none()));
     }
 
     #[test]

@@ -1410,7 +1410,11 @@ mod tests {
                             if drawn_top == Some(surface + 1) {
                                 at_the_surface += 1;
                             }
-                            if block == blocks.grass {
+                            // Grass, or the floor of a pit under one of its
+                            // columns (`WorldGen::top_block`).
+                            if block == blocks.grass
+                                || world.worldgen.a_pit_under_shows(x, z, step_h, block, blocks)
+                            {
                                 tops_are_grass += 1;
                             }
                         }

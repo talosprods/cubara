@@ -988,6 +988,19 @@ impl WorldGen {
         Some(self.material_at(x, floor, z, surface, blocks))
     }
 
+    /// Whether `block` is what level 0 shows from above one of the columns
+    /// `[x0, x0 + w) x [z0, z0 + w)` that a cave has opened ([`from_above`]):
+    /// the other thing a coarse top may wear besides the surface block.
+    ///
+    /// [`from_above`]: Self::from_above
+    #[cfg(test)]
+    pub(crate) fn a_pit_under_shows(&self, x0: i32, z0: i32, w: i32, block: BlockId, blocks: TerrainBlocks) -> bool {
+        (0..w * w).any(|k| {
+            let (x, z) = (x0 + k % w, z0 + k / w);
+            self.from_above(x, z, self.surface_height(x, z), blocks) == Some(block)
+        })
+    }
+
     /// Whether a cave has carved away the row of `v` blocks from `y` of a
     /// coarse cell whose top is `top` and whose highest column is `peak`:
     /// `columns` its level-0 columns as `(x, z, surface)`.
@@ -2927,7 +2940,9 @@ mod tests {
     /// real column is. Seen from far away, those tops are most of what the
     /// ground is; when a third of them wore soil (the cell's own top block
     /// sits under the surface), the distant fields came out patched with
-    /// brown.
+    /// brown. **Or the floor of a pit under it** (the colour morph,
+    /// [`WorldGen::top_block`]): what level 0 shows from above one of the
+    /// cell's columns that a cave has opened, and nothing else.
     ///
     /// (This also held "and only the top: the cell under it is soil or
     /// stone" until issue #423. That was the bug: on a slope the cells under
@@ -2965,7 +2980,7 @@ mod tests {
                             continue;
                         }
                         tops += 1;
-                        if block != blocks.grass {
+                        if block != blocks.grass && !gen.a_pit_under_shows(x, z, step, block, blocks) {
                             soil += 1;
                         }
                     }
@@ -3000,6 +3015,66 @@ mod tests {
     /// of level 0's faces are soil. Depth below the cell's own top gave
     /// mostly stone here, and the least depth any covered column offers gave
     /// nine tenths surface block; this test is red on both.
+    /// **A coarse top shows a pit's floor in the share its columns are pit**
+    /// (the colour morph, [`WorldGen::top_block`]): over the default seed's
+    /// mountains, at cell widths 4 and 8 (levels 2 and 3, where the zoom
+    /// pairs lost the grey patches), the tops that wear something other
+    /// than the surface block number what the pit share of their cells'
+    /// columns says they should -- within [`PIT_SHARE`] of it. Before the
+    /// rule none did, which is red here.
+    #[test]
+    fn a_coarse_top_shows_pit_floors_in_the_share_level_0_does() {
+        /// Chosen, not derived: the pick is a hash per cell, so the count is
+        /// a sample of the expectation; a few hundred cells land within a
+        /// fifth of it.
+        const PIT_SHARE: f64 = 0.25;
+        let gen = WorldGen::new(DEFAULT_TEST_SEED);
+        let blocks = test_blocks();
+        let (mx, mz): (i32, i32) = (-848, 4832);
+        for (step, v) in [(4, 1), (8, 4)] {
+            let size = 16 * step;
+            let (mut expected, mut shown, mut tops) = (0f64, 0u32, 0u32);
+            let mut nodes = std::collections::BTreeMap::new();
+            for nz in -2..2 {
+                for nx in -2..2 {
+                    let (ox, oz) = (mx.div_euclid(size) * size + nx * size, mz.div_euclid(size) * size + nz * size);
+                    for lz in 0..Chunk::SIZE as i32 {
+                        for lx in 0..Chunk::SIZE as i32 {
+                            let (x0, z0) = (ox + lx * step, oz + lz * step);
+                            let top = gen.cell_surface_height(x0, z0, step);
+                            let oy = top.div_euclid(size) * size;
+                            let node = nodes
+                                .entry((ox, oy, oz))
+                                .or_insert_with(|| gen.generate_aniso([ox, oy, oz], step, v, blocks));
+                            let ly = ((top - oy) / v) as usize;
+                            let block = node.get(lx as usize, ly, lz as usize);
+                            if block == BlockId::AIR {
+                                continue; // the whole cell is pit
+                            }
+                            tops += 1;
+                            let pit = (0..step * step)
+                                .filter(|k| {
+                                    let (x, z) = (x0 + k % step, z0 + k / step);
+                                    gen.from_above(x, z, gen.surface_height(x, z), blocks).is_some()
+                                })
+                                .count();
+                            expected += pit as f64 / (step * step) as f64;
+                            if block != blocks.grass {
+                                shown += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("width {step}: {shown} of {tops} tops show a pit's floor, {expected:.1} expected");
+            assert!(expected > 30.0, "width {step}: too few pits to measure ({expected:.1})");
+            assert!(
+                (shown as f64 - expected).abs() <= PIT_SHARE * expected,
+                "width {step}: {shown} tops show a pit's floor, {expected:.1} expected"
+            );
+        }
+    }
+
     #[test]
     fn a_coarse_riser_is_made_of_level_0s_faces() {
         /// **Chosen, not derived**: a hash picks one face per cell, so the
@@ -3070,7 +3145,9 @@ mod tests {
                             let wears = layer_of(block);
                             let at = format!("step {step} cell ({x0}, {y}, {z0})");
                             if top < y + v {
-                                assert_eq!(wears, GroundLayer::Surface, "{at}: the top cell");
+                                if !gen.a_pit_under_shows(x0, z0, step, block, blocks) {
+                                    assert_eq!(wears, GroundLayer::Surface, "{at}: the top cell");
+                                }
                                 tops += 1;
                                 continue;
                             }
