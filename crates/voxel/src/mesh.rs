@@ -136,8 +136,7 @@ pub const MORPH_DELTA_STEP: f32 = 0.25;
 /// flat and morphed it seals like any riser.
 const LATENT_BIT: u32 = 1 << 31;
 /// The largest morph delta a vertex can carry, in blocks.
-pub const MAX_MORPH_DELTA: f32 =
-    ((1i32 << (MORPH_DELTA_BITS - 1)) - 1) as f32 * MORPH_DELTA_STEP;
+pub const MAX_MORPH_DELTA: f32 = ((1i32 << (MORPH_DELTA_BITS - 1)) - 1) as f32 * MORPH_DELTA_STEP;
 
 /// A single mesh vertex, packed into 12 bytes: node-local lattice position,
 /// baked ambient occlusion, texture-array layer, face direction, this
@@ -425,7 +424,16 @@ mod tests {
             assert_eq!(v.morph_delta(), delta.max(-MAX_MORPH_DELTA));
             assert_eq!(v.is_latent(), level % 2 == 1);
             assert_eq!(
-                (v.x(), v.y(), v.z(), v.ao(), v.face(), v.tex_layer(), v.u(), v.v()),
+                (
+                    v.x(),
+                    v.y(),
+                    v.z(),
+                    v.ao(),
+                    v.face(),
+                    v.tex_layer(),
+                    v.u(),
+                    v.v()
+                ),
                 (1023, 7, 512, 2, Face::NegZ, 4095, 255, 200)
             );
             assert_eq!(
@@ -434,7 +442,11 @@ mod tests {
             );
         }
         assert_eq!(base.with_morph(1, 1000.0).morph_delta(), MAX_MORPH_DELTA);
-        assert_eq!(base.with_morph(1, 0.3).morph_delta(), 0.25, "quarter blocks");
+        assert_eq!(
+            base.with_morph(1, 0.3).morph_delta(),
+            0.25,
+            "quarter blocks"
+        );
         assert_eq!(base.with_y(9).y(), 9);
         assert_eq!(base.with_y(9).z(), 512);
     }

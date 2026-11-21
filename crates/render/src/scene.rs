@@ -590,6 +590,7 @@ impl SceneRenderer {
     /// for the height haze; nothing is cached here -- the frame hands the
     /// anchor it draws against to [`encode_scene`](Self::encode_scene)
     /// explicitly ([`SceneFrame::anchor`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_camera(
         &mut self,
         device: &wgpu::Device,

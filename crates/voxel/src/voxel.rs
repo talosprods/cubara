@@ -154,8 +154,7 @@ impl Morph {
                 if s_top == s_bot {
                     return if y >= s_top { t_top } else { t_bot } as f32;
                 }
-                t_bot as f32
-                    + (y - s_bot) as f32 * (t_top - t_bot) as f32 / (s_top - s_bot) as f32
+                t_bot as f32 + (y - s_bot) as f32 * (t_top - t_bot) as f32 / (s_top - s_bot) as f32
             }
         }
     }
@@ -1457,7 +1456,11 @@ fn push_latent_riser(
 ) {
     // One row, `[l.y - 1, l.y)`, then folded onto its top: in an x slice the
     // rows run along u, in a z slice along v.
-    let (i, j) = if d == 0 { (l.y - 1, l.seg) } else { (l.seg, l.y - 1) };
+    let (i, j) = if d == 0 {
+        (l.y - 1, l.seg)
+    } else {
+        (l.seg, l.y - 1)
+    };
     let start = mesh.vertices.len();
     push_quad(
         mesh,
@@ -2253,7 +2256,9 @@ mod tests {
             .collect();
         assert_eq!(latent.len(), 2, "one per row of z: {latent:?}");
         for q in latent {
-            assert!(q.iter().all(|v| v.is_latent() && v.y() == 2 && v.morph_level() == 1));
+            assert!(q
+                .iter()
+                .all(|v| v.is_latent() && v.y() == 2 && v.morph_level() == 1));
             let mut deltas: Vec<f32> = q.iter().map(|v| v.morph_delta()).collect();
             deltas.sort_by(|p, q| p.partial_cmp(q).unwrap());
             // Its top edge rises to a's parent's top (4); its foot stays at
@@ -2284,9 +2289,16 @@ mod tests {
         assert_eq!(moving.len(), 2, "a's top, one quad per cell: {moving:?}");
         assert_eq!(still.len(), 1, "b's top, merged: {still:?}");
         for q in moving {
-            assert!(q.iter().all(|v| v.morph_delta() == 2.0 && v.x() <= 1), "{q:?}");
+            assert!(
+                q.iter().all(|v| v.morph_delta() == 2.0 && v.x() <= 1),
+                "{q:?}"
+            );
             let z: Vec<u32> = q.iter().map(|v| v.z()).collect();
-            assert_eq!(z.iter().max().unwrap() - z.iter().min().unwrap(), 1, "one cell");
+            assert_eq!(
+                z.iter().max().unwrap() - z.iter().min().unwrap(),
+                1,
+                "one cell"
+            );
         }
         assert!(still[0].iter().all(|v| v.morph_delta() == 0.0));
     }
@@ -2310,7 +2322,10 @@ mod tests {
                             // never under its floor as built.
                             let lowest = if nb_target == nb_top { floor } else { 0 };
                             for tfloor in lowest..=nb_target {
-                                let (own, nb) = ([top, target, top, target], [nb_top, nb_target, floor, tfloor]);
+                                let (own, nb) = (
+                                    [top, target, top, target],
+                                    [nb_top, nb_target, floor, tfloor],
+                                );
                                 let Some([s0, s1, t0, t1]) = riser_map(own, nb) else {
                                     continue;
                                 };

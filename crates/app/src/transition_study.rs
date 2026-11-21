@@ -190,7 +190,11 @@ pub fn edge_swaps(
     let slot = |level: u32| EDGES.iter().position(|&l| l == level);
     for &n in before.difference(after) {
         let Some(e) = slot(n.level) else { continue };
-        let children: Vec<NodeKey> = n.children().into_iter().filter(|c| after.contains(c)).collect();
+        let children: Vec<NodeKey> = n
+            .children()
+            .into_iter()
+            .filter(|c| after.contains(c))
+            .collect();
         if !children.is_empty() {
             out[e].0.insert(n);
             out[e].1.extend(children);
@@ -198,8 +202,11 @@ pub fn edge_swaps(
     }
     for &n in after.difference(before) {
         let Some(e) = slot(n.level) else { continue };
-        let children: Vec<NodeKey> =
-            n.children().into_iter().filter(|c| before.contains(c)).collect();
+        let children: Vec<NodeKey> = n
+            .children()
+            .into_iter()
+            .filter(|c| before.contains(c))
+            .collect();
         if !children.is_empty() {
             out[e].1.insert(n);
             out[e].0.extend(children);
@@ -285,7 +292,11 @@ struct Viewer {
 impl Viewer {
     /// Make `want` exactly what is resident.
     fn show(&mut self, scene: &mut Scene, want: &BTreeSet<NodeKey>) {
-        let remove: Vec<_> = self.resident.difference(want).map(|&n| to_node_id(n)).collect();
+        let remove: Vec<_> = self
+            .resident
+            .difference(want)
+            .map(|&n| to_node_id(n))
+            .collect();
         let add: Vec<MeshedNode> = want
             .difference(&self.resident)
             .filter_map(|&n| scene.meshed(n))
@@ -322,7 +333,9 @@ impl Viewer {
                 break;
             }
         }
-        self.renderer.read_frame().expect("an offscreen renderer has a frame")
+        self.renderer
+            .read_frame()
+            .expect("an offscreen renderer has a frame")
     }
 }
 
@@ -354,7 +367,11 @@ fn approach(gen: &WorldGen) -> Approach {
     let frames = (seconds * FPS).round() as usize;
     let step = FLY_SPEED / FPS;
     // `toward_peak` starts 900 blocks out, level with the summit (+3).
-    let peak = [start[0] + look[0] * 900.0, start[1] - 3.0, start[2] + look[2] * 900.0];
+    let peak = [
+        start[0] + look[0] * 900.0,
+        start[1] - 3.0,
+        start[2] + look[2] * 900.0,
+    ];
     let eyes: Vec<[f32; 3]> = (0..=frames)
         .map(|i| {
             let t = i as f32 * step;
@@ -401,13 +418,24 @@ impl EdgeTally {
         self.frames.iter().map(|(_, c)| c.luminance).sum()
     }
     fn max_step(&self) -> i32 {
-        self.frames.iter().map(|(_, c)| c.max_step).max().unwrap_or(0)
+        self.frames
+            .iter()
+            .map(|(_, c)| c.max_step)
+            .max()
+            .unwrap_or(0)
     }
     fn max_silhouette(&self) -> u32 {
-        self.frames.iter().map(|(_, c)| c.silhouette).max().unwrap_or(0)
+        self.frames
+            .iter()
+            .map(|(_, c)| c.silhouette)
+            .max()
+            .unwrap_or(0)
     }
     fn max_luminance(&self) -> f64 {
-        self.frames.iter().map(|(_, c)| c.luminance).fold(0.0, f64::max)
+        self.frames
+            .iter()
+            .map(|(_, c)| c.luminance)
+            .fold(0.0, f64::max)
     }
     fn frames_over_tolerance(&self) -> usize {
         self.frames.iter().filter(|(_, c)| c.changed > 0).count()
@@ -625,11 +653,15 @@ fn save(path: &Path, frame: &Frame) {
 
 /// `after` with every pixel that changed from `before` painted: red where the
 /// luminance moved by more than the tolerance, yellow where land and nothing
+#[allow(clippy::chunks_exact_to_as_chunks)] // the index also addresses `before`/`after`
 /// traded places, the rest dimmed.
 fn diff_image(before: &Frame, after: &Frame) -> Frame {
     let mut out = after.clone();
     for (i, px) in out.pixels.chunks_exact_mut(4).enumerate() {
-        let (pb, pa) = (&before.pixels[i * 4..i * 4 + 4], &after.pixels[i * 4..i * 4 + 4]);
+        let (pb, pa) = (
+            &before.pixels[i * 4..i * 4 + 4],
+            &after.pixels[i * 4..i * 4 + 4],
+        );
         let flip = nothing(pb) != nothing(pa);
         let step = (luminance(pa) - luminance(pb)).abs();
         if flip {
@@ -673,9 +705,14 @@ fn height_steps(
             if f < o[1] || f >= o[1] + extent {
                 continue;
             }
-            let c = snapshot.cell_surface_height(cx.div_euclid(wc) * wc, cz.div_euclid(wc) * wc, wc);
+            let c =
+                snapshot.cell_surface_height(cx.div_euclid(wc) * wc, cz.div_euclid(wc) * wc, wc);
             let d = f - c;
-            let centre = [cx as f32 + wf as f32 * 0.5, f as f32 + 1.0, cz as f32 + wf as f32 * 0.5];
+            let centre = [
+                cx as f32 + wf as f32 * 0.5,
+                f as f32 + 1.0,
+                cz as f32 + wf as f32 * 0.5,
+            ];
             let dist = ((centre[0] - eye[0]).powi(2)
                 + (centre[1] - eye[1]).powi(2)
                 + (centre[2] - eye[2]).powi(2))
@@ -686,7 +723,9 @@ fn height_steps(
             any = true;
             max_d = max_d.max(a);
             swap = swap.max(px(a as f32));
-            r6 = r6.max(px((a - delta).max(0) as f32 + a.min(delta) as f32 / HALF_FADE_FRAMES));
+            r6 = r6.max(px(
+                (a - delta).max(0) as f32 + a.min(delta) as f32 / HALF_FADE_FRAMES
+            ));
             if let Some(b) = band {
                 // The morph moves `d` over `b` blocks of the metric, at the
                 // flight's 0.4 blocks a frame; at the band, about as far out
@@ -856,7 +895,11 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
             .filter_map(|(_, n, eye)| height_steps(&scene.snapshot, *n, *eye, band))
             .collect();
         if rows.is_empty() {
-            let _ = writeln!(s, "| {} | 0 | -- | -- | -- | -- |", edge_name(level, schedule));
+            let _ = writeln!(
+                s,
+                "| {} | 0 | -- | -- | -- | -- |",
+                edge_name(level, schedule)
+            );
             continue;
         }
         let pct = |v: &mut Vec<f32>, q: f32| -> f32 {
@@ -900,20 +943,35 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
         if let Some((i, _, b, a)) = &swap.kept[k] {
             save(&dir.join(format!("{tag}_swap_f{i:04}_before.png")), b);
             save(&dir.join(format!("{tag}_swap_f{i:04}_after.png")), a);
-            save(&dir.join(format!("{tag}_swap_f{i:04}_diff.png")), &diff_image(b, a));
+            save(
+                &dir.join(format!("{tag}_swap_f{i:04}_diff.png")),
+                &diff_image(b, a),
+            );
         }
         if let Some((i, _, b, a)) = &morph.kept[k] {
             save(&dir.join(format!("{tag}_morph_f{i:04}_before.png")), b);
             save(&dir.join(format!("{tag}_morph_f{i:04}_after.png")), a);
-            save(&dir.join(format!("{tag}_morph_f{i:04}_diff.png")), &diff_image(b, a));
+            save(
+                &dir.join(format!("{tag}_morph_f{i:04}_diff.png")),
+                &diff_image(b, a),
+            );
         }
     }
     for (k, i, b, a) in &morph.focused {
         let tag = format!("edge{}{}", EDGES[*k] - 1, EDGES[*k]);
         let c = change(b, a);
-        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_before.png")), b);
-        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_after.png")), a);
-        save(&dir.join(format!("{tag}_morph_at_swap_f{i:04}_diff.png")), &diff_image(b, a));
+        save(
+            &dir.join(format!("{tag}_morph_at_swap_f{i:04}_before.png")),
+            b,
+        );
+        save(
+            &dir.join(format!("{tag}_morph_at_swap_f{i:04}_after.png")),
+            a,
+        );
+        save(
+            &dir.join(format!("{tag}_morph_at_swap_f{i:04}_diff.png")),
+            &diff_image(b, a),
+        );
         let _ = writeln!(
             s,
             "\nmorph at the swap's worst frame, edge {}: frame {i}, {} pixels over the tolerance ({} land<->nothing), largest step {}",
@@ -935,12 +993,7 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
                 let _ = writeln!(
                     csv,
                     "{i},{},{label},{},{},{:.2},{},{}",
-                    level,
-                    c.changed,
-                    c.flips,
-                    c.luminance,
-                    c.max_step,
-                    c.silhouette
+                    level, c.changed, c.flips, c.luminance, c.max_step, c.silhouette
                 );
             }
         }
@@ -1040,7 +1093,10 @@ mod tests {
         let aspect = SIZE.0 as f32 / SIZE.1 as f32;
         let vp = CameraUniform::look_view_proj(aspect, eye, glam::Vec3::from(look).normalize());
         let inv = vp.inverse();
-        let ndc = glam::vec2((px + 0.5) / SIZE.0 as f32 * 2.0 - 1.0, 1.0 - (py + 0.5) / SIZE.1 as f32 * 2.0);
+        let ndc = glam::vec2(
+            (px + 0.5) / SIZE.0 as f32 * 2.0 - 1.0,
+            1.0 - (py + 0.5) / SIZE.1 as f32 * 2.0,
+        );
         let far = inv * glam::vec4(ndc.x, ndc.y, 0.5, 1.0);
         let dir = (far.truncate() / far.w - eye).normalize();
         let mut hit = None;
@@ -1057,7 +1113,11 @@ mod tests {
         println!("eye {eye:?} dir {dir:?}: level 0's ground at {hit:?}, {d:.1} blocks out");
         let schedule = DEFAULT_RING_SCHEDULE;
         let bands = morph_bands(schedule, VERTICAL_LOD_SQUASH);
-        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye.to_array()), VERTICAL_LOD_SQUASH, schedule);
+        let nodes = desired_nodes_3d(
+            ChunkCoord::from_world_pos(eye.to_array()),
+            VERTICAL_LOD_SQUASH,
+            schedule,
+        );
         let registry = cubara_render::load_registry();
         let blocks = TerrainBlocks::from_registry(&registry)
             .with_oak(&crate::game::load_structure_registry(), &registry)
@@ -1084,7 +1144,13 @@ mod tests {
                             let (x, z) = (cx + dx, cz + dz);
                             if (-1..=16).contains(&x) && (-1..=16).contains(&z) {
                                 let [t, g, f, tf] = c.at(x, z);
-                                format!("({x},{z}) top {} target {} floor {} tfloor {}", t + o[1], g + o[1], f + o[1], tf + o[1])
+                                format!(
+                                    "({x},{z}) top {} target {} floor {} tfloor {}",
+                                    t + o[1],
+                                    g + o[1],
+                                    f + o[1],
+                                    tf + o[1]
+                                )
                             } else {
                                 "--".to_string()
                             }
@@ -1093,7 +1159,8 @@ mod tests {
                     println!("  columns: {}", row.join(" | "));
                 }
             }
-            let Some(g) = cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks) else {
+            let Some(g) = cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks)
+            else {
                 println!("  (nothing drawn)");
                 continue;
             };
@@ -1101,7 +1168,13 @@ mod tests {
             for q in g.mesh.vertices.chunks(4) {
                 let w: Vec<[f32; 3]> = q
                     .iter()
-                    .map(|v| [o[0] as f32 + v.x() as f32, o[1] as f32 + v.y() as f32, o[2] as f32 + v.z() as f32])
+                    .map(|v| {
+                        [
+                            o[0] as f32 + v.x() as f32,
+                            o[1] as f32 + v.y() as f32,
+                            o[2] as f32 + v.z() as f32,
+                        ]
+                    })
                     .collect();
                 // The quad's extent comes within 1.5 blocks of the hit.
                 let lo = |k: usize| w.iter().map(|p| p[k]).fold(f32::MAX, f32::min);
@@ -1118,11 +1191,19 @@ mod tests {
                     .zip(&w)
                     .map(|(v, p)| {
                         let f = band.map_or(0.0, |b| {
-                            morph_factor(morph_metric([p[0] - eye.x, p[1] - eye.y, p[2] - eye.z], VERTICAL_LOD_SQUASH), b)
+                            morph_factor(
+                                morph_metric(
+                                    [p[0] - eye.x, p[1] - eye.y, p[2] - eye.z],
+                                    VERTICAL_LOD_SQUASH,
+                                ),
+                                b,
+                            )
                         });
                         format!(
                             "({},{},{}){}{:+}*{f:.3}={:.3}",
-                            p[0], p[1], p[2],
+                            p[0],
+                            p[1],
+                            p[2],
                             if v.is_latent() { "L" } else { "" },
                             v.morph_delta(),
                             p[1] + v.morph_delta() * f
@@ -1164,80 +1245,103 @@ mod tests {
         let layer = |_: &str| 0u32;
         let schedule = DEFAULT_RING_SCHEDULE;
         let bands = morph_bands(schedule, VERTICAL_LOD_SQUASH);
-        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye.to_array()), VERTICAL_LOD_SQUASH, schedule);
+        let nodes = desired_nodes_3d(
+            ChunkCoord::from_world_pos(eye.to_array()),
+            VERTICAL_LOD_SQUASH,
+            schedule,
+        );
         // Triangles of one node, world space, morphed by `morph` (0 or 1 as
         // a switch), each tagged with its quad's description.
         let mut cache: HashMap<NodeKey, Option<cubara_world::mesh::NodeGeometry>> = HashMap::new();
-        let ray_hits = |dir: glam::Vec3, morph: bool, cache: &mut HashMap<NodeKey, Option<cubara_world::mesh::NodeGeometry>>| {
-            let mut best: Option<(f32, NodeKey, usize)> = None;
-            for n in &nodes {
-                let o = n.world_origin();
-                let size = 16.0 * n.extent_chunks() as f32;
-                let (lo, hi) = (
-                    glam::vec3(o[0] as f32, o[1] as f32 - 40.0, o[2] as f32),
-                    glam::vec3(o[0] as f32 + size, o[1] as f32 + size + 40.0, o[2] as f32 + size),
-                );
-                // Slab test.
-                let (mut t0, mut t1) = (0.0f32, 3000.0f32);
-                for k in 0..3 {
-                    let inv_d = 1.0 / dir[k];
-                    let (a, b) = ((lo[k] - eye[k]) * inv_d, (hi[k] - eye[k]) * inv_d);
-                    t0 = t0.max(a.min(b));
-                    t1 = t1.min(a.max(b));
-                }
-                if t0 > t1 {
-                    continue;
-                }
-                let g = cache
-                    .entry(*n)
-                    .or_insert_with(|| cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks));
-                let Some(g) = g else { continue };
-                let band = bands[n.level as usize];
-                let pos = |i: u32| {
-                    let v = g.mesh.vertices[i as usize];
-                    let mut p = glam::vec3(
-                        g.origin[0] as f32 + v.x() as f32,
-                        g.origin[1] as f32 + v.y() as f32,
-                        g.origin[2] as f32 + v.z() as f32,
+        let ray_hits =
+            |dir: glam::Vec3,
+             morph: bool,
+             cache: &mut HashMap<NodeKey, Option<cubara_world::mesh::NodeGeometry>>| {
+                let mut best: Option<(f32, NodeKey, usize)> = None;
+                for n in &nodes {
+                    let o = n.world_origin();
+                    let size = 16.0 * n.extent_chunks() as f32;
+                    let (lo, hi) = (
+                        glam::vec3(o[0] as f32, o[1] as f32 - 40.0, o[2] as f32),
+                        glam::vec3(
+                            o[0] as f32 + size,
+                            o[1] as f32 + size + 40.0,
+                            o[2] as f32 + size,
+                        ),
                     );
-                    if morph {
-                        let f = band.map_or(0.0, |b| {
-                            morph_factor(morph_metric((p - eye).to_array(), VERTICAL_LOD_SQUASH), b)
-                        });
-                        p.y += v.morph_delta() * f;
+                    // Slab test.
+                    let (mut t0, mut t1) = (0.0f32, 3000.0f32);
+                    for k in 0..3 {
+                        let inv_d = 1.0 / dir[k];
+                        let (a, b) = ((lo[k] - eye[k]) * inv_d, (hi[k] - eye[k]) * inv_d);
+                        t0 = t0.max(a.min(b));
+                        t1 = t1.min(a.max(b));
                     }
-                    p
-                };
-                for (k, tri) in g.mesh.indices.chunks(3).enumerate() {
-                    let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
-                    // Moller-Trumbore, both sides.
-                    let (e1, e2) = (b - a, c - a);
-                    let h = dir.cross(e2);
-                    let det = e1.dot(h);
-                    if det.abs() < 1e-9 {
+                    if t0 > t1 {
                         continue;
                     }
-                    let inv_det = 1.0 / det;
-                    let s0 = eye - a;
-                    let u = s0.dot(h) * inv_det;
-                    if !(0.0..=1.0).contains(&u) {
-                        continue;
-                    }
-                    let q = s0.cross(e1);
-                    let v = dir.dot(q) * inv_det;
-                    if v < 0.0 || u + v > 1.0 {
-                        continue;
-                    }
-                    let t = e2.dot(q) * inv_det;
-                    if t > 0.1 && best.is_none_or(|(bt, _, _)| t < bt) {
-                        best = Some((t, *n, k));
+                    let g = cache.entry(*n).or_insert_with(|| {
+                        cubara_world::mesh::mesh_node(&snapshot, &registry, &layer, *n, blocks)
+                    });
+                    let Some(g) = g else { continue };
+                    let band = bands[n.level as usize];
+                    let pos = |i: u32| {
+                        let v = g.mesh.vertices[i as usize];
+                        let mut p = glam::vec3(
+                            g.origin[0] as f32 + v.x() as f32,
+                            g.origin[1] as f32 + v.y() as f32,
+                            g.origin[2] as f32 + v.z() as f32,
+                        );
+                        if morph {
+                            let f = band.map_or(0.0, |b| {
+                                morph_factor(
+                                    morph_metric((p - eye).to_array(), VERTICAL_LOD_SQUASH),
+                                    b,
+                                )
+                            });
+                            p.y += v.morph_delta() * f;
+                        }
+                        p
+                    };
+                    for (k, tri) in g.mesh.indices.chunks(3).enumerate() {
+                        let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+                        // Moller-Trumbore, both sides.
+                        let (e1, e2) = (b - a, c - a);
+                        let h = dir.cross(e2);
+                        let det = e1.dot(h);
+                        if det.abs() < 1e-9 {
+                            continue;
+                        }
+                        let inv_det = 1.0 / det;
+                        let s0 = eye - a;
+                        let u = s0.dot(h) * inv_det;
+                        if !(0.0..=1.0).contains(&u) {
+                            continue;
+                        }
+                        let q = s0.cross(e1);
+                        let v = dir.dot(q) * inv_det;
+                        if v < 0.0 || u + v > 1.0 {
+                            continue;
+                        }
+                        let t = e2.dot(q) * inv_det;
+                        if t > 0.1 && best.is_none_or(|(bt, _, _)| t < bt) {
+                            best = Some((t, *n, k));
+                        }
                     }
                 }
-            }
-            best
-        };
-        for (sx, sy) in [(0.5f32, 0.5f32), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
-            let ndc = glam::vec2((px + sx) / SIZE.0 as f32 * 2.0 - 1.0, 1.0 - (py + sy) / SIZE.1 as f32 * 2.0);
+                best
+            };
+        for (sx, sy) in [
+            (0.5f32, 0.5f32),
+            (0.25, 0.25),
+            (0.75, 0.25),
+            (0.25, 0.75),
+            (0.75, 0.75),
+        ] {
+            let ndc = glam::vec2(
+                (px + sx) / SIZE.0 as f32 * 2.0 - 1.0,
+                1.0 - (py + sy) / SIZE.1 as f32 * 2.0,
+            );
             let far = inv * glam::vec4(ndc.x, ndc.y, 0.5, 1.0);
             let dir = (far.truncate() / far.w - eye).normalize();
             let fixed = ray_hits(dir, false, &mut cache);
@@ -1255,14 +1359,22 @@ mod tests {
             let Some((t, _, _)) = fixed else { continue };
             let hit = eye + dir * t;
             for n in &nodes {
-                let Some(Some(g)) = cache.get(n) else { continue };
+                let Some(Some(g)) = cache.get(n) else {
+                    continue;
+                };
                 let o = g.origin;
                 let band = bands[n.level as usize];
                 let mut lines = Vec::new();
                 for q in g.mesh.vertices.chunks(4) {
                     let w: Vec<glam::Vec3> = q
                         .iter()
-                        .map(|v| glam::vec3(o[0] as f32 + v.x() as f32, o[1] as f32 + v.y() as f32, o[2] as f32 + v.z() as f32))
+                        .map(|v| {
+                            glam::vec3(
+                                o[0] as f32 + v.x() as f32,
+                                o[1] as f32 + v.y() as f32,
+                                o[2] as f32 + v.z() as f32,
+                            )
+                        })
                         .collect();
                     let lo = w.iter().fold(glam::Vec3::splat(f32::MAX), |a, b| a.min(*b));
                     let hi = w.iter().fold(glam::Vec3::splat(f32::MIN), |a, b| a.max(*b));
@@ -1275,9 +1387,20 @@ mod tests {
                         .zip(&w)
                         .map(|(v, p)| {
                             let f = band.map_or(0.0, |b| {
-                                morph_factor(morph_metric((*p - eye).to_array(), VERTICAL_LOD_SQUASH), b)
+                                morph_factor(
+                                    morph_metric((*p - eye).to_array(), VERTICAL_LOD_SQUASH),
+                                    b,
+                                )
                             });
-                            format!("({},{},{}){}{:+}->{:.2}", p.x, p.y, p.z, if v.is_latent() { "L" } else { "" }, v.morph_delta(), p.y + v.morph_delta() * f)
+                            format!(
+                                "({},{},{}){}{:+}->{:.2}",
+                                p.x,
+                                p.y,
+                                p.z,
+                                if v.is_latent() { "L" } else { "" },
+                                v.morph_delta(),
+                                p.y + v.morph_delta() * f
+                            )
                         })
                         .collect();
                     lines.push(format!("    {:?} {}", q[0].face(), desc.join(" ")));
@@ -1288,13 +1411,22 @@ mod tests {
                 println!("  node {n:?} origin {:?}", n.world_origin());
                 if let Some(c) = cubara_world::morph::node_columns(&snapshot, *n, blocks) {
                     let w = 1 << n.level;
-                    let (cx, cz) = ((hit.x as i32 - o[0]).div_euclid(w), (hit.z.round() as i32 - o[2]).div_euclid(w));
+                    let (cx, cz) = (
+                        (hit.x as i32 - o[0]).div_euclid(w),
+                        (hit.z.round() as i32 - o[2]).div_euclid(w),
+                    );
                     for dz in -1..=0 {
                         for dx in -1..=1 {
                             let (x, z) = (cx + dx, cz + dz);
                             if (-1..=16).contains(&x) && (-1..=16).contains(&z) {
                                 let [tp, tg, fl, tf] = c.at(x, z);
-                                println!("    column ({x},{z}) top {} target {} floor {} tfloor {}", tp + o[1], tg + o[1], fl + o[1], tf + o[1]);
+                                println!(
+                                    "    column ({x},{z}) top {} target {} floor {} tfloor {}",
+                                    tp + o[1],
+                                    tg + o[1],
+                                    fl + o[1],
+                                    tf + o[1]
+                                );
                             }
                         }
                     }

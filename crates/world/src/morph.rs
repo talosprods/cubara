@@ -109,7 +109,9 @@ pub fn morph_bands(schedule: &RingSchedule, squash: i32) -> [Option<MorphBand>; 
 /// continuous -- horizontal distance, or `squash` times the vertical one,
 /// whichever is larger.
 pub fn morph_metric(rel: [f32; 3], squash: i32) -> f32 {
-    rel[0].hypot(rel[2]).max(squash.max(1) as f32 * rel[1].abs())
+    rel[0]
+        .hypot(rel[2])
+        .max(squash.max(1) as f32 * rel[1].abs())
 }
 
 /// How far a vertex at metric `metric` has moved to its parent's height: 0
@@ -191,9 +193,8 @@ pub fn node_columns(
             };
         }
     }
-    let morphs = |cx: i32, cz: i32| {
-        (-1..=1).all(|dz| (-1..=1).all(|dx| pure[at(cx + dx, cz + dz)]))
-    };
+    let morphs =
+        |cx: i32, cz: i32| (-1..=1).all(|dz| (-1..=1).all(|dx| pure[at(cx + dx, cz + dz)]));
 
     let row = |y_top_block: i32| y_top_block + 1 - oy;
     let mut columns = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
@@ -231,11 +232,7 @@ pub fn node_columns(
             columns.push([row(top), row(target), row(floor), row(target_floor)]);
         }
     }
-    Some(MorphColumns {
-        n,
-        level,
-        columns,
-    })
+    Some(MorphColumns { n, level, columns })
 }
 
 #[cfg(test)]
@@ -292,7 +289,11 @@ mod tests {
                 let y = snapshot.surface_height(x, z);
                 nodes.push(NodeKey::new(
                     level,
-                    [x.div_euclid(extent), y.div_euclid(extent), z.div_euclid(extent)],
+                    [
+                        x.div_euclid(extent),
+                        y.div_euclid(extent),
+                        z.div_euclid(extent),
+                    ],
                 ));
             }
         }
@@ -332,11 +333,11 @@ mod tests {
                 let columns = node_columns(&snapshot, node, blocks).expect("a morphing level");
                 let chunk = snapshot.node_at(node, blocks).expect("a drawn node");
                 let ny = 16 * w; // rows of one block
-                // Whether column (cx, cz) is drawn as the height field says
-                // over rows `from..to`: solid under `top`, air from it -- no
-                // cave or pit there (a tree's leaves above `to` are not
-                // asked). The closure is held on that ground; where a column
-                // is not, the morph must leave it still (below).
+                                 // Whether column (cx, cz) is drawn as the height field says
+                                 // over rows `from..to`: solid under `top`, air from it -- no
+                                 // cave or pit there (a tree's leaves above `to` are not
+                                 // asked). The closure is held on that ground; where a column
+                                 // is not, the morph must leave it still (below).
                 let height_field = |cx: i32, cz: i32, from: i32, top: i32, to: i32| {
                     (from.max(0)..to.min(ny)).all(|y| {
                         let solid = chunk.drawn(cx as usize, y as usize, cz as usize)
@@ -358,12 +359,15 @@ mod tests {
                             let [top, target, _, _] = columns.at(cx, cz);
                             // Tops: one face over the column's square, at
                             // the morphed top.
-                            if (1..=ny).contains(&top) && height_field(cx, cz, top - 1, top, top + 1) {
+                            if (1..=ny).contains(&top)
+                                && height_field(cx, cz, top - 1, top, top + 1)
+                            {
                                 let (x0, z0) = (cx * w, cz * w);
                                 let found = quads.iter().any(|q| {
                                     q[0].face() == cubara_voxel::Face::PosY
                                         && q[0].y() as i32 == top
-                                        && q.iter().all(|v| (y(*v) - lerp(top, target)).abs() < 1e-3)
+                                        && q.iter()
+                                            .all(|v| (y(*v) - lerp(top, target)).abs() < 1e-3)
                                         && q.iter().map(|v| v.x() as i32).min() <= Some(x0)
                                         && q.iter().map(|v| v.x() as i32).max() >= Some(x0 + w)
                                         && q.iter().map(|v| v.z() as i32).min() <= Some(z0)
@@ -390,7 +394,8 @@ mod tests {
                                     continue;
                                 }
                                 // The higher one's riser, facing the lower.
-                                let (high, low, sign) = if ta > tb { (a, b, 1) } else { (b, a, -1) };
+                                let (high, low, sign) =
+                                    if ta > tb { (a, b, 1) } else { (b, a, -1) };
                                 let span = [high[0], high[1], low[0], low[1]];
                                 if span.iter().any(|&r| !(1..=ny).contains(&r)) {
                                     continue; // crosses into the node above or below
@@ -440,7 +445,10 @@ mod tests {
                                     })
                                     .map(|q| {
                                         let ys = q.iter().map(|v| y(*v));
-                                        (ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max))
+                                        (
+                                            ys.clone().fold(f32::MAX, f32::min),
+                                            ys.fold(f32::MIN, f32::max),
+                                        )
                                     })
                                     .collect();
                                 cover.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap());
@@ -464,7 +472,10 @@ mod tests {
             }
         }
         eprintln!("checked {tops} tops and {risers} risers; {skipped} pairs not a height field");
-        assert!(tops > 1000 && risers > 1000, "checked {tops} tops and {risers} risers");
+        assert!(
+            tops > 1000 && risers > 1000,
+            "checked {tops} tops and {risers} risers"
+        );
         assert!(skipped * 10 < risers, "{skipped} pairs skipped of {risers}");
     }
 
@@ -472,12 +483,30 @@ mod tests {
     fn the_default_schedule_has_a_band_for_levels_0_to_2_and_none_for_3() {
         let bands = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH);
         // 160 m edge: ends 32 before it, 64 wide (the cap).
-        assert_eq!(bands[0], Some(MorphBand { start: 64.0, end: 128.0 }));
+        assert_eq!(
+            bands[0],
+            Some(MorphBand {
+                start: 64.0,
+                end: 128.0
+            })
+        );
         // 288 m edge: the ring leaves 32 blocks between the inner reach of a
         // level-1 node (160 + 64) and the outer margin (288 - 32).
-        assert_eq!(bands[1], Some(MorphBand { start: 224.0, end: 256.0 }));
+        assert_eq!(
+            bands[1],
+            Some(MorphBand {
+                start: 224.0,
+                end: 256.0
+            })
+        );
         // 512 m edge: 288 + 128 to 512 - 32.
-        assert_eq!(bands[2], Some(MorphBand { start: 416.0, end: 480.0 }));
+        assert_eq!(
+            bands[2],
+            Some(MorphBand {
+                start: 416.0,
+                end: 480.0
+            })
+        );
         assert_eq!(bands[3], None, "level 3 meets the far terrain");
     }
 
@@ -488,14 +517,23 @@ mod tests {
         // and the band must end 2 chunks before its outer one.
         let half = [(0u32, 5i32), (1, 9), (2, 16), (3, 32)];
         let bands = morph_bands(&half, SQUASH);
-        assert_eq!(bands[0], Some(MorphBand { start: 0.0, end: 48.0 }));
+        assert_eq!(
+            bands[0],
+            Some(MorphBand {
+                start: 0.0,
+                end: 48.0
+            })
+        );
         assert_eq!(bands[1], None);
         assert_eq!(bands[2], None);
     }
 
     #[test]
     fn the_factor_is_zero_before_the_band_one_after_and_linear_in_it() {
-        let b = MorphBand { start: 100.0, end: 140.0 };
+        let b = MorphBand {
+            start: 100.0,
+            end: 140.0,
+        };
         assert_eq!(morph_factor(0.0, b), 0.0);
         assert_eq!(morph_factor(100.0, b), 0.0);
         assert_eq!(morph_factor(110.0, b), 0.25);
@@ -638,10 +676,13 @@ mod tests {
         let bands = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH);
         let mut checked = 0;
         for eye in eyes(40) {
-            let nodes: std::collections::HashSet<NodeKey> =
-                desired_nodes_3d(ChunkCoord::from_world_pos(eye), SQUASH, DEFAULT_RING_SCHEDULE)
-                    .into_iter()
-                    .collect();
+            let nodes: std::collections::HashSet<NodeKey> = desired_nodes_3d(
+                ChunkCoord::from_world_pos(eye),
+                SQUASH,
+                DEFAULT_RING_SCHEDULE,
+            )
+            .into_iter()
+            .collect();
             for &n in &nodes {
                 let Some(band) = bands[n.level as usize] else {
                     continue;
@@ -711,7 +752,8 @@ mod tests {
                             let lerp = |s: i32, t: i32| s as f32 + (t - s) as f32 * f;
                             let (ta, tb) = (lerp(a[0], a[1]), lerp(b[0], b[1]));
                             let span = |own: [i32; 4], nb: [i32; 4]| {
-                                riser_map(own, nb).map(|[s0, s1, t0, t1]| (lerp(s0, t0), lerp(s1, t1)))
+                                riser_map(own, nb)
+                                    .map(|[s0, s1, t0, t1]| (lerp(s0, t0), lerp(s1, t1)))
                             };
                             let (lo, hi) = (ta.min(tb), ta.max(tb));
                             if hi - lo < 1e-4 {
@@ -758,7 +800,8 @@ mod tests {
                 else {
                     continue;
                 };
-                let quads: Vec<&[cubara_voxel::Vertex]> = geometry.mesh.vertices.chunks(4).collect();
+                let quads: Vec<&[cubara_voxel::Vertex]> =
+                    geometry.mesh.vertices.chunks(4).collect();
                 // Horizontal edges of quads that move, by height: (y, a, b)
                 // with a and b the (x, z) ends.
                 let mut edges: std::collections::HashMap<u32, Vec<([u32; 2], [u32; 2])>> =
@@ -831,7 +874,11 @@ mod tests {
                 (v.len() == 3).then(|| [v[0], v[1], v[2]])
             })
             .unwrap_or([8.0, 40.0, 8.0]);
-        let nodes = desired_nodes_3d(ChunkCoord::from_world_pos(eye), SQUASH, DEFAULT_RING_SCHEDULE);
+        let nodes = desired_nodes_3d(
+            ChunkCoord::from_world_pos(eye),
+            SQUASH,
+            DEFAULT_RING_SCHEDULE,
+        );
         // Per level: [triangles, vertices] without and with the morph, latent
         // quads, quads that move, the largest delta, nodes, milliseconds.
         let mut rows = [[0u64; 9]; 4];
@@ -839,10 +886,12 @@ mod tests {
         for &node in &nodes {
             let l = node.level as usize;
             let start = std::time::Instant::now();
-            let plain = crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, false);
+            let plain =
+                crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, false);
             let t_plain = start.elapsed();
             let start = std::time::Instant::now();
-            let morphed = crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, true);
+            let morphed =
+                crate::mesh::mesh_node_with(&snapshot, &registry, &layer, node, blocks, true);
             let t_morph = start.elapsed();
             rows[l][7] += t_plain.as_micros() as u64;
             rows[l][8] += t_morph.as_micros() as u64;
@@ -867,7 +916,10 @@ mod tests {
                 }
             }
         }
-        println!("morph cost census around {eye:?}: {} nodes, radius 64, squash {SQUASH}", nodes.len());
+        println!(
+            "morph cost census around {eye:?}: {} nodes, radius 64, squash {SQUASH}",
+            nodes.len()
+        );
         println!("| level | nodes | triangles, plain | triangles, morph | change | vertices, plain | vertices, morph | change | latent quads | quads that move | mesh ms plain / morph |");
         println!("|---|---|---|---|---|---|---|---|---|---|---|");
         let mut total = [0u64; 4];
@@ -881,20 +933,38 @@ mod tests {
             let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
             println!(
                 "| {l} | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | {} | {} | {:.0} / {:.0} |",
-                r[6], r[0], r[2], pct(r[0], r[2]), r[1], r[3], pct(r[1], r[3]), r[4], r[5],
-                r[7] as f64 / 1000.0, r[8] as f64 / 1000.0
+                r[6],
+                r[0],
+                r[2],
+                pct(r[0], r[2]),
+                r[1],
+                r[3],
+                pct(r[1], r[3]),
+                r[4],
+                r[5],
+                r[7] as f64 / 1000.0,
+                r[8] as f64 / 1000.0
             );
         }
         let pct = |a: u64, b: u64| 100.0 * (b as f64 - a as f64) / (a.max(1) as f64);
         println!(
             "| all | {} | {} | {} | {:+.1}% | {} | {} | {:+.1}% | | | |",
-            nodes.len(), total[0], total[2], pct(total[0], total[2]), total[1], total[3], pct(total[1], total[3])
+            nodes.len(),
+            total[0],
+            total[2],
+            pct(total[0], total[2]),
+            total[1],
+            total[3],
+            pct(total[1], total[3])
         );
         println!(
             "largest delta a vertex carries: {largest} blocks (the format holds {})",
             cubara_voxel::MAX_MORPH_DELTA
         );
-        assert!(largest < cubara_voxel::MAX_MORPH_DELTA, "a delta was clamped");
+        assert!(
+            largest < cubara_voxel::MAX_MORPH_DELTA,
+            "a delta was clamped"
+        );
     }
 
     #[test]
