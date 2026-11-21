@@ -1188,17 +1188,90 @@ smooth surface shared one vertex among four quads. Vertices are reused only with
 some 64 of the index stream (measured: the second triangle of each face
 pointed 16 faces back costs next to nothing, 32 faces back half again).
 
-What follows from that, none of it built here:
+**Shared corners, built** (the first lever below, 2026-11-21). A quad is four
+vertices, the corners of its top at its height, and every face of the patch
+is drawn from them by one fixed index list for all patches (`far::
+patch_indices`): the top is its quad's four, the riser between two
+neighbouring quads is the two corners each has on the line between them, the
+wall on a patch's edge is its quad's two corners and two vertices under them
+(`FAR_PATCH_VERTICES` = 4,096 + 256 a patch). One draw for all patches in
+view, no size classes, no padding, no direction culling (the rasteriser culls
+what faces away, after the vertices it shares with what does not).
 
-- **Shared corners.** A top's four corners are also the upper edge of its
-  walls, and a wall's lower edge is the next quad's corners: four vertices a
-  quad for every face of it, in one fixed index list for every patch (one
-  draw, no classes, no padding), each face's colour carried flat from a
-  corner of its own. Prototyped with a trivial shader at the same patches:
-  the vertex part goes from 0.84 to 0.51 ms, which with the rasteriser's
-  share is about 790 FPS at the ground eye and 715 at the hill eye where the
-  blocks as built measure 636 and 577 -- 1.4 times, not the 3.4 the gate
-  wants. Four vertices a quad is the least blocks can have.
+- **The GPU holds quads, not faces** (`far::dense_patch`, 16 KiB a patch): a
+  quad's height and the light of its top, the material and openness of the
+  four walls it can stand behind, and the step of each edge wall. The mesher
+  (`cubara_world::far::mesh`) is unchanged and is still the definition of what
+  a patch shows; `the_shared_corners_draw_the_faces_the_mesher_makes` holds
+  the new topology to it face by face, from the triangles' areas and normals.
+- **A riser is wound so that it faces the lower of its two quads, whichever
+  that is**: the winding of a triangle flips with the heights and the
+  pipeline culls the back, so the one list shows each step from the side it
+  faces. A flat-shaded face reads its material from the *first vertex of its
+  triangle* (`@interpolate(flat, first)`), which names the quad it was drawn
+  from; which face it is -- top or which wall -- is read off the screen, the
+  normal from the derivatives of the world position, turned to the eye. A
+  riser belongs to the higher quad: the one it was drawn from if it faces
+  `+x` / `+z`, the next one along otherwise
+  (`a_triangle_reads_the_quad_its_face_belongs_to`; on the GPU
+  `far_shading_is_the_face_reference` renders all four walls and a top).
+  Lit, haze and fog are as before (`face.wgsl`, `haze.wgsl`); the fog is still
+  worked out per vertex and interpolated, the light now per pixel.
+- **The join with the voxels is the same rule on the corners, with one
+  change** (`far::join`): a corner one quad inside the box's side folds onto
+  the side only along an axis where its *own quad* touches that side; a
+  quad's far end is hidden like the rest. Folded as the old per-vertex rule
+  did, the riser between two quads of the second ring stood in the side's
+  plane with a hidden corner beside it, a spike a thousand blocks tall that an
+  eye inside the box sees the front of
+  (`nothing_inside_the_box_faces_an_eye_inside_it` is red without it).
+- **The crack seal** (`CRACK_SEAL`) now moves only a corner's footing; a
+  riser is exactly as tall as its step. Each far riser used to be about 0.11
+  of a pixel taller than its step (twice the seal, at any distance), which
+  at 1080 rows is a few percent of every one-block riser: the far mountain
+  golden has 3.5% fewer dark pixels and is re-blessed (CONTRIBUTING's rules;
+  the PR says so).
+
+- **Cracks: the cost that is not paid yet.** Shared corners leave pixels of
+  sky in the ground: `--bench flight` (1080p, eye at 3,000 blocks, 20 s) finds
+  about 13 pixels a frame with ground on all four sides, 1,198 of 1,200 frames
+  with at least one, and 22 to 27 frames where the finished frame has land at
+  the pixel (`HOLES`), where the far terrain as it was (`8343a0c`) has none
+  (0 candidate frames, 0 holes, both flights); the far mountain golden has 8
+  such pixels where the old image has none. Where two risers stand in one plane
+  side by side, or at right angles round a corner, their edges on the column
+  of that corner are different vertices at different heights, a T-junction,
+  and the GPU's snapped edges leave a pixel's gap along it; the old faces hid
+  theirs by inflating every wall along its run. Tried and not enough
+  (`stepped_ground_crack_report`, worst frame of its scene; the same scene
+  with the old faces: 1): every corner out of its quad on both axes (3), the
+  seal at the patch's edge only (2-3), no seal (2), the lower quad's corners
+  towards a higher neighbour (2; flight 27 holes), the seal four and sixteen
+  times as large (4, 7), no back-face culling (2), no seal and no culling
+  (flight 5 holes of 1,200). What would close them is overlap between
+  neighbouring risers, which a riser that borrows its corners cannot have.
+
+Measured as a gate run at Medium on a machine that was not quiet (one run each;
+the rows against it were taken the same way, so the differences count and the
+absolute numbers do not):
+
+| quad scale | FPS ground / hill, as built | FPS ground / hill, shared corners | far vertices a frame, as built | shared corners |
+|---|--:|--:|--:|--:|
+| x1 | 636 / 577 | 739 / 691 | 1.96 M / 1.98 M | 0.93 M / 0.94 M |
+| x1.5 | 853 / 787 | 1,018 / 946 | 1.13 M | 0.51 M / 0.52 M |
+| x2 | 907 / 836 | 1,062 / 996 | 1.03 M | 0.45 M / 0.46 M |
+| x2.5 | 1,127 / 1,050 | 1,187 / 1,104 (High: Medium was not asked, the gate was met there) | 0.51 M | |
+
+The vertices more than halve, and the frame rate rises 1.16 times at x1 and
+1.1 to 1.2 times at the others -- not the 1.4 the prototype with a trivial
+shader estimated (790 / 715 at x1): a real shader reads the quad's record and
+works the normal out per pixel, which the prototype did not. The whole frame
+at the ground eye goes from 1.57 to 1.35 ms at x1. The gate still turns on the
+quad size, which is the owner's: at x2 the hill eye is 4 FPS short at Medium
+(996), and x2.5 meets the gate at High.
+
+What follows from the rest of that, none of it built here:
+
 - **Coarser quads** (`far_view_scaled`; the default is the owner's): as
   built, x1.5 measures 853 / 787 FPS (ground / hill), x2 907 / 836, x2.5
   1,127 / 1,050 -- the first that holds 1,000. With shared corners the same

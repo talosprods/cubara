@@ -3312,3 +3312,159 @@ fn the_mountains_mean_colour_holds_across_levels() {
         }
     }
 }
+
+/// The faces of the patch whose lowest quad is `(ox, oz)` in a world of
+/// stepped ground (`height` by quad): a top on every quad, a wall of exactly
+/// the step between neighbours, and a wall on every quad along the patch's
+/// edge hanging the step to the neighbouring patch's quad and the skirt --
+/// what `cubara_world::far::mesh` makes of one level, without the merging.
+fn stepped_patch_faces(
+    (ox, oz): (i32, i32),
+    height: &dyn Fn(i32, i32) -> i32,
+) -> Vec<cubara_render::FarFace> {
+    use cubara_render::{FarDir, FarFace};
+    let n = cubara_render::FAR_QUADS as i32;
+    let h = |i: i32, j: i32| height(ox + i, oz + j);
+    let face = |dir, i0: i32, j0: i32, i1: i32, j1: i32, top, rise, border| FarFace {
+        dir,
+        i0: i0 as u8,
+        j0: j0 as u8,
+        i1: i1 as u8,
+        j1: j1 as u8,
+        top,
+        rise,
+        border,
+        mix: [100, 100],
+        open: 255,
+    };
+    let mut faces = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            faces.push(face(FarDir::Top, i, j, i + 1, j + 1, h(i, j), 0, false));
+        }
+    }
+    for k in 0..n {
+        for line in 0..=n {
+            // Walls facing along x on `line`, beside quad `k` along z; then
+            // along z.
+            for (along_x, a, b) in [(true, h(line - 1, k), h(line, k)), (false, h(k, line - 1), h(k, line))] {
+                let (lo_dir, hi_dir) = if along_x {
+                    (FarDir::PosX, FarDir::NegX)
+                } else {
+                    (FarDir::PosZ, FarDir::NegZ)
+                };
+                let wall = |dir, top, rise, border| {
+                    if along_x {
+                        face(dir, line, k, line, k + 1, top, rise, border)
+                    } else {
+                        face(dir, k, line, k + 1, line, top, rise, border)
+                    }
+                };
+                if line == 0 {
+                    faces.push(wall(hi_dir, b, (b - a).max(0) as u32, true));
+                } else if line == n {
+                    faces.push(wall(lo_dir, a, (a - b).max(0) as u32, true));
+                } else if a > b {
+                    faces.push(wall(lo_dir, a, (a - b) as u32, false));
+                } else if b > a {
+                    faces.push(wall(hi_dir, b, (b - a) as u32, false));
+                }
+            }
+        }
+    }
+    faces
+}
+
+/// **Cracks in the far terrain** (a measurement, not a check: it is `#[ignore]`d
+/// because it is red, see below). Patches of stepped ground side by side, seen
+/// from many eyes: pixels of sky with ground on all four sides, which a
+/// picture of a mountain does not show and `flight`'s HOLES does.
+///
+/// With every face's own four vertices (the far terrain as it was) the worst
+/// frame of this scene has 1 such pixel; with shared corners 2 to 3, and in
+/// `--bench flight` (1080p, eye at 3,000 blocks) about 13 a frame where it
+/// had none (`docs/PHASE3_ARCHITECTURE.md` §9.6). Where two risers stand in
+/// one plane side by side, or at right angles round a corner, their edges on
+/// the column of that corner are different vertices at different heights --
+/// a T-junction -- and the GPU's snapped edges leave a pixel's gap along it.
+/// Inflating the corners (the crack seal in either axis, towards the
+/// higher quad, out of the patch's edge) was tried and does not close them
+/// (the report's third column of the doc).
+#[test]
+#[ignore = "a measurement of the shared corners' cracks, red by design: see its doc"]
+fn stepped_ground_crack_report() {
+    use cubara_render::far::{FarParams, FarPatch};
+    // Rough ground, steps of one to four blocks, and flat stretches.
+    let height = |x: i32, z: i32| {
+        let hash = (x.wrapping_mul(73856093) ^ z.wrapping_mul(19349663)) as u32;
+        let rough = (hash >> 7) % 5;
+        60 + if (x / 5 + z / 7) % 3 == 0 { 0 } else { rough as i32 }
+    };
+    let origins = [(0, 0), (32, 0), (0, 32), (32, 32)];
+    let faces: Vec<_> = origins.iter().map(|&o| stepped_patch_faces(o, &height)).collect();
+    let patches: Vec<_> = origins
+        .iter()
+        .zip(&faces)
+        .map(|(&(ox, oz), faces)| FarPatch {
+            origin: [ox as i64 * 4, oz as i64 * 4],
+            quad: 4.0,
+            faces,
+            skirt: 6.0,
+        })
+        .collect();
+    let params = FarParams {
+        hole: None,
+        materials: far_materials(),
+    };
+    let mut worst = 0;
+    let mut frames = 0;
+    for k in 0..60 {
+        // From above and from low, so risers face the eye and edge-on.
+        let at = glam::vec3(
+            120.0 + (k * 37 % 160) as f32 - 80.0,
+            75.0 + (k % 6) as f32 * 40.0,
+            -60.0 + (k * 53 % 80) as f32,
+        );
+        let target = glam::vec3(128.0 + (k % 9) as f32 * 3.0, 62.0, 128.0);
+        let shot = Shot {
+            width: 320,
+            height: 240,
+            camera: Some((at.as_dvec3(), (target - at).normalize())),
+            ..Shot::default()
+        };
+        let frame = {
+            let _gpu = gpu_lifecycle::lock();
+            headless::render_with_far(Vec::new(), &patches, Some(params), shot)
+        };
+        let Some(frame) = frame else {
+            headless::skip_or_require_gpu("stepped_ground_crack_report");
+            return;
+        };
+        let sky = [frame.pixels[0], frame.pixels[1], frame.pixels[2]];
+        let is_sky = |x: u32, y: u32| {
+            let i = ((y * frame.width + x) * 4) as usize;
+            frame.pixels[i..i + 3] == sky
+        };
+        let mut cracks = 0;
+        let mut land = 0;
+        for y in 1..frame.height - 1 {
+            for x in 1..frame.width - 1 {
+                if !is_sky(x, y) {
+                    land += 1;
+                } else if !is_sky(x - 1, y)
+                    && !is_sky(x + 1, y)
+                    && !is_sky(x, y - 1)
+                    && !is_sky(x, y + 1)
+                {
+                    cracks += 1;
+                }
+            }
+        }
+        if land > 20_000 {
+            frames += 1;
+            worst = worst.max(cracks);
+        }
+    }
+    assert!(frames > 20, "only {frames} frames saw much ground");
+    eprintln!("CRACKS: worst of {frames} frames: {worst} pixels of sky with ground on all four sides");
+}
