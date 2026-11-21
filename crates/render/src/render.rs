@@ -39,6 +39,15 @@ const FAR_PLANE: f32 = 1.0e7;
 /// ones kept drawn while their replacements generate: room for twice that.
 const FAR_PATCH_CAPACITY: u32 = 4096;
 
+/// Far-terrain faces the window holds at once, eight bytes each
+/// (`far::FarFace::pack`): 32 MiB. Drawn as blocks (issue #422) a patch is
+/// about 2,700 faces wherever the land is not level, and High holds about
+/// 1,100 patches at the gate eyes: 3 million faces, with a third as much
+/// again for the ones kept drawn while their replacements generate. Chosen
+/// from that measurement, not derived; a patch that does not fit is not
+/// drawn, and `far_streaming` says so once.
+const FAR_FACE_CAPACITY: u32 = 4_000_000;
+
 /// What an offscreen [`Renderer`] draws into: the format the headless
 /// screenshots and golden images use, so its pixels read back the same way.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = crate::headless::COLOR_FORMAT;
@@ -936,7 +945,12 @@ impl Renderer {
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect, anchor));
 
         let arena = ChunkArena::new(&device, multi_draw, anchor);
-        let far = crate::far::FarTerrain::new(&device, &queue, FAR_PATCH_CAPACITY, anchor);
+        let far = crate::far::FarTerrain::new(
+            &device,
+            &queue,
+            (FAR_PATCH_CAPACITY, FAR_FACE_CAPACITY),
+            anchor,
+        );
 
         // GPU work for F3, only where it was asked for (the game's window).
         let gpu_timing = wants_gpu_timing(
@@ -2133,9 +2147,9 @@ pub fn build_tree_pipeline(
     })
 }
 
-/// `@group(1)` in `far.wgsl`: the far terrain's heights, patches, the slots
-/// drawn this frame, and its parameters (`crate::far::FarTerrain` owns all
-/// four).
+/// `@group(1)` in `far.wgsl`: the far terrain's patch records, its
+/// parameters, its faces and the runs of them drawn this frame
+/// (`crate::far::FarTerrain` owns all four).
 pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |binding| wgpu::BindGroupLayoutEntry {
         binding,
@@ -2151,11 +2165,11 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         label: Some("far-bind-group-layout"),
         entries: &[
             storage(0),
-            storage(1),
             storage(2),
+            storage(3),
             wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -2163,30 +2177,12 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
-            // The masking table (`aggregate::MaskingTable`), and its filter,
-            // read where `far.wgsl` shades: per vertex.
-            wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 5,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
         ],
     })
 }
 
 /// The far terrain's pipeline (`far.wgsl`): no vertex buffer, one instance
-/// per patch, depth-tested against the voxels drawn before it.
+/// per run of faces, depth-tested against the voxels drawn before it.
 pub fn build_far_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -2224,10 +2220,11 @@ pub fn build_far_pipeline(
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                // Tops face up and skirts face out (`far.rs`'s grid winds both
-                // counter-clockwise from outside), so what faces away is the
-                // underside of the ground: measured on the M3, +13-28% FPS at
-                // the gate eyes for nothing visible.
+                // Tops face up and walls face out (`far::FarFace::corners`
+                // winds both counter-clockwise from outside), so what faces
+                // away is the underside of the ground and the far side of a
+                // step: measured on the M3 for the smooth surface this
+                // replaced, +13-28% FPS at the gate eyes for nothing visible.
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },

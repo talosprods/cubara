@@ -453,6 +453,11 @@ pub struct Flight {
     pub every: f32,
     pub size: (u32, u32),
     pub quality: FarQuality,
+    /// The far terrain's quads this many times as wide on screen as
+    /// `quality` names them: the game's
+    /// ([`FAR_QUAD_SCALE`](crate::far_streaming::FAR_QUAD_SCALE)) unless
+    /// `--far-quad-scale` asked for another.
+    pub far_quad_scale: f64,
     /// Whether the levels of detail morph into each other over distance
     /// (issue #380's study, the game's default) or swap as before
     /// (`--no-morph`), so one binary flies both.
@@ -1301,7 +1306,8 @@ impl Streamed {
             move |name: &str| layers.layer_of(name),
         );
         let world = Arc::new(World::new());
-        let far = FarStreaming::new(world.seed(), flight.quality);
+        let far =
+            FarStreaming::new(world.seed(), flight.quality).with_quad_scale(flight.far_quad_scale);
         Some(Self {
             world,
             nodes,
@@ -2171,6 +2177,7 @@ mod tests {
             every: 0.5,
             size: (64, 32),
             quality: FarQuality::High,
+            far_quad_scale: crate::far_streaming::FAR_QUAD_SCALE,
             morph: true,
         }
     }
@@ -2477,6 +2484,7 @@ mod tests {
             every: 1.0,
             size: (1920, 1080),
             quality: FarQuality::High,
+            far_quad_scale: crate::far_streaming::FAR_QUAD_SCALE,
             morph: true,
         };
         let mut runs = Vec::new();

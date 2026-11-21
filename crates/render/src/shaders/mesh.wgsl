@@ -137,34 +137,8 @@ const FACE_NORMALS = array<vec3<f32>, 6>(
     vec3<f32>(0.0, 0.0, -1.0),
 );
 
-// How far a corner moves out of its quad, per block of distance from the eye:
-// 0.06 of a pixel at 1080p with a 60-degree field of view (a pixel is about
-// 0.97 milliradians there). See `vs_main`.
-//
-// Issue #397: the down flight (`--bench flight --eye 8,450,8 --look
-// 0.4,-0.8,0.2`) still confirmed a one-frame, single-pixel hole at 0.05 px
-// (the value #321/BENCHMARKS.md footnote 81 picked), in 5 of 7 runs on a
-// quiet machine, clustered at one spot (t ~ 11.6-11.9 s, screen x 813-817,
-// y 688-706). Traced (`cubara_world::raycast` + `cubara_world::mesh::
-// mesh_node`, same seed/registry, no GPU) to a real greedy-mesh T-junction:
-// node (level 0, [12, 1, 4])'s top face has a 14-cell-long quad (z 7..8,
-// x 2..16) beside a fragmented row (z 8..9, several shorter quads); the
-// ray's continuous plane intersection lands within 0.03-0.05 blocks of
-// their shared edge -- under a third of a pixel at this ~193-block range,
-// i.e. already inside 0.05 px's own margin. 0.06 px (this value) closed it
-// in 11 of 11 `--bench flight` runs afterward (6 at this exact value, 5
-// more at 0.07 px) with the goldens still well inside tolerance (`terrain`
-// 0.31%, `lod_boundary` 0.09%, against 0.5%) -- see the PR for the full
-// before/after. A *static* single-frame re-render of the same node from
-// the same eye (headless, and the bench's own "finished" pass) never shows
-// the gap; only the continuously-streamed live pass does, intermittently --
-// consistent with a borderline case landing right at the shader's own
-// floating-point margin, not a stable geometric one a CPU test can pin.
-// That is also why this fix is a measured margin increase on the existing
-// mechanism, not a redesign: nothing here found a different class (a
-// same-level node seam, a voxel/far-terrain seam, or a depth-precision
-// bug) to fix instead.
-const CRACK_SEAL: f32 = 0.00006;
+// `CRACK_SEAL`, how far a corner moves out of its quad, is `face.wgsl`'s:
+// the far terrain's blocks seal their T-junctions with the same number.
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -278,13 +252,11 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = in.normal;
 
-    // Directional sun: clear sun-side / shadow-side split. `sun_dir` is
-    // normalized on the CPU (`Lighting`'s doc comment); not renormalized here.
+    // Hemispheric ambient plus the directional sun's diffuse term:
+    // `face.wgsl`'s `face_brightness`, the one definition the far terrain's
+    // blocks are lit by too (issue #422).
     let sun_dir = vec3<f32>(sun_dir_x, sun_dir_y, sun_dir_z);
-    let diffuse = max(dot(n, sun_dir), 0.0) * diffuse_weight;
-
-    // Hemispheric ambient: a touch brighter facing up (sky) than down (ground).
-    let ambient = mix(ambient_low, ambient_high, n.y * 0.5 + 0.5);
+    let brightness = face_brightness(n, sun_dir, ambient_low, ambient_high, diffuse_weight);
 
     // Baked ambient occlusion darkens crevices; already resolved in vs_main
     // (R1c scales its floor by the corner's own cell width before this stage
@@ -303,7 +275,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         tex = mix(tex, parent, in.ao_haze.z);
     }
     let sun_color = vec3<f32>(sun_color_r, sun_color_g, sun_color_b);
-    let lit = tex.rgb * sun_color * (ambient + diffuse) * ao;
+    let lit = tex.rgb * sun_color * brightness * ao;
 
     // Radial distance fog, fading toward `fog_color` (the sky colour, by
     // default `Lighting::default`) rather than a hard render-radius edge.

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
 use cubara_render::aggregate::Materials;
-use cubara_render::{FarParams, FarPatch, FarSlot, Renderer};
+use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
@@ -90,24 +90,86 @@ impl FarQuality {
 const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 
 /// How far the eye moves before the selection is worked out again, in blocks.
-/// The finest far patches are a few hundred blocks wide, so this is well
-/// inside one of them.
-const RESELECT_BLOCKS: f64 = 32.0;
+///
+/// One block. It was 32 -- "well inside the finest patch" -- which let the
+/// drawn selection trail the eye's own by up to 1.3 s of flight: a far
+/// mountain stood a level coarser than it should for that long (#398's
+/// stale terrain). With the smooth far surface that moved an outline by
+/// less than the error bound; with blocks (#422) a level coarser is quads
+/// twice as wide, and at the foot of a far mountain a pixel of land turned
+/// to sky until the finer patch came: 26 frames of the low flight showed a
+/// hole at [`FAR_QUAD_SCALE`] 2.5 and 7 at 3, none at either with this.
+/// **Chosen, not derived**: #398's "tiny" variant, a third of a second of
+/// walking and two or three frames of flight. It is not that issue's fix --
+/// its plan replaces this constant by the slack `select` can report, and
+/// generates ahead -- and the cost is a `select` that often
+/// (`far_plan_cost_report`).
+const RESELECT_BLOCKS: f64 = 1.0;
+
+/// **How large the far terrain's quads are on screen**, as a factor on the
+/// pixel sizes a quality names ([`FarQuality::detail`]): its quads, its
+/// error bound and its floor are all this many times as wide as the sizes
+/// `PROPOSAL_FAR_VIEW.md` §3.2 measured for the smooth surface (at Medium,
+/// quads of at most 16 pixels). The one number for it: the window, the
+/// benchmarks, the flights and the screenshot all draw at this unless
+/// `--far-quad-scale F` says otherwise ([`far_view`]).
+///
+/// Above 1 because the far terrain is blocks now (issue #422): a block
+/// surface costs about nine vertices a quad where the smooth one shared one
+/// among four, and the M3 spends about 0.4 ns on each of them whatever the
+/// shader does. That cost follows the triangles: a mesh with fewer vertices
+/// but more triangles was slower (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1
+/// the gate is not met at any quality. **Chosen, not derived**: 3 is the
+/// smallest size measured on a quiet M3 to hold 1,000 FPS at Medium with room
+/// to spare (hill eye 1,121 / 1,130 FPS against main's 1,049 / 1,055; 2.5
+/// held by 3.5% and stood below main there, `BENCHMARKS.md` footnote 96). The
+/// owner left the size to the engine ("as long as it is good", 2026-11-21);
+/// the candidates' numbers are in §9.8.
+pub const FAR_QUAD_SCALE: f64 = 3.0;
+
+/// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
+/// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from
+/// 0.5 to 8 -- a typo is refused, not measured as the scale that was asked
+/// for.
+pub fn parse_quad_scale(text: &str) -> Option<f64> {
+    text.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && (0.5..=8.0).contains(f))
+}
 
 /// The view the far terrain is selected for at `quality`, scaled to a screen
-/// `screen_height` pixels tall, leaving `hole` to the voxels. `None` when the
-/// quality is `Off`.
+/// `screen_height` pixels tall, leaving `hole` to the voxels: the game's, at
+/// [`FAR_QUAD_SCALE`]. `None` when the quality is `Off`.
+///
+/// Only tests ask this way: the window's plan, the benchmarks, the flights
+/// and the screenshot each carry the scale they were started with (the
+/// constant, or `--far-quad-scale`) to [`far_view_scaled`].
+#[cfg(test)]
 pub fn far_view(
     eye: [f64; 3],
     screen_height: u32,
     hole: Option<Hole>,
     quality: FarQuality,
 ) -> Option<FarView> {
+    far_view_scaled(eye, screen_height, hole, quality, FAR_QUAD_SCALE)
+}
+
+/// [`far_view`] with every pixel size of the quality -- its quads, its error
+/// bound and its floor -- `scale` times as large as the quality names them.
+/// The game draws at [`FAR_QUAD_SCALE`]; `--far-quad-scale` and `far_census`
+/// ask what the others would cost.
+pub fn far_view_scaled(
+    eye: [f64; 3],
+    screen_height: u32,
+    hole: Option<Hole>,
+    quality: FarQuality,
+    scale: f64,
+) -> Option<FarView> {
     let d = quality.detail()?;
-    let pixel = FOV_Y / screen_height.max(1) as f64;
+    let pixel = FOV_Y / screen_height.max(1) as f64 * scale;
     Some(FarView {
         eye,
-        split_ratio: far::split_ratio_for(d.quad_px, screen_height.max(1) as f64, FOV_Y),
+        split_ratio: far::split_ratio_for(d.quad_px * scale, screen_height.max(1) as f64, FOV_Y),
         max_error: d.error_px * pixel,
         min_quad: d.floor_px * pixel,
         radius: FAR_VIEW_RADIUS,
@@ -136,15 +198,41 @@ pub fn voxel_hole(eye: [f32; 3]) -> Hole {
     ))
 }
 
-/// The renderer's form of a patch.
-pub fn to_far_patch(p: &PatchHeights) -> FarPatch<'_> {
+/// The renderer's form of a patch's faces: the same rectangles, field for
+/// field (the render crate does not know the world crate, Rule 3).
+pub fn to_far_faces(p: &PatchHeights) -> Vec<FarFace> {
+    p.faces
+        .iter()
+        .map(|f| FarFace {
+            dir: match f.dir {
+                far::FaceDir::Top => FarDir::Top,
+                far::FaceDir::PosX => FarDir::PosX,
+                far::FaceDir::NegX => FarDir::NegX,
+                far::FaceDir::PosZ => FarDir::PosZ,
+                far::FaceDir::NegZ => FarDir::NegZ,
+            },
+            i0: f.i0,
+            j0: f.j0,
+            i1: f.i1,
+            j1: f.j1,
+            top: f.top,
+            rise: f.rise,
+            border: f.border,
+            mix: f.mix,
+            open: f.open,
+        })
+        .collect()
+}
+
+/// The renderer's form of a patch, with its `faces` ([`to_far_faces`]).
+pub fn to_far_patch<'a>(p: &PatchHeights, faces: &'a [FarFace]) -> FarPatch<'a> {
     FarPatch {
         // The integer it is: the renderer subtracts its anchor from it
         // exactly (issue #379).
         origin: p.key.origin(),
         quad: p.key.quad() as f32,
-        heights: &p.heights,
-        skirt: p.skirt(),
+        faces,
+        skirt: p.skirt_blocks() as f32,
     }
 }
 
@@ -225,8 +313,17 @@ fn swap(drawn: &HashSet<PatchKey>, draw: &HashSet<PatchKey>) -> (Vec<PatchKey>, 
 /// knows why its ground was split, merges it back, and then splits it again
 /// once the ancestor is regenerated: a selection that never settles (review
 /// of #284).
-fn to_keep(wanted: &[PatchKey], draw: HashSet<PatchKey>) -> HashSet<PatchKey> {
-    let top = top_level(wanted);
+///
+/// Every ancestor up to `root_level`, the level the selection walks down
+/// from ([`far::root_level_for`]) -- not only up to the coarsest patch
+/// wanted. A root split for its roughness alone, too far away to be split
+/// by distance, is no wanted patch's level once all of them are split, and
+/// was dropped: the plan then asked for it, split it and dropped it again,
+/// for ever. Quads of 16 pixels split every root by distance, so it took
+/// the wider quads of [`FAR_QUAD_SCALE`] to show it (at the tests' radius;
+/// the game's roots are too large to be rough at their distance).
+fn to_keep(wanted: &[PatchKey], draw: HashSet<PatchKey>, root_level: u32) -> HashSet<PatchKey> {
+    let top = top_level(wanted).max(root_level);
     let mut keep = draw;
     for &k in wanted {
         keep.insert(k);
@@ -299,6 +396,9 @@ struct FarPlan {
     quality: FarQuality,
     /// [`FAR_VIEW_RADIUS`] in the game; tests use less.
     radius: f64,
+    /// The quality's pixel sizes times this ([`far_view_scaled`]):
+    /// [`FAR_QUAD_SCALE`] unless `--far-quad-scale` says otherwise.
+    quad_scale: f64,
     /// Every patch generated and still of use: the ones drawn, and the ones
     /// whose error decides whether their area is split.
     heights: HashMap<PatchKey, PatchHeights>,
@@ -321,6 +421,7 @@ impl FarPlan {
         Self {
             quality,
             radius,
+            quad_scale: FAR_QUAD_SCALE,
             heights: HashMap::new(),
             in_flight: HashSet::new(),
             selected_at: None,
@@ -393,7 +494,13 @@ impl FarPlan {
         self.arrived = false;
         let drawn = drawn();
 
-        let Some(view) = far_view(eye, screen_height, Some(hole), self.quality) else {
+        let Some(view) = far_view_scaled(
+            eye,
+            screen_height,
+            Some(hole),
+            self.quality,
+            self.quad_scale,
+        ) else {
             // Off: nothing beyond the voxels.
             let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
             leave.sort();
@@ -425,7 +532,7 @@ impl FarPlan {
         // Swap the drawn set, never leaving ground uncovered.
         let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
         let (leave, arrive) = swap(&drawn, &draw);
-        let keep = to_keep(&wanted, draw);
+        let keep = to_keep(&wanted, draw, far::root_level_for(view.radius));
         self.heights.retain(|k, _| keep.contains(k));
         Step {
             request,
@@ -461,6 +568,15 @@ impl FarStreaming {
             materials: far_materials(),
             warned_full: false,
         }
+    }
+
+    /// Draw with the quality's quads, error bound and floor `scale` times as
+    /// wide on screen as it names them, in place of [`FAR_QUAD_SCALE`]
+    /// (`--far-quad-scale`). Before the first frame: patches already drawn
+    /// are not selected again.
+    pub fn with_quad_scale(mut self, scale: f64) -> Self {
+        self.plan.quad_scale = scale;
+        self
     }
 
     /// The seed the far terrain is generated from.
@@ -534,13 +650,13 @@ impl FarStreaming {
             let Some(patch) = self.plan.patch(key) else {
                 continue;
             };
-            match renderer.far_insert(to_far_patch(patch)) {
+            match renderer.far_insert(to_far_patch(patch, &to_far_faces(patch))) {
                 Some(slot) => {
                     self.slots.insert(key, slot);
                 }
                 None if !self.warned_full => {
                     log::warn!(
-                        "far terrain: every slot is taken -- some distant ground is not drawn"
+                        "far terrain: out of slots or vertices -- some distant ground is not drawn"
                     );
                     self.warned_full = true;
                 }
@@ -677,21 +793,30 @@ mod tests {
         assert!(hole.min[0] < -1000.0 && hole.max[0] > 1000.0, "{hole:?}");
     }
 
-    /// The same numbers the far terrain module measured (`far.rs`, §3.2).
+    /// The same numbers the far terrain module measured (`far.rs`, §3.2),
+    /// every one of them [`FAR_QUAD_SCALE`] times as wide -- and the scale
+    /// asked for where one is: the quads, the error bound and the floor all
+    /// follow it.
     #[test]
     fn the_view_uses_the_measured_settings() {
         let pixel = FOV_Y / 1080.0;
         for q in FarQuality::BEST_FIRST {
-            let Some(v) = far_view([0.0; 3], 1080, None, q) else {
+            let Some(game) = far_view([0.0; 3], 1080, None, q) else {
                 assert_eq!(q, FarQuality::Off, "only Off draws nothing");
                 continue;
             };
             let d = q.detail().unwrap();
-            assert!((v.max_error / pixel - d.error_px).abs() < 1e-9);
-            assert!((v.min_quad / pixel - d.floor_px).abs() < 1e-9);
-            let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
-            assert!((quad_angle / pixel - d.quad_px).abs() < 1e-6);
-            assert_eq!(v.radius, FAR_VIEW_RADIUS);
+            for (v, scale) in [
+                (game, FAR_QUAD_SCALE),
+                (far_view_scaled([0.0; 3], 1080, None, q, 1.0).unwrap(), 1.0),
+                (far_view_scaled([0.0; 3], 1080, None, q, 3.5).unwrap(), 3.5),
+            ] {
+                assert!((v.max_error / pixel - d.error_px * scale).abs() < 1e-9);
+                assert!((v.min_quad / pixel - d.floor_px * scale).abs() < 1e-9);
+                let quad_angle = 1.0 / (v.split_ratio * far::PATCH_QUADS as f64);
+                assert!((quad_angle / pixel - d.quad_px * scale).abs() < 1e-6);
+                assert_eq!(v.radius, FAR_VIEW_RADIUS);
+            }
         }
         // High is what `PROPOSAL_FAR_VIEW.md` §3.2 measured.
         let high = FarQuality::High.detail().unwrap();
@@ -707,16 +832,21 @@ mod tests {
     /// The cache also holds everything generated around a second eye far
     /// away, as it would after the player moved: that is what the rule has
     /// to drop, and what it must not drop with it.
+    ///
+    /// At the quality's own sizes ([`SIM_QUAD_SCALE`]): at the game's wider
+    /// quads (3) no ancestor's split reaches this eye's selection, so keeping
+    /// less moves nothing and the test would test nothing (its last assert).
     #[test]
     fn keeping_the_ancestors_keeps_the_selection_still() {
         let gen = WorldGen::new(0x005E_ED00_00C0_FFEE);
         let view_at = |eye: [f64; 3]| FarView {
             radius: 20_000.0,
-            ..far_view(
+            ..far_view_scaled(
                 eye,
                 720,
                 Some(voxel_hole(eye.map(|v| v as f32))),
                 FarQuality::High,
+                SIM_QUAD_SCALE,
             )
             .unwrap()
         };
@@ -742,7 +872,11 @@ mod tests {
             far::select(&here, |k| h.get(&k).map(|p| p.error))
         };
 
-        let keep = to_keep(&wanted, wanted.iter().copied().collect());
+        let keep = to_keep(
+            &wanted,
+            wanted.iter().copied().collect(),
+            far::root_level_for(here.radius),
+        );
         let mut kept = heights.clone();
         kept.retain(|k, _| keep.contains(k));
         assert!(
@@ -764,6 +898,28 @@ mod tests {
         );
     }
 
+    /// **A root split for its roughness alone keeps its heights.** Its
+    /// children are all that is wanted, so no wanted patch is of its level;
+    /// kept only up to the coarsest wanted patch, it was dropped, selected
+    /// again unsplit (its error unknown), generated, split and dropped
+    /// again: `standing_still_selects_nothing` and six more never settled
+    /// at [`FAR_QUAD_SCALE`], where a root can be too far to be split by
+    /// distance.
+    #[test]
+    fn a_root_all_of_whose_ground_is_split_is_kept() {
+        let root = PatchKey::new(7, 0, -1);
+        let wanted: Vec<PatchKey> = root.children().to_vec();
+        let keep = to_keep(&wanted, wanted.iter().copied().collect(), root.level);
+        assert!(keep.contains(&root), "the root was dropped: {keep:?}");
+        // Two levels down as well: every ancestor on the way up.
+        let deeper: Vec<PatchKey> = wanted[0].children().to_vec();
+        let keep = to_keep(&deeper, HashSet::new(), root.level);
+        assert!(
+            keep.contains(&root) && keep.contains(&wanted[0]),
+            "{keep:?}"
+        );
+    }
+
     /// Fog ends at the far terrain's edge, not past it: past it, the edge of
     /// the world would be as hard as it was before fog existed.
     #[test]
@@ -775,7 +931,44 @@ mod tests {
     #[test]
     fn the_renderer_and_the_world_agree_on_the_patch_size() {
         assert_eq!(cubara_render::FAR_QUADS, far::PATCH_QUADS);
-        assert_eq!(cubara_render::FAR_VERTS, far::PATCH_VERTS);
+        // A face travels in three words (`FarFace::pack`): every height the
+        // terrain can have, and the tallest step between two of them, must
+        // fit their fields, or a mountain is drawn clamped.
+        let (lo, hi) = far::surface_bounds();
+        assert!(cubara_render::FAR_TOP_RANGE.contains(&(lo.floor() as i32 - 1)));
+        assert!(cubara_render::FAR_TOP_RANGE.contains(&(hi.ceil() as i32 + 1)));
+        assert!((hi - lo).ceil() as u32 <= cubara_render::FAR_MAX_RISE);
+        // And the renderer's face is the world's, field for field.
+        let patch = far::generate(&WorldGen::new(7), PatchKey::new(5, -27, 151));
+        let faces = to_far_faces(&patch);
+        assert_eq!(faces.len(), patch.faces.len());
+        for (ours, theirs) in faces.iter().zip(&patch.faces) {
+            assert_eq!(ours.dir as usize, theirs.dir as usize);
+            assert_eq!(
+                (
+                    ours.i0,
+                    ours.j0,
+                    ours.i1,
+                    ours.j1,
+                    ours.top,
+                    ours.rise,
+                    ours.border
+                ),
+                (
+                    theirs.i0,
+                    theirs.j0,
+                    theirs.i1,
+                    theirs.j1,
+                    theirs.top,
+                    theirs.rise,
+                    theirs.border
+                )
+            );
+        }
+        assert!(faces.len() <= cubara_render::far::FAR_MAX_FACES);
+        for (ours, theirs) in faces.iter().zip(&patch.faces) {
+            assert_eq!((ours.mix, ours.open), (theirs.mix, theirs.open));
+        }
     }
 
     // --- The plan without a GPU (#398, rule 6) --------------------------
@@ -875,9 +1068,22 @@ mod tests {
         gen: WorldGen,
         hole: Hole,
         radius: f64,
+        /// The quad scale the plan and the reference ([`Sim::exact`]) both
+        /// select at.
+        scale: f64,
         /// `fly` asserts that drawn, still-wanted ground stays covered.
         check_coverage: bool,
     }
+
+    /// The quad scale the plan's mechanics are tried at: quads of 16 pixels,
+    /// the scenario these tests were written on. What they pin -- what is
+    /// asked for, kept, swapped and dropped, and when -- does not depend on
+    /// the scale; whether anything happens in three seconds of flight inside
+    /// [`TEST_RADIUS`] does, and at [`FAR_QUAD_SCALE`] nothing would (the
+    /// tests' own guards against proving nothing say so).
+    /// `a_plan_at_the_games_quad_scale_settles_on_the_exact_selection` is the
+    /// one that flies the game's.
+    const SIM_QUAD_SCALE: f64 = 1.0;
 
     /// Is the ground of `key` covered by `shown`: by `key` itself, by a
     /// coarser patch holding it, or by finer patches that together fill it?
@@ -889,15 +1095,22 @@ mod tests {
 
     impl Sim {
         fn new(radius: f64, hole: Hole, pool: PoolModel) -> Self {
+            Self::at_scale(radius, hole, pool, SIM_QUAD_SCALE)
+        }
+
+        fn at_scale(radius: f64, hole: Hole, pool: PoolModel, scale: f64) -> Self {
             let seed = cubara_world::World::new().seed();
+            let mut plan = FarPlan::new(FarQuality::High, radius);
+            plan.quad_scale = scale;
             Self {
-                plan: FarPlan::new(FarQuality::High, radius),
+                plan,
                 pool,
                 shown: HashSet::new(),
                 memo: RefCell::new(HashMap::new()),
                 gen: WorldGen::new(seed),
                 hole,
                 radius,
+                scale,
                 check_coverage: false,
             }
         }
@@ -916,7 +1129,7 @@ mod tests {
         fn exact(&self, eye: [f64; 3]) -> HashSet<PatchKey> {
             let view = FarView {
                 radius: self.radius,
-                ..far_view(eye, 1080, Some(self.hole), FarQuality::High).unwrap()
+                ..far_view_scaled(eye, 1080, Some(self.hole), FarQuality::High, self.scale).unwrap()
             };
             loop {
                 let wanted = far::select(&view, |k| self.memo.borrow().get(&k).map(|p| p.error));
@@ -1007,11 +1220,21 @@ mod tests {
         (Sim::new(TEST_RADIUS, hole, pool), start)
     }
 
-    /// Behaviour of today's `RESELECT_BLOCKS`, pinned so that the plan that
-    /// replaces it (#398 PR B) has something to differ from. Replaced by
-    /// `the_live_selection_is_the_exact_one_on_every_frame` there.
+    /// **Flying, what is shown is seldom behind the exact selection**: with
+    /// patches that arrive at once, the frames of three seconds of low
+    /// flight that show something other than the selection at their own eye
+    /// are few -- the plan works its selection out again every
+    /// [`RESELECT_BLOCKS`], and the eye flies 0.4 block a frame. Measured:
+    /// 21 of 180. At 32 blocks (what the constant was until blocks turned
+    /// the lag into holes, #422) it was 132, which this is red on. Not
+    /// none: #398's plan (the slack `select` can report) is what makes the
+    /// live selection the exact one on every frame, and
+    /// `the_live_selection_is_the_exact_one_on_every_frame` there replaces
+    /// this.
     #[test]
-    fn today_the_live_selection_trails_the_exact_one() {
+    fn the_live_selection_is_seldom_behind_the_exact_one() {
+        /// **Chosen, not derived**: the measured 21 with room.
+        const MOST: usize = 30;
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
         let eyes = low_flight(180);
@@ -1027,7 +1250,13 @@ mod tests {
         );
         assert!(
             behind > 0,
-            "the live selection never differed from the exact one in 3 s"
+            "the live selection never differed from the exact one in 3 s: \
+             this test no longer says what it was written to"
+        );
+        assert!(
+            behind <= MOST,
+            "{behind} of {} frames show something other than the exact selection, allowed {MOST}",
+            eyes.len()
         );
     }
 
@@ -1039,6 +1268,34 @@ mod tests {
         sim.settle(start);
         assert_eq!(sim.shown, sim.exact(start));
         assert!(sim.shown.len() > 100, "{} patches", sim.shown.len());
+    }
+
+    /// **At the game's quad scale the plan settles, on the exact
+    /// selection.** With quads this wide a root of the test's radius is too
+    /// far to be split by distance and is split for its roughness alone;
+    /// its heights were then dropped (`to_keep` kept ancestors only up to
+    /// the coarsest wanted patch), and the plan asked for it, split it and
+    /// dropped it again without end -- "the plan never settled", which this
+    /// was red with. Not vacuous: some root here is split, all of it.
+    #[test]
+    fn a_plan_at_the_games_quad_scale_settles_on_the_exact_selection() {
+        let start = low_flight(1)[0];
+        let hole = voxel_hole(start.map(|v| v as f32));
+        let mut sim = Sim::at_scale(TEST_RADIUS, hole, PoolModel::new(4, 2), FAR_QUAD_SCALE);
+        sim.settle(start);
+        assert_eq!(sim.shown, sim.exact(start));
+        let root_level = far::root_level_for(TEST_RADIUS);
+        assert!(
+            sim.shown.iter().all(|k| k.level < root_level),
+            "a root is drawn whole, so no root's heights were needed"
+        );
+        // And it stays settled: nothing more is selected, asked for or moved.
+        let selects = sim.plan.selects;
+        for _ in 0..20 {
+            let done = sim.pool.tick();
+            assert_eq!(sim.frame(start, done), Step::default());
+        }
+        assert_eq!(sim.plan.selects, selects);
     }
 
     /// A settled plan at a standing eye costs nothing: no step, no select.
@@ -1075,6 +1332,51 @@ mod tests {
         assert_eq!(sim.plan.selects, n + 3, "a new hole did nothing");
         sim.plan.step(start, 720, hole, || shown.clone());
         assert_eq!(sim.plan.selects, n + 3, "nothing changed but it selected");
+    }
+
+    /// **The plan selects at the quad scale it is given** -- the game's
+    /// ([`FAR_QUAD_SCALE`]) unless told another (`--far-quad-scale`, through
+    /// [`FarStreaming::with_quad_scale`]): what it first asks for is what
+    /// [`far_view_scaled`] at that scale selects, and a finer scale asks for
+    /// more.
+    #[test]
+    fn the_plan_selects_at_its_quad_scale() {
+        let eye = [8.0, 120.0, 8.0];
+        let hole = voxel_hole(eye.map(|v| v as f32));
+        let asked = |scale: Option<f64>| -> HashSet<PatchKey> {
+            let mut plan = FarPlan::new(FarQuality::Medium, TEST_RADIUS);
+            if let Some(scale) = scale {
+                plan.quad_scale = scale;
+            }
+            let step = plan.step(eye, 1080, hole, HashSet::new);
+            step.request.into_iter().collect()
+        };
+        let selected = |scale: f64| -> HashSet<PatchKey> {
+            let view = FarView {
+                radius: TEST_RADIUS,
+                ..far_view_scaled(eye, 1080, Some(hole), FarQuality::Medium, scale).unwrap()
+            };
+            far::select(&view, |_| None).into_iter().collect()
+        };
+        assert_eq!(asked(None), selected(FAR_QUAD_SCALE), "the game's scale");
+        assert_eq!(asked(Some(1.0)), selected(1.0), "a scale asked for");
+        assert!(
+            selected(1.0).len() > selected(FAR_QUAD_SCALE).len(),
+            "the two scales select alike, and the test tells nothing"
+        );
+    }
+
+    /// `--far-quad-scale` takes a number from 0.5 to 8 and refuses the rest:
+    /// a typo must not be measured as some other scale.
+    #[test]
+    fn a_quad_scale_is_a_number_in_range_or_refused() {
+        assert_eq!(parse_quad_scale("2.5"), Some(2.5));
+        assert_eq!(parse_quad_scale("3"), Some(3.0));
+        assert_eq!(parse_quad_scale("0.5"), Some(0.5));
+        assert_eq!(parse_quad_scale("8"), Some(8.0));
+        for wrong in ["", "x3", "3x", "0", "0.4", "8.5", "-2", "nan", "inf"] {
+            assert_eq!(parse_quad_scale(wrong), None, "{wrong:?}");
+        }
     }
 
     /// `Off` draws nothing beyond the voxels: everything shown leaves, and
@@ -1133,12 +1435,14 @@ mod tests {
         let eyes = low_flight(600);
         let start = eyes[0];
         let hole = voxel_hole(start.map(|v| v as f32));
-        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        // At the game's quad scale: what the game's own plan costs.
+        let game = |pool| Sim::at_scale(FAR_VIEW_RADIUS, hole, pool, FAR_QUAD_SCALE);
+        let mut sim = game(PoolModel::new(4, 2));
         sim.settle(start);
         sim.fly(&eyes);
         // The timed flight, from a fresh plan over the warm memo.
         let memo = std::mem::take(&mut sim.memo);
-        let mut sim = Sim::new(FAR_VIEW_RADIUS, hole, PoolModel::new(4, 2));
+        let mut sim = game(PoolModel::new(4, 2));
         sim.memo = memo;
         sim.settle(start);
         let selects_before = sim.plan.selects;
