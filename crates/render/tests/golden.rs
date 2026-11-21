@@ -895,13 +895,12 @@ fn the_288_m_edge_matches_a_finer_ring_on_screen() {
     assert_frame_golden("ring_edge_288m", Some(frame));
 }
 
-/// **#380's visual pin**: the level-1 ring's height morph, drawn. The eye
-/// stands 30 blocks above the origin's ground and 240 blocks from the level-1
-/// ring's far part, inside level 1's band (224 - 256 blocks of the metric), so
-/// the ground there is part-way to level 2's. With the morph off the same
-/// meshes draw as they were meshed; the two frames must differ (else the
-/// shader or the vertex bits stopped carrying the morph) and the morph-on frame
-/// is the golden.
+/// **#380's visual pin**: the height morph, drawn. The eye stands at 90
+/// blocks, looking toward +x and slightly down, over the real 160 m, 288 m and
+/// 512 m rings, so the ground ahead is in levels 0, 1 and 2's bands at once.
+/// With the morph off the same meshes draw as they were meshed; the two
+/// frames must differ (else the shader or the vertex bits stopped carrying
+/// the morph) and the morph-on frame is the golden.
 #[test]
 fn the_level_one_ring_morphs_its_heights_on_screen() {
     let world = World::new();
@@ -937,8 +936,8 @@ fn the_level_one_ring_morphs_its_heights_on_screen() {
 }
 
 /// The least pixels the morph must change in that frame (chosen, not
-/// derived: well under what the frame shows, well over backend noise).
-const MORPH_MIN_MOVED_PIXELS: usize = 500;
+/// derived: a quarter of the 82,000 this frame shows, far over backend noise).
+const MORPH_MIN_MOVED_PIXELS: usize = 20_000;
 
 /// Mesh exactly `schedule`'s nodes around the origin (never level 0, which
 /// callers assert for themselves) with trees, and again with every node's
