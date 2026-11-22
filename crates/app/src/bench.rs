@@ -134,6 +134,9 @@ pub enum Target {
     /// `--bench flight`: how much of the screen is still loading while
     /// flying (`crate::flight`).
     Flight,
+    /// `--bench reload`: in what order the picture comes back after a jump
+    /// away and back (`crate::reload`).
+    Reload,
     /// `--bench walk`: the whole frame's time -- the game's tick, streaming,
     /// drawing and the GPU -- while a scripted player walks (`crate::flight::walk`).
     Walk,
@@ -152,6 +155,7 @@ pub fn parse_target(word: Option<&str>) -> Target {
         Some("gate") => Target::Gate,
         Some("tune") => Target::Tune,
         Some("flight") => Target::Flight,
+        Some("reload") => Target::Reload,
         Some("walk") => Target::Walk,
         Some("edits") => Target::Edits,
         other => Target::Radius(other.and_then(|w| w.parse().ok()).unwrap_or(12)),
@@ -1300,6 +1304,7 @@ mod tests {
         assert_eq!(parse_target(Some("gate")), Target::Gate);
         assert_eq!(parse_target(Some("tune")), Target::Tune);
         assert_eq!(parse_target(Some("flight")), Target::Flight);
+        assert_eq!(parse_target(Some("reload")), Target::Reload);
         assert_eq!(parse_target(Some("edits")), Target::Edits);
         assert_eq!(parse_target(Some("64")), Target::Radius(64));
         assert_eq!(parse_target(None), Target::Radius(12));

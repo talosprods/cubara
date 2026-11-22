@@ -40,7 +40,7 @@ const NOTHING: wgpu::Color = wgpu::Color {
 };
 
 /// Whether an RGBA pixel shows [`NOTHING`].
-fn shows_nothing(p: &[u8]) -> bool {
+pub(crate) fn shows_nothing(p: &[u8]) -> bool {
     p[0] >= 250 && p[1] <= 5 && p[2] >= 250
 }
 
@@ -436,7 +436,7 @@ impl PopStats {
 /// from the finished frame. Far above what a far patch one level coarser or
 /// a node one level off moves a pixel by on open ground, far below ground
 /// against sky.
-const TOLERANCE: u8 = 40;
+pub(crate) const TOLERANCE: u8 = 40;
 
 /// What to fly.
 #[derive(Clone, Debug)]
@@ -1278,17 +1278,17 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
 
 /// Everything a flight streams: the world, the game's two streamers, and the
 /// game's renderer.
-struct Streamed {
-    world: Arc<World>,
-    nodes: NodeStreaming,
-    far: FarStreaming,
-    renderer: Renderer,
+pub(crate) struct Streamed {
+    pub(crate) world: Arc<World>,
+    pub(crate) nodes: NodeStreaming,
+    pub(crate) far: FarStreaming,
+    pub(crate) renderer: Renderer,
 }
 
 impl Streamed {
     /// `sky`: frames clear to the real sky (a video) rather than to
     /// [`NOTHING`] (the hole count, which a sky-cleared run cannot make).
-    fn new(flight: &Flight, sky: bool) -> Option<Self> {
+    pub(crate) fn new(flight: &Flight, sky: bool) -> Option<Self> {
         let camera = pose(flight, flight.start);
         let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
         if !sky {
@@ -1345,7 +1345,7 @@ impl Streamed {
     }
 
     /// Stream for `eye` and draw one frame, the way the game's frame does.
-    fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
+    pub(crate) fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
         self.frame_at(flight, eye, eye);
     }
 
@@ -1369,11 +1369,11 @@ impl Streamed {
 
     /// Stream and draw at `eye` until nothing is left to load, then once more
     /// so what arrived last is drawn.
-    fn settle(&mut self, flight: &Flight, eye: [f32; 3]) {
+    pub(crate) fn settle(&mut self, flight: &Flight, eye: [f32; 3]) {
         self.settle_at(flight, eye, eye);
     }
 
-    fn settled(&self) -> bool {
+    pub(crate) fn settled(&self) -> bool {
         self.nodes.settled() && self.far.settled() && self.renderer.uploads_pending() == 0
     }
 }
@@ -1936,7 +1936,7 @@ fn keep_worst<T>(worst: &mut Option<(f64, T)>, loading: f64, candidate: T) {
     }
 }
 
-fn save(path: &Path, frame: &Frame) {
+pub(crate) fn save(path: &Path, frame: &Frame) {
     if let Err(e) = image::save_buffer(
         path,
         &frame.pixels,

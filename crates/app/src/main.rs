@@ -28,6 +28,7 @@ mod lod_probe;
 mod options;
 mod paths;
 mod present;
+mod reload;
 mod screenshot;
 mod settings;
 mod streaming;
@@ -1350,6 +1351,50 @@ fn main() {
                 match flight::walk(seconds, size, fps, fly) {
                     Some(report) => log::info!("{}", report.line()),
                     None => log::error!("WALK: no GPU to walk on"),
+                }
+                return;
+            }
+            // `--bench reload [--eye X,Y,Z] [--look DX,DY,DZ] [--away BLOCKS]
+            // [--fps F] [--frames DIR]`: jump the eye away, let that settle,
+            // jump back, and say in what order the picture returns.
+            bench::Target::Reload => {
+                let number = |name: &str, default: f32| {
+                    flag(name).map_or(default, |t| {
+                        t.parse().unwrap_or_else(|_| {
+                            eprintln!("{name} needs a number");
+                            std::process::exit(2);
+                        })
+                    })
+                };
+                let look = flag("--look").map_or([1.0, -0.15, 0.3], |text| {
+                    bench::parse_eye(text).unwrap_or_else(|| {
+                        eprintln!("--look needs DX,DY,DZ, e.g. --look 1,-0.15,0.3");
+                        std::process::exit(2);
+                    })
+                });
+                let reload = reload::Reload {
+                    flight: flight::Flight {
+                        start: eye.unwrap_or([8.0, 120.0, 8.0]),
+                        look,
+                        speed: flight::FLY_SPEED,
+                        seconds: 0.0,
+                        fps: number("--fps", 60.0) as u32,
+                        every: 0.25,
+                        size,
+                        quality: far_streaming::FarQuality::High,
+                        far_quad_scale,
+                        morph: !args.iter().any(|a| a == "--no-morph"),
+                    },
+                    away: number("--away", 5000.0),
+                };
+                match reload::reload(&reload, flag("--frames").map(std::path::Path::new)) {
+                    Some(report) => {
+                        for line in report.timeline(number("--every", 0.25)) {
+                            log::info!("{line}");
+                        }
+                        log::info!("{}", report.line());
+                    }
+                    None => log::error!("RELOAD: no GPU to reload on"),
                 }
                 return;
             }

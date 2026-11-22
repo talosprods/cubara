@@ -831,6 +831,19 @@ impl NodeStreaming {
         )
     }
 
+    /// How many nodes of each level, 0 to 3, are drawn (held ones included)
+    /// -- for a measurement's log (`crate::reload`): which ring the nodes
+    /// arriving after a jump belong to.
+    pub fn drawn_per_level(&self) -> [usize; 4] {
+        let mut out = [0; 4];
+        for node in &self.resident {
+            if let Some(n) = out.get_mut(node.level as usize) {
+                *n += 1;
+            }
+        }
+        out
+    }
+
     /// Nothing left to do for this camera: no search running or due, nothing
     /// being meshed, nothing drawn in place of what replaces it. What a
     /// finished frame waits for (`crate::flight`).
