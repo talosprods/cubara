@@ -96,6 +96,13 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 height: v.size.1,
                 region_radius: v.radius,
                 camera: Some((glam::Vec3::from(v.eye).as_dvec3(), glam::Vec3::from(v.look))),
+                // The distance morph, as the game draws it (without it a
+                // shot showed every node at its own heights and could not
+                // show what the morph does near the player, #380).
+                morph: Some(crate::streaming::morph_params_for(
+                    &schedule_for_radius(v.radius),
+                    VERTICAL_LOD_SQUASH,
+                )),
                 ..Shot::default()
             };
             let (min, max) =
