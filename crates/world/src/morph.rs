@@ -53,12 +53,23 @@ pub const MORPH_LEVELS: std::ops::RangeInclusive<u32> = 0..=2;
 /// The widest band, in blocks of the morph metric. **Chosen, not derived**:
 /// wider spreads a change over more frames, and leaves less of the ring at
 /// its own detail; 128 blocks is 5.3 s at the flight speed of 24 blocks/s.
-/// At the default schedule it is level 0's whole ring (0 to 128: the band
-/// starts at the eye), which cost no triangles and halved the toward-peak
-/// flight's holes against 64 (issue #380's study, 2026-11-21); levels 1 and
-/// 2 get less than this anyway (32 and 64 blocks): [`morph_bands`] gives
-/// each level all the room its ring leaves.
+/// At the default schedule level 0's band is [`NEAR_EXACT`] to its ring's
+/// end (see there); levels 1 and 2 get less than this anyway (32 and 64
+/// blocks): [`morph_bands`] gives each level all the room its ring leaves.
 pub const MAX_BAND: f32 = 128.0;
+
+/// How far from the eye the finest level's terrain stands exactly on the
+/// block grid: level 0's band never starts nearer, in blocks of the metric.
+/// **Chosen, not derived**: near the player a block is tens to hundreds of
+/// pixels tall, so any fraction of one shows -- a band that started at the
+/// eye (as #380's first one did, 0 to 128) moved a vertex at 20 blocks 16%
+/// of the way to its parent's height, and the owner's play test of
+/// 2026-11-25 saw thin slabs on the terraces and slivers at the foot of
+/// walls. The value is the measurement of that day (`docs/PHASE3_ARCHITECTURE.md`
+/// §9.5): the transition study at the 160 m edge, against today's band.
+/// [`morph_bands`] keeps it at most three quarters of the way to the band's
+/// end, so a short ring (a weak PC's) still has a band.
+pub const NEAR_EXACT: f32 = 96.0;
 
 /// A level's morph band, in blocks of [`morph_metric`]: its vertices start
 /// moving to their parent's height at `start` and have arrived at `end`.
@@ -93,7 +104,7 @@ pub fn inner_reach(level: u32, squash: i32) -> f32 {
 /// Each level's morph band for `schedule` (indexed by level, four levels):
 /// ending [`outer_margin`] before the level's ring edge, and starting at most
 /// [`MAX_BAND`] before that but never closer than [`inner_reach`] past the
-/// ring's inner edge. `None` for the last ring (its join is the far
+/// ring's inner edge (for level 0: than [`NEAR_EXACT`] from the eye). `None` for the last ring (its join is the far
 /// terrain's), for a level the schedule does not have, and for a ring with
 /// no room for a band at all -- whose swap the morph cannot hide.
 pub fn morph_bands(schedule: &RingSchedule, squash: i32) -> [Option<MorphBand>; 4] {
@@ -104,7 +115,7 @@ pub fn morph_bands(schedule: &RingSchedule, squash: i32) -> [Option<MorphBand>; 
         }
         let end = CHUNK * radius as f32 - outer_margin(squash);
         let floor = match k {
-            0 => 0.0,
+            0 => NEAR_EXACT.min(0.75 * end),
             _ => CHUNK * schedule[k - 1].1 as f32 + inner_reach(level, squash),
         };
         let start = (end - MAX_BAND).max(floor);
@@ -946,11 +957,12 @@ mod tests {
     #[test]
     fn the_default_schedule_has_a_band_for_levels_0_to_2_and_none_for_3() {
         let bands = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH);
-        // 160 m edge: ends 32 before it, and the cap (128) reaches the eye.
+        // 160 m edge: ends 32 before it; the cap (128) would reach the eye,
+        // but the near field (96 blocks) stands exactly on the grid.
         assert_eq!(
             bands[0],
             Some(MorphBand {
-                start: 0.0,
+                start: NEAR_EXACT,
                 end: 128.0
             })
         );
@@ -974,6 +986,76 @@ mod tests {
         assert_eq!(bands[3], None, "level 3 meets the far terrain");
     }
 
+    /// **The near field is exactly on the block grid** (the owner's play
+    /// test, 2026-11-25: thin slabs on the terraces and slivers at the foot
+    /// of walls, which were level-0 vertices a few percent of the way to
+    /// their parent's height). Real level-0 nodes around eyes standing on
+    /// the mountain's terraces, and hovering above them: every vertex that
+    /// has a morph target and is within [`NEAR_EXACT`] of the eye, by the
+    /// morph metric (horizontal, or twice the vertical), has factor 0 --
+    /// its drawn height is the block's own. Goes red when the band starts
+    /// nearer than [`NEAR_EXACT`] (main's started at the eye).
+    #[test]
+    fn level_0_stands_exactly_on_the_grid_near_the_eye() {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        // The floor of the measured candidates (64, 80, 96): the radius
+        // cannot be set back toward the eye without this failing to build.
+        const _: () = assert!(NEAR_EXACT >= 64.0, "the near field is at least 64 blocks");
+        let band = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH)[0].expect("level 0 morphs");
+        let ground = snapshot.surface_height(336 * 16, 213 * 16);
+        let (mut near_moving, mut far_moving) = (0, 0);
+        for up in [2.6f32, 6.0, 20.0] {
+            let eye = [336.0 * 16.0 + 0.5, ground as f32 + up, 213.0 * 16.0 + 0.5];
+            let at = ChunkCoord::from_world_pos(eye);
+            for node in desired_nodes_3d(at, SQUASH, DEFAULT_RING_SCHEDULE) {
+                if node.level != 0 {
+                    continue;
+                }
+                let (min, _) = metric_range(node, eye);
+                if min > 140.0 {
+                    continue;
+                }
+                let Some(geometry) =
+                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                else {
+                    continue;
+                };
+                let o = geometry.origin;
+                for v in &geometry.mesh.vertices {
+                    if v.morph_delta() == 0.0 {
+                        continue;
+                    }
+                    let rel = [
+                        (o[0] + v.x() as i32) as f32 - eye[0],
+                        (o[1] + v.y() as i32) as f32 - eye[1],
+                        (o[2] + v.z() as i32) as f32 - eye[2],
+                    ];
+                    let metric = morph_metric(rel, SQUASH);
+                    if metric < NEAR_EXACT {
+                        near_moving += 1;
+                        assert_eq!(
+                            morph_factor(metric, band),
+                            0.0,
+                            "{node:?} vertex {rel:?} (metric {metric}, eye {up} up) has a \
+                             morph target but is inside the near radius and would stand off \
+                             the block grid"
+                        );
+                    } else {
+                        far_moving += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            near_moving > 100 && far_moving > 100,
+            "near {near_moving}, far {far_moving} moving vertices: the test saw too little"
+        );
+    }
+
     #[test]
     fn a_ring_too_narrow_for_its_nodes_has_no_band() {
         // Every radius halved: the level-1 ring is 4 chunks wide, but a
@@ -984,7 +1066,7 @@ mod tests {
         assert_eq!(
             bands[0],
             Some(MorphBand {
-                start: 0.0,
+                start: 36.0,
                 end: 48.0
             })
         );
