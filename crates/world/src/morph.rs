@@ -820,8 +820,8 @@ mod tests {
         let snapshot = world.snapshot();
         let layer = |_: &str| 0u32;
         // The floor of the measured candidates (64, 80, 96): the radius
-        // cannot be set back toward the eye without this going red.
-        assert!(NEAR_EXACT >= 64.0, "the near field is {NEAR_EXACT} blocks");
+        // cannot be set back toward the eye without this failing to build.
+        const _: () = assert!(NEAR_EXACT >= 64.0, "the near field is at least 64 blocks");
         let band = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH)[0].expect("level 0 morphs");
         let ground = snapshot.surface_height(336 * 16, 213 * 16);
         let (mut near_moving, mut far_moving) = (0, 0);
