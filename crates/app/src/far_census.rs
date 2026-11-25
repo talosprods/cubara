@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use cubara_render::far::{
     class_of, frame_runs, hidden_height, issued, lowest_over, place, runs_room, segment_runs,
-    stored_order, tile_masks, CullPatch, PatchCull, CLASS_FACES, PATCH_TILES, QUAD_INDICES,
-    TILES, TILE_QUADS,
+    stored_order, tile_masks, CullPatch, PatchCull, CLASS_FACES, PATCH_TILES, QUAD_INDICES, TILES,
+    TILE_QUADS,
 };
 use cubara_render::{Aabb, CameraUniform, FarCulling, FarDir, FarFace, Frustum};
 use cubara_voxel::ChunkCoord;
@@ -421,7 +421,10 @@ impl Scene {
                     continue;
                 };
                 let side = (TILE_QUADS as f32) * p.quad;
-                let (tx, tz) = ((t % PATCH_TILES) as f32 * side, (t / PATCH_TILES) as f32 * side);
+                let (tx, tz) = (
+                    (t % PATCH_TILES) as f32 * side,
+                    (t / PATCH_TILES) as f32 * side,
+                );
                 tiles.push(HorizonTile {
                     bounds,
                     square: [
@@ -1053,11 +1056,7 @@ impl Raster {
             .iter()
             .map(|c| {
                 let iw = 1.0 / c.w;
-                [
-                    (c.x * iw * 0.5 + 0.5) * w,
-                    (0.5 - c.y * iw * 0.5) * h,
-                    iw,
-                ]
+                [(c.x * iw * 0.5 + 0.5) * w, (0.5 - c.y * iw * 0.5) * h, iw]
             })
             .collect();
         for k in 1..s.len() - 1 {
@@ -1130,7 +1129,11 @@ fn voxel_stand_in(
     let mut out = Vec::new();
     for p in &patches {
         let [ox, oz] = p.key.origin();
-        let placement = ([ox as f32, oz as f32], p.key.quad() as f32, p.skirt_blocks() as f32);
+        let placement = (
+            [ox as f32, oz as f32],
+            p.key.quad() as f32,
+            p.skirt_blocks() as f32,
+        );
         for face in to_far_faces(p) {
             let corners = face.corners().map(|v| place(&v, placement, None, 0.0));
             let inside = corners.iter().all(|c| {
@@ -1217,7 +1220,8 @@ fn far_census_visible() {
                 raster.clear();
                 // The voxels' ground first, under an id that is nobody's.
                 for corners in &stand_in {
-                    let clip = corners.map(|p| m * glam::DVec4::new(p.x as f64, p.y as f64, p.z as f64, 1.0));
+                    let clip = corners
+                        .map(|p| m * glam::DVec4::new(p.x as f64, p.y as f64, p.z as f64, 1.0));
                     for idx in QUAD_INDICES.chunks(3) {
                         let [a, b, c] = [idx[0], idx[1], idx[2]].map(|v| clip[v as usize]);
                         raster.draw([a, b, c], u32::MAX - 1);
@@ -1250,7 +1254,8 @@ fn far_census_visible() {
                             // `CRACK_SEAL`) -- without it a T-junction is a
                             // pinhole here that the GPU never shows.
                             let world = face.corners().map(|v| {
-                                let p = place(&v, scene.placement[i], Some(scene.hole), scene.hidden);
+                                let p =
+                                    place(&v, scene.placement[i], Some(scene.hole), scene.hidden);
                                 p + v.outward() * (CRACK_SEAL * p.distance(eye))
                             });
                             for (t, idx) in tris.iter().zip(QUAD_INDICES.chunks(3)) {
@@ -1328,7 +1333,10 @@ fn far_census_visible() {
     }
     println!();
     println!("Triangles that own a pixel and are not drawn: {wrongly_left_out}");
-    assert_eq!(wrongly_left_out, 0.0, "the cull left out ground the eye sees");
+    assert_eq!(
+        wrongly_left_out, 0.0,
+        "the cull left out ground the eye sees"
+    );
 }
 
 /// **The quad-scale scan `FAR_QUAD_SCALE` is chosen by**: at each gate eye,

@@ -183,9 +183,8 @@ impl Horizon {
             let rise = top - ey;
             let steepest = if rise >= 0.0 { rise / near } else { rise / far };
             let hidden = hi - lo < 2.0
-                && (bin(lo) - 1..=bin(hi) + 1).all(|b| {
-                    self.slope[b.rem_euclid(HORIZON_BINS as i64) as usize] > steepest
-                });
+                && (bin(lo) - 1..=bin(hi) + 1)
+                    .all(|b| self.slope[b.rem_euclid(HORIZON_BINS as i64) as usize] > steepest);
             if hidden {
                 shown[k as usize] = false;
             } else if tile.floor.is_finite() {
@@ -234,7 +233,12 @@ mod tests {
             last = p;
         }
         // A quarter turn is one, and opposite directions are two apart.
-        for (dx, dz, p) in [(1.0, 0.0, 0.0), (0.0, 1.0, 1.0), (-1.0, 0.0, 2.0), (0.0, -1.0, 3.0)] {
+        for (dx, dz, p) in [
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 1.0),
+            (-1.0, 0.0, 2.0),
+            (0.0, -1.0, 3.0),
+        ] {
             assert_eq!(pseudo_angle(dx, dz), p);
         }
     }

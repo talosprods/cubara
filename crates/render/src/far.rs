@@ -802,7 +802,10 @@ pub fn runs_of(
     (frustum, eye): (&Frustum, Vec3),
 ) -> Vec<(usize, u32, u32)> {
     let placed: Vec<PlacedPatch> = patches.iter().map(PlacedPatch::of).collect();
-    let boxes: Vec<Option<Aabb>> = placed.iter().map(|p| Some(p.aabb(anchor::ORIGIN))).collect();
+    let boxes: Vec<Option<Aabb>> = placed
+        .iter()
+        .map(|p| Some(p.aabb(anchor::ORIGIN)))
+        .collect();
     let culls: Vec<PatchCull> = patches
         .iter()
         .map(|p| PatchCull::of(&stored_order(p.faces), p.skirt))
@@ -854,8 +857,7 @@ pub fn runs_of(
 /// whole groups: a tile's group is a few faces. **Chosen, not derived**: a
 /// finer ladder pads less and draws more often.
 pub const CLASS_FACES: [u32; 21] = [
-    4, 6, 8, 11, 16, 23, 32, 46, 64, 91, 128, 182, 256, 363, 512, 725, 1024, 1449, 2048, 2897,
-    4096,
+    4, 6, 8, 11, 16, 23, 32, 46, 64, 91, 128, 182, 256, 363, 512, 725, 1024, 1449, 2048, 2897, 4096,
 ];
 
 /// The class a run of `faces` faces is drawn in: the smallest that holds it.
@@ -2256,8 +2258,16 @@ mod tests {
             dir,
             i0,
             j0,
-            i1: if matches!(dir, FarDir::PosZ | FarDir::NegZ) { i0 + 1 } else { i0 },
-            j1: if matches!(dir, FarDir::PosX | FarDir::NegX) { j0 + 1 } else { j0 },
+            i1: if matches!(dir, FarDir::PosZ | FarDir::NegZ) {
+                i0 + 1
+            } else {
+                i0
+            },
+            j1: if matches!(dir, FarDir::PosX | FarDir::NegX) {
+                j0 + 1
+            } else {
+                j0
+            },
             rise: 3,
             ..unit_top(i0, j0, 40)
         };
@@ -2269,8 +2279,16 @@ mod tests {
         // The patch's far edges: still a quad of the patch.
         assert_eq!(wall(FarDir::PosX, 32, 0).owner(), [31, 0]);
         let t = TILE_QUADS;
-        assert_eq!(wall(FarDir::PosX, t as u8, 0).tile(), 0, "the tile before the line");
-        assert_eq!(wall(FarDir::NegX, t as u8, 0).tile(), 1, "the tile after it");
+        assert_eq!(
+            wall(FarDir::PosX, t as u8, 0).tile(),
+            0,
+            "the tile before the line"
+        );
+        assert_eq!(
+            wall(FarDir::NegX, t as u8, 0).tile(),
+            1,
+            "the tile after it"
+        );
     }
 
     /// A tile's floor is the lowest of its own tops: a top belongs to the
@@ -2316,7 +2334,10 @@ mod tests {
         assert!(tile_groups(&b, 50.0, true, below)[TOP_GROUP], "exempt");
         assert!(tile_groups(&b, 50.0, false, Vec3::new(0.0, 50.5, 0.0))[TOP_GROUP]);
         // The walls are the box's to decide, whatever the height.
-        let (walls, facing) = (tile_groups(&b, 50.0, false, below), groups_facing(&b, below));
+        let (walls, facing) = (
+            tile_groups(&b, 50.0, false, below),
+            groups_facing(&b, below),
+        );
         for g in (0..GROUP_ORDER.len()).filter(|&g| g != TOP_GROUP) {
             assert_eq!(walls[g], facing[g], "group {g}");
         }
@@ -2372,9 +2393,11 @@ mod tests {
             &mut patches_only,
         );
         let mut whole = Vec::new();
-        facing_runs(cull.group_counts(), groups_facing(&aabb, eye), |first, count| {
-            whole.push((0, first, count))
-        });
+        facing_runs(
+            cull.group_counts(),
+            groups_facing(&aabb, eye),
+            |first, count| whole.push((0, first, count)),
+        );
         assert_eq!(out, whole);
         assert_eq!(patches_only, whole, "culling by whole patches");
     }

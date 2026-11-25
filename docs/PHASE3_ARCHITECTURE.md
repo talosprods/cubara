@@ -1802,7 +1802,7 @@ hill eye (-3.7%), 167,998 to 49,938 at the ground eye (-70%), none at the
 flight eye. It hides much from the ground eye (the far terrain behind the
 first hills) and almost nothing from the hill eye,
 which looks down on the far terrain and sees most of it; the gate turns on
-the hill eye, so it would not move the scale. It costs 0.3 to 0.9 ms of
+the hill eye, so it would not move the scale. It costs 0.4 to 1.4 ms of
 CPU a frame as prototyped, and it is sound only with the voxels' ground
 closing the seam at the box's sides: a line of sight that leaves the box
 under the far terrain's skirt there has gone into the voxels' ground, and

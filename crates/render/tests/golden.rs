@@ -2704,10 +2704,13 @@ fn no_sky_shows_through_the_far_terrain() {
     }
 }
 
+/// Pixels of a frame, as `(x, y)`.
+type Pixels = Vec<(u32, u32)>;
+
 /// Where frames `a` and `b` differ, split in two: pixels where each frame's
 /// colour is one the other frame has in the 3 x 3 pixels around -- an edge
-/// between two faces moved by a pixel -- and the rest, as `(x, y)`.
-fn edge_ties(a: &Frame, b: &Frame) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+/// between two faces moved by a pixel -- and the rest.
+fn edge_ties(a: &Frame, b: &Frame) -> (Pixels, Pixels) {
     fn at(f: &Frame, x: u32, y: u32) -> &[u8] {
         &f.pixels[((y * f.width + x) * 4) as usize..][..4]
     }
@@ -2788,8 +2791,10 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
     let mut sent = [0u64; 2];
     for (name, eye, pitch) in eyes {
         // The voxels' box round the eye, as the game's streaming makes it.
-        let (min, max) =
-            cubara_world::node::covered_box_3d(ChunkCoord::from_world_pos(eye.to_array()), &schedule);
+        let (min, max) = cubara_world::node::covered_box_3d(
+            ChunkCoord::from_world_pos(eye.to_array()),
+            &schedule,
+        );
         let (min, max) = (min.map(|c| c * 16), max.map(|c| c * 16));
         // Quads of 32 pixels, an error bound and a floor of 8 -- about the
         // game's Medium -- to 30 km: patches of five levels, and the voxels'
@@ -2847,8 +2852,16 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
                 look,
             );
             let frustum = cubara_render::Frustum::from_view_proj(view_proj);
-            for (k, culling) in [FarCulling::Patches, FarCulling::Tiles].into_iter().enumerate() {
-                let runs = cubara_render::far::runs_of(&patches, Some((min, max)), culling, (&frustum, eye));
+            for (k, culling) in [FarCulling::Patches, FarCulling::Tiles]
+                .into_iter()
+                .enumerate()
+            {
+                let runs = cubara_render::far::runs_of(
+                    &patches,
+                    Some((min, max)),
+                    culling,
+                    (&frustum, eye),
+                );
                 sent[k] += runs.iter().map(|r| r.2 as u64 * 2).sum::<u64>();
             }
             let (ties, other) = edge_ties(&frames[0], &frames[1]);

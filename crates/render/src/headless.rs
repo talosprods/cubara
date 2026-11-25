@@ -278,7 +278,13 @@ pub fn render_with_far(
     far_params: Option<crate::far::FarParams>,
     shot: Shot,
 ) -> Option<Frame> {
-    render_with_far_culled(meshed, far, far_params, crate::far::FarCulling::default(), shot)
+    render_with_far_culled(
+        meshed,
+        far,
+        far_params,
+        crate::far::FarCulling::default(),
+        shot,
+    )
 }
 
 /// [`render_with_far`] with the far terrain culled as `culling` says, not as
