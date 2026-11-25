@@ -20,11 +20,11 @@
 use std::collections::BTreeMap;
 
 use cubara_render::far::{
-    class_of, frame_runs, hidden_height, issued, lowest_over, place, runs_room, segment_runs,
-    stored_order, tile_masks, CullPatch, PatchCull, CLASS_FACES, PATCH_TILES, QUAD_INDICES, TILES,
-    TILE_QUADS,
+    class_of, frame_runs, hidden_height, issued, lowest_over, patch_box, place, runs_room,
+    segment_runs, stored_order, tile_masks, CullPatch, PatchCull, CLASS_FACES, PATCH_TILES,
+    QUAD_INDICES, TILES, TILE_QUADS,
 };
-use cubara_render::{Aabb, CameraUniform, FarCulling, FarDir, FarFace, Frustum};
+use cubara_render::{Aabb, CameraUniform, FarCulling, FarDir, FarFace, FarPatch, Frustum};
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, PatchHeights, PATCH_QUADS};
 use cubara_world::{node, World, WorldGen};
@@ -317,17 +317,18 @@ impl Scene {
                 )
             })
             .collect();
-        let boxes: Vec<Aabb> = faces
+        // The renderer's own box of each patch.
+        let boxes: Vec<Aabb> = patches
             .iter()
+            .zip(&faces)
             .zip(&placement)
-            .map(|(faces, &(origin, quad, skirt))| {
-                let ys = faces.iter().flat_map(|f| f.corners()).map(|v| v.y(skirt));
-                let (lo, hi) = ys.fold((f32::MAX, f32::MIN), |(l, h), y| (l.min(y), h.max(y)));
-                let size = quad * PATCH_QUADS as f32;
-                Aabb {
-                    min: Vec3::new(origin[0], lo, origin[1]),
-                    max: Vec3::new(origin[0] + size, hi, origin[1] + size),
-                }
+            .map(|((p, faces), &(_, quad, skirt))| {
+                patch_box(&FarPatch {
+                    origin: p.key.origin(),
+                    quad,
+                    faces,
+                    skirt,
+                })
             })
             .collect();
         let culls = faces

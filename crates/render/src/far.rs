@@ -1596,9 +1596,10 @@ fn hole_aabb(min: [i32; 3], max: [i32; 3], anchor: Anchor) -> Aabb {
 }
 
 /// A patch's box: its square of ground, from the bottom of its skirt to its
-/// highest vertex -- against the world origin, i.e. in world blocks.
-#[cfg(test)]
-fn patch_box(patch: &FarPatch<'_>) -> Aabb {
+/// highest vertex -- against the world origin, i.e. in world blocks. The box
+/// [`FarTerrain`] culls the patch by, for a count of what a frame draws
+/// (`cubara-app`'s `far_census`).
+pub fn patch_box(patch: &FarPatch<'_>) -> Aabb {
     PlacedPatch::of(patch).aabb(anchor::ORIGIN)
 }
 
