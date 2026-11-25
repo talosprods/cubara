@@ -2752,7 +2752,7 @@ fn edge_ties(a: &Frame, b: &Frame) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
 /// overlap by the crack seal's sliver, at one depth, and the one drawn first
 /// keeps those pixels. Tiles draw the faces in another order (by run, run by
 /// class), so a pixel on such an edge can take the other face's colour: seen
-/// as three pixels in one of the twelve views. Such a pixel shows, in each
+/// as 3, 1 and 1 pixels in three of the twelve views. Such a pixel shows, in each
 /// picture, a colour the other picture has beside it; a face the cull left
 /// out shows what is behind it, which neither has there. At most
 /// `MOST_TIES` of them a view (**chosen, not derived**: ten times the most
