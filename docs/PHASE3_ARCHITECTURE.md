@@ -1621,7 +1621,7 @@ gate and is watertight:
 |---|--:|--:|---|--:|--:|--:|---|
 | x1 (the quality's own sizes; as first built) | 636 / 577 | | not met at any quality | | | 1.96 M | |
 | x2.5 | 1,080 / 1,035 | 988 / 944 | met at Medium | 163 / 56 | 244,604 | 591,064 | 0 of 1,195 / 0 of 1,798 |
-| **x3 (the default)** | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
+| **x3 (the default until the tiles below)** | 1,152 / 1,124 | 1,028 / 983 | met at Medium | 127 / 44 | 192,333 | 467,201 | 0 of 1,194 / 0 of 1,798 |
 | x3.5 | not run: the gate stops at High | 1,059 / 1,013 | met at High | 181 / 61 at High | 263,342 at High | 637,284 at High | 0 of 1,195 / 0 of 1,799 |
 
 (M3 on battery, the machine in use and other sessions running: **not
@@ -1631,7 +1631,7 @@ the hill eye held the gate by 3.5% there.)
 
 **The quiet bench chose 3** (`BENCHMARKS.md` footnote 96: AC power, no
 agents, five quiet minutes, two runs of each, alternating; Medium, ground /
-hill FPS). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
+hill FPS; since the far terrain is culled by tiles the scale is 2.09, below). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
 1,036 / 1,034 -- it holds, by 3.5% at the hill eye, and stands below main
 there. At 3: 1,153 / 1,161 and 1,121 / 1,130, 7% over main at the hill eye.
 Both fly with no hole and with 1 or 2 stale frames where main has 16.
@@ -1664,6 +1664,129 @@ rule alone draws quads of 32 there), so the hand-over to level 3 is from
 quads two levels coarser over smooth ground. The exactness of a quad of 8
 is a property of the rule and stands; how much ground is drawn with it is
 what the scale trades.
+
+**Fewer triangles: the far terrain culled by tiles** (2026-11-25). The
+census first (`far_census_by_kind`, `far_census_visible` in
+`crates/app/src/far_census.rs`; Medium, 1920x1080, the bench's 40
+directions at each gate eye, per frame; the renderer's own functions for
+what is drawn). Before, at the hill eye -- the gate's lowest -- by scale:
+
+| scale | patches | triangles | vertices issued | tops | walls +x / -x / +z / -z | edge walls | facing the eye, on screen | facing away | off screen | no area |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| x1 | 216 | 894,968 | 2,143,303 | 441,907 | 105,336 / 108,945 / 31,147 / 177,893 | 29,739 | 80.8% | 3.3% | 15.2% | 0.8% |
+| x1.5 | 119 | 503,831 | 1,217,861 | 244,224 | 64,101 / 58,560 / 20,425 / 99,584 | 16,938 | 74.6% | 4.2% | 20.1% | 1.1% |
+| x2 | 105 | 447,941 | 1,082,877 | 215,808 | 57,233 / 52,524 / 19,398 / 87,860 | 15,119 | 73.3% | 4.6% | 21.2% | 0.9% |
+| x2.5 | 57 | 246,462 | 595,612 | 116,070 | 32,078 / 29,277 / 13,315 / 47,221 | 8,501 | 67.6% | 6.0% | 25.5% | 0.9% |
+| x3 (as built) | 44 | 193,641 | 470,415 | 90,214 | 25,966 / 22,367 / 12,677 / 35,670 | 6,746 | 63.5% | 6.6% | 28.7% | 1.2% |
+
+(The ground eye draws within 1% of these counts, with 22% of its triangles
+facing away -- the tops of hills above it; the flight eye 75 to 78% of them,
+none facing away.)
+
+- **Merging does not pay.** The faces of the patches in view, meshed with
+  other rules (`merged_counts`): equal tops and walls merged across
+  `far::JOIN_GRID`, which today keeps every quad of 16 blocks and wider a
+  face of its own, 1% fewer; merged whatever they wear (which would need a
+  colour per pixel), 4 to 5%; and with faces reaching into the ground
+  besides (a top on under higher quads, a wall down past the lower top), 9
+  to 11%. At the far terrain's quads the ground is too rough for faces to
+  meet at one height.
+- **Most of what is drawn is not seen.** A software depth buffer of
+  everything drawn (`far_census_visible`, every fourth direction): of the
+  hill eye's triangles that face the eye on screen at x3, one in six owns a
+  pixel (20,135 of 124,164, no voxels drawn); at the ground eye one in 25.
+  A patch is drawn whole or not at all, and the patches across the edges
+  of the view and beside the eye are much of the waste; the rest is behind
+  nearer ground.
+
+**The cull** (`cubara_render::far::cull_runs`): a patch's faces are stored
+by direction group, and in each group by **tile** -- 4 x 4 quads,
+`far::TILE_QUADS` -- the tile of the quad a face belongs to (a wall's is the
+higher of its two quads). Each frame, of every patch the frustum passes,
+each tile is tested against the frustum (unless the patch is wholly inside
+it, or the voxels' box reaches the tile: the join moves those corners, and a
+tile's box is of where they were) and its groups against the eye: a wall
+group by the side of the tile's
+box the eye is on, as a patch's were; and the tops, which face the eye only
+from above, are left out of a tile whose lowest top is above the eye --
+unless the voxels' box reaches the tile, where the join may fold a top into
+a wall. Kept segments that lie next to each other in the buffer are one run.
+Both tests are exact, so no face that shows is left out:
+`every_level_of_far_culling_draws_the_same_pixels` draws the far terrain by
+tiles and by whole patches from the ground and hill eyes and low among the
+mountains, and the pictures must be equal pixel for pixel;
+`far_census_visible` holds every triangle that owns a pixel of its depth
+buffer to being drawn; and `no_sky_shows_through_the_far_terrain` (from the
+shared-corner branch, where it was seen red) that the far terrain drawn so
+is still watertight from above. Runs are now some tiles of a group -- up to
+650 a frame at x2.09, where whole patches made about 100 -- so the size
+classes start at 4 faces (`far::CLASS_FACES`, 21 classes), and the far
+terrain is 17 to 19 draws a frame where it was 4 to 5. The cull costs the
+main thread about 0.045 ms a frame (census timing, not a quiet machine).
+
+After, the same census (the hill eye; ground and flight eye in the PR):
+
+| scale | patches | triangles (before tiles) | vertices issued (before) | tops | walls +x / -x / +z / -z | edge walls | facing the eye, on screen | facing away | off screen | no area |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| x1 | 216 | 755,332 (894,968: -16%) | 1,806,398 (2,143,303) | 385,733 | 78,331 / 95,135 / 13,535 / 158,320 | 24,278 | 95.7% | 0.7% | 2.8% | 0.8% |
+| x1.5 | 119 | 400,501 (503,831: -21%) | 967,655 (1,217,861) | 203,534 | 43,882 / 48,623 / 6,343 / 85,256 | 12,863 | 93.9% | 0.9% | 3.9% | 1.3% |
+| x2 | 105 | 349,358 (447,941: -22%) | 844,389 (1,082,877) | 177,326 | 37,827 / 43,037 / 5,604 / 74,324 | 11,241 | 94.0% | 1.0% | 4.0% | 1.0% |
+| **x2.09** | 57 | **182,132** | 439,972 | 92,349 | 18,844 / 23,359 / 3,144 / 38,521 | 5,916 | 92.4% | 1.3% | 5.1% | 1.1% |
+| x2.5 | 57 | 180,249 (246,462: -27%) | 435,475 (595,612) | 91,374 | 18,700 / 23,077 / 2,733 / 38,521 | 5,844 | 92.4% | 1.3% | 5.1% | 1.1% |
+| x3 | 44 | 135,424 (193,641: -30%) | 328,574 (470,415) | 68,623 | 14,390 / 16,945 / 2,674 / 28,358 | 4,434 | 90.9% | 1.5% | 6.2% | 1.4% |
+
+At the ground eye the cut is 23 to 34% (x3: 191,621 to 127,394), at the
+flight eye 19 to 36% (x3: 149,745 to 96,334). What still faces away at the
+ground eye (15 to 22% of its triangles) is mostly tops -- a third of them at
+x2.09 -- of tiles whose lowest top is under the eye and others over it: a
+tile is one height test, not sixteen.
+
+Tiles of 8 quads cull less: at x2.09 the hill eye drew 190,942 triangles
+against 180,799 with tiles of 4 (both measured before the tiles the voxels'
+box reaches were let off the frustum test, which adds about 1,300), for a
+third of the CPU time (0.014 ms a frame against 0.044) and 301 runs at most
+against 515. The far pass is the
+GPU's and the CPU has room (`BENCHMARKS.md`: about 0.42 ms a frame at the
+ground eye, of about 0.9), so 4 (chosen, not derived).
+
+**The quad scale is now 2.09** (`far_census_scale_scan`, Medium, the
+hill eye; triangles a frame, the tiles' cull):
+
+| scale | patches in view | triangles | against x3 before tiles (193,641) |
+|---|--:|--:|--:|
+| x2 | 105 | 347,639 | +80% |
+| x2.02 | 69 | 222,558 | +15% |
+| x2.06 | 61 | 193,872 | +0.1% |
+| x2.08 | 61 | 193,868 | +0.1% |
+| x2.082 | 59 | 187,351 | -3.2% |
+| **x2.09** | 57 | 180,799 | -6.6% |
+| x2.1 to x2.4 | 57 | 180,117 to 180,799 | -6.6% to -7.0% |
+| x3 | 44 | 134,091 | -31% |
+
+The patches in view change in steps -- a ring of them splits at once -- so
+the count jumps between 2.0 and 2.1 and stands still from 2.09 to 2.4.
+2.09 is the smallest scale, to two places, under the x3 count at the hill
+eye (2.082 is the smallest found at all, three thousandths before the next
+step up); at it the ground eye draws 165,936 (191,621 at x3 before) and the
+flight eye 122,667 (149,745). Whether 2.09 holds the gate is the quiet
+bench's to say.
+
+**Measured and not built: hiding the far terrain behind itself.** A
+conservative horizon per tile -- round the eye, the steepest slope under
+which nearer far terrain is solid, from each tile's lowest top
+(`far_census_horizon.rs`, a census-only prototype) -- leaves of the tiles'
+triangles at x2.09 (every fourth direction): 183,376 to 176,595 at the
+hill eye (-3.7%), 167,998 to 49,938 at the ground eye (-70%), none at the
+flight eye. It hides much from the ground eye (the far terrain behind the
+first hills) and almost nothing from the hill eye,
+which looks down on the far terrain and sees most of it; the gate turns on
+the hill eye, so it would not move the scale. It costs 0.3 to 0.9 ms of
+CPU a frame as prototyped, and it is sound only with the voxels' ground
+closing the seam at the box's sides: a line of sight that leaves the box
+under the far terrain's skirt there has gone into the voxels' ground, and
+the census's depth buffer, which draws no voxels, saw ground behind such
+lines (17,363 triangles in ten frames) until it drew a stand-in for them
+(`voxel_stand_in`).
 
 **The plan kept too little at a wider quad.** `far_streaming::to_keep` holds
 on to every ancestor of a wanted patch, since an ancestor's error is what

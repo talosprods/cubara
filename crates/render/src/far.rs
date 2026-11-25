@@ -672,6 +672,11 @@ pub fn hole_reaches(hole: Option<&Aabb>, b: &Aabb) -> bool {
 /// none for a tile the frustum cannot see -- a patch wholly inside it is not
 /// asked again -- and of the others, those [`tile_groups`] keeps: the walls
 /// by the side of the tile the eye is on, the tops by its height.
+///
+/// A tile the voxels' box reaches is not tested against the frustum: the
+/// join moves its tops' corners (to the box's side, a skirt's depth down, or
+/// out of sight, [`place`]), and its box is of the corners where they were.
+/// It is drawn whenever its patch is, as every tile was before tiles.
 pub fn tile_masks(
     p: &CullPatch<'_>,
     (frustum, eye): (&Frustum, Vec3),
@@ -683,11 +688,12 @@ pub fn tile_masks(
         let Some(b) = p.tile_box(t) else {
             continue;
         };
-        if !inside && !frustum.intersects_aabb(&b) {
+        let joined = hole_reaches(hole, &b);
+        if !inside && !joined && !frustum.intersects_aabb(&b) {
             continue;
         }
         let floor = p.cull.tiles[t].floor - p.dy;
-        let groups = tile_groups(&b, floor, hole_reaches(hole, &b), eye);
+        let groups = tile_groups(&b, floor, joined, eye);
         *mask = groups
             .iter()
             .enumerate()
@@ -2113,17 +2119,6 @@ mod tests {
         Frustum::from_view_proj(proj * view)
     }
 
-    /// The box of the tile `t` of a patch at `origin` of quads of `quad`,
-    /// as [`cull_runs`] makes it.
-    fn tile_box(tb: &TileBounds, origin: [f32; 2], quad: f32) -> Aabb {
-        let at = |i: u8, j: u8| Vec3::new(origin[0] + i as f32 * quad, 0.0, origin[1] + j as f32 * quad);
-        let (lo, hi) = (at(tb.quads[0], tb.quads[1]), at(tb.quads[2], tb.quads[3]));
-        Aabb {
-            min: Vec3::new(lo.x, tb.lo, lo.z),
-            max: Vec3::new(hi.x, tb.hi, hi.z),
-        }
-    }
-
     /// **Culling never drops a face the eye could see** (issue #422): over
     /// seeded eyes and faces, every face is inside its tile's box, and any
     /// face with a corner the eye is in front of is in a group its tile
@@ -2162,10 +2157,17 @@ mod tests {
                 let look = Vec3::new(origin[0] + 30.0, 0.0, origin[1] + 50.0);
                 Frustum::from_view_proj(proj * glam::Mat4::look_at_rh(at, look, Vec3::Y))
             };
+            let input = CullPatch {
+                aabb,
+                origin,
+                quad,
+                dy: 0.0,
+                cull: &cull,
+            };
             let mut want = vec![0u32; stored.len()];
             for (k, face) in stored.iter().enumerate() {
                 let tb = &cull.tiles[face.tile()];
-                let b = tile_box(tb, origin, quad);
+                let b = input.tile_box(face.tile()).expect("a tile with a face");
                 for v in face.corners() {
                     let p = Vec3::new(
                         origin[0] + v.at[0] as f32 * quad,
@@ -2200,13 +2202,6 @@ mod tests {
             }
             // The runs: every face of a kept segment once, none of another.
             let mut drawn = vec![0u32; stored.len()];
-            let input = CullPatch {
-                aabb,
-                origin,
-                quad,
-                dy: 0.0,
-                cull: &cull,
-            };
             cull_runs(&[input], (&frustum, eye), None, |n, first, count| {
                 assert_eq!(n, 0);
                 for face in first..first + count {
@@ -2249,6 +2244,33 @@ mod tests {
             assert_eq!(segment, of_it.as_slice(), "segment {s}");
         }
         assert_eq!(cull.group_counts(), group_counts(&faces));
+    }
+
+    /// A face belongs to the quad it stands on top of or looks away from:
+    /// a top to its first quad, a wall to the higher of the two it stands
+    /// between -- the quad before its line for one facing `+x` or `+z`, the
+    /// quad after it for one facing `-x` or `-z`.
+    #[test]
+    fn a_face_belongs_to_its_higher_quad() {
+        let wall = |dir, i0, j0| FarFace {
+            dir,
+            i0,
+            j0,
+            i1: if matches!(dir, FarDir::PosZ | FarDir::NegZ) { i0 + 1 } else { i0 },
+            j1: if matches!(dir, FarDir::PosX | FarDir::NegX) { j0 + 1 } else { j0 },
+            rise: 3,
+            ..unit_top(i0, j0, 40)
+        };
+        assert_eq!(unit_top(9, 13, 40).owner(), [9, 13]);
+        assert_eq!(wall(FarDir::PosX, 8, 13).owner(), [7, 13]);
+        assert_eq!(wall(FarDir::NegX, 8, 13).owner(), [8, 13]);
+        assert_eq!(wall(FarDir::PosZ, 9, 12).owner(), [9, 11]);
+        assert_eq!(wall(FarDir::NegZ, 9, 12).owner(), [9, 12]);
+        // The patch's far edges: still a quad of the patch.
+        assert_eq!(wall(FarDir::PosX, 32, 0).owner(), [31, 0]);
+        let t = TILE_QUADS;
+        assert_eq!(wall(FarDir::PosX, t as u8, 0).tile(), 0, "the tile before the line");
+        assert_eq!(wall(FarDir::NegX, t as u8, 0).tile(), 1, "the tile after it");
     }
 
     /// A tile's floor is the lowest of its own tops: a top belongs to the

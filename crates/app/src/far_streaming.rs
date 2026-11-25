@@ -123,8 +123,8 @@ const RESELECT_BLOCKS: f64 = 1.0;
 /// 96); since the far terrain is culled by tiles (`cubara_render::far::
 /// cull_runs`) the same triangles draw a finer one, and 2.09 is the smallest
 /// size, to two places, at which the gate's hill eye -- its lowest -- draws
-/// no more far triangles at Medium than 3 drew before the tiles: 180,799
-/// against 193,641 (`far_census_scale_scan`; at 2.08, 193,868). The owner
+/// no more far triangles at Medium than 3 drew before the tiles: 182,132
+/// against 193,641 (`far_census_scale_scan`; at 2.08, 195,200). The owner
 /// left the size to the engine ("as long as it is good", 2026-11-21); the
 /// candidates' numbers are in §9.8.
 pub const FAR_QUAD_SCALE: f64 = 2.09;

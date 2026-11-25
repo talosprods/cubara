@@ -2704,6 +2704,35 @@ fn no_sky_shows_through_the_far_terrain() {
     }
 }
 
+/// Where frames `a` and `b` differ, split in two: pixels where each frame's
+/// colour is one the other frame has in the 3 x 3 pixels around -- an edge
+/// between two faces moved by a pixel -- and the rest, as `(x, y)`.
+fn edge_ties(a: &Frame, b: &Frame) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    fn at(f: &Frame, x: u32, y: u32) -> &[u8] {
+        &f.pixels[((y * f.width + x) * 4) as usize..][..4]
+    }
+    let (w, h) = (a.width, a.height);
+    let near = |f: &Frame, x: u32, y: u32, colour: &[u8]| {
+        (x.saturating_sub(1)..=(x + 1).min(w - 1))
+            .any(|nx| (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|ny| at(f, nx, ny) == colour))
+    };
+    let (mut ties, mut other) = (Vec::new(), Vec::new());
+    for y in 0..h {
+        for x in 0..w {
+            let (pa, pb) = (at(a, x, y), at(b, x, y));
+            if pa == pb {
+                continue;
+            }
+            if near(a, x, y, pb) && near(b, x, y, pa) {
+                ties.push((x, y));
+            } else {
+                other.push((x, y));
+            }
+        }
+    }
+    (ties, other)
+}
+
 /// **Culling the far terrain by tiles draws the same pixels as by patches**
 /// (the far terrain's triangles, after #422): the real far terrain round
 /// the gate's ground and hill eyes and low over the approach to this seed's
@@ -2717,21 +2746,34 @@ fn no_sky_shows_through_the_far_terrain() {
 /// No voxels are drawn, so nothing of the far terrain is hidden by them and
 /// every culled face would show if the cull were wrong about it; the box
 /// shows sky.
+///
+/// **Pixel for pixel, but for ties** (`edge_ties`): two faces in one plane
+/// side by side -- a grass top beside a pit's floor at the same height --
+/// overlap by the crack seal's sliver, at one depth, and the one drawn first
+/// keeps those pixels. Tiles draw the faces in another order (by run, run by
+/// class), so a pixel on such an edge can take the other face's colour: seen
+/// as three pixels in one of the twelve views. Such a pixel shows, in each
+/// picture, a colour the other picture has beside it; a face the cull left
+/// out shows what is behind it, which neither has there. At most
+/// `MOST_TIES` of them a view (**chosen, not derived**: ten times the most
+/// seen); any other difference fails.
 #[test]
 fn every_level_of_far_culling_draws_the_same_pixels() {
+    const MOST_TIES: usize = 30;
     use cubara_render::far::FarParams;
     use cubara_render::FarCulling;
     use cubara_world::far::{build, split_ratio_for, FarView, Hole};
     const SIZE: (u32, u32) = (960, 540);
     let world = World::new();
     let gen = cubara_world::WorldGen::new(world.seed());
-    let (approach, summit) = approach_to_the_peak(&gen);
+    let (approach, _) = approach_to_the_peak(&gen);
+    let ground = gen.surface_height(approach.x as i32, approach.y as i32) as f32;
     let eyes = [
         ("the ground eye", glam::vec3(8.0, 40.0, 8.0), -0.25),
         ("the hill eye", glam::vec3(8.0, 300.0, 8.0), -0.25),
         (
             "low over the approach to the peak",
-            glam::vec3(approach.x, summit - 150.0, approach.y),
+            glam::vec3(approach.x, ground + 60.0, approach.y),
             -0.05,
         ),
     ];
@@ -2749,8 +2791,9 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
         let (min, max) =
             cubara_world::node::covered_box_3d(ChunkCoord::from_world_pos(eye.to_array()), &schedule);
         let (min, max) = (min.map(|c| c * 16), max.map(|c| c * 16));
-        // Quads of 32 pixels -- the game's Medium at twice its size -- to
-        // 30 km: patches of five levels and the voxels' box among them.
+        // Quads of 32 pixels, an error bound and a floor of 8 -- about the
+        // game's Medium -- to 30 km: patches of five levels, and the voxels'
+        // box among them.
         let view = FarView {
             eye: [eye.x as f64, eye.y as f64, eye.z as f64],
             split_ratio: split_ratio_for(32.0, SIZE.1 as f64, fov),
@@ -2808,13 +2851,15 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
                 let runs = cubara_render::far::runs_of(&patches, Some((min, max)), culling, (&frustum, eye));
                 sent[k] += runs.iter().map(|r| r.2 as u64 * 2).sum::<u64>();
             }
-            let differ = frames[0]
-                .pixels
-                .chunks(4)
-                .zip(frames[1].pixels.chunks(4))
-                .filter(|(a, b)| a != b)
-                .count();
-            if differ > 0 {
+            let (ties, other) = edge_ties(&frames[0], &frames[1]);
+            if ties.len() + other.len() > 0 {
+                eprintln!(
+                    "{name}, looking {look}: {} pixels differ, every one an edge between two \
+                     faces drawn in another order: {ties:?}",
+                    ties.len()
+                );
+            }
+            if !other.is_empty() || ties.len() > MOST_TIES {
                 for (frame, what) in frames.iter().zip(["patches", "tiles"]) {
                     let file = format!(
                         "far_culling_{}_{dx}_{dz}_{what}.actual.png",
@@ -2823,10 +2868,17 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
                     save_png(&golden_dir().join(file), SIZE.0, SIZE.1, &frame.pixels);
                 }
             }
-            assert_eq!(
-                differ, 0,
-                "{name}, looking {look}: culled by tiles, {differ} pixels differ from whole \
-                 patches"
+            assert!(
+                other.is_empty(),
+                "{name}, looking {look}: culled by tiles, {} pixels show what whole patches do \
+                 not show beside them, e.g. {:?}",
+                other.len(),
+                &other[..other.len().min(8)]
+            );
+            assert!(
+                ties.len() <= MOST_TIES,
+                "{name}, looking {look}: {} pixels on edges differ, more than {MOST_TIES}",
+                ties.len()
             );
         }
     }
