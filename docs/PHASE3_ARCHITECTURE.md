@@ -407,7 +407,11 @@ case), steep mountain faces and cliffs, drawn by a printed seed, not picked:
   `DISTANT_CAVE_DEPTH` of the surface, the far terrain draws none. A cave
   mouth is detail. It is 4 to 12% of level 0's sky-visible area and about
   half stone, so counted in with the surface it made a steep slope look
-  4.0% stone where its surface is 0.1%.
+  4.0% stone where its surface is 0.1%. (Since §9.9 a pit is ground at
+  every level: a cell over one sinks by its share of it. The split stands
+  -- the harness's colours and shapes are still held on the surface term
+  -- and what a level draws of the pits is held by `pit_study.rs`: the
+  air, the pits shown, the nodes themselves.)
 - **A column is carved where level 0 is not the height field**: its drawn
   top is not `surface_height + 1`, or a block of a side that a lower
   neighbour bares is missing (a cave under an intact top). Everywhere else
@@ -498,18 +502,24 @@ one (`a_level_3_node_is_measured_in_blocks`, a node made by hand).
 (Rule 5; #423 decisions 1, 2). All in `cubara_world::WorldGen`:
 
 ```rust
-/// The column function, and level 0 itself: the y of a column's surface block.
+/// The height field: the y of a column's surface block, before caves.
 pub fn surface_height(&self, x: i32, z: i32) -> i32;
+
+/// The column function, and level 0 itself: the y of the highest block of
+/// ground the sky sees in a column -- its surface block, or the floor of
+/// the pit a cave has opened there (§9.9). `column` gives both.
+pub fn column_top(&self, x: i32, z: i32) -> i32;
+pub fn column(&self, x: i32, z: i32) -> GroundColumn; // { surface, top }
 
 /// What a column is made of `depth` blocks below ITS OWN surface.
 pub fn ground_layer(depth: i32) -> GroundLayer; // Surface | Soil | Stone
 
 /// A cell's drawn top block over the columns [x0, x0 + w) x [z0, z0 + w):
-/// the MEAN of their surface_height, rounded to the nearest block (a half
+/// the MEAN of their column_top, rounded to the nearest block (a half
 /// to the even one) -- and, where the cell holds a summit (the first
 /// highest column of the nine cells around it is one of its own), the
 /// highest MEAN OF ITS FOUR HALF-WIDTH CELLS. cell_top(x, z, 1) is
-/// surface_height(x, z).
+/// column_top(x, z).
 pub fn cell_top(&self, x0: i32, z0: i32, w: i32) -> i32;
 
 /// The same over an n x n grid of the cell's columns, centred in the cell,
@@ -524,9 +534,15 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
 
 - **Height: the mean of the covered columns, to the block, with summits
   lifted; at every level.** A coarse cell's top, a far quad's top and a
-  level-0 column's top are `cell_top` at three widths. The mean is rounded
-  to the nearest block, a half to the even one, so that rounding lifts
-  nothing. A cell that **holds a summit** -- the first highest column (`z`,
+  level-0 column's top are `cell_top` at three widths. **A column stands
+  where the sky sees it** (`column_top`): at its surface block, or, where
+  a cave has carved that away, at the floor of the pit -- so a pit is
+  ground like any other, and a cell over one sinks by the share of its
+  columns that are pit times their depth. (Until §9.9 the mean was of the
+  *surfaces*, and a pit showed only where a cave had carved every column
+  of a cell: it appeared out of flat grass on the way in. §9.9 has the
+  study that chose this.) The mean is rounded to the nearest block, a
+  half to the even one, so that rounding lifts nothing. A cell that **holds a summit** -- the first highest column (`z`,
   then `x`) of the nine cells around it is one of its own -- stands at the
   **highest mean of the four half-width cells it splits into** instead
   (the summit study below; until then it stood at that highest column).
@@ -574,8 +590,10 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
 - **Material: by depth below each column's own surface.** `ground_layer` is
   the only depth rule; `material_at` reads it. A coarse cell wears the
   layer of one of the level-0 side faces its columns show at its rows --
-  each made of `ground_layer` at its depth below its **own** column's
-  surface -- picked by a hash of the cell's position, so a gentle slope's
+  a column shows one at every row above a neighbour's top and at or under
+  its own, the wall of a pit among them (§9.9), each made of
+  `ground_layer` at its depth below its **own** column's surface --
+  picked by a hash of the cell's position, so a gentle slope's
   coarse riser is grass side nearly row after row, and stone shows where a
   covered column really stands more than `1 + SOIL_DEPTH` blocks proud
   (PR 2, §9.4). A far wall, which cannot band, takes the mix
@@ -589,7 +607,9 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
   `ground_faces_are_what_the_level_0_mesher_draws` counts the game's level-0
   quads over the same square and requires every count equal -- tops, and
   riser area per direction and layer -- wherever no cave touches the
-  surface. The openness is within 0.08 on tops and 0.14 on a direction's
+  surface. (Since §9.9 it counts the columns' tops, so a pit's walls and
+  the risers of its floor are in it, stone under the soil: what a far wall
+  beside a sunk quad is mixed from.) The openness is within 0.08 on tops and 0.14 on a direction's
   risers, and the test shows where the rest goes: **the mesher bakes a
   chunk's AO without looking into the next chunk**, so faces at a chunk's
   edge come out more open than the height field says (up to 0.06 of
@@ -762,7 +782,9 @@ What changed, all of it behind the functions of §9.3:
   column's surface and the cell's top. One block of rock and the cell stays
   whole. A finer cell inside it covers some of the same blocks, so whatever
   a level draws open every finer level draws open too, and **a pit only
-  ever opens on approach**. The depth limit nests as well: a row is carved
+  ever opens on approach** (so it was until §9.9: a pit is now in the
+  *tops*, which never nested, and is drawn at every level; what nests is
+  the caves under a top). The depth limit nests as well: a row is carved
   only if its lowest block is within `DISTANT_CAVE_DEPTH` of the cell's
   highest column. It replaces a vote (§9.1 item 7; PHASE1 §8.6 is amended).
   The first block of rock ends the count, so a cell still costs one noise
@@ -1148,7 +1170,9 @@ frames.
    the first search after a crossing asks for everything that will be seen
    through it. The second and fourth rows of the table are the cheaper
    guesses that do not hold; the last is the dearer one that adds nothing
-   measured (a merged node is still searched as its children drew it).
+   measured (a merged node was still searched as its children drew it;
+   since §9.9, where a coarser node's dent is wider than its children's
+   pit, it is searched as open too).
 2. **A stale node also waits for the bare nodes beside it**
    (`cubara-app`'s `can_unload`). The node seen through a new opening may
    be one nothing drew before -- under the pit's floor, in another parent.
@@ -1282,8 +1306,8 @@ vertices take 128 MB instead of 96.
 **A coarse top wears what level 0 shows from above one of its columns**
 (`WorldGen::top_block`, `from_above`), picked by a hash of the cell as its
 riser rows are: the surface block over a whole column, the floor of the pit
-over one a cave has opened. A coarse level shows a pit only where all of a
-cell is one (§9.4), so on the default seed's mountains the pits that open
+over one a cave has opened. A coarse level showed a pit only where all of
+a cell is one (§9.4; until §9.9 sank the cell), so on the default seed's mountains the pits that open
 6.1% of level 0's columns were 3.4% of level 2's ground and 1.3% of level
 3's: the grey patches a mountain lost from afar in the zoom pairs. Partly
 pit cells now wear the floor in the share their columns are pit
@@ -1729,3 +1753,341 @@ most. A standing eye selects nothing, as before.
   a wall, picked by a hash as a voxel cell must, was tried and puts a
   footprint's walls 4.4/255 off level 0's colour at quads of 16, where the
   bound is 3.25 and the blend measures 2.4.
+### 9.9 A pit at every distance: the ground is what the sky sees
+
+After §9.3 to §9.8 the thing the lead's zoom pairs still rated worst
+(2026-11-25, the forest line of §9.7: severity 4 at the level 1 -> 0, 2 -> 1
+and 3 -> 2 edges alike) was "missing pit / depression with exposed grey
+stone". A pit is a cave open to the sky: a column whose surface block the
+cave noise has carved away, down to its floor (`WorldGen::pit_floor`).
+Level 0 draws every one. A coarse cell was cave only where all of its
+ground is (§9.4), and its top was the mean of its columns' *surfaces*, so a
+pit showed at a level only where it filled a cell: it appeared out of flat
+grass on the way in, and #438 could only paint its colour on the grass.
+
+**Pits are not rare.** Around the spawn a cave opens 6.98% of the columns
+(1,024 blocks square: 293 pits, half of them over 149 columns, the largest
+4,053); along the forest line 7.14% (seven squares of 512 blocks: 575
+pits); on the owner's mountain 5.91%. A pit column is 9 blocks deep at the
+median and 26 to 28 at the 90th percentile, and seven to eight in ten are
+deeper than the soil: their floor is stone.
+
+**The study** (`crates/render/tests/lod_consistency/pit_study.rs`,
+`pit_rule_study_report`). Every candidate is worked out from the world's own
+columns (`surface_height`, `pit_floor`, `solid_on`) over that ground, per
+cell width -- 2, 4 and 8 blocks for levels 1 to 3 (level 3 in its rows of
+four), and far quads of 16 and 32 on the far terrain's 4 x 4 samples -- and
+judged against level 0:
+
+- **the depression from above**: the columns drawn at least a block under
+  what the same level draws of the ground with no caves (`TopRule` over the
+  surfaces), and the air between the two, as a multiple of level 0's;
+- **presence**: the share of level 0's pits (columns that touch along an
+  edge; under 16 columns, 16 to 63, 64 and over) the level shows anything
+  of. What is left appears out of nothing at a finer level;
+- **the swap**: per level-0 column a pit touches, the coarser level's drawn
+  top minus the finer one's, in blocks and in pixels at the edge (1080
+  rows); summed, the blocks moved per 1,000 columns of ground; and the
+  signed mean over *every* column, the systematic part;
+- **what an eye sees**: parallel rays from 15, 30 and 60 degrees above the
+  horizon, four ways round, half a block apart -- how many of them travel a
+  block or more further than over the same level's ground with no caves;
+- **the trees** standing on a cell the rule sinks.
+
+Along the forest line (the spawn and the mountain agree to a few points;
+the report prints all three), cell width 2 / 4 / 8, then far 16 / 32:
+
+What is drawn (the forest line; level 0's pit column is 11.3 blocks deep in
+the mean):
+
+| rule | area from above | air over the pits | mean depth, blocks | pits shown at level 3: small / middling / large, % | at far 16 |
+|---|---|---|---|---|---|
+| the mean of the surfaces; a row cave where all its ground is (main) | x0.88 / x0.69 / x0.31 / 0 / 0 | x0.78 / x0.56 / x0.19 / 0 / 0 | 10.0 / 9.2 / 7.1 | 0 / 0 / 54 | 0 / 0 / 0 |
+| **the mean of what the sky sees (built)** | x1.10 / x1.30 / x1.71 / x2.49 / x4.18 | **x1.03 / x1.03 / x1.01 / x0.99 / x0.98** | 10.7 / 9.0 / 6.7 / 4.5 / 2.7 | **54 / 89 / 100** | 42 / 70 / 99 |
+| the surfaces' top, sunk by share x depth | x1.10 / x1.30 / x1.70 / x2.54 / x4.18 | x1.04 / x1.04 / x1.01 / x1.00 / x0.99 | 10.7 / 9.0 / 6.8 / 4.5 / 2.7 | 48 / 83 / 100 | 40 / 63 / 99 |
+| a row cave where at least half its ground is | x1.05 / x1.01 / x0.95 / x0.89 / x0.48 | x0.96 / x0.91 / x0.82 / x0.64 / x0.21 | 10.3 / 10.2 / 9.8 / 8.2 / 5.0 | 21 / 44 / 98 | 8 / 7 / 60 |
+| ... at least a quarter | x1.12 / x1.19 / x1.35 / x1.55 / x1.68 | x1.03 / x1.10 / x1.29 / x1.34 / x1.14 | 10.4 / 10.5 / 10.8 / 9.8 / 7.7 | 34 / 63 / 100 | 16 / 19 / 86 |
+| a cell at least half pit stands at its floors' mean | x1.06 / x1.02 / x0.95 / x0.84 / x0.30 | x1.05 / x1.03 / x0.97 / x0.86 / x0.31 | 11.2 / 11.5 / 11.6 / 11.7 / 11.8 | 2 / 22 / 98 | 2 / 0 / 58 |
+| what the sky sees, a pit's bottom at its lowest half | x1.16 / x1.38 / x1.83 / x2.65 / x4.31 | x1.04 / x1.05 / x1.11 / x1.43 / x1.66 | 10.2 / 8.6 / 6.9 / 6.1 / 4.4 | 57 / 90 / 100 | 44 / 74 / 99 |
+
+What a swap changes, at the 160 / 288 / 512-block edges:
+
+| rule | on a pit's columns: mean; 95th percentile, blocks | the mean, pixels | blocks moved per 1,000 columns of ground | every column, pixels | an eye at 15 degrees: rays into a pit, levels 1 / 2 / 3 | trees on a sunk cell, of 562 |
+|---|---|---|---|---|---|---|
+| main | 2.6 / 2.6 / 4.4; 12 / 13 / 17 | 16.7 / 9.4 / 8.9 | 186 / 189 / 318 | +1.19 / +0.64 / +0.61 | x0.88 / x0.67 / x0.30 | 0 |
+| **what the sky sees (built)** | **1.4 / 2.1 / 3.1; 7 / 9 / 11** | **9.3 / 7.7 / 6.3** | 114 / 204 / 399 | **-0.14 / +0.02 / +0.06** | x1.10 / x1.27 / x1.59 | 7 / 11 / 29 |
+| sunk by share x depth | 1.5 / 2.2 / 3.2; 7 / 9 / 11 | 9.4 / 7.7 / 6.3 | 116 / 205 / 398 | -0.18 / +0.02 / +0.05 | x1.11 / x1.27 / x1.59 | 7 / 9 / 23 |
+| cave at half | 2.2 / 2.1 / 4.0; 11 / 11 / 17 | 14.0 / 7.4 / 8.1 | 167 / 170 / 355 | +0.24 / +0.16 / +0.16 | x1.05 / x0.99 / x0.94 | 5 / 3 / 4 |
+| cave at a quarter | 2.4 / 2.0 / 4.1; 12 / 11 / 18 | 15.5 / 7.3 / 8.3 | 194 / 185 / 449 | -0.12 / -0.21 / -0.28 | x1.11 / x1.18 / x1.34 | 8 / 9 / 15 |
+| half pit: the floors' mean | 1.3 / 2.3 / 4.2; 6 / 11 / 18 | 8.5 / 8.4 / 8.6 | 102 / 192 / 373 | -0.24 / +0.09 / +0.10 | x1.07 / x1.01 / x0.94 | 3 / 3 / 2 |
+| a pit's bottom at its lowest half | 1.4 / 2.0 / 3.1; 6 / 8 / 12 | 9.0 / 7.3 / 6.2 | 118 / 214 / 434 | -0.19 / -0.01 / -0.08 | x1.14 / x1.32 / x1.66 | 11 / 14 / 32 |
+
+
+What the table says:
+
+- **Main draws a pit in pieces and the far terrain not at all**: 88, 69 and
+  31% of its area at levels 1 to 3, a fifth of its air at level 3, none of
+  the pits under 16 columns from level 2 on, and half of even the large
+  ones at level 3. Every edge deepens the ground on the way in (+1.14,
+  +0.64 and +0.61 pixels over *every* column).
+- **A vote keeps the area and drops the pit.** Carving a row where half its
+  ground is cave draws level 0's area to five points at every voxel level
+  -- and shows 61, 19 and 21% of the small pits and 44% of the middling
+  ones at level 3: a cell flips whole, so what is under half a cell is not
+  there and arrives at once. Its swap is no smaller than main's at 288 and
+  512 blocks. A quarter overdraws (x1.30 of the air at level 3) and still
+  drops a third of the middling pits; a cell standing at its pit floors'
+  mean once half of it is pit is the same all-or-nothing with a deeper
+  step. And a vote is a carved row: it is not part of a top, so the
+  distance morph cannot slide it.
+- **The mean of what the sky sees keeps the air and the pit.** x1.03, x1.03
+  and x1.01 of level 0's air at levels 1 to 3 and x0.99 and x0.98 on far
+  quads of 16 and 32; every large pit at every voxel level and 99% of them
+  at far 16; the smallest step at every edge on the columns a pit touches
+  (1.4, 2.1 and 3.1 blocks in the mean, 7, 9 and 11 at the 95th percentile,
+  where the votes are at 11, 11 and 17), and no direction left in it
+  (-0.14, +0.02 and +0.06 pixels over every column).
+- **Summed over the ground it moves less at the near edge and more at the
+  far ones**: 114, 204 and 399 blocks per 1,000 columns against main's 186,
+  189 and 318. Main moves a pit's own columns the whole depth at once; the
+  mean moves the pit's cells and the cells round its rim, each a part of
+  it. More columns move, each by less (9.3, 7.7 and 6.3 pixels where main's
+  move 16.7, 9.4 and 8.9) -- and what moves is a *top*, which the distance
+  morph slides (below). A pit that arrives as a carved row is swapped.
+- **What it costs is width.** A cell a quarter pit sinks a quarter of the
+  depth, all of it: the depression is drawn x1.10, x1.30 and x1.71 as wide
+  at 10.7, 9.0 and 6.7 blocks deep where level 0's is 11.3, and from 15
+  degrees an eye sees x1.10, x1.27 and x1.59 as many rays go into a pit as
+  at level 0. A pit from afar is a wider, shallower dent that narrows and
+  deepens on the way in. That is the size of a cell, as §9.4's 95th
+  percentile is on a slope, and it is what the morph spreads over distance.
+- **Sinking the surfaces' top by share times depth** is the same rule
+  rounded twice, with a second notion of height beside the first: the same
+  numbers to a point, fewer of the small pits (68 / 64 / 48% against 80 /
+  77 / 54).
+- **A pit's bottom at its lowest half** (the summit rule turned over)
+  overdraws: x1.11 of the air at level 3, x1.41 and x1.64 on the far
+  quads. A summit is lifted because an outline is seen against the sky;
+  nothing sees a pit's bottom from afar.
+
+**The rule: the column function is what the sky sees**
+(`WorldGen::column`, `column_top`). A column stands at the highest block of
+ground the sky sees in it: its surface block, or the floor of the pit a
+cave has opened there. That *is* level 0's drawn top, block for block, and
+every coarser top is §9.3's rule over it, unchanged: the mean, a half to
+the even block, a summit at the mean of its highest half. Nothing else was
+added; what follows from it:
+
+- **A cell over a pit sinks by the share of its columns that are pit times
+  their depth** (`a_cell_over_a_pit_sinks_by_its_share_of_the_depth`: a pit
+  4 x 4 and 20 deep is 320 blocks of air at widths 1 to 8, and 256 at 16,
+  whose block and a quarter is drawn as one).
+- **The cave rule is §9.4's, on what is left**: a row at or under a cell's
+  top is cave where every block of ground in it is, a column's ground being
+  what is at or under its own top. The air of a pit is no longer a cave the
+  rule has to find; it is where the top is. Caves still nest
+  (`coarse_caves_nest`); tops never did.
+- **A riser is level 0's faces**, as before: a column shows a side at every
+  row above a neighbour's top and at or under its own, so the wall of a pit
+  is among the faces a coarse cell picks from, by its depth below its
+  column's own *surface*: stone under the soil
+  (`a_coarse_riser_is_made_of_level_0s_faces`) -- under the cell's own
+  risers, that is: the slope's come first (below, "Measured after").
+  `ground_faces` counts the same faces per direction, so a far wall beside
+  a sunk quad is mixed from them (`ground_faces_are_level_0s_risers`).
+- **A top wears what §9.6 gave it**: what level 0 shows from above one of
+  the cell's columns, picked by the cell's hash -- now off the column
+  itself (`from_above`), with no second search for the floor.
+- **The far terrain follows with no change of its own**: `far::quad_top` is
+  `cell_top_sampled`, so a far quad of 8 over a pit stands where the
+  level-3 cell does, and a wider one sinks by what its 4 x 4 samples see of
+  the pit (`a_quads_top_is_the_voxel_cells_top`). One rule (Rule 5).
+- **The distance morph slides a pit as it slides a slope** (#436). A pit's
+  floor is its column's top and its wall is a riser between two tops, so a
+  node's pit is moved to its parent's over the band and the swap shows
+  nothing. `morph::node_columns` reads `cell_top`; nothing in it had to
+  change.
+- **A tree stands in the dent its cell draws** (`node_trees` reads
+  `cell_top`), and rides it through the band as it rides any ground (§9.7).
+
+**What the morph makes of it.** Until now no column a cave had opened
+morphed, nor any beside one: a level's pit was swapped for its parent's
+ground at the ring edge. On the nodes that hold the pits near the spawn
+(`a_morphed_pit_is_closed_and_stands_on_its_parent`) 121 of 190 cells that
+hold a pit morph at level 0, 77 of 151 at level 1 and 50 of 70 at level 2,
+their meshes closed at every factor and standing on the parent at the end
+of the band. What does not morph is #436's limit, unchanged: **a pit that
+widens under its rim**. Its wall is an overhang, a column with one among
+the rows it shows stays still, and so does every column beside it -- so the
+pits that slide are the bowls, whose rims step down a block or two (the
+morphing pit cells move 0 / 1 / 2 blocks at the median at levels 0 / 1 / 2
+and 4 / 5 / 6 at most), and the rim of a pit with a sheer or overhung wall
+still swaps, by the step of the table above.
+
+On screen (`transition_study`, the toward-peak flight, the morph's worst
+single frame per edge in pixels over the goldens' tolerance, and its
+luminance; main `9ec668a` beside it, the same machine and day):
+
+| edge | main | pits in the ground | luminance |
+|---|---|---|---|
+| 0<->1 (160 m) | 4,926 | **2,882** (-41%) | 783 -> 498 |
+| 1<->2 (288 m) | 4,747 | **3,531** (-26%) | 1,005 -> 829 |
+| 2<->3 (512 m) | 8,993 | **8,455** (-6%) | 1,576 -> 1,473 |
+
+The holes the morph opens are #436's, as before: 265 of 450 frames checked
+with any, at most 32 pixels (main: 251, at most 32).
+
+**A merged node is searched as open** (`visibility::stand_in`; §9.5 had it
+searched as its children drew it, "not a proof"). A
+coarser node is not the less open one any more: a cell beside a pit sinks
+where the finer cells under it stood whole, so its dent reaches a face of
+the node that the children's narrower pit did not. The seeded crossings of
+`the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn` found
+it at once: stepping from the mountain column (336, 213), the level-2 node
+(82, 0, 53) merges; as its one known child drew it its sub-block joined one
+pair of faces, as the node is, three, and the node beside it was seen only
+after another search. With a known child a node is now open until its own
+links arrive, as a split node is. What that costs, replayed without a GPU
+along the low flight's 41 chunk crossings at the game's rings (a throwaway
+probe, as §9.5's was): the first searches ask for 15,393 nodes where they
+asked for 15,300 (+0.6%), and neither leaves a node out there. **The
+lever, not built:** a node's parent is already generated for its colour
+morph (§9.6); keeping that parent's links would make a node that merges
+known before it is asked for (15,271 asked for in the same replay).
+
+**Measured after** (`consistency_report` and the studies of §9.3 and
+§9.4, each run on main `9ec668a` and on this rule):
+
+- **The surface term has not moved in shape or in stone.** Every voxel
+  level's mean column, skyline and summit rows are main's to 0.01 block,
+  and the stone share of the sides main's to 0.1 point. That took the
+  order the faces are picked in: with a pit's wall among the faces a cell
+  picks from, a cell beside a pit wore stone on the side that faces the
+  slope too (2.4% of a steep footprint's sides at level 3, level 0: 0.1%).
+  A row that is part of the cell's own riser wears the slope; the wall of
+  a pit is picked only under it (`coarse_block`).
+- **The tops are a little lighter beside a pit.** A cell a pit has sunk no
+  longer shades the top of the whole cell below it, where level 0's rim
+  columns still do: the worst footprint's T3 on tops went 1.50 -> 1.48,
+  1.66 -> 1.93 and 2.88 -> 2.98 at levels 1 to 3 (bounds 2.0, 2.0 and 3.0;
+  pooled, at most +0.2).
+- **The pitted ground wears level 0's stone again.** The stone share of the
+  sides the sky sees on or beside carved ground (the harness's cave term,
+  reported, not held), main -> now:
+
+  | | level 0 | L1 | L2 | L3 | far 8 | far 16 |
+  |---|---|---|---|---|---|---|
+  | rolling hills | 69.1% | 67.3 -> 68.2 | 52.3 -> 62.3 | 23.3 -> 41.8 | 0.0 -> 44.0 | 0.0 -> 19.4 |
+  | gentle slope | 58.8% | 52.3 -> 58.1 | 31.1 -> 52.5 | 10.4 -> 28.5 | 0.0 -> 20.6 | 0.0 -> 8.5 |
+  | steep mountain | 60.9% | 37.0 -> 50.8 | 17.4 -> 33.9 | 3.6 -> 10.9 | 0.3 -> 16.0 | 0.5 -> 7.4 |
+  | cliffs | 49.4% | 35.1 -> 48.8 | 16.5 -> 31.2 | 4.1 -> 10.9 | 0.7 -> 12.9 | 0.3 -> 7.7 |
+
+  What is still missing at level 3 on a slope is the price of the order
+  above and of the width: a dent 6.7 blocks deep has under three rows
+  below its soil where level 0's 11.3 have seven, and its top rows wear
+  the slope.
+- **The swap on the whole ground** (`height_rule_study_report`, now over
+  what the sky sees): the systematic part stays within 0.1 pixel at every
+  edge on every kind of ground; the outline's mean moves by at most 0.3
+  pixel (gentle slopes: -0.1 / -0.4 / -0.4 where it was +0.1 / -0.1 /
+  -0.2); the 95th percentile at the 512-block edge is a block more on
+  three kinds (16.1 pixels on steep ground, 14.1 before). Summits are
+  where they were (0 / -0.8 / -2.2 on steep ground).
+- **Towers**, the cells standing their own width over all four beside
+  them around the owner's mountain (`summit_lift_report`): 34 / 16 / 9 / 5
+  at widths 4 / 8 / 16 / 32 where main counts 33 / 12 / 8 / 5. The ones
+  more each stand beside a cell a pit has sunk -- the pit's wall, which
+  level 0 has too -- so the two tests that hold the count
+  (`a_coarse_crest_grows_few_towers`, `a_far_crest_grows_few_towers`) now
+  hold a cell against what the cells beside it draw of the ground with no
+  cave in it, and count what they counted.
+
+**Triangles** (`geometry_census`, every node of the game's selection
+around a gate eye, radius 64, squash 2; main `9ec668a` -> now):
+
+| | ground eye (8, 40, 8) | hill eye (8, 300, 8) |
+|---|---|---|
+| level 0 | 467,648 -> 481,164 (+2.9%) | |
+| level 1 | 340,166 -> 354,294 (+4.2%) | |
+| level 2 | 376,534 -> 393,144 (+4.4%) | 522,086 -> 541,538 (+3.7%) |
+| level 3 | 448,078 -> 468,994 (+4.7%) | 448,964 -> 471,124 (+4.9%) |
+| all | 1,632,426 -> **1,697,596 (+4.0%)** | 971,050 -> **1,012,662 (+4.3%)** |
+
+A dent has walls, and a top that moves is not merged across cells (§9.6),
+which is level 0's share. The far terrain at the game's quad scale
+(`far_census`'s count through `FAR_QUAD_SCALE`, triangles facing the eye a
+frame, Medium / High): ground eye 191,621 -> 192,703 and 283,758 -> 285,349,
+hill eye 193,641 -> 194,533 and 286,600 -> 287,790, flight eye 149,745 ->
+150,361 and 209,646 -> 210,257: **+0.3 to +0.6%**. What these do to a frame
+is the gate benchmark's to say (the lead's, on a quiet machine).
+
+**Generation and build cost** (`generation_cost_report`, microseconds a
+node, fastest of three passes, test profile; main -> now):
+
+| | L0 | L1 | L2 | L3 |
+|---|---|---|---|---|
+| generate | 367 -> 361 | 357 -> 423 (1.19x) | 1,088 -> 1,329 (1.22x) | 1,807 -> 2,650 (1.47x) |
+| build (generate, mesh, links, trees) | 3,786 -> 3,984 (1.05x) | 9,294 -> 10,346 (1.11x) | 25,798 -> 31,572 (1.22x) | 15,585 -> 19,012 (1.22x) |
+
+Every column asked is now one cave sample over its surface height (and a
+walk down the pit under one column in fourteen). It is worker time, to be
+judged against the flight benchmark's swap lag with §9.4's. **The lever,
+not built:** the cave noise is one octave of value noise, an interpolation
+of the eight lattice values around a block, so a lattice cell (22 blocks
+a side) none of whose corners is over the threshold holds no cave, and one
+look at its corners spares every sample in it. How many cells that is was
+not measured. An accelerator only (§3).
+
+**What is left, and why.**
+
+- **A pit is drawn wider and shallower from afar** (x1.3 and x1.7 the area
+  at levels 2 and 3). That is one top a cell; a rule that keeps the area
+  drops the pit instead (the votes above).
+- **The rim of a pit with a sheer or overhung wall still swaps**: a third
+  to a half of the cells that hold a pit do not morph (#436's purity
+  limit). Letting an overhang ride its column is a change to the morph,
+  not to the ground.
+- **A tree beside a pit at 160 m.** A coarse tree stands in the dent its
+  cell draws and rides it through the band; a level-0 tree does not morph
+  (§9.7's first open item). Along the forest line 7 of 562 trees stand on
+  a sunk cell at level 1 (11 and 29 at levels 2 and 3), 5.3 blocks down in
+  the mean and 14 at most, and those 7 step up at the 160 m swap where
+  they moved a block at most before.
+- **A sunk cell's top is one pick** (§9.6): the floor in the share its
+  columns are pit, the surface block in the rest, so a cell three quarters
+  pit is a grass ledge deep in the pit one time in four. The share is
+  level 0's; the ledge is not. Wearing the floor by how far the cell has
+  sunk would trade the one for the other and was not measured.
+- **A far quad over 8 blocks samples its pits**: 42 / 70 / 99% of the
+  small, middling and large ones show at quads of 16 and 25 / 38 / 90% at
+  32. What it shows has the right air in the sum (x0.99, x0.98).
+- **A pit deeper than `PIT_FLOOR_SEARCH`** (256 blocks) stands at the block
+  the search stops at. It was 48, and a cave can run on under a pit's
+  mouth: the deepest pit columns found are 73 blocks around the spawn, 80
+  along the forest line and 118 on the owner's mountain. A colour could
+  stop short of the floor; a height every level is held to may not.
+
+**Tests** (no GPU unless said). `crates/world`:
+`a_cell_over_a_pit_sinks_by_its_share_of_the_depth` (by hand);
+`a_cells_top_is_its_columns_mean_and_its_summit` (the rule over the columns'
+tops, cells a pit sinks among them); `a_pits_floor_is_the_first_ground_under_the_carved_surface`
+(a column's top is level 0's); `a_coarse_riser_is_made_of_level_0s_faces`
+(slope first, then a pit's wall); `ground_faces_are_level_0s_risers` (pit
+walls and floor risers among them); `a_coarse_cell_is_cave_only_where_all_its_ground_is`;
+`a_quads_top_is_the_voxel_cells_top` (sunk quads among them);
+`a_morphed_pit_is_closed_and_stands_on_its_parent` and
+`a_morphed_node_closes_with_the_nodes_above_and_below` (pit nodes added);
+`a_merged_node_is_searched_as_open` and
+`the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn`.
+`crates/render/tests/lod_consistency/pit_study.rs`:
+`the_chosen_pit_rule_is_the_games` (the study's copy is the game's);
+`every_level_draws_level_0s_pits` (the air within 6% at the voxel widths
+and 15% at far 16 and 32, every large pit shown at every voxel level, a
+swap with no direction -- and main's rule measured beside it, red);
+`the_nodes_draw_the_pits_where_the_rule_says` (the generated nodes, cell by
+cell, down to level 0's own blocks). GPU: the goldens of the mountain and
+the forest at levels 1 to 3, `lod_boundary`, `ring_edge_288m`,
+`morph_level_1` and the two far scenes were drawn again -- each shows its
+pits as dents with stone walls where it showed flat ground, or flat paint
+(#438) -- and `a_fully_morphed_level_draws_its_parents_colours` and
+`a_forest_swaps_nothing_at_its_ring_edges` pass unchanged.

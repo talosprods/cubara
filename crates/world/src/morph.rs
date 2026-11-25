@@ -22,10 +22,14 @@
 //! `aggregate.rs`'s CPU twins do for its lighting.
 //!
 //! **What does not morph** (and so still swaps as today): a column with a
-//! cave mouth, a pit or an overhang among the rows it shows, or with
-//! anything standing on it (a tree, a player's block) -- and every column
-//! beside one, so that a moving face never shares an edge with a face that
-//! stays. Level 3, whose next level is the far terrain (#422's join). And
+//! cave mouth or an overhang among the rows it shows, or with anything
+//! standing on it (a tree, a player's block) -- and every column beside
+//! one, so that a moving face never shares an edge with a face that stays.
+//! **A pit morphs**: its floor is its column's top and its wall a riser
+//! between two tops (`WorldGen::column_top`, `docs/PHASE3_ARCHITECTURE.md`
+//! §9.9), so a node's pit slides to its parent's wider, shallower one like
+//! any slope -- but for a pit that widens under its rim, whose wall is an
+//! overhang. Level 3, whose next level is the far terrain (#422's join). And
 //! no column morphs across a floor or ceiling of its parent level's nodes
 //! ([`node_columns`]): there the node across may be a coarser one that draws
 //! none of this level's faces, so a column whose parent stands across such
@@ -145,8 +149,10 @@ const PAD: i32 = 3;
 ///
 /// A column **morphs** where it and its eight neighbours are *pure*: solid
 /// in every row it shows to a neighbour and the row under them (no cave
-/// mouth, pit or overhang there), with nothing standing on it at level 0
-/// (no tree, no player's block). Its target is then its parent cell's top,
+/// mouth or overhang there), with nothing standing on it at level 0 (no
+/// tree, no player's block). A column's top is what the sky sees of it
+/// (`WorldGen::column_top`): the floor of a pit is a top, and a pit with
+/// whole walls is pure. Its target is then its parent cell's top,
 /// held inside the rows of the parent-level node that holds its own top --
 /// and a top lying on such a node's floor keeps its height (see the body);
 /// any other column's target is its own top.
@@ -194,6 +200,9 @@ pub fn node_columns(
                 .fold(top, i32::min);
             let (x, z) = corner(cx, cz);
             pure[at(cx, cz)] = if level == 0 {
+                // (`top` for the column's surface: under a pit the top is
+                // the floor, and at or under a column's top the two give
+                // the same answer.)
                 (lowest..=top).all(|y| world.certainly_solid_at(x, y, z, top))
                     && !world.is_solid_at(x, top + 1, z, blocks)
             } else {
@@ -364,28 +373,188 @@ mod tests {
     /// move differently.
     #[test]
     fn a_morphed_node_is_closed_and_stands_on_its_parent() {
-        let registry = registry();
-        let blocks = TerrainBlocks::from_registry(&registry);
         let world = crate::World::new();
         let snapshot = world.snapshot();
+        let nodes = MORPH_LEVELS
+            .flat_map(|level| mountain_nodes(&snapshot, level))
+            .collect();
+        let Closed {
+            tops,
+            risers,
+            skipped,
+            ..
+        } = closed_at_every_factor(&snapshot, nodes);
+        eprintln!("checked {tops} tops and {risers} risers; {skipped} pairs not a height field");
+        assert!(
+            tops > 1000 && risers > 1000,
+            "checked {tops} tops and {risers} risers"
+        );
+        assert!(skipped * 10 < risers, "{skipped} pairs skipped of {risers}");
+    }
+
+    /// Whether a cave has opened a column of the cell `w` blocks wide at
+    /// `(x0, z0)`: a pit, or part of one.
+    fn holds_a_pit(snapshot: &WorldSnapshot, x0: i32, z0: i32, w: i32) -> bool {
+        (0..w * w).any(|k| {
+            let column = snapshot.column(x0 + k % w, z0 + k / w);
+            column.top < column.surface
+        })
+    }
+
+    /// Nodes of a morphing `level` that hold the pits near the spawn: those
+    /// holding the floor of a pit column of the 192 blocks square from the
+    /// origin, the first `count` in key order.
+    fn pit_nodes(snapshot: &WorldSnapshot, level: u32, count: usize) -> Vec<NodeKey> {
+        let extent = 16 << level;
+        let mut nodes = std::collections::BTreeSet::new();
+        for z in 0..192 {
+            for x in 0..192 {
+                let column = snapshot.column(x, z);
+                if column.top < column.surface {
+                    nodes.insert(NodeKey::new(
+                        level,
+                        [
+                            x.div_euclid(extent),
+                            column.top.div_euclid(extent),
+                            z.div_euclid(extent),
+                        ],
+                    ));
+                }
+            }
+        }
+        nodes.into_iter().take(count).collect()
+    }
+
+    /// **A pit is ground, and the morph slides it** (`PHASE3_ARCHITECTURE.md`
+    /// §9.9): on the nodes that hold the pits near the spawn, the mesh is
+    /// closed at every factor and stands on its parent at full morph, as on
+    /// the mountain -- and the tops and the risers checked include the
+    /// floors of pits and their walls, moving. Until §9.9 no column a cave
+    /// had opened morphed, nor any beside one: a level's pit was swapped
+    /// for its parent's flat ground at the ring edge. Goes red when a top is
+    /// the surface again (a pit's floor is then no column's top, and
+    /// nothing of a pit moves).
+    #[test]
+    fn a_morphed_pit_is_closed_and_stands_on_its_parent() {
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let nodes = MORPH_LEVELS
+            .flat_map(|level| pit_nodes(&snapshot, level, 6))
+            .collect();
+        let Closed {
+            tops,
+            risers,
+            skipped,
+            pit_tops,
+            pit_risers,
+            pit_cells,
+            moves,
+        } = closed_at_every_factor(&snapshot, nodes);
+        eprintln!(
+            "checked {tops} tops and {risers} risers, {pit_tops} and {pit_risers} of them a moving pit's; {skipped} pairs not a height field; cells that hold a pit, and morph, by level: {pit_cells:?}"
+        );
+        for (level, (pit, other)) in moves.into_iter().enumerate() {
+            let describe = |mut v: Vec<i32>| {
+                v.sort_unstable();
+                let at = |p: usize| v.get((v.len() * p / 100).min(v.len().max(1) - 1)).copied();
+                format!(
+                    "{} cells, {} moving 3 blocks or more; median {:?}, 95th percentile {:?}, most {:?}",
+                    v.len(),
+                    v.iter().filter(|&&m| m >= 3).count(),
+                    at(50),
+                    at(95),
+                    v.last()
+                )
+            };
+            eprintln!(
+                "level {level}: morphing cells that hold a pit: {}; the others: {}",
+                describe(pit),
+                describe(other)
+            );
+        }
+        assert!(
+            pit_tops >= 100 && pit_risers >= 200,
+            "only {pit_tops} moving tops and {pit_risers} moving risers of pits were checked"
+        );
+        // Measured: 64, 51 and 71% of the cells that hold a pit morph at
+        // levels 0, 1 and 2. What does not is a pit that widens under its
+        // rim: a column with an overhang among the rows it shows stays
+        // still, and so does every column beside it (#436's limit).
+        for (level, (held, morphing)) in pit_cells.into_iter().enumerate() {
+            assert!(
+                held >= 50 && 5 * morphing >= 2 * held,
+                "level {level}: {morphing} of {held} cells that hold a pit morph"
+            );
+        }
+    }
+
+    /// What [`closed_at_every_factor`] checked.
+    struct Closed {
+        tops: usize,
+        risers: usize,
+        /// Pairs of columns that are not a height field as drawn.
+        skipped: usize,
+        /// Of `tops`, those of cells that hold a pit and move.
+        pit_tops: usize,
+        /// Of `risers`, those between two such cells, or one and its rim.
+        pit_risers: usize,
+        /// Per level, the cells that hold a pit and have their top in the
+        /// node, and how many of them morph.
+        pit_cells: [(usize, usize); 3],
+        /// Per level, how far each morphing cell's top moves at full morph,
+        /// in blocks: those of cells that hold a pit, and of the others.
+        moves: [(Vec<i32>, Vec<i32>); 3],
+    }
+
+    /// The check of `a_morphed_node_is_closed_and_stands_on_its_parent`
+    /// over `nodes`.
+    fn closed_at_every_factor(snapshot: &WorldSnapshot, nodes: Vec<NodeKey>) -> Closed {
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
         let layer = |_: &str| 0u32;
         let (mut tops, mut risers, mut skipped) = (0, 0, 0);
-        for level in MORPH_LEVELS {
-            let w = 1i32 << level;
-            for node in mountain_nodes(&snapshot, level) {
+        let (mut pit_tops, mut pit_risers) = (0, 0);
+        let mut pit_cells = [(0, 0); 3];
+        let mut moves: [(Vec<i32>, Vec<i32>); 3] = Default::default();
+        {
+            for node in nodes {
+                let level = node.level;
+                let w = 1i32 << level;
+                let origin = node.world_origin();
+                let moving_pit = |cx: i32, cz: i32, column: [i32; 4]| {
+                    column[1] != column[0]
+                        && holds_a_pit(snapshot, origin[0] + cx * w, origin[2] + cz * w, w)
+                };
                 let Some(geometry) =
-                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                    crate::mesh::mesh_node(snapshot, &registry, &layer, node, blocks)
                 else {
                     continue;
                 };
-                let columns = node_columns(&snapshot, node, blocks).expect("a morphing level");
+                let columns = node_columns(snapshot, node, blocks).expect("a morphing level");
                 let chunk = snapshot.node_at(node, blocks).expect("a drawn node");
                 let ny = 16 * w; // rows of one block
-                                 // Whether column (cx, cz) is drawn as the height field says
-                                 // over rows `from..to`: solid under `top`, air from it -- no
-                                 // cave or pit there (a tree's leaves above `to` are not
-                                 // asked). The closure is held on that ground; where a column
-                                 // is not, the morph must leave it still (below).
+                for cz in 0..16 {
+                    for cx in 0..16 {
+                        let [top, target, _, _] = columns.at(cx, cz);
+                        if !(1..=ny).contains(&top) {
+                            continue;
+                        }
+                        let pit = holds_a_pit(snapshot, origin[0] + cx * w, origin[2] + cz * w, w);
+                        if pit {
+                            pit_cells[level as usize].0 += 1;
+                            pit_cells[level as usize].1 += columns.morphs_at(cx, cz) as usize;
+                        }
+                        if columns.morphs_at(cx, cz) {
+                            let of = &mut moves[level as usize];
+                            if pit { &mut of.0 } else { &mut of.1 }.push((target - top).abs());
+                        }
+                    }
+                }
+                // Whether column (cx, cz) is drawn as the height field says
+                // over rows `from..to`: solid under `top`, air from it -- no
+                // cave or pit there (a tree's leaves above `to` are not
+                // asked). The closure is held on that ground; where a column
+                // is not, the morph must leave it still (below).
                 let height_field = |cx: i32, cz: i32, from: i32, top: i32, to: i32| {
                     (from.max(0)..to.min(ny)).all(|y| {
                         let solid = chunk.drawn(cx as usize, y as usize, cz as usize)
@@ -428,6 +597,8 @@ mod tests {
                                     lerp(top, target)
                                 );
                                 tops += 1;
+                                pit_tops +=
+                                    (f == 1.0 && moving_pit(cx, cz, columns.at(cx, cz))) as usize;
                             }
                             // Risers toward the +x and +z neighbours, both ways.
                             for (dx, dz) in [(1, 0), (0, 1)] {
@@ -513,18 +684,24 @@ mod tests {
                                      tops {ta}/{tb}, risers reach only {reached}"
                                 );
                                 risers += 1;
+                                pit_risers += (f == 0.5
+                                    && (moving_pit(cx, cz, a) || moving_pit(nx, nz, b)))
+                                    as usize;
                             }
                         }
                     }
                 }
             }
         }
-        eprintln!("checked {tops} tops and {risers} risers; {skipped} pairs not a height field");
-        assert!(
-            tops > 1000 && risers > 1000,
-            "checked {tops} tops and {risers} risers"
-        );
-        assert!(skipped * 10 < risers, "{skipped} pairs skipped of {risers}");
+        Closed {
+            tops,
+            risers,
+            skipped,
+            pit_tops,
+            pit_risers,
+            pit_cells,
+            moves,
+        }
     }
 
     /// `geometry`'s quads in world blocks, every vertex moved by factor `f`
@@ -592,7 +769,13 @@ mod tests {
         let mesh = |n: NodeKey| crate::mesh::mesh_node(&snapshot, &registry, &layer, n, blocks);
         let mut fine = vec![NodeKey::new(0, [-190, 10, -201])];
         for level in MORPH_LEVELS {
-            for n in mountain_nodes(&snapshot, level) {
+            // The mountain's nodes, and nodes that hold the pits near the
+            // spawn: a pit's wall crosses a node's floor as a cliff does,
+            // and since §9.9 it moves.
+            let nodes = mountain_nodes(&snapshot, level)
+                .into_iter()
+                .chain(pit_nodes(&snapshot, level, 3));
+            for n in nodes {
                 for dy in -1..=1 {
                     fine.push(NodeKey::new(level, [n.pos[0], n.pos[1] + dy, n.pos[2]]));
                 }

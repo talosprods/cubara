@@ -70,7 +70,13 @@ fn far_rows(measure: fn(&Setup, Footprint, u32) -> Measure, rep_of: fn(u32) -> R
                 faces: other.faces,
                 delta,
                 shape,
-                summit: holds_a_summit(&setup, fp, &[true; (FOOTPRINT * FOOTPRINT) as usize]),
+                // Over the columns the shape is taken on: the quad's
+                // surface term (`compare`).
+                summit: holds_a_summit(
+                    &setup,
+                    fp,
+                    &setup.on_the_surface(fp, Rep::Far(level).mask()),
+                ),
             });
         }
     }

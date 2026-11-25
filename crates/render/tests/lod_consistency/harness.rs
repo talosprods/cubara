@@ -1022,7 +1022,7 @@ pub enum TopRule {
 /// `fp` under `rule`: a model of a proposal, from the height field alone, for
 /// deciding with numbers (no faces: it has no colours yet).
 pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) -> Measure {
-    let h = |i: i32, j: i32| gen.surface_height(fp.x0 + i, fp.z0 + j);
+    let h = |i: i32, j: i32| gen.column_top(fp.x0 + i, fp.z0 + j);
     let mut tops = vec![f64::NAN; (FOOTPRINT * FOOTPRINT) as usize];
     for cj in (0..FOOTPRINT).step_by(cell as usize) {
         for ci in (0..FOOTPRINT).step_by(cell as usize) {
@@ -1058,13 +1058,13 @@ pub fn measure_stepped(gen: &WorldGen, fp: Footprint, cell: i32, rule: TopRule) 
 /// How one representation's shape differs from level 0's, over one footprint
 /// or several pooled.
 ///
-/// **Level 0 here is the height field**: `surface_height + 1`, the top face
-/// of every column's surface block, which is what #423's decisions 1 and 4
-/// name. A cave mouth lowers a level-0 column's drawn top below that, and
-/// caves have their own rule for coarse cells (`WorldGen::row_is_cave`: all
-/// of the cell's ground), so they are not what is compared --
-/// `level_0_draws_its_surface` holds the drawn level 0 to the height field
-/// everywhere else.
+/// **Level 0 here is what the sky sees of every column**: `column_top + 1`,
+/// the top face of its surface block -- which is what #423's decisions 1
+/// and 4 name -- or of the floor of the pit a cave has opened in it, which
+/// every level draws since §9.9. A voxel level is compared over the columns
+/// of its surface term ([`Shape::over`]), where the two are the same and
+/// `level_0_draws_its_surface` holds the drawn level 0 to the height field;
+/// the far terrain and the stepped models over every column, pits and all.
 #[derive(Clone, Debug, Default)]
 pub struct Shape {
     /// `drawn - level 0`, per column, in blocks.
@@ -1082,14 +1082,15 @@ pub struct Shape {
     pub left_out: usize,
 }
 
-/// The level-0 height field over `fp`, as a [`Measure`] with no faces.
+/// Level 0's tops over `fp` -- what the sky sees of every column
+/// (`WorldGen::column_top`) -- as a [`Measure`] with no faces.
 pub fn height_field(gen: &WorldGen, fp: Footprint) -> Measure {
     Measure {
         faces: Faces::default(),
         cave: Faces::default(),
         tops: (0..FOOTPRINT)
             .flat_map(|j| (0..FOOTPRINT).map(move |i| (i, j)))
-            .map(|(i, j)| gen.surface_height(fp.x0 + i, fp.z0 + j) as f64 + 1.0)
+            .map(|(i, j)| gen.column_top(fp.x0 + i, fp.z0 + j) as f64 + 1.0)
             .collect(),
     }
 }

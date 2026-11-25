@@ -802,10 +802,11 @@ mod m4 {
             .copied()
     }
 
-    /// The exact per-block height field's drawn top FACE (one above the top
-    /// solid block) at `(x, z)` -- M4's reference, everywhere.
+    /// The exact per-block drawn top FACE (one above the highest block of
+    /// ground the sky sees: the surface block, or the floor of a pit,
+    /// `WorldGen::column_top`) at `(x, z)` -- M4's reference, everywhere.
     pub fn exact_face_height(gen: &WorldGen, x: i32, z: i32) -> f64 {
-        gen.surface_height(x, z) as f64 + 1.0
+        gen.column_top(x, z) as f64 + 1.0
     }
 
     /// The inverse of a drawn top face's `+ 1.0`: the solid block a face at
@@ -2155,7 +2156,7 @@ mod m4 {
             assert_eq!(got, want);
         }
 
-        /// `exact_face_height` is exactly `surface_height + 1` -- the exact
+        /// `exact_face_height` is exactly `column_top + 1` -- the exact
         /// per-block reference's own version of the same "+1 for the top
         /// face" offset `ring_face_height_is_one_above_coarse_top` pins for
         /// the coarse path.
@@ -2163,7 +2164,7 @@ mod m4 {
         fn exact_face_height_is_one_above_the_exact_surface() {
             let gen = WorldGen::new(World::new().seed());
             for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
-                let want = gen.surface_height(x, z) as f64 + 1.0;
+                let want = gen.column_top(x, z) as f64 + 1.0;
                 assert_eq!(exact_face_height(&gen, x, z), want);
             }
         }
@@ -2175,7 +2176,7 @@ mod m4 {
             let gen = WorldGen::new(World::new().seed());
             for (x, z) in [(0, 0), (37, -19), (128, 300), (-50, 12)] {
                 let face = exact_face_height(&gen, x, z);
-                assert_eq!(block_below_face(face), gen.surface_height(x, z));
+                assert_eq!(block_below_face(face), gen.column_top(x, z));
             }
             // And directly, for values with no world behind them.
             for face_y in [1.0f64, 25.0, -8.0, 100.5] {
@@ -2535,7 +2536,7 @@ mod m4 {
             for (x, z) in [(0, 0), (37, -12), (900, 450)] {
                 assert_eq!(
                     coarse_top(&gen, x, z, 1, 1),
-                    gen.surface_height(x, z),
+                    gen.column_top(x, z),
                     "step_h 1: exact"
                 );
                 assert_eq!(
@@ -2557,7 +2558,7 @@ mod m4 {
                 for (x, z) in [(10, 10), (-500, 300), (123, 456)] {
                     let top = coarse_top(&gen, x, z, 1, v);
                     assert_eq!(top.rem_euclid(v), v - 1, "v {v} ({x},{z}): top {top}");
-                    let exact = gen.surface_height(x, z);
+                    let exact = gen.column_top(x, z);
                     assert!(
                         (top - exact).abs() <= v / 2,
                         "v {v} ({x},{z}): top {top} vs exact {exact}, more than half a cell off"

@@ -1661,7 +1661,9 @@ mod block_tests {
     /// face of the voxel cell over the same columns (`WorldGen::cell_top`,
     /// whatever that rule is: the mean, and a summit at its highest half's
     /// mean since #437), never above the highest of them and the column's
-    /// own surface at level 0 -- in the mountains, where the three differ.
+    /// own top at level 0 (what the sky sees of it, `column_top`: the floor
+    /// of a pit under one a cave has opened, §9.9) -- in the mountains,
+    /// where the three differ.
     #[test]
     fn a_quads_top_is_the_voxel_cells_top() {
         let gen = WorldGen::new(SEED);
@@ -1669,12 +1671,12 @@ mod block_tests {
             let mut top = i32::MIN;
             for z in z0..z0 + q {
                 for x in x0..x0 + q {
-                    top = top.max(gen.surface_height(x as i32, z as i32));
+                    top = top.max(gen.column_top(x as i32, z as i32));
                 }
             }
             top
         };
-        // Levels 0 to 2: whole blocks, exactly: a column's own surface at
+        // Levels 0 to 2: whole blocks, exactly: a column's own top at
         // level 0, and the voxel cell's `cell_top` (never above the highest
         // column) at levels 1 and 2.
         for level in 0..3 {
@@ -1691,17 +1693,30 @@ mod block_tests {
             }
         }
         // Level 3: eight columns a side, every one looked at -- the level-3
-        // voxel cell over the same columns, `cell_top(.., 8)`.
+        // voxel cell over the same columns, `cell_top(.., 8)`. Quads that a
+        // pit sinks are among them (§9.9): under the same rule over the
+        // surfaces, which is what a quad's top was until then, they stand
+        // higher.
         let key = PatchKey::containing(3, -848, 4832);
         let [ox, oz] = key.origin();
+        let mut sunk = 0;
         for j in -1..=PATCH_QUADS as i32 {
             for i in -1..=PATCH_QUADS as i32 {
                 let (x0, z0) = (ox + i as i64 * 8, oz + j as i64 * 8);
                 let top = quad_top(&gen, key, i, j);
                 assert_eq!(top, gen.cell_top(x0 as i32, z0 as i32, 8) + 1);
                 assert!(top <= highest(x0, z0, 8) + 1, "({i}, {j}): {top}");
+                let whole = WorldGen::top_over(
+                    &|x, z| gen.surface_height(x, z),
+                    x0 as i32,
+                    z0 as i32,
+                    8,
+                    8,
+                );
+                sunk += (top < whole + 1) as u32;
             }
         }
+        assert!(sunk >= 20, "only {sunk} quads of 8 stand lower for a pit");
         // Wider: the sampled form of the same rule.
         let key = PatchKey::containing(6, -848, 4832);
         let [ox, oz] = key.origin();
@@ -1728,6 +1743,12 @@ mod block_tests {
     ///
     /// Measured: 12, 8 and 5 at quads of 8, 16 and 32. Under the highest
     /// column (#432's rule, which this is red on) they were 53, 24 and 9.
+    ///
+    /// A quad is held against what the four beside it draw of the ground
+    /// with no cave in it (the rule over the surfaces): a quad beside one a
+    /// pit has sunk stands over the pit at level 0 too, and that is the
+    /// pit's wall, not a tower (§9.9; the voxels'
+    /// `a_coarse_crest_grows_few_towers` says the same).
     #[test]
     fn a_far_crest_grows_few_towers() {
         /// Per far level, the most towers allowed. **Chosen, not derived**:
@@ -1746,12 +1767,24 @@ mod block_tests {
                 .map(|k| quad_top(&gen, key, x_lo / q + k % n, z_lo / q + k / n))
                 .collect();
             let at = |i: i32, j: i32| tops[(j * n + i) as usize];
+            // The top face the quad `(i, j)` would have with no cave in the
+            // ground: the same rule, on the same samples, over the surfaces.
+            let [ox, oz] = key.origin();
+            let ground = |i: i32, j: i32| {
+                WorldGen::top_over(
+                    &|x, z| gen.surface_height(x, z),
+                    ox as i32 + (x_lo / q + i) * q,
+                    oz as i32 + (z_lo / q + j) * q,
+                    q,
+                    top_samples(key),
+                ) + 1
+            };
             let towers = (1..n - 1)
                 .flat_map(|j| (1..n - 1).map(move |i| (i, j)))
                 .filter(|&(i, j)| {
-                    [at(i - 1, j), at(i + 1, j), at(i, j - 1), at(i, j + 1)]
-                        .iter()
-                        .all(|&beside| at(i, j) - beside >= q)
+                    let beside = [(i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)];
+                    beside.iter().all(|&(a, b)| at(i, j) - at(a, b) >= q)
+                        && beside.iter().all(|&(a, b)| at(i, j) - ground(a, b) >= q)
                 })
                 .count();
             println!("quads of {q}: {towers} towers");
@@ -1907,10 +1940,10 @@ mod block_tests {
             for i in 1..31 {
                 let [ox, oz] = key.origin();
                 let (x, z) = (ox as i32 + i, oz as i32 + j);
-                let h = gen.surface_height(x, z);
+                let h = gen.column_top(x, z);
                 let level = [(1, 0), (-1, 0), (0, 1), (0, -1)]
                     .iter()
-                    .all(|&(dx, dz)| gen.surface_height(x + dx, z + dz) >= h);
+                    .all(|&(dx, dz)| gen.column_top(x + dx, z + dz) >= h);
                 if level {
                     found += 1;
                     assert_eq!(
@@ -2002,7 +2035,7 @@ mod block_tests {
         let [ox, oz] = key.origin();
         for j in -1..=PATCH_QUADS as i32 {
             for i in -1..=PATCH_QUADS as i32 {
-                let column = gen.surface_height((ox + i as i64) as i32, (oz + j as i64) as i32);
+                let column = gen.column_top((ox + i as i64) as i32, (oz + j as i64) as i32);
                 assert_eq!(patch.top(i, j), column + 1, "quad ({i}, {j})");
             }
         }
