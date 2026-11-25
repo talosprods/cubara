@@ -116,16 +116,18 @@ const RESELECT_BLOCKS: f64 = 1.0;
 ///
 /// Above 1 because the far terrain is blocks now (issue #422): a block
 /// surface costs about nine vertices a quad where the smooth one shared one
-/// among four, and the M3 spends about 0.4 ns on each of them whatever the
-/// shader does. That cost follows the triangles: a mesh with fewer vertices
-/// but more triangles was slower (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1
-/// the gate is not met at any quality. **Chosen, not derived**: 3 is the
-/// smallest size measured on a quiet M3 to hold 1,000 FPS at Medium with room
-/// to spare (hill eye 1,121 / 1,130 FPS against main's 1,049 / 1,055; 2.5
-/// held by 3.5% and stood below main there, `BENCHMARKS.md` footnote 96). The
-/// owner left the size to the engine ("as long as it is good", 2026-11-21);
-/// the candidates' numbers are in §9.8.
-pub const FAR_QUAD_SCALE: f64 = 3.0;
+/// among four, and the far pass's cost follows the triangles it draws
+/// (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1 the gate is not met at any
+/// quality. **Chosen, not derived**: 3 was the smallest size a quiet M3 held
+/// 1,000 FPS at Medium with, with room to spare (`BENCHMARKS.md` footnote
+/// 96); since the far terrain is culled by tiles (`cubara_render::far::
+/// cull_runs`) the same triangles draw a finer one, and 2.09 is the smallest
+/// size, to two places, at which the gate's hill eye -- its lowest -- draws
+/// no more far triangles at Medium than 3 drew before the tiles: 180,799
+/// against 193,641 (`far_census_scale_scan`; at 2.08, 193,868). The owner
+/// left the size to the engine ("as long as it is good", 2026-11-21); the
+/// candidates' numbers are in §9.8.
+pub const FAR_QUAD_SCALE: f64 = 2.09;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
 /// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from

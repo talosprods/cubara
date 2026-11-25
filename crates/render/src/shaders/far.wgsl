@@ -70,11 +70,14 @@ struct Face {
     word2: u32,
 };
 
-// One run of faces: its patch's slot, its first face, and how many it is.
+// One run of faces: its patch's slot, its first face, and how many it is
+// (and a word of padding: a class's runs start on 256 bytes, `far.rs`'s
+// `RUN_ALIGN`).
 struct Run {
     slot: u32,
     first: u32,
     count: u32,
+    pad: u32,
 };
 
 const QUADS: i32 = 32;

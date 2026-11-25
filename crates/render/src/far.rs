@@ -22,6 +22,30 @@ pub const FAR_QUADS: usize = 32;
 /// every quad line beside every quad, both ways.
 pub const FAR_MAX_FACES: usize = FAR_QUADS * FAR_QUADS + 2 * (FAR_QUADS + 1) * FAR_QUADS;
 
+/// Quads along one side of a **tile**: the piece of a patch the far terrain
+/// is culled by, frame by frame ([`cull_runs`]) -- against the frustum, and
+/// against the side of it the eye is on (a wall) and its height (a top). A
+/// patch is 32 quads, and a whole one is in view less often than not: the
+/// patches straddling the edges of the view, and those the eye stands
+/// beside, are most of what was drawn and not seen
+/// (`docs/PHASE3_ARCHITECTURE.md` §9.8). **Chosen, not derived**: see
+/// §9.8 for 4 against 8.
+pub const TILE_QUADS: usize = 4;
+
+/// Tiles along one side of a patch.
+pub const PATCH_TILES: usize = FAR_QUADS / TILE_QUADS;
+
+/// Tiles in a patch.
+pub const TILES: usize = PATCH_TILES * PATCH_TILES;
+
+/// A patch's faces are stored in **segments**: the faces of one direction
+/// group ([`GROUP_ORDER`]) that belong to one tile ([`FarFace::tile`]), the
+/// groups outermost -- so a run of faces to draw is some tiles of a group,
+/// or of neighbouring groups.
+pub const SEGMENTS: usize = GROUP_ORDER.len() * TILES;
+
+const _: () = assert!(FAR_QUADS.is_multiple_of(TILE_QUADS) && TILE_QUADS * TILE_QUADS <= 64);
+
 /// Which way a [`FarFace`] looks. `far.wgsl`'s `DIR_*` and `FACE_NORMALS`
 /// are in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -137,6 +161,27 @@ impl FarVertex {
 }
 
 impl FarFace {
+    /// The quad the face belongs to, `[i, j]`: a top's first; a wall's, the
+    /// higher of the two quads it stands between -- the one it looks away
+    /// from (`cubara_world::far::mesh`). Clamped into the patch, for a face
+    /// no mesher would make.
+    pub fn owner(&self) -> [usize; 2] {
+        let (i, j) = (self.i0 as usize, self.j0 as usize);
+        let [i, j] = match self.dir {
+            FarDir::PosX => [i.saturating_sub(1), j],
+            FarDir::PosZ => [i, j.saturating_sub(1)],
+            _ => [i, j],
+        };
+        [i.min(FAR_QUADS - 1), j.min(FAR_QUADS - 1)]
+    }
+
+    /// The tile the face is culled with: its [`owner`](Self::owner)'s, row
+    /// by row.
+    pub fn tile(&self) -> usize {
+        let [i, j] = self.owner();
+        (j / TILE_QUADS) * PATCH_TILES + i / TILE_QUADS
+    }
+
     /// The three words `far.wgsl` unpacks: `i0:6 j0:6 i1:6 j1:6 dir:3
     /// border:1`, then `top + 131072 : 18, rise : 14`, then `surface:8
     /// soil:8 open:8`. A height or a step beyond what fits is clamped -- the
@@ -390,7 +435,7 @@ impl ParamsGpu {
 
 /// The order a patch's faces are stored in, by direction, so that the
 /// directions that can face one eye are next to each other: an eye sees at
-/// most one of `PosX`/`NegX` and one of `PosZ`/`NegZ` of a patch it is not
+/// most one of `PosX`/`NegX` and one of `PosZ`/`NegZ` of a tile it is not
 /// over, and the tops. With this order that is one run of faces for two of
 /// the four quarters the eye can be in and two runs for the others.
 const GROUP_ORDER: [FarDir; 5] = [
@@ -401,13 +446,28 @@ const GROUP_ORDER: [FarDir; 5] = [
     FarDir::NegX,
 ];
 
+/// Where `dir` is in [`GROUP_ORDER`].
+fn group_of(dir: FarDir) -> usize {
+    match dir {
+        FarDir::PosX => 0,
+        FarDir::PosZ => 1,
+        FarDir::Top => 2,
+        FarDir::NegZ => 3,
+        FarDir::NegX => 4,
+    }
+}
+
+/// The tops' place in [`GROUP_ORDER`].
+const TOP_GROUP: usize = 2;
+
 /// Which of a patch's face groups ([`GROUP_ORDER`]) an eye at `eye` can see
-/// the front of, for a patch whose box is `b` (both relative to the same
-/// anchor): a wall facing `+x` stands somewhere in the box's span of x and is
-/// seen only from further along `+x` than itself, so not at all from an eye
-/// at or before the box's low side -- and so on for the other three. The tops
-/// are always drawn: inside the voxels' box the join folds some of them into
-/// walls (`join`), which face wherever the box's side does.
+/// the front of, for a patch -- or a tile -- whose box is `b` (both relative
+/// to the same anchor): a wall facing `+x` stands somewhere in the box's span
+/// of x and is seen only from further along `+x` than itself, so not at all
+/// from an eye at or before the box's low side -- and so on for the other
+/// three. The tops are always drawn here ([`tile_groups`] knows more):
+/// inside the voxels' box the join folds some of them into walls (`join`),
+/// which face wherever the box's side does.
 ///
 /// What the voxel arena does per node (`arena::faces_facing`), and for the
 /// same reason: about two walls in five face away from any one eye, and a
@@ -422,13 +482,25 @@ pub fn groups_facing(b: &Aabb, eye: Vec3) -> [bool; 5] {
     })
 }
 
-/// A patch's faces in the order they are stored and drawn in: by direction
-/// ([`GROUP_ORDER`]), otherwise as they came.
-pub fn stored_order(faces: &[FarFace]) -> Vec<FarFace> {
-    let mut out = Vec::with_capacity(faces.len());
-    for dir in GROUP_ORDER {
-        out.extend(faces.iter().filter(|f| f.dir == dir));
+/// [`groups_facing`] for one tile whose lowest top is `floor` (in the box's
+/// frame of reference): its tops too face away when every one of them is
+/// above the eye -- a top is seen only from above its own height -- unless
+/// the voxels' box reaches the tile (`exempt`), where the join may fold a
+/// top into a wall that faces sideways. A block of margin, for `f32`.
+pub fn tile_groups(b: &Aabb, floor: f32, exempt: bool, eye: Vec3) -> [bool; 5] {
+    let mut groups = groups_facing(b, eye);
+    if !exempt && eye.y < floor - 1.0 {
+        groups[TOP_GROUP] = false;
     }
+    groups
+}
+
+/// A patch's faces in the order they are stored and drawn in: by direction
+/// ([`GROUP_ORDER`]), then by tile ([`FarFace::tile`]), otherwise as they
+/// came -- segment by segment ([`SEGMENTS`]).
+pub fn stored_order(faces: &[FarFace]) -> Vec<FarFace> {
+    let mut out = faces.to_vec();
+    out.sort_by_key(|f| group_of(f.dir) * TILES + f.tile());
     out
 }
 
@@ -440,6 +512,8 @@ pub fn group_counts(faces: &[FarFace]) -> [u32; 5] {
 /// The runs of consecutive faces to draw, as `(first face, faces)`, for a
 /// patch whose groups hold `counts` faces each (in [`GROUP_ORDER`]) and of
 /// which `facing` are wanted. Empty groups neither start nor break a run.
+/// How a patch is drawn when this frame has no room left for its tiles'
+/// runs ([`cull_runs`]).
 pub fn facing_runs(counts: [u32; 5], facing: [bool; 5], mut emit: impl FnMut(u32, u32)) {
     let mut start = 0;
     let mut run: Option<(u32, u32)> = None;
@@ -461,6 +535,300 @@ pub fn facing_runs(counts: [u32; 5], facing: [bool; 5], mut emit: impl FnMut(u32
     }
 }
 
+/// How finely [`FarTerrain::prepare`] culls the far terrain each frame.
+/// Both draw the same pixels -- each leaves out only faces no pixel shows --
+/// and the finer sends fewer triangles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FarCulling {
+    /// Whole patches, by the groups of each that face the eye
+    /// ([`facing_runs`]): the far terrain before tiles, and what a frame
+    /// with no room for its tiles' runs falls back to.
+    Patches,
+    /// Tiles, against the frustum and the side and height of the eye
+    /// ([`cull_runs`]): the game's.
+    #[default]
+    Tiles,
+}
+
+/// What the per-frame cull knows of one tile of a patch ([`PatchCull`]), in
+/// the patch's own terms: quads from its corner, heights in blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TileBounds {
+    /// The span of the tile's faces across the ground, in quads from the
+    /// patch's corner, `[i0, j0, i1, j1]`; `i0 > i1` for a tile with no faces.
+    pub quads: [u8; 4],
+    /// The lowest point of its faces, skirts included, and the highest.
+    pub lo: f32,
+    pub hi: f32,
+    /// The lowest of the tile's tops; `+inf` for a tile with none. While the
+    /// eye is under it, every top of the tile faces away ([`tile_groups`]).
+    pub floor: f32,
+}
+
+/// What [`cull_runs`] knows of one patch: where each segment of its stored
+/// faces starts, and its tiles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatchCull {
+    /// Segment `s` ([`SEGMENTS`]: group `s / TILES`, tile `s % TILES`) is
+    /// the stored faces `starts[s]..starts[s + 1]`.
+    pub starts: [u16; SEGMENTS + 1],
+    pub tiles: [TileBounds; TILES],
+}
+
+impl PatchCull {
+    /// Of a patch whose faces, in [`stored_order`], are `stored`, and whose
+    /// skirt is `skirt` deep.
+    pub fn of(stored: &[FarFace], skirt: f32) -> Self {
+        let mut starts = [0u16; SEGMENTS + 1];
+        let mut tiles = [TileBounds {
+            quads: [u8::MAX, u8::MAX, 0, 0],
+            lo: f32::INFINITY,
+            hi: f32::NEG_INFINITY,
+            floor: f32::INFINITY,
+        }; TILES];
+        for f in stored {
+            let t = f.tile();
+            starts[group_of(f.dir) * TILES + t + 1] += 1;
+            let tile = &mut tiles[t];
+            for v in f.corners() {
+                let [i, j] = v.at.map(|a| a as u8);
+                tile.quads = [
+                    tile.quads[0].min(i),
+                    tile.quads[1].min(j),
+                    tile.quads[2].max(i),
+                    tile.quads[3].max(j),
+                ];
+                let y = v.y(skirt);
+                tile.lo = tile.lo.min(y);
+                tile.hi = tile.hi.max(y);
+            }
+            if f.dir == FarDir::Top {
+                tile.floor = tile.floor.min(f.top as f32);
+            }
+        }
+        for s in 0..SEGMENTS {
+            starts[s + 1] += starts[s];
+        }
+        Self { starts, tiles }
+    }
+
+    /// How many faces of each direction group ([`GROUP_ORDER`]).
+    pub fn group_counts(&self) -> [u32; 5] {
+        [0, 1, 2, 3, 4].map(|g| (self.starts[(g + 1) * TILES] - self.starts[g * TILES]) as u32)
+    }
+}
+
+/// One patch as [`cull_runs`] takes it, in one frame of reference with the
+/// eye, the frustum and the voxels' box (the renderer's: relative to its
+/// anchor).
+#[derive(Clone, Copy, Debug)]
+pub struct CullPatch<'a> {
+    /// The patch's box.
+    pub aabb: Aabb,
+    /// Its lowest `(x, z)` corner.
+    pub origin: [f32; 2],
+    /// The width of a quad, in blocks.
+    pub quad: f32,
+    /// What comes off a height (an absolute one, as a face carries) to put
+    /// it in this frame: the anchor's `y`.
+    pub dy: f32,
+    pub cull: &'a PatchCull,
+}
+
+impl CullPatch<'_> {
+    /// The box of the tile `t` ([`TileBounds`]), in this frame; `None` for a
+    /// tile with no faces.
+    pub fn tile_box(&self, t: usize) -> Option<Aabb> {
+        let tb = &self.cull.tiles[t];
+        if tb.quads[0] > tb.quads[2] {
+            return None;
+        }
+        let at = |i: u8, j: u8| {
+            (
+                self.origin[0] + i as f32 * self.quad,
+                self.origin[1] + j as f32 * self.quad,
+            )
+        };
+        let ((x0, z0), (x1, z1)) = (at(tb.quads[0], tb.quads[1]), at(tb.quads[2], tb.quads[3]));
+        Some(Aabb {
+            min: Vec3::new(x0, tb.lo - self.dy, z0),
+            max: Vec3::new(x1, tb.hi - self.dy, z1),
+        })
+    }
+}
+
+/// Whether the voxels' box reaches the tile whose box is `b`: across the
+/// ground, to within a block -- where the join may move its corners.
+pub fn hole_reaches(hole: Option<&Aabb>, b: &Aabb) -> bool {
+    hole.is_some_and(|h| {
+        b.min.x <= h.max.x + 1.0
+            && b.max.x >= h.min.x - 1.0
+            && b.min.z <= h.max.z + 1.0
+            && b.max.z >= h.min.z - 1.0
+    })
+}
+
+/// The groups ([`GROUP_ORDER`], bit `g`) each tile of `p` draws this frame:
+/// none for a tile the frustum cannot see -- a patch wholly inside it is not
+/// asked again -- and of the others, those [`tile_groups`] keeps: the walls
+/// by the side of the tile the eye is on, the tops by its height.
+pub fn tile_masks(
+    p: &CullPatch<'_>,
+    (frustum, eye): (&Frustum, Vec3),
+    hole: Option<&Aabb>,
+) -> [u8; TILES] {
+    let inside = frustum.contains_aabb(&p.aabb);
+    let mut masks = [0u8; TILES];
+    for (t, mask) in masks.iter_mut().enumerate() {
+        let Some(b) = p.tile_box(t) else {
+            continue;
+        };
+        if !inside && !frustum.intersects_aabb(&b) {
+            continue;
+        }
+        let floor = p.cull.tiles[t].floor - p.dy;
+        let groups = tile_groups(&b, floor, hole_reaches(hole, &b), eye);
+        *mask = groups
+            .iter()
+            .enumerate()
+            .fold(0u8, |m, (g, &on)| m | (on as u8) << g);
+    }
+    masks
+}
+
+/// The runs of a patch's stored faces to draw, as `(first, count)`, for a
+/// patch whose segments start at `starts` ([`PatchCull::starts`]) and whose
+/// tiles draw the groups `masks` say ([`tile_masks`]): every face of a
+/// kept segment once, none of another; neighbouring kept segments make one
+/// run, and empty ones neither start nor break one.
+pub fn segment_runs(
+    starts: &[u16; SEGMENTS + 1],
+    masks: &[u8; TILES],
+    mut emit: impl FnMut(u32, u32),
+) {
+    let mut run: Option<(u32, u32)> = None;
+    for g in 0..GROUP_ORDER.len() {
+        for (t, &mask) in masks.iter().enumerate() {
+            let s = g * TILES + t;
+            let (a, b) = (starts[s] as u32, starts[s + 1] as u32);
+            if a == b {
+                continue;
+            }
+            if mask & (1 << g) != 0 {
+                run = Some(match run {
+                    Some((first, len)) => (first, len + b - a),
+                    None => (a, b - a),
+                });
+            } else if let Some((first, len)) = run.take() {
+                emit(first, len);
+            }
+        }
+    }
+    if let Some((first, len)) = run {
+        emit(first, len);
+    }
+}
+
+/// **What the far terrain draws this frame** (the far terrain's triangles,
+/// after #422): of each of `patches` -- those whose box the frustum passes,
+/// in the order they are drawn -- the runs of its stored faces whose tile the
+/// frustum can see and can show the eye the front of a face of that group
+/// ([`tile_masks`], [`segment_runs`]). `emit(patch, first, count)`: `patch`
+/// an index into `patches`, `first` a face from the patch's first.
+///
+/// Both tests are exact -- a face of a tile the frustum cannot see is off
+/// screen, and one of a group facing away is culled by the GPU -- so this
+/// leaves out only faces no pixel shows. What it leaves out, at Medium and
+/// the gate's eyes: `docs/PHASE3_ARCHITECTURE.md` §9.8.
+pub fn cull_runs(
+    patches: &[CullPatch<'_>],
+    view: (&Frustum, Vec3),
+    hole: Option<&Aabb>,
+    mut emit: impl FnMut(usize, u32, u32),
+) {
+    for (n, p) in patches.iter().enumerate() {
+        let masks = tile_masks(p, view, hole);
+        if masks.iter().any(|&m| m != 0) {
+            segment_runs(&p.cull.starts, &masks, |first, count| emit(n, first, count));
+        }
+    }
+}
+
+/// This frame's runs, culled as `culling` says: [`cull_runs`] -- or, should
+/// that be more than `room`, every patch whole by the groups of it that face
+/// the eye ([`facing_runs`]): more to draw, and no face left out. Into
+/// `out`, as `(patch, first, count)`.
+pub fn frame_runs(
+    patches: &[CullPatch<'_>],
+    (frustum, eye): (&Frustum, Vec3),
+    (hole, culling): (Option<&Aabb>, FarCulling),
+    room: usize,
+    out: &mut Vec<(usize, u32, u32)>,
+) {
+    out.clear();
+    if culling == FarCulling::Tiles {
+        cull_runs(patches, (frustum, eye), hole, |n, first, count| {
+            out.push((n, first, count))
+        });
+    }
+    if culling == FarCulling::Patches || out.len() > room {
+        out.clear();
+        for (n, p) in patches.iter().enumerate() {
+            facing_runs(
+                p.cull.group_counts(),
+                groups_facing(&p.aabb, eye),
+                |first, count| out.push((n, first, count)),
+            );
+        }
+    }
+}
+
+/// What [`FarTerrain::prepare`] draws of `patches` for a frame seen through
+/// `frustum` from `eye`, the voxels' box `hole` left to them and culled as
+/// `culling` says -- without a GPU, in world blocks: the same patches in
+/// view, in the same order, and the same runs ([`frame_runs`]), as
+/// `(patch, first, count)` with `first` a face of the patch's
+/// [`stored_order`]. For a test, or a count, of what a frame sends.
+pub fn runs_of(
+    patches: &[FarPatch<'_>],
+    hole: Option<([i32; 3], [i32; 3])>,
+    culling: FarCulling,
+    (frustum, eye): (&Frustum, Vec3),
+) -> Vec<(usize, u32, u32)> {
+    let placed: Vec<PlacedPatch> = patches.iter().map(PlacedPatch::of).collect();
+    let boxes: Vec<Option<Aabb>> = placed.iter().map(|p| Some(p.aabb(anchor::ORIGIN))).collect();
+    let culls: Vec<PatchCull> = patches
+        .iter()
+        .map(|p| PatchCull::of(&stored_order(p.faces), p.skirt))
+        .collect();
+    let hole = hole.map(|(min, max)| hole_aabb(min, max, anchor::ORIGIN));
+    let order = slots_to_draw(true, &boxes, frustum, hole.as_ref(), eye);
+    let inputs: Vec<CullPatch> = order
+        .iter()
+        .map(|&slot| {
+            let p = &placed[slot as usize];
+            CullPatch {
+                aabb: p.aabb(anchor::ORIGIN),
+                origin: p.origin_relative(anchor::ORIGIN),
+                quad: p.quad,
+                dy: 0.0,
+                cull: &culls[slot as usize],
+            }
+        })
+        .collect();
+    let mut out = Vec::new();
+    frame_runs(
+        &inputs,
+        (frustum, eye),
+        (hole.as_ref(), culling),
+        runs_room(patches.len() as u32),
+        &mut out,
+    );
+    out.into_iter()
+        .map(|(n, first, count)| (order[n] as usize, first, count))
+        .collect()
+}
+
 /// How many faces one draw's instances each hold: the far terrain's runs of
 /// faces are sorted into these classes, and each class with anything in it
 /// is one instanced draw, every instance padded to the class's size with
@@ -470,15 +838,18 @@ pub fn facing_runs(counts: [u32; 5], facing: [bool; 5], mut emit: impl FnMut(u32
 /// differ in length; one draw needs one vertex count. A draw per run is
 /// hundreds of draws a frame, and draws are what the M3 is bound by
 /// (`PHASE1_ARCHITECTURE.md` §2) -- Metal has no multi-draw, so an indirect
-/// list would be the same hundreds of draws issued in a loop. Seventeen
-/// classes are at most seventeen draws, whatever is in view.
+/// list would be the same hundreds of draws issued in a loop. Twenty-one
+/// classes are at most twenty-one draws, whatever is in view.
 ///
-/// Each is `sqrt 2` times the last, rounded up, from 16 to the first one that
+/// Each is `sqrt 2` times the last, rounded up, from 4 to the first one that
 /// holds a whole patch ([`FAR_MAX_FACES`]), so a run is padded by 41% at
-/// most and about a fifth on average. **Chosen, not derived**: a finer
-/// ladder pads less and draws more often.
-pub const CLASS_FACES: [u32; 17] = [
-    16, 23, 32, 46, 64, 91, 128, 182, 256, 363, 512, 725, 1024, 1449, 2048, 2897, 4096,
+/// most and about a fifth on average (but a run of one face, by three). From
+/// 4 since runs are some tiles of a patch ([`cull_runs`]), not a patch's
+/// whole groups: a tile's group is a few faces. **Chosen, not derived**: a
+/// finer ladder pads less and draws more often.
+pub const CLASS_FACES: [u32; 21] = [
+    4, 6, 8, 11, 16, 23, 32, 46, 64, 91, 128, 182, 256, 363, 512, 725, 1024, 1449, 2048, 2897,
+    4096,
 ];
 
 /// The class a run of `faces` faces is drawn in: the smallest that holds it.
@@ -490,14 +861,28 @@ pub fn class_of(faces: u32) -> usize {
 }
 
 /// One run of faces to draw, as `far.wgsl` reads it: the patch's slot, the
-/// run's first face in the shared buffer, and how many faces it is.
+/// run's first face in the shared buffer, and how many faces it is. Sixteen
+/// bytes, so a class's runs start on a multiple of 256 with whole runs
+/// between them ([`RUN_ALIGN`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 struct RunGpu {
     slot: u32,
     first: u32,
     count: u32,
+    pad: u32,
 }
+
+/// Runs between two class starts: a dynamic offset into a storage buffer is
+/// a multiple of 256 bytes (WebGPU's `minStorageBufferOffsetAlignment` at
+/// its largest).
+const RUN_ALIGN: usize = 256 / std::mem::size_of::<RunGpu>();
+
+/// The most runs one frame draws. **Chosen, not derived**: at the gate's
+/// eyes a frame draws a few thousand (`far_census`); beyond this a frame
+/// draws the rest of its patches whole ([`FarTerrain::prepare`]), which is
+/// slower and never wrong.
+const MAX_RUNS: usize = 65_536;
 
 /// The far terrain on the GPU: every held patch's faces in one storage
 /// buffer, and the runs of them drawn this frame.
@@ -513,12 +898,12 @@ pub struct FarTerrain {
     patches: wgpu::Buffer,
     params: wgpu::Buffer,
     indices: wgpu::Buffer,
-    /// The runs drawn this frame, a region of [`runs_per_class`] for each
-    /// class.
+    /// The runs drawn this frame, class after class, each class's from a
+    /// multiple of [`RUN_ALIGN`] runs; bound at that offset for its draw.
     runs: wgpu::Buffer,
-    /// One bind group a class: the same buffers, with that class's region of
-    /// `runs`.
-    bind_groups: Vec<wgpu::BindGroup>,
+    /// How many runs `runs` has room for in one frame.
+    runs_room: usize,
+    bind_group: wgpu::BindGroup,
     capacity: u32,
     /// Slots not holding a patch, handed out last-freed first.
     free: Vec<u32>,
@@ -531,6 +916,10 @@ pub struct FarTerrain {
     /// Each occupied slot's patch in world terms -- what `boxes` and the
     /// GPU records are re-derived from on a [`rebase`](Self::rebase).
     placed: Vec<Option<PlacedPatch>>,
+    /// Each occupied slot's segments and tiles ([`cull_runs`]).
+    culls: Vec<Option<Box<PatchCull>>>,
+    /// How finely each frame is culled ([`set_culling`](Self::set_culling)).
+    culling: FarCulling,
     /// The last [`set_params`](Self::set_params), in world terms, for the
     /// same reason.
     params_world: FarParams,
@@ -539,6 +928,8 @@ pub struct FarTerrain {
     anchor: Anchor,
     /// This frame's runs by class, from the last [`prepare`](Self::prepare).
     by_class: Vec<Vec<RunGpu>>,
+    /// Where each class's runs start in `runs`, in runs, this frame.
+    class_at: Vec<usize>,
     /// How many slots [`prepare`](Self::prepare) found in view.
     drawn: u32,
     /// The triangles of this frame's runs: two a face.
@@ -565,9 +956,8 @@ struct PlacedPatch {
     hi: f32,
     /// Where its faces are in the shared buffer.
     first_face: u32,
-    /// How many faces it has of each direction, in [`GROUP_ORDER`] -- the
-    /// order they are stored in.
-    groups: [u32; 5],
+    /// How many faces it has.
+    faces: u32,
 }
 
 impl PlacedPatch {
@@ -580,12 +970,12 @@ impl PlacedPatch {
             lo,
             hi,
             first_face: 0,
-            groups: group_counts(patch.faces),
+            faces: patch.faces.len() as u32,
         }
     }
 
     fn face_len(&self) -> u32 {
-        self.groups.iter().sum()
+        self.faces
     }
 
     /// The `(x, z)` origin relative to `anchor`: the one exact integer
@@ -619,21 +1009,14 @@ impl PlacedPatch {
     }
 }
 
-/// A patch's faces as they go up: grouped by direction ([`GROUP_ORDER`]),
-/// three words each.
-fn pack_patch(faces: &[FarFace]) -> Vec<[u32; 3]> {
-    stored_order(faces).iter().map(FarFace::pack).collect()
-}
-
 /// Bytes a face takes: [`FarFace::pack`]'s three words.
 const FACE_BYTES: u64 = 12;
 
-/// How many runs one class has room for, for `capacity` patches: every
-/// patch's two runs at most ([`GROUP_ORDER`]), rounded up so that a class's
-/// region of the buffer starts on a multiple of 256 bytes, as a bound range
-/// of a storage buffer must.
-fn runs_per_class(capacity: u32) -> u32 {
-    (2 * capacity).next_multiple_of(64)
+/// How many runs a frame has room for, for `capacity` patches: every
+/// patch's most ([`SEGMENTS`] segments, every other one kept), up to
+/// [`MAX_RUNS`].
+pub fn runs_room(capacity: u32) -> usize {
+    (capacity as usize * SEGMENTS.div_ceil(2)).clamp(1, MAX_RUNS)
 }
 
 impl FarTerrain {
@@ -659,9 +1042,13 @@ impl FarTerrain {
             "far-patches",
             std::mem::size_of::<PatchGpu>() as u64 * capacity as u64,
         );
+        // Every class's runs one after the other, each from a multiple of
+        // `RUN_ALIGN`; a class is bound at its start, `room` runs long, so
+        // the buffer reaches that far past the last start there can be.
         let run_bytes = std::mem::size_of::<RunGpu>() as u64;
-        let region = runs_per_class(capacity) as u64 * run_bytes;
-        let runs = storage("far-runs", region * CLASS_FACES.len() as u64);
+        let room = runs_room(capacity);
+        let span = (2 * room + CLASS_FACES.len() * RUN_ALIGN) as u64 * run_bytes;
+        let runs = storage("far-runs", span);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("far-params"),
             size: std::mem::size_of::<ParamsGpu>() as u64,
@@ -688,36 +1075,32 @@ impl FarTerrain {
         queue.write_buffer(&indices, 0, bytemuck::cast_slice(&quads));
 
         let layout = far_bind_group_layout(device);
-        let bind_groups = (0..CLASS_FACES.len() as u64)
-            .map(|class| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("far-bind-group"),
-                    layout: &layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: patches.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: faces.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &runs,
-                                offset: class * region,
-                                size: wgpu::BufferSize::new(region),
-                            }),
-                        },
-                    ],
-                })
-            })
-            .collect();
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("far-bind-group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: patches.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: faces.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &runs,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(room as u64 * run_bytes),
+                    }),
+                },
+            ],
+        });
         Self {
             faces,
             face_slab: SlabAllocator::new(face_capacity),
@@ -725,14 +1108,18 @@ impl FarTerrain {
             params,
             indices,
             runs,
-            bind_groups,
+            runs_room: room,
+            bind_group,
             capacity,
             free: (0..capacity).rev().collect(),
             boxes: vec![None; capacity as usize],
             placed: vec![None; capacity as usize],
+            culls: vec![None; capacity as usize],
+            culling: FarCulling::default(),
             params_world,
             anchor,
             by_class: vec![Vec::new(); CLASS_FACES.len()],
+            class_at: vec![0; CLASS_FACES.len()],
             drawn: 0,
             drawn_triangles: 0,
             shown: true,
@@ -768,6 +1155,13 @@ impl FarTerrain {
     /// again.
     pub fn set_shown(&mut self, shown: bool) {
         self.shown = shown;
+    }
+
+    /// How finely each frame is culled: the game's ([`FarCulling`]'s
+    /// default), unless a test or a measurement asks for a coarser one to
+    /// see what the finer changes -- which must be nothing on screen.
+    pub fn set_culling(&mut self, culling: FarCulling) {
+        self.culling = culling;
     }
 
     /// The render anchor the records, hole and boxes are relative to.
@@ -826,11 +1220,13 @@ impl FarTerrain {
         let slot = *self.free.last()?;
         let first_face = self.face_slab.alloc(patch.faces.len() as u32)?;
         self.free.pop();
-        if !patch.faces.is_empty() {
+        let stored = stored_order(patch.faces);
+        if !stored.is_empty() {
+            let packed: Vec<[u32; 3]> = stored.iter().map(FarFace::pack).collect();
             queue.write_buffer(
                 &self.faces,
                 first_face as u64 * FACE_BYTES,
-                bytemuck::cast_slice(&pack_patch(patch.faces)),
+                bytemuck::cast_slice(&packed),
             );
         }
         let placed = PlacedPatch {
@@ -844,6 +1240,7 @@ impl FarTerrain {
         );
         self.boxes[slot as usize] = Some(placed.aabb(self.anchor));
         self.placed[slot as usize] = Some(placed);
+        self.culls[slot as usize] = Some(Box::new(PatchCull::of(&stored, patch.skirt)));
         Some(FarSlot(slot))
     }
 
@@ -854,6 +1251,7 @@ impl FarTerrain {
             if let Some(placed) = self.placed[slot.0 as usize].take() {
                 self.face_slab.free(placed.first_face, placed.face_len());
             }
+            self.culls[slot.0 as usize] = None;
             self.free.push(slot.0);
         }
     }
@@ -899,32 +1297,55 @@ impl FarTerrain {
             class.clear();
         }
         self.drawn_triangles = 0;
+        // The patches in view as the cull takes them, and their slots.
+        let dy = self.anchor[1] as f32;
+        let (mut slots, mut inputs) = (Vec::with_capacity(order.len()), Vec::new());
         for &slot in &order {
-            let (Some(placed), Some(aabb)) =
-                (&self.placed[slot as usize], &self.boxes[slot as usize])
+            let s = slot as usize;
+            let (Some(placed), Some(aabb), Some(cull)) =
+                (&self.placed[s], self.boxes[s], self.culls[s].as_deref())
             else {
                 continue;
             };
-            let by_class = &mut self.by_class;
-            let triangles = &mut self.drawn_triangles;
-            facing_runs(placed.groups, groups_facing(aabb, eye), |first, count| {
-                by_class[class_of(count)].push(RunGpu {
-                    slot,
-                    first: placed.first_face + first,
-                    count,
-                });
-                *triangles += count as u64 * 2;
+            slots.push((slot, placed.first_face));
+            inputs.push(CullPatch {
+                aabb,
+                origin: placed.origin_relative(self.anchor),
+                quad: placed.quad,
+                dy,
+                cull,
             });
         }
-        let region = runs_per_class(self.capacity) as u64 * std::mem::size_of::<RunGpu>() as u64;
+        let mut runs = Vec::new();
+        frame_runs(
+            &inputs,
+            (frustum, eye),
+            (self.hole.as_ref(), self.culling),
+            self.runs_room,
+            &mut runs,
+        );
+        for (n, first, count) in runs {
+            let (slot, first_face) = slots[n];
+            self.by_class[class_of(count)].push(RunGpu {
+                slot,
+                first: first_face + first,
+                count,
+                pad: 0,
+            });
+            self.drawn_triangles += count as u64 * 2;
+        }
+        // Class after class, each from a multiple of `RUN_ALIGN`.
+        let mut staged: Vec<RunGpu> = Vec::new();
         for (class, runs) in self.by_class.iter().enumerate() {
-            if !runs.is_empty() {
-                queue.write_buffer(
-                    &self.runs,
-                    class as u64 * region,
-                    bytemuck::cast_slice(runs),
-                );
-            }
+            staged.resize(
+                staged.len().next_multiple_of(RUN_ALIGN),
+                bytemuck::Zeroable::zeroed(),
+            );
+            self.class_at[class] = staged.len();
+            staged.extend_from_slice(runs);
+        }
+        if !staged.is_empty() {
+            queue.write_buffer(&self.runs, 0, bytemuck::cast_slice(&staged));
         }
         self.drawn = order.len() as u32;
         self.drawn
@@ -980,7 +1401,8 @@ impl FarTerrain {
             if runs.is_empty() {
                 continue;
             }
-            pass.set_bind_group(1, &self.bind_groups[class], &[]);
+            let offset = self.class_at[class] * std::mem::size_of::<RunGpu>();
+            pass.set_bind_group(1, &self.bind_group, &[offset as u32]);
             pass.draw_indexed(0..CLASS_FACES[class] * 6, 0, 0..runs.len() as u32);
         }
     }
@@ -1669,93 +2091,270 @@ mod tests {
         }
         // Three runs in class 0 and one in class 2: two draws, and every
         // run's whole class in vertices.
-        let mut runs = [0usize; 17];
+        let mut runs = [0usize; CLASS_FACES.len()];
         runs[0] = 3;
         runs[2] = 1;
-        assert_eq!(issued(&runs), (2, (3 * 16 + 32) * 4));
+        assert_eq!(
+            issued(&runs),
+            (2, (3 * CLASS_FACES[0] as u64 + CLASS_FACES[2] as u64) * 4)
+        );
+        // A class's runs start on a multiple of 256 bytes, whole runs apart.
+        assert_eq!(RUN_ALIGN * std::mem::size_of::<RunGpu>(), 256);
     }
 
-    /// **Direction culling never drops a face the eye could see** (issue
-    /// #422): over seeded eyes and faces, any face with a corner the eye is
-    /// in front of is in a group [`groups_facing`] keeps -- and the runs
-    /// [`facing_runs`] makes of the kept groups are exactly their faces.
+    /// A frustum that sees all of a patch at `origin` of quads of `quad`
+    /// between heights -300 and 800: from far above it, looking down.
+    fn frustum_over(origin: [f32; 2], quad: f32) -> Frustum {
+        let size = quad * FAR_QUADS as f32;
+        let centre = Vec3::new(origin[0] + size / 2.0, 0.0, origin[1] + size / 2.0);
+        let eye = centre + Vec3::Y * 20.0 * size;
+        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), 1.0, 1.0, 1.0e6);
+        let view = glam::Mat4::look_at_rh(eye, centre, Vec3::Z);
+        Frustum::from_view_proj(proj * view)
+    }
+
+    /// The box of the tile `t` of a patch at `origin` of quads of `quad`,
+    /// as [`cull_runs`] makes it.
+    fn tile_box(tb: &TileBounds, origin: [f32; 2], quad: f32) -> Aabb {
+        let at = |i: u8, j: u8| Vec3::new(origin[0] + i as f32 * quad, 0.0, origin[1] + j as f32 * quad);
+        let (lo, hi) = (at(tb.quads[0], tb.quads[1]), at(tb.quads[2], tb.quads[3]));
+        Aabb {
+            min: Vec3::new(lo.x, tb.lo, lo.z),
+            max: Vec3::new(hi.x, tb.hi, hi.z),
+        }
+    }
+
+    /// **Culling never drops a face the eye could see** (issue #422): over
+    /// seeded eyes and faces, every face is inside its tile's box, and any
+    /// face with a corner the eye is in front of is in a group its tile
+    /// keeps ([`tile_groups`]) -- and the runs [`cull_runs`] makes are
+    /// exactly the faces of the kept segments of the tiles the frustum
+    /// passes, once each.
     #[test]
     fn a_face_that_can_face_the_eye_is_always_drawn() {
         let mut next = stream(0xD1EC);
-        let patch = ([64.0, -128.0], 4.0, 9.0);
-        let (mut kept, mut dropped) = (0, 0);
-        for _ in 0..400 {
+        let (origin, quad, skirt) = ([64.0, -128.0], 4.0, 9.0);
+        let patch = (origin, quad, skirt);
+        let (mut kept, mut dropped, mut outside) = (0, 0, 0);
+        for round in 0..400 {
             let faces: Vec<FarFace> = (0..40).map(|_| some_face(&mut next)).collect();
+            let stored = stored_order(&faces);
+            let cull = PatchCull::of(&stored, skirt);
             let far_patch = FarPatch {
                 origin: [64, -128],
-                quad: 4.0,
-                faces: &faces,
-                skirt: 9.0,
+                quad,
+                faces: &stored,
+                skirt,
             };
-            let placed = PlacedPatch::of(&far_patch);
-            let aabb = placed.aabb(anchor::ORIGIN);
+            let aabb = PlacedPatch::of(&far_patch).aabb(anchor::ORIGIN);
             // Eyes around the patch, over it, and inside its box.
             let eye = Vec3::new(
                 next(600) as f32 - 200.0,
                 next(1200) as f32 - 300.0,
                 next(600) as f32 - 400.0,
             );
-            let facing = groups_facing(&aabb, eye);
-            for face in &faces {
-                let group = GROUP_ORDER.iter().position(|d| *d == face.dir).unwrap();
+            // Every other round, a frustum that sees part of the patch.
+            let frustum = if round % 2 == 0 {
+                frustum_over(origin, quad)
+            } else {
+                let at = Vec3::new(origin[0] - 40.0, 300.0, origin[1] - 40.0);
+                let proj = glam::Mat4::perspective_rh(30f32.to_radians(), 1.0, 1.0, 1.0e6);
+                let look = Vec3::new(origin[0] + 30.0, 0.0, origin[1] + 50.0);
+                Frustum::from_view_proj(proj * glam::Mat4::look_at_rh(at, look, Vec3::Y))
+            };
+            let mut want = vec![0u32; stored.len()];
+            for (k, face) in stored.iter().enumerate() {
+                let tb = &cull.tiles[face.tile()];
+                let b = tile_box(tb, origin, quad);
+                for v in face.corners() {
+                    let p = Vec3::new(
+                        origin[0] + v.at[0] as f32 * quad,
+                        v.y(skirt),
+                        origin[1] + v.at[1] as f32 * quad,
+                    );
+                    assert!(
+                        b.min.cmple(p).all() && p.cmple(b.max).all(),
+                        "{face:?}: corner {p} outside its tile's box {b:?}"
+                    );
+                }
+                let groups = tile_groups(&b, tb.floor, false, eye);
                 let seen = face
                     .corners()
                     .iter()
                     .any(|v| face.dir.normal().dot(eye - place(v, patch, None, 0.0)) > 0.0);
+                let group = group_of(face.dir);
                 assert!(
-                    !seen || facing[group],
-                    "eye {eye}: {face:?} faces it and its group is not drawn"
+                    !seen || groups[group],
+                    "eye {eye}: {face:?} faces it and its tile does not draw its group"
                 );
-                if facing[group] {
+                if groups[group] {
                     kept += 1;
                 } else {
                     dropped += 1;
                 }
+                if !frustum.intersects_aabb(&b) {
+                    outside += 1;
+                } else if groups[group] {
+                    want[k] = 1;
+                }
             }
-            // The runs: every face of a kept group once, none of a dropped.
-            let mut drawn = vec![0u32; faces.len()];
-            facing_runs(placed.groups, facing, |first, count| {
+            // The runs: every face of a kept segment once, none of another.
+            let mut drawn = vec![0u32; stored.len()];
+            let input = CullPatch {
+                aabb,
+                origin,
+                quad,
+                dy: 0.0,
+                cull: &cull,
+            };
+            cull_runs(&[input], (&frustum, eye), None, |n, first, count| {
+                assert_eq!(n, 0);
                 for face in first..first + count {
                     drawn[face as usize] += 1;
                 }
             });
-            let mut at = 0;
-            for (group, &count) in placed.groups.iter().enumerate() {
-                for face in at..at + count {
-                    assert_eq!(drawn[face as usize], facing[group] as u32, "group {group}");
-                }
-                at += count;
-            }
+            assert_eq!(drawn, want, "eye {eye}");
         }
-        // And it does drop some: a rule that kept everything would pass the
-        // above and cull nothing.
+        // And it does drop some, both ways: a rule that kept everything would
+        // pass the above and cull nothing.
         assert!(
             dropped * 4 > kept,
             "only {dropped} of {} dropped",
             kept + dropped
         );
+        assert!(outside > 0, "the frustum culled no tile");
     }
 
-    /// Faces go up grouped by direction, so a run is a direction or a few
-    /// neighbouring ones.
+    /// Faces go up segment by segment -- a direction's faces together, and
+    /// in them a tile's -- so a run is some tiles of a direction or of a few
+    /// neighbouring ones; and [`PatchCull`] knows where each segment starts.
     #[test]
-    fn a_patchs_faces_are_stored_by_direction() {
+    fn a_patchs_faces_are_stored_by_segment() {
         let mut next = stream(0x6E0);
         let faces: Vec<FarFace> = (0..200).map(|_| some_face(&mut next)).collect();
-        let packed = pack_patch(&faces);
-        assert_eq!(packed.len(), faces.len());
-        let stored: Vec<FarFace> = packed.into_iter().map(FarFace::unpack).collect();
-        let mut at = 0;
-        for dir in GROUP_ORDER {
-            let of_dir: Vec<FarFace> = faces.iter().copied().filter(|f| f.dir == dir).collect();
-            assert_eq!(&stored[at..at + of_dir.len()], of_dir.as_slice(), "{dir:?}");
-            at += of_dir.len();
+        let stored = stored_order(&faces);
+        let cull = PatchCull::of(&stored, 4.0);
+        assert_eq!(cull.starts[SEGMENTS] as usize, faces.len());
+        for s in 0..SEGMENTS {
+            let segment = &stored[cull.starts[s] as usize..cull.starts[s + 1] as usize];
+            for f in segment {
+                assert_eq!((group_of(f.dir), f.tile()), (s / TILES, s % TILES), "{f:?}");
+            }
+            // In the order they came.
+            let of_it: Vec<FarFace> = faces
+                .iter()
+                .copied()
+                .filter(|f| group_of(f.dir) == s / TILES && f.tile() == s % TILES)
+                .collect();
+            assert_eq!(segment, of_it.as_slice(), "segment {s}");
         }
+        assert_eq!(cull.group_counts(), group_counts(&faces));
+    }
+
+    /// A tile's floor is the lowest of its own tops: a top belongs to the
+    /// tile of its first quad, wherever it reaches.
+    #[test]
+    fn a_tiles_floor_is_its_lowest_top() {
+        let n = TILE_QUADS as u8;
+        // The first tile: a top at 30 over all of it, one at 20 on a quad;
+        // the second: one top at 50, and one from the first quad of the
+        // third reaching back over it at 10, which is the third's.
+        let faces = vec![
+            FarFace {
+                i1: n,
+                j1: n,
+                ..unit_top(0, 0, 30)
+            },
+            unit_top(1, 1, 20),
+            unit_top(n, 0, 50),
+            FarFace {
+                i0: 2 * n,
+                i1: 2 * n + 1,
+                ..unit_top(2 * n, 0, 10)
+            },
+        ];
+        let cull = PatchCull::of(&stored_order(&faces), 0.0);
+        assert_eq!(cull.tiles[0].floor, 20.0);
+        assert_eq!(cull.tiles[1].floor, 50.0);
+        assert_eq!(cull.tiles[2].floor, 10.0);
+        assert_eq!(cull.tiles[3].floor, f32::INFINITY, "no top at all");
+    }
+
+    /// Under a tile's lowest top, an eye sees none of its tops -- unless the
+    /// voxels' box reaches the tile, where the join may fold a top into a
+    /// wall.
+    #[test]
+    fn the_tops_of_a_tile_above_the_eye_are_not_drawn() {
+        let b = Aabb {
+            min: Vec3::new(100.0, 40.0, 100.0),
+            max: Vec3::new(132.0, 90.0, 132.0),
+        };
+        let below = Vec3::new(0.0, 30.0, 0.0);
+        assert!(!tile_groups(&b, 50.0, false, below)[TOP_GROUP]);
+        assert!(tile_groups(&b, 50.0, true, below)[TOP_GROUP], "exempt");
+        assert!(tile_groups(&b, 50.0, false, Vec3::new(0.0, 50.5, 0.0))[TOP_GROUP]);
+        // The walls are the box's to decide, whatever the height.
+        let (walls, facing) = (tile_groups(&b, 50.0, false, below), groups_facing(&b, below));
+        for g in (0..GROUP_ORDER.len()).filter(|&g| g != TOP_GROUP) {
+            assert_eq!(walls[g], facing[g], "group {g}");
+        }
+    }
+
+    /// With more runs than a frame has room for, every patch is drawn whole
+    /// by the groups of it that face the eye -- never fewer faces.
+    #[test]
+    fn a_frame_without_room_draws_every_patch_whole() {
+        let mut next = stream(0xF00D);
+        let (origin, quad) = ([0.0, 0.0], 4.0);
+        let faces: Vec<FarFace> = (0..300).map(|_| some_face(&mut next)).collect();
+        let stored = stored_order(&faces);
+        let cull = PatchCull::of(&stored, 4.0);
+        let aabb = PlacedPatch::of(&FarPatch {
+            origin: [0, 0],
+            quad,
+            faces: &stored,
+            skirt: 4.0,
+        })
+        .aabb(anchor::ORIGIN);
+        let input = CullPatch {
+            aabb,
+            origin,
+            quad,
+            dy: 0.0,
+            cull: &cull,
+        };
+        let eye = Vec3::new(64.0, 200.0, -300.0);
+        let frustum = frustum_over(origin, quad);
+        let mut out = Vec::new();
+        frame_runs(
+            &[input],
+            (&frustum, eye),
+            (None, FarCulling::Tiles),
+            usize::MAX,
+            &mut out,
+        );
+        assert!(out.len() > 2, "{} runs: the room is not tested", out.len());
+        frame_runs(
+            &[input],
+            (&frustum, eye),
+            (None, FarCulling::Tiles),
+            2,
+            &mut out,
+        );
+        let mut patches_only = Vec::new();
+        frame_runs(
+            &[input],
+            (&frustum, eye),
+            (None, FarCulling::Patches),
+            usize::MAX,
+            &mut patches_only,
+        );
+        let mut whole = Vec::new();
+        facing_runs(cull.group_counts(), groups_facing(&aabb, eye), |first, count| {
+            whole.push((0, first, count))
+        });
+        assert_eq!(out, whole);
+        assert_eq!(patches_only, whole, "culling by whole patches");
     }
 
     /// **A wall inside the voxels' box shows an eye inside it nothing**

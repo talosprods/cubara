@@ -20,6 +20,8 @@ mod caps;
 mod capture;
 #[cfg(test)]
 mod far_census;
+#[cfg(test)]
+mod far_census_horizon;
 mod far_streaming;
 mod flight;
 mod game;
