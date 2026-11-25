@@ -1967,16 +1967,21 @@ still swaps, by the step of the table above.
 
 On screen (`transition_study`, the toward-peak flight, the morph's worst
 single frame per edge in pixels over the goldens' tolerance, and its
-luminance; main `9ec668a` beside it, the same machine and day):
+luminance; main `ca3f5bc` beside it -- level 0's band from 96 blocks,
+§9.6.1 -- the same machine and day):
 
 | edge | main | pits in the ground | luminance |
 |---|---|---|---|
-| 0<->1 (160 m) | 4,926 | **2,882** (-41%) | 783 -> 498 |
+| 0<->1 (160 m) | 4,933 | **2,889** (-41%) | 785 -> 500 |
 | 1<->2 (288 m) | 4,747 | **3,531** (-26%) | 1,005 -> 829 |
 | 2<->3 (512 m) | 8,993 | **8,455** (-6%) | 1,576 -> 1,473 |
 
 The holes the morph opens are #436's, as before: 265 of 450 frames checked
-with any, at most 32 pixels (main: 251, at most 32).
+with any, at most 32 pixels (main: 251, at most 32). (Everything else in
+this section was measured against main `9ec668a`, before §9.6.1 landed; it
+moves where level 0's band starts and no mesh, so the counts and the
+studies stand. A level-0 pit within 96 blocks of the eye stands exactly
+as its blocks do.)
 
 **A merged node is searched as open** (`visibility::stand_in`; §9.5 had it
 searched as its children drew it, "not a proof"). A
