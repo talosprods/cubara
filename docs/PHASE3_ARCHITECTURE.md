@@ -1631,7 +1631,7 @@ the hill eye held the gate by 3.5% there.)
 
 **The quiet bench chose 3** (`BENCHMARKS.md` footnote 96: AC power, no
 agents, five quiet minutes, two runs of each, alternating; Medium, ground /
-hill FPS; since the far terrain is culled by tiles the scale is 2.09, below). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
+hill FPS; since the far terrain is culled by tiles the scale is 2.7, below). Main: 1,052 / 1,074 and 1,049 / 1,055. At 2.5: 1,070 / 1,081 and
 1,036 / 1,034 -- it holds, by 3.5% at the hill eye, and stands below main
 there. At 3: 1,153 / 1,161 and 1,121 / 1,130, 7% over main at the hill eye.
 Both fly with no hole and with 1 or 2 stale frames where main has 16.
@@ -1719,10 +1719,11 @@ mountains, and the pictures must be equal pixel for pixel;
 buffer to being drawn; and `no_sky_shows_through_the_far_terrain` (from the
 shared-corner branch, where it was seen red) that the far terrain drawn so
 is still watertight from above. Runs are now some tiles of a group -- up to
-650 a frame at x2.09, where whole patches made about 100 -- so the size
+580 a frame at x2.7, where whole patches made about 100 -- so the size
 classes start at 4 faces (`far::CLASS_FACES`, 21 classes), and the far
 terrain is 17 to 19 draws a frame where it was 4 to 5. The cull costs the
-main thread about 0.045 ms a frame (census timing, not a quiet machine).
+main thread about 0.035 ms a frame at x2.7 (census timing, not a quiet
+machine).
 
 After, the same census (the hill eye; ground and flight eye in the PR):
 
@@ -1731,8 +1732,9 @@ After, the same census (the hill eye; ground and flight eye in the PR):
 | x1 | 216 | 755,332 (894,968: -16%) | 1,806,398 (2,143,303) | 385,733 | 78,331 / 95,135 / 13,535 / 158,320 | 24,278 | 95.7% | 0.7% | 2.8% | 0.8% |
 | x1.5 | 119 | 400,501 (503,831: -21%) | 967,655 (1,217,861) | 203,534 | 43,882 / 48,623 / 6,343 / 85,256 | 12,863 | 93.9% | 0.9% | 3.9% | 1.3% |
 | x2 | 105 | 349,358 (447,941: -22%) | 844,389 (1,082,877) | 177,326 | 37,827 / 43,037 / 5,604 / 74,324 | 11,241 | 94.0% | 1.0% | 4.0% | 1.0% |
-| **x2.09** | 57 | **182,132** | 439,972 | 92,349 | 18,844 / 23,359 / 3,144 / 38,521 | 5,916 | 92.4% | 1.3% | 5.1% | 1.1% |
+| x2.09 | 57 | 182,132 | 439,972 | 92,349 | 18,844 / 23,359 / 3,144 / 38,521 | 5,916 | 92.4% | 1.3% | 5.1% | 1.1% |
 | x2.5 | 57 | 180,249 (246,462: -27%) | 435,475 (595,612) | 91,374 | 18,700 / 23,077 / 2,733 / 38,521 | 5,844 | 92.4% | 1.3% | 5.1% | 1.1% |
+| **x2.7** | 47 | **146,586** | 356,498 | 74,115 | 14,390 / 19,645 / 2,704 / 30,958 | 4,774 | 91.3% | 1.5% | 5.9% | 1.4% |
 | x3 | 44 | 135,424 (193,641: -30%) | 328,574 (470,415) | 68,623 | 14,390 / 16,945 / 2,674 / 28,358 | 4,434 | 90.9% | 1.5% | 6.2% | 1.4% |
 
 At the ground eye the cut is 23 to 34% (x3: 191,621 to 127,394), at the
@@ -1749,27 +1751,47 @@ against 515. The far pass is the
 GPU's and the CPU has room (`BENCHMARKS.md`: about 0.42 ms a frame at the
 ground eye, of about 0.9), so 4 (chosen, not derived).
 
-**The quad scale is now 2.09** (`far_census_scale_scan`, Medium, the
-hill eye; triangles a frame, the tiles' cull):
+**The quad scale is now 2.7.** Fewer triangles was not the measure.
+The quiet M3 bench of the tiles (`BENCHMARKS.md`; Medium, two runs, hill eye,
+FPS): main at x3 1,043 and 1,043; the tiles at x3 1,111 (+6.5%); the tiles
+at x2.09 -- fewer triangles than main's x3, 182,132 against 193,641 -- 1,026
+and 999. What the tiles leave out are triangles the GPU threw away early
+anyway (facing away, off screen); what a finer scale adds are triangles that
+face the eye on screen, which it bins and rasterises. Fitted to the three
+(chosen, not derived; F the triangles facing the eye on screen, C the rest):
+a C costs about 1.0 ns, an F 1.6 to 2.2 ns (the two x2.09 runs). Main sends
+F 122,962 and C 70,679 at the hill eye; the tiles at x3 F 123,100 and C
+12,324 -- the same F, so the 59 µs they save is what a finer scale can
+spend, about 31,000 more F.
 
-| scale | patches in view | triangles | against x3 before tiles (193,641) |
-|---|--:|--:|--:|
-| x2 | 105 | 347,639 | +80% |
-| x2.02 | 69 | 222,558 | +15% |
-| x2.06 | 61 | 193,872 | +0.1% |
-| x2.08 | 61 | 193,868 | +0.1% |
-| x2.082 | 59 | 187,351 | -3.2% |
-| **x2.09** | 57 | 180,799 | -6.6% |
-| x2.1 to x2.4 | 57 | 180,117 to 180,799 | -6.6% to -7.0% |
-| x3 | 44 | 134,091 | -31% |
+The patches in view change in steps -- a ring of them splits at once.
+Every step of the hill eye's selection between 2 and 3
+(`far_census_scale_scan` at 0.02 and, near 2.69, 0.002; `far_census_by_kind`
+for F), and what the costs above make of it against main's 1,043:
 
-The patches in view change in steps -- a ring of them splits at once -- so
-the count jumps between 2.0 and 2.1 and stands still from 2.09 to 2.4.
-2.09 is the smallest scale, to two places, under the x3 count at the hill
-eye (2.082 is the smallest found at all, three thousandths before the next
-step up); at it the ground eye draws 165,936 (191,621 at x3 before) and the
-flight eye 122,667 (149,745). Whether 2.09 holds the gate is the quiet
-bench's to say.
+| scale (step from) | hill: patches / triangles / F | draws / runs, most / cull, ms | hill FPS expected | ground: patches / triangles | flight: patches / triangles |
+|---|--:|--:|--:|--:|--:|
+| main, x3 | 44 / 193,641 / 122,962 | 4.8 / 86 / -- | 1,043 measured | 44 / 191,621 | 33 / 149,745 |
+| x2.09 | 57 / 182,132 / 168,290 | 18.6 / 554 / 0.044 | 1,026, 999 measured | 57 / 167,276 | 41 / 122,690 |
+| x2.54 | 56 / 176,678 / 163,074 | 18.5 / 551 / 0.042 | 1,011 to 1,035 | 55 / 162,481 | 34 / 96,314 |
+| x2.58 | 53 / 169,081 / 155,893 | 18.5 / 540 / 0.039 | 1,028 to 1,048 | 53 / 155,364 | 34 / 96,314 |
+| x2.62 | 52 / 165,625 / 152,375 | 18.4 / 542 / 0.039 | 1,036 to 1,054 | 52 / 152,261 | 34 / 96,314 |
+| x2.676 | 50 / 158,022 / 144,906 | 18.4 / 536 / 0.036 | 1,054 to 1,068 | 50 / 145,500 | 34 / 96,314 |
+| x2.682 | 49 / 154,395 / -- | 18.2 / 533 / 0.036 | -- | 49 / 142,100 | 34 / 96,314 |
+| **x2.688 to x2.86** | 47 / 146,586 / 133,833 | 18.1 / 522 / 0.034 | **1,082 to 1,089** | 46 / 135,008 | 34 / 96,314 |
+| x2.88 | 45 / 139,779 / 127,199 | 18.0 / 502 / 0.032 | 1,100 to 1,103 | 45 / 130,897 | 33 / 96,334 |
+| x3 | 44 / 135,424 / 123,100 | 17.9 / 502 / 0.032 | 1,111 measured | 44 / 127,394 | 33 / 96,334 |
+
+(Medium, 1920x1080, the bench's 40 directions, per frame; draws are the far
+terrain's own, runs its instances; the cull's time is the census's on a busy
+machine. CPU/frame was the same within 0.01 ms in the quiet bench at x2.09.)
+
+2.7 is the smallest step expected to cost no more at the hill eye than main
+did with room for the bench's noise (its two x2.09 runs were 2.7% apart): the
+steps below it come out within 2.4% either way. 2.7 sits 0.5% above the
+step's start; from 2.688 to 2.86 the hill eye draws the same 47 patches.
+The quiet bench is what decides; at x3 the tiles also held High in one run
+(1,070 / 1,007).
 
 **Measured and not built: hiding the far terrain behind itself.** A
 conservative horizon per tile -- round the eye, the steepest slope under

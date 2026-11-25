@@ -120,14 +120,21 @@ const RESELECT_BLOCKS: f64 = 1.0;
 /// (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1 the gate is not met at any
 /// quality. **Chosen, not derived**: 3 was the smallest size a quiet M3 held
 /// 1,000 FPS at Medium with, with room to spare (`BENCHMARKS.md` footnote
-/// 96); since the far terrain is culled by tiles (`cubara_render::far::
-/// cull_runs`) the same triangles draw a finer one, and 2.09 is the smallest
-/// size, to two places, at which the gate's hill eye -- its lowest -- draws
-/// no more far triangles at Medium than 3 drew before the tiles: 182,132
-/// against 193,641 (`far_census_scale_scan`; at 2.08, 195,200). The owner
-/// left the size to the engine ("as long as it is good", 2026-11-21); the
-/// candidates' numbers are in §9.8.
-pub const FAR_QUAD_SCALE: f64 = 2.09;
+/// 96). Culled by tiles (`cubara_render::far::cull_runs`), the far terrain
+/// sends fewer triangles -- but the ones tiles leave out are those the GPU
+/// threw away early (facing away, off screen), about 1 ns each on the quiet
+/// M3, and a finer scale adds ones that face the eye on screen, about 2 ns
+/// each. 2.7 is the smallest size whose step in the gate's hill eye's
+/// selection (47 patches, from 2.688 to 2.86) is expected to cost no more
+/// there than 3 did before tiles, by more than the bench's noise: 146,586
+/// triangles, 133,833 of them facing the eye on screen, against 193,641 and
+/// 122,962 (`far_census_scale_scan`, `far_census_by_kind`): 3.6 to 4.3%
+/// faster than that, by the two costs above. The steps below it -- 50
+/// patches from 2.676, 52 from 2.62 -- come out 1.0 to 2.4% faster and 0.7%
+/// slower to 1.1% faster, inside the bench's noise; 2.09 measured 1.6 and
+/// 4.2% slower. The owner left the size to the engine ("as long as it is
+/// good", 2026-11-21); the numbers are in §9.8.
+pub const FAR_QUAD_SCALE: f64 = 2.7;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
 /// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from
