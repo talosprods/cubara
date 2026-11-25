@@ -1339,6 +1339,47 @@ siblings; the low flight's swap lag p50 / p90 / p99 is 100 / 151 / 251 and
 237 / 339 before the cache), the flight toward the mountain's 84 / 100 / 150
 against 84 / 100 / 134.
 
+#### 9.6.1 The near field stands exactly on the block grid (play test, 2026-11-25)
+
+The distance morph's level-0 band started **at the eye** (0 to 128 blocks,
+§9.5's study), so every level-0 vertex at metric m had moved m/128 of the way
+to its parent's height: 4% at 5 blocks, 16% at 20, 31% at 40. Near the
+player a block is tens to hundreds of pixels tall, and a few percent of one
+read as a misaligned slab: on the owner's play test of 2026-11-25, thin
+grass slabs a fraction of a block thick on the terraces and thin brown
+slivers at the foot of the nearest walls. Reproduced from the ground
+(`--screenshot`, an eye on the terraces at the steep mountain of #432, 1544 x
+1146): the slivers and slabs are in the render of main, and gone from the
+one with the band starting at `NEAR_EXACT`.
+
+**Level 0's band starts no closer than `morph::NEAR_EXACT` (96 blocks,
+chosen, not derived), and ends where it did (128: 32 before the ring's
+edge).** Measured with the transition study (the toward-peak flight,
+`CUBARA_STUDY_VARIANTS=morph`, the 160 m edge; `hole`: pixels of nothing the
+morph opens, over 450 frames checked):
+
+| level 0's band | worst single frame (px over tol.) | its luminance | frames that change | total over the approach | holes (frames with any / most px) | worst off-grid offset in the band |
+|---|---|---|---|---|---|---|
+| 0 to 128 (before) | 4,926 | 783 | 190 | 22,988 | 251 / 32 | 18.6 px |
+| 64 to 128 | 4,929 | 784 | 190 | 25,373 | 251 / 32 | 14.6 px |
+| 80 to 128 | 4,929 | 784 | 191 | 26,525 | 251 / 32 | 13.5 px |
+| **96 to 128** | **4,933** | **785** | **192** | **28,140** | **251 / 32** | **12.5 px** |
+
+(The off-grid offset is the largest `delta * min(f, 1 - f) * 935 / distance`
+over the real level-0 vertices around the mountain's terraces, in pixels at
+1080 rows and 60 degrees; `delta` reaches 3 blocks inside the near field and
+4 beyond it.) The worst frame and the holes do not move (+0.1%); only the
+sum over the approach grows (+22%), because the same change is spread over
+a narrower band. 96 is the largest candidate and does not make the worst
+frame worse, so it is the one. Levels 1 and 2 keep their bands. A ring too
+short for it (a weak PC's) keeps a band: the start is at most three quarters
+of the way to the band's end.
+
+Pinned by `morph::tests::level_0_stands_exactly_on_the_grid_near_the_eye`:
+real level-0 nodes around eyes on the terraces and above them; every vertex
+with a morph target within `NEAR_EXACT` of the eye, by the metric (the
+vertical part included), has factor 0.
+
 ### 9.7 One tree at every distance (#433, items 2 to 4)
 
 The ground was made the same at every level by §9.3 to §9.6; the trees on
