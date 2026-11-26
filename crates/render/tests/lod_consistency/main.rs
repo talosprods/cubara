@@ -26,6 +26,7 @@
 mod far_rows;
 mod far_study;
 mod harness;
+mod pit_study;
 mod study;
 mod trees;
 
@@ -136,14 +137,19 @@ fn compare(setup: &Setup, fp: Footprint, rep: Rep, level0: &Measure, other: &Mea
             ))
         };
     }
-    // The shape on the same ground: a voxel level draws its own caves, so
-    // it is compared over the columns of its surface term; the far terrain
-    // and the stepped models draw none, and neither does the height field,
-    // so every column of theirs is the surface.
+    // The shape on the same ground: a voxel level and the far terrain are
+    // compared over the columns of their surface term. Over a pit each
+    // draws its cell's mean of what the sky sees -- a dent as wide as the
+    // cell where level 0 has a shaft (§9.9) -- and `pit_study.rs` holds
+    // that; a voxel level carves its own caves under it as well. The
+    // stepped models are the rule itself, and are compared with level 0's
+    // tops over every column, pits and all.
     let field = height_field(&setup.gen, fp);
     let shape = match rep {
-        Rep::Voxel(_) => Shape::over(&field, other, &setup.on_the_surface(fp, rep.mask())),
-        Rep::Far(_) | Rep::Stepped(..) => Shape::of(&field, other),
+        Rep::Voxel(_) | Rep::Far(_) => {
+            Shape::over(&field, other, &setup.on_the_surface(fp, rep.mask()))
+        }
+        Rep::Stepped(..) => Shape::of(&field, other),
     };
     Compared { delta, shape }
 }
@@ -1362,12 +1368,8 @@ fn the_far_rows_follow_the_ground() {
                 (k as i32 % FOOTPRINT) / 4 * 4,
                 (k as i32 / FOOTPRINT) / 4 * 4,
             );
-            let heights = (0..16).map(|c| {
-                setup
-                    .gen
-                    .surface_height(fp.x0 + i + c % 4, fp.z0 + j + c / 4) as f64
-                    + 1.0
-            });
+            let heights = (0..16)
+                .map(|c| setup.gen.column_top(fp.x0 + i + c % 4, fp.z0 + j + c / 4) as f64 + 1.0);
             let (lo, hi) = heights.fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h), hi.max(h)));
             assert!(
                 (lo..=hi).contains(top),
@@ -1761,7 +1763,7 @@ fn holds_a_summit(setup: &Setup, fp: Footprint, counted: &[bool]) -> bool {
     let (mut high, mut at) = (i32::MIN, (0, 0));
     for j in 0..FOOTPRINT {
         for i in 0..FOOTPRINT {
-            let h = setup.gen.surface_height(fp.x0 + i, fp.z0 + j);
+            let h = setup.gen.column_top(fp.x0 + i, fp.z0 + j);
             if counted[(j * FOOTPRINT + i) as usize] && h > high {
                 (high, at) = (h, (fp.x0 + i, fp.z0 + j));
             }
@@ -1773,7 +1775,7 @@ fn holds_a_summit(setup: &Setup, fp: Footprint, counted: &[bool]) -> bool {
     let (mut first, mut first_at) = (i32::MIN, (0, 0));
     for z in cz - 8..cz + 16 {
         for x in cx - 8..cx + 16 {
-            let h = setup.gen.surface_height(x, z);
+            let h = setup.gen.column_top(x, z);
             if h > first {
                 (first, first_at) = (h, (x, z));
             }

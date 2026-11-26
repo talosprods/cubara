@@ -223,50 +223,6 @@ impl<'a> Index<'a> {
     }
 }
 
-/// What joins what in a whole node, from its sub-blocks: face `a` joins face
-/// `b` when air joins a sub-block on side `a` to one on side `b`, through the
-/// sub-blocks between.
-fn whole(subs: &NodeLinks) -> FaceLinks {
-    let at = |i: usize| [i % GRAIN, i / GRAIN % GRAIN, i / GRAIN / GRAIN];
-    let axis = |f: Face| (0..3).find(|&k| step_of(f)[k] != 0).expect("an axis");
-    let on_side = |i: usize, f: Face| {
-        let k = axis(f);
-        if step_of(f)[k] > 0 {
-            at(i)[k] == GRAIN - 1
-        } else {
-            at(i)[k] == 0
-        }
-    };
-    FaceLinks::from_fn(|a, b| {
-        let mut seen = [[false; 6]; GRAIN * GRAIN * GRAIN];
-        let mut stack: Vec<(usize, Face)> = (0..subs.len())
-            .filter(|&i| on_side(i, a))
-            .map(|i| (i, a))
-            .collect();
-        while let Some((i, entered)) = stack.pop() {
-            if std::mem::replace(&mut seen[i][entered as usize], true) {
-                continue;
-            }
-            for out in FACES {
-                if !subs[i].joins(entered, out) {
-                    continue;
-                }
-                if on_side(i, out) {
-                    if out == b {
-                        return true;
-                    }
-                    continue;
-                }
-                let mut c = at(i);
-                let k = axis(out);
-                c[k] = (c[k] as i32 + step_of(out)[k]) as usize;
-                stack.push(((c[2] * GRAIN + c[1]) * GRAIN + c[0], opposite(out)));
-            }
-        }
-        false
-    })
-}
-
 /// What to search a node through while its own links are not known yet.
 ///
 /// **Why this exists: the holes of 2026-09-27.** An unknown node used to be a
@@ -301,16 +257,26 @@ fn whole(subs: &NodeLinks) -> FaceLinks {
 ///   drawn until then (45 on the tree before #423, whose coarse cells were
 ///   cave by a vote: the same defect, which happened not to show in that
 ///   flight). `docs/PHASE3_ARCHITECTURE.md` §9.5 has the measurement.
-/// - **It merged** (some of its children are known): each sub-block is one
-///   child, as that child drew it whole; a child not known yet is taken as
-///   open. A coarser node draws fewer openings than the nodes it replaces
-///   (caves nest), so this leans the safe way. That is not a proof -- a mean
-///   top can join two columns' air that level 0 keeps apart -- and nothing
-///   was left out behind a merged node in that flight or on the seeded
-///   crossings of
-///   `the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn`;
-///   taking it as open too would have cost 43% more nodes generated where
-///   the split rule costs 23%.
+/// - **It merged** (some of its children are known): **open** as well. A
+///   coarser node is not the less open one either. Its top is the mean of
+///   what the sky sees of its columns, a pit's floor among them
+///   (`docs/PHASE3_ARCHITECTURE.md` §9.9), so a cell beside a pit sinks
+///   where the finer cells under it stood whole, and its dent reaches a
+///   face of the node that the children's narrower pit did not.
+///
+///   It used to be searched as its children drew it -- each sub-block one
+///   child -- on the argument that caves nest, "not a proof: a mean top can
+///   join two columns' air that level 0 keeps apart". With a pit in the mean
+///   that case is a common one: stepping from the mountain column
+///   (336, 213), the level-2 node (82, 0, 53) merges; as its one known
+///   child drew it, its sub-block joined one pair of faces, and as the node
+///   is, three -- and the node beside it, (82, 0, 52), was seen only once
+///   another search had run
+///   (`the_first_search_after_a_crossing_leaves_out_nothing_that_was_drawn`).
+///   What open costs is the nodes behind a merged node that turn out to be
+///   hidden: over the low flight's 41 crossings the first searches ask for
+///   15,393 nodes where they asked for 15,300, 0.6% more (§9.9 has the
+///   replay).
 /// - **Neither**: new ground, at the edge of what is streamed or on the first
 ///   frame. It stays a wall, so what is generated grows outward along what can
 ///   be seen.
@@ -322,19 +288,10 @@ fn stand_in(node: NodeKey, links: &impl Fn(NodeKey) -> Option<NodeLinks>) -> Opt
             return Some(OPEN);
         }
     }
-    // A child is exactly one of its parent's sub-blocks only at grain 2.
-    const _: () = assert!(GRAIN == 2, "stand_in takes a sub-block to be a child");
-    let children: Vec<Option<NodeLinks>> = node.children().into_iter().map(links).collect();
-    if children.iter().any(Option::is_some) {
-        let mut merged = OPEN;
-        for (i, child) in children.iter().enumerate() {
-            if let Some(child) = child {
-                merged[i] = whole(child);
-            }
-        }
-        return Some(merged);
-    }
-    None
+    node.children()
+        .into_iter()
+        .any(|child| links(child).is_some())
+        .then_some(OPEN)
 }
 
 /// What a search from the camera found: [`search`].
@@ -379,8 +336,8 @@ pub fn visible_nodes(
 /// `links(node)` is what joins what inside each of a node's sub-blocks; `None`
 /// means not known yet (not generated). An unknown node is included -- it may
 /// well be seen -- and searched through on what is known of the nodes that
-/// drew its space before it did ([`stand_in`]: open where it split, as its
-/// children drew it where it merged); only a node nothing is known about is
+/// drew its space before it did ([`stand_in`]: open, where it split or
+/// merged); only a node nothing is known about is
 /// not searched through, which is what lets a caller generate outward along
 /// what can be seen instead of generating everything.
 ///
@@ -739,36 +696,6 @@ mod tests {
         None
     }
 
-    /// **Nothing a straight line of sight reaches is left out.** About 1,200
-    /// rays each from a camera above the ground, one inside a cave and one high in
-    /// the air, through a real world with caves and levels of detail.
-    /// Links joining exactly `a` and `b`.
-    fn pair(a: Face, b: Face) -> FaceLinks {
-        FaceLinks::from_fn(|x, y| (x, y) == (a, b) || (x, y) == (b, a))
-    }
-
-    #[test]
-    fn a_whole_node_joins_what_its_sub_blocks_join_between_them() {
-        assert_eq!(whole(&OPEN), FaceLinks::ALL);
-        assert_eq!(whole(&[FaceLinks::NONE; 8]), FaceLinks::NONE);
-        // In at -x through sub-block 0, on into sub-block 1, up into 3, and
-        // out at +y: -x joins +y, and nothing else joins anything.
-        let mut subs = [FaceLinks::NONE; 8];
-        subs[0] = pair(Face::NegX, Face::PosX);
-        subs[1] = pair(Face::NegX, Face::PosY);
-        subs[3] = pair(Face::NegY, Face::PosY);
-        let w = whole(&subs);
-        for a in FACES {
-            for b in FACES {
-                let want = matches!((a, b), (Face::NegX, Face::PosY) | (Face::PosY, Face::NegX));
-                assert_eq!(w.joins(a, b), want, "{a:?} {b:?}");
-            }
-        }
-        // A sub-block that joins nothing breaks the path.
-        subs[1] = FaceLinks::NONE;
-        assert_eq!(whole(&subs), FaceLinks::NONE);
-    }
-
     /// A split node is open whatever its ancestor drew in its place: the
     /// ancestor's rock is no promise about a finer node (`stand_in`).
     #[test]
@@ -796,25 +723,23 @@ mod tests {
         assert_eq!(stand_in(NodeKey::new(1, [50, 50, 50]), &links), None);
     }
 
+    /// A merged node is open whatever its children drew in its place: a
+    /// child's rock is no promise about the coarser node, whose cells sink
+    /// for a pit the child drew narrower (`stand_in`). One known child is
+    /// enough to say something was drawn here.
     #[test]
-    fn a_merged_node_is_searched_as_its_children_drew_it() {
+    fn a_merged_node_is_searched_as_open() {
         let node = NodeKey::new(1, [0, 2, -3]);
         let children = node.children();
         let solid = children[3];
-        let unknown = children[6];
-        let links = |n: NodeKey| {
-            if n == solid {
-                Some([FaceLinks::NONE; 8])
-            } else if n == unknown || !children.contains(&n) {
-                None
-            } else {
-                Some(OPEN)
-            }
-        };
-        let merged = stand_in(node, &links).expect("its children are known");
-        assert_eq!(merged[3], FaceLinks::NONE);
-        assert_eq!(merged[6], FaceLinks::ALL, "an unknown child is open");
-        assert_eq!(merged[0], FaceLinks::ALL);
+        let links = |n: NodeKey| (n == solid).then_some([FaceLinks::NONE; 8]);
+        assert_eq!(
+            stand_in(node, &links),
+            Some(OPEN),
+            "where its one known child drew rock"
+        );
+        let all = |n: NodeKey| children.contains(&n).then_some([FaceLinks::NONE; 8]);
+        assert_eq!(stand_in(node, &all), Some(OPEN));
         assert_eq!(
             stand_in(NodeKey::new(1, [50, 50, 50]), &links),
             None,
@@ -1071,6 +996,9 @@ mod tests {
         );
     }
 
+    /// **Nothing a straight line of sight reaches is left out.** About 1,200
+    /// rays each from a camera above the ground, one inside a cave and one high in
+    /// the air, through a real world with caves and levels of detail.
     #[test]
     fn every_node_a_line_of_sight_hits_is_visible() {
         let registry = registry();

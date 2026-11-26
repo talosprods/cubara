@@ -229,7 +229,7 @@ impl Window {
         let (x0, z0) = (align(centre.0), align(centre.1));
         let h = (0..SIDE)
             .flat_map(|j| (0..SIDE).map(move |i| (i, j)))
-            .map(|(i, j)| gen.surface_height(x0 + i, z0 + j))
+            .map(|(i, j)| gen.column_top(x0 + i, z0 + j))
             .collect();
         Self { x0, z0, h }
     }
@@ -574,7 +574,7 @@ fn summit_lift_report() {
     let gen = WorldGen::new(cubara_world::World::new().seed());
     const SPAN: i32 = 1792;
     let (x_lo, z_lo) = (ZOOM_PEAK[0] - 1024, ZOOM_PEAK[1] - 1120);
-    let height = |x: i32, z: i32| gen.surface_height(x, z);
+    let height = |x: i32, z: i32| gen.column_top(x, z);
     println!("| cell width | summits lifted (mean, most) | cells a width above all four neighbours: rule / mean / lift capped at w/2 / at w/4 | a summit lowered by the cap w/2 (mean, most) | by w/4 |");
     println!("|---|---|---|---|---|");
     for w in [4, 8, 16, 32] {
