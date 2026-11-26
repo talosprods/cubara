@@ -2520,6 +2520,414 @@ fn the_far_terrain_beyond_the_box_is_still_drawn_from_above_ground() {
     }
 }
 
+/// The pixels of `pixels` (RGBA, `width` a row) that show `sky` more than
+/// `band` rows under the highest land in their own column: **holes**, for
+/// an eye well above all the land it sees, looking down on it.
+///
+/// Why: from above, whatever is behind a point of the land is more land,
+/// out to where the far terrain ends -- so under the band of the outline,
+/// where the last ground and its hills stand against the sky, a ray that
+/// reaches the sky has gone through the ground, and the pixel is one the
+/// triangles left open. Inside the band a pixel of sky under land proves
+/// nothing: the camera is pitched, a column of pixels is then a leaning
+/// plane, and the top of a far pillar can stand a pixel to the side of its
+/// foot. (A level camera would make the columns upright and the rule exact
+/// with no band -- and would also stand every upright edge on one column of
+/// pixels, where a T-junction on it cannot show. The pitch is what makes
+/// this able to fail.)
+fn sky_under_land(pixels: &[u8], width: usize, sky: [u8; 4], band: usize) -> Vec<(usize, usize)> {
+    let is_sky = |p: &[u8]| (0..3).all(|c| p[c].abs_diff(sky[c]) <= 2);
+    let height = pixels.len() / 4 / width;
+    let at = |x: usize, y: usize| &pixels[(y * width + x) * 4..][..4];
+    let mut holes = Vec::new();
+    for x in 0..width {
+        let Some(outline) = (0..height).find(|&y| !is_sky(at(x, y))) else {
+            continue;
+        };
+        holes.extend(
+            (outline + band + 1..height)
+                .filter(|&y| is_sky(at(x, y)))
+                .map(|y| (x, y)),
+        );
+    }
+    holes
+}
+
+/// The approach to this seed's highest peak within 4 km of the origin, as
+/// `--bench flight --toward-peak` finds it: 900 blocks before the summit,
+/// and the summit's height.
+fn approach_to_the_peak(gen: &cubara_world::WorldGen) -> (glam::Vec2, f32) {
+    let mut best = (i32::MIN, 0, 0);
+    for x in (-4096..=4096).step_by(32) {
+        for z in (-4096..=4096).step_by(32) {
+            let h = gen.surface_height(x, z);
+            if h > best.0 {
+                best = (h, x, z);
+            }
+        }
+    }
+    let at = glam::vec2(best.1 as f32, best.2 as f32);
+    (at - at.normalize_or(glam::Vec2::X) * 900.0, best.0 as f32)
+}
+
+/// **No sky shows through the far terrain** (issue #422; ported from the
+/// shared-corner branch that first needed it): the far terrain alone, with
+/// no voxels to cover anything, seen from above -- from the gate's flight
+/// eye, 3,000 blocks up; from over where the low flight starts; and from
+/// over the approach to this seed's highest peak -- each looking down four
+/// ways, culled as the game culls it (tiles and the horizon, `far::
+/// cull_runs`). Every pixel under the band of the land's outline must be
+/// land (`sky_under_land`).
+///
+/// What it is for: a far mesh with a crack -- a T-junction the rasteriser
+/// leaves open, a wall that stops short of the ground beside it, a tile
+/// culled that the eye sees past -- leaves sky under the land. It was seen
+/// red on the shared-corner mesh, which left T-junctions where risers of
+/// different heights met on one upright line (4 pixels from the flight eye).
+#[test]
+fn no_sky_shows_through_the_far_terrain() {
+    use cubara_render::far::FarParams;
+    use cubara_world::far::{build, split_ratio_for, FarView};
+    // The counter counts: land with one pixel of sky in it, sky above, and
+    // a notch in the outline that the band covers.
+    let (sky, land) = ([10, 20, 30, 255], [90, 120, 60, 255]);
+    let mut picture: Vec<u8> = (0..8 * 8)
+        .flat_map(|i| if i / 8 < 3 { sky } else { land })
+        .collect();
+    assert!(sky_under_land(&picture, 8, sky, 1).is_empty());
+    picture[(6 * 8 + 5) * 4..][..4].copy_from_slice(&sky);
+    picture[(4 * 8 + 2) * 4..][..4].copy_from_slice(&sky);
+    assert_eq!(sky_under_land(&picture, 8, sky, 1), vec![(5, 6)]);
+    assert_eq!(sky_under_land(&picture, 8, sky, 0), vec![(2, 4), (5, 6)]);
+
+    const SIZE: (u32, u32) = (1280, 720);
+    // How far the far terrain reaches here, and the rows its last ground and
+    // hills take up against the sky from the lowest of the eyes: hills of 600
+    // blocks at that distance are 10 rows. Chosen, not derived.
+    const RADIUS: f64 = 40_000.0;
+    const BAND: usize = 16;
+    let world = World::new();
+    let gen = cubara_world::WorldGen::new(world.seed());
+    let (approach, summit) = approach_to_the_peak(&gen);
+    // (the eye, how steeply it looks down)
+    let eyes = [
+        ("the flight eye", glam::vec3(8.0, 3000.0, 8.0), -0.15),
+        ("over the low flight", glam::vec3(8.0, 900.0, 8.0), -0.35),
+        (
+            "over the approach to the peak",
+            glam::vec3(approach.x, summit + 600.0, approach.y),
+            -0.5,
+        ),
+    ];
+    let lighting = cubara_render::Lighting {
+        // No haze: far ground must not fade into the sky it is told from.
+        haze: cubara_render::haze::Haze {
+            density: 0.0,
+            ..Default::default()
+        },
+        ..cubara_render::Lighting::default()
+    };
+    let shot = |eye: glam::Vec3, look: glam::Vec3| Shot {
+        width: SIZE.0,
+        height: SIZE.1,
+        camera: Some((eye.as_dvec3(), look)),
+        lighting,
+        ..Shot::default()
+    };
+    let _gpu = gpu_lifecycle::lock();
+    // The sky is one colour whichever way the eye looks: an empty frame's.
+    let Some(empty) =
+        headless::render_with_far(Vec::new(), &[], None, shot(eyes[0].1, glam::Vec3::X))
+    else {
+        headless::skip_or_require_gpu("no_sky_shows_through_the_far_terrain");
+        return;
+    };
+    let sky = *empty.pixels.as_chunks::<4>().0.first().expect("a pixel");
+    assert!(
+        empty.pixels.as_chunks::<4>().0.iter().all(|p| *p == sky),
+        "an empty frame is not one colour, so the sky cannot be told by its colour"
+    );
+    let fov = std::f64::consts::FRAC_PI_3;
+    let pixel = fov / SIZE.1 as f64;
+    for (name, eye, pitch) in eyes {
+        // Quads of 16 pixels, an error bound of 2 and a floor of 4, as the
+        // other far pictures here: more levels, and more joins between
+        // them, than the game draws at once.
+        let view = FarView {
+            eye: [eye.x as f64, eye.y as f64, eye.z as f64],
+            split_ratio: split_ratio_for(16.0, SIZE.1 as f64, fov),
+            max_error: 2.0 * pixel,
+            min_quad: 4.0 * pixel,
+            radius: RADIUS,
+            hole: None,
+        };
+        let far = build(&gen, &view);
+        assert!(far.len() > 100, "{name}: only {} patches", far.len());
+        // Well above everything it sees, or the rule above does not hold.
+        let highest = far.iter().map(|p| p.max).fold(f32::MIN, f32::max);
+        assert!(eye.y > highest + 200.0, "{name}: land up to {highest}");
+        let faces: Vec<_> = far.iter().map(|p| far_faces(&p.faces)).collect();
+        let patches = far_patches(&far, &faces);
+        let params = FarParams {
+            hole: None,
+            materials: far_materials(),
+        };
+        for (dx, dz) in [(1.0, 0.3), (-0.3, 1.0), (-1.0, -0.3), (0.3, -1.0)] {
+            let look = glam::vec3(dx, pitch, dz);
+            let frame =
+                headless::render_with_far(Vec::new(), &patches, Some(params), shot(eye, look))
+                    .expect("the adapter that drew the empty frame");
+            let pixels = frame.pixels.as_chunks::<4>().0;
+            let land = pixels.iter().filter(|p| **p != sky).count();
+            assert!(
+                land > (SIZE.0 * SIZE.1 / 2) as usize,
+                "{name}, looking {look}: land on only {land} pixels, so this proves little"
+            );
+            let holes = sky_under_land(&frame.pixels, SIZE.0 as usize, sky, BAND);
+            if !holes.is_empty() {
+                // The frame, and the holes in magenta, beside the goldens.
+                let mut marked = frame.pixels.clone();
+                for &(x, y) in &holes {
+                    marked[(y * SIZE.0 as usize + x) * 4..][..4]
+                        .copy_from_slice(&[255, 0, 255, 255]);
+                }
+                let file = format!("no_sky_{}_{dx}_{dz}.actual.png", name.replace(' ', "_"));
+                save_png(&golden_dir().join(file), SIZE.0, SIZE.1, &marked);
+            }
+            assert!(
+                holes.is_empty(),
+                "{name}, looking {look}: {} pixels of sky under the land's outline, e.g. at {:?}",
+                holes.len(),
+                &holes[..holes.len().min(8)]
+            );
+        }
+    }
+}
+
+/// Pixels of a frame, as `(x, y)`.
+type Pixels = Vec<(u32, u32)>;
+
+/// Where frames `a` and `b` differ, split in two: pixels where each frame's
+/// colour is one the other frame has in the 3 x 3 pixels around -- an edge
+/// between two faces moved by a pixel -- and the rest. "Has" within
+/// `TIE_TOLERANCE` per channel: a face's colour changes a little from one
+/// pixel to the next (the haze is per pixel), and a software rasterizer
+/// (CI's Linux and Windows runners) rounds it differently from the M3, so an
+/// exact match missed real ties there (PR #442's first CI run: 1 and 4
+/// pixels). A face the cull left out shows what is behind it -- sky, or a
+/// face far away -- many times this tolerance off.
+fn edge_ties(a: &Frame, b: &Frame) -> (Pixels, Pixels) {
+    /// **Chosen, not derived**: the goldens' own per-channel tolerance.
+    const TIE_TOLERANCE: u8 = 12;
+    fn at(f: &Frame, x: u32, y: u32) -> &[u8] {
+        &f.pixels[((y * f.width + x) * 4) as usize..][..4]
+    }
+    fn close(p: &[u8], q: &[u8]) -> bool {
+        p.iter()
+            .zip(q)
+            .all(|(a, b)| a.abs_diff(*b) <= TIE_TOLERANCE)
+    }
+    let (w, h) = (a.width, a.height);
+    let near = |f: &Frame, x: u32, y: u32, colour: &[u8]| {
+        (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| {
+            (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|ny| close(at(f, nx, ny), colour))
+        })
+    };
+    let (mut ties, mut other) = (Vec::new(), Vec::new());
+    for y in 0..h {
+        for x in 0..w {
+            let (pa, pb) = (at(a, x, y), at(b, x, y));
+            if close(pa, pb) {
+                continue;
+            }
+            if near(a, x, y, pb) && near(b, x, y, pa) {
+                ties.push((x, y));
+            } else {
+                other.push((x, y));
+            }
+        }
+    }
+    (ties, other)
+}
+
+/// **Culling the far terrain by tiles draws the same pixels as by patches**
+/// (the far terrain's triangles, after #422): the real far terrain round
+/// the gate's ground and hill eyes and low over the approach to this seed's
+/// highest peak, the voxels' box left to the voxels as the game leaves it,
+/// drawn by whole patches ([`FarCulling::Patches`], as before tiles) and by
+/// tiles ([`FarCulling::Tiles`], the game's) -- each looking four ways. The
+/// two must be the same picture, pixel for pixel: tiles only ever leave out
+/// faces no pixel shows. And they must not be the same triangles: tiles
+/// send fewer, or this tests nothing.
+///
+/// No voxels are drawn, so nothing of the far terrain is hidden by them and
+/// every culled face would show if the cull were wrong about it; the box
+/// shows sky.
+///
+/// **Pixel for pixel, but for ties** (`edge_ties`): two faces in one plane
+/// side by side -- a grass top beside a pit's floor at the same height --
+/// overlap by the crack seal's sliver, at one depth, and the one drawn first
+/// keeps those pixels. Tiles draw the faces in another order (by run, run by
+/// class), so a pixel on such an edge can take the other face's colour: seen
+/// as 3, 1 and 1 pixels in three of the twelve views. Such a pixel shows, in each
+/// picture, a colour the other picture has beside it; a face the cull left
+/// out shows what is behind it, which neither has there. At most
+/// `MOST_TIES` of them a view (**chosen, not derived**: ten times the most
+/// seen); any other difference fails.
+#[test]
+fn every_level_of_far_culling_draws_the_same_pixels() {
+    const MOST_TIES: usize = 30;
+    use cubara_render::far::FarParams;
+    use cubara_render::FarCulling;
+    use cubara_world::far::{build, split_ratio_for, FarView, Hole};
+    const SIZE: (u32, u32) = (960, 540);
+    let world = World::new();
+    let gen = cubara_world::WorldGen::new(world.seed());
+    let (approach, _) = approach_to_the_peak(&gen);
+    let ground = gen.surface_height(approach.x as i32, approach.y as i32) as f32;
+    let eyes = [
+        ("the ground eye", glam::vec3(8.0, 40.0, 8.0), -0.25),
+        ("the hill eye", glam::vec3(8.0, 300.0, 8.0), -0.25),
+        (
+            "low over the approach to the peak",
+            glam::vec3(approach.x, ground + 60.0, approach.y),
+            -0.05,
+        ),
+    ];
+    let fov = std::f64::consts::FRAC_PI_3;
+    let pixel = fov / SIZE.1 as f64;
+    let schedule = schedule_for_radius(
+        cubara_world::node::DEFAULT_RING_SCHEDULE
+            .last()
+            .expect("a schedule")
+            .1,
+    );
+    let mut sent = [0u64; 2];
+    for (name, eye, pitch) in eyes {
+        // The voxels' box round the eye, as the game's streaming makes it.
+        let (min, max) = cubara_world::node::covered_box_3d(
+            ChunkCoord::from_world_pos(eye.to_array()),
+            &schedule,
+        );
+        let (min, max) = (min.map(|c| c * 16), max.map(|c| c * 16));
+        // Quads of 32 pixels, an error bound and a floor of 8 -- about the
+        // game's Medium -- to 30 km: patches of five levels, and the voxels'
+        // box among them.
+        let view = FarView {
+            eye: [eye.x as f64, eye.y as f64, eye.z as f64],
+            split_ratio: split_ratio_for(32.0, SIZE.1 as f64, fov),
+            max_error: 8.0 * pixel,
+            min_quad: 8.0 * pixel,
+            radius: 30_000.0,
+            hole: Some(Hole {
+                min: min.map(|v| v as f64),
+                max: max.map(|v| v as f64),
+            }),
+        };
+        let far = build(&gen, &view);
+        let faces: Vec<_> = far.iter().map(|p| far_faces(&p.faces)).collect();
+        let patches = far_patches(&far, &faces);
+        let params = FarParams {
+            hole: Some((min, max)),
+            materials: far_materials(),
+        };
+        for (dx, dz) in [(1.0, 0.3), (-0.3, 1.0), (-1.0, -0.3), (0.3, -1.0)] {
+            let look = glam::vec3(dx, pitch, dz);
+            let shot = Shot {
+                width: SIZE.0,
+                height: SIZE.1,
+                camera: Some((eye.as_dvec3(), look)),
+                ..Shot::default()
+            };
+            let frames: Vec<Frame> = {
+                let _gpu = gpu_lifecycle::lock();
+                let mut out = Vec::new();
+                for culling in [FarCulling::Patches, FarCulling::Tiles] {
+                    let Some(frame) = headless::render_with_far_culled(
+                        Vec::new(),
+                        &patches,
+                        Some(params),
+                        culling,
+                        shot.clone(),
+                    ) else {
+                        headless::skip_or_require_gpu(
+                            "every_level_of_far_culling_draws_the_same_pixels",
+                        );
+                        return;
+                    };
+                    out.push(frame);
+                }
+                out
+            };
+            // What each level sent: the renderer's own runs for this view.
+            let view_proj = cubara_render::CameraUniform::look_view_proj(
+                SIZE.0 as f32 / SIZE.1 as f32,
+                eye,
+                look,
+            );
+            let frustum = cubara_render::Frustum::from_view_proj(view_proj);
+            for (k, culling) in [FarCulling::Patches, FarCulling::Tiles]
+                .into_iter()
+                .enumerate()
+            {
+                let runs = cubara_render::far::runs_of(
+                    &patches,
+                    Some((min, max)),
+                    culling,
+                    (&frustum, eye),
+                );
+                sent[k] += runs.iter().map(|r| r.2 as u64 * 2).sum::<u64>();
+            }
+            let (ties, other) = edge_ties(&frames[0], &frames[1]);
+            if ties.len() + other.len() > 0 {
+                eprintln!(
+                    "{name}, looking {look}: {} pixels differ, every one an edge between two \
+                     faces drawn in another order: {ties:?}",
+                    ties.len()
+                );
+            }
+            if !other.is_empty() || ties.len() > MOST_TIES {
+                for (frame, what) in frames.iter().zip(["patches", "tiles"]) {
+                    let file = format!(
+                        "far_culling_{}_{dx}_{dz}_{what}.actual.png",
+                        name.replace(' ', "_")
+                    );
+                    save_png(&golden_dir().join(file), SIZE.0, SIZE.1, &frame.pixels);
+                }
+            }
+            // A lone pixel where three or more faces meet can resolve to a
+            // face neither picture has beside it, on CI's software
+            // rasterizers only (PR #442: one pixel in one view each on
+            // Linux and Windows, none on the M3). **Chosen, not derived**:
+            // at most `MOST_LONE` such pixels a view, none touching another;
+            // a face the cull left out shows as a patch of many pixels
+            // (defect D3: 33,576).
+            const MOST_LONE: usize = 2;
+            let lone = other.iter().all(|&(x, y)| {
+                !other
+                    .iter()
+                    .any(|&(u, v)| (u, v) != (x, y) && u.abs_diff(x) <= 1 && v.abs_diff(y) <= 1)
+            });
+            assert!(
+                other.len() <= MOST_LONE && lone,
+                "{name}, looking {look}: culled by tiles, {} pixels show what whole patches do \
+                 not show beside them, e.g. {:?}",
+                other.len(),
+                &other[..other.len().min(8)]
+            );
+            assert!(
+                ties.len() <= MOST_TIES,
+                "{name}, looking {look}: {} pixels on edges differ, more than {MOST_TIES}",
+                ties.len()
+            );
+        }
+    }
+    assert!(
+        sent[1] * 10 < sent[0] * 9,
+        "tiles send less than a tenth fewer triangles than whole patches: {sent:?}"
+    );
+}
+
 /// **The far terrain's shader is the CPU reference** (issue #422): a face is
 /// rendered alone, seen from in front, and the pixel at the centre of the
 /// image must be its colour ([`cubara_render::far::face_colour`]) in the

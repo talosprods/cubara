@@ -247,6 +247,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-26 | Gate eye: hill at #441, 2 runs, same conditions⁹⁹ | -- | -- | 1,040 / 1,042 (−1.6%) | 0.461 / 0.461 ms | 1.099 / 1.142 ms | `e89e5c9` |
 | 2026-11-26 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws⁹⁹ | 0 | far only | 3,996 / 3,974 | 0.109 / 0.109 ms | 0.282 / 0.262 ms | `ca3f5bc` |
 | 2026-11-26 | Gate eye: flight at #441, 2 runs, same conditions; 0 draws⁹⁹ | 0 | far only | 3,965 / 3,946 (−0.7%) | 0.109 / 0.115 ms | 0.254 / 0.314 ms | `e89e5c9` |
+| 2026-11-26 | **Gate eye: ground** at main (#441 merged: pits at every distance), A of the A/B for #442 (the far terrain culled by tiles of 4 x 4 quads, quads x3), 2 runs (`GATE: MET at Medium` each; High missed: 950 / 952), alternating A, B, A, B; AC power, battery 100% and charged, no thermal or performance warning recorded, no input for hours, no agents running, 5 quiet minutes before the first run; 792 draws¹⁰⁰ | -- | -- | 1,057 / 1,058 | 0.453 / 0.453 ms | 1.174 / 1.670 ms | `2715b30` |
+| 2026-11-26 | **Gate eye: ground** at #442 (tiles, `FAR_QUAD_SCALE` 3), B, 2 runs (`GATE: MET at Medium` each; High missed: 1,028 / 1,027), same conditions¹⁰⁰ | -- | -- | 1,129 / 1,128 (+6.7%) | 0.424 / 0.425 ms | 1.035 / 1.032 ms | `458a2be` |
+| 2026-11-26 | Gate eye: hill at main (A), 2 runs, same conditions¹⁰⁰ | -- | -- | 1,024 / 1,026 | 0.468 / 0.470 ms | 1.457 / 1.331 ms | `2715b30` |
+| 2026-11-26 | Gate eye: hill at #442, 2 runs, same conditions¹⁰⁰ | -- | -- | 1,094 / 1,094 (+6.7%) | 0.439 / 0.439 ms | 1.303 / 1.237 ms | `458a2be` |
+| 2026-11-26 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws¹⁰⁰ | 0 | far only | 3,910 / 3,860 | 0.114 / 0.116 ms | 0.330 / 0.307 ms | `2715b30` |
+| 2026-11-26 | Gate eye: flight at #442, 2 runs, same conditions; 0 draws¹⁰⁰ | 0 | far only | 4,154 / 4,086 (+6.0%) | 0.109 / 0.106 ms | 0.261 / 0.238 ms | `458a2be` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3384,3 +3390,14 @@ The trees cost 5.3% at the ground eye and 7.7% at the hill eye: level 3 now draw
 | toward a mountain, #441 | 0 of 1,780; 0 of 1,780 | 0; 0 | 267; 264 | 2,170 / 23,696 / 37,134; 1,957 / 18,583 / 31,345 | 84 / 117 / 150 / 234; 84 / 101 / 151 / 218 |
 
 The pits cost 2.8% at the ground eye and 1.6% at the hill eye (4% more voxel triangles, §9.9). The holes are one pixel each and belong to the hand-over between the far terrain and a strip of level-3 nodes the voxels' box has just gained: main's at t 2.97 s, #441's at t 5.49 s on the far-left skyline -- the sliver PR #443's hunt traced to two far-terrain ridges 0.2 px apart, which main shows as a candidate at the same place; at this pose the finished frame has it inside land, so #443's rule still counts it. Drawing that strip's stand-in at level 3's own quads is the follow-up. The swap lag's tail grows (p99 268 against 235-251 ms) with the nodes' build cost (1.05-1.22x, §9.9); STALE stays within 2 to 4 kept frames.
+
+¹⁰⁰ **#442's quiet A/B on the main #441 made** (main `2715b30`, #442 `458a2be` with that main merged in, both built in release at 03:4x on 2026-11-26 and checked distinct; 5 quiet minutes, then gate A, B, A, B, then each flight A, B twice; both runs of each; the flights count holes by #443's rule).
+
+| Flight | HOLES (frames) | STALE kept frames | POPS swaps | POPS px p50 / p99 / max | SWAP LAG p50 / p90 / p99 / max ms |
+|---|---|---|---|---|---|
+| low, main | **3 of 1,182**; 0 of 1,180 | 4; 2 | 294; 294 | 1,490 / 35,122 / 45,275; 1,274 / 38,944 / 47,892 | 85 / 186 / 254 / 288; 102 / 186 / 254 / 339 |
+| low, #442 | **1 of 1,180; 1 of 1,183** | 3; 3 | 297; 287 | 1,297 / 33,832 / 44,002; 1,261 / 36,672 / 40,923 | 102 / 169 / 254 / 271; 101 / 169 / 254 / 287 |
+| toward a mountain, main | 0 of 1,779; 0 of 1,779 | 0; 0 | 269; 272 | 1,907 / 18,150 / 26,400; 1,704 / 20,300 / 39,941 | 84 / 101 / 152 / 219; 84 / 118 / 152 / 219 |
+| toward a mountain, #442 | 0 of 1,782; 0 of 1,780 | 0; 0 | 270; 271 | 1,713 / 19,702 / 28,263; 2,013 / 20,328 / 26,081 | 84 / 101 / 152 / 236; 84 / 101 / 169 / 236 |
+
+The tiles give the hill eye 6.7% (1,094 against 1,024 / 1,026 FPS) at the same quad size: main had 2.5% left above the gate after #441's pits, #442 leaves 9.4%. The low flight's holes are the far terrain's hand-over class on both sides (main 3 and 0, #442 1 and 1, one pixel or two for a few frames where the voxels' strip hand-over or a late far split leaves a notch; PR #442's probe and #443's hunt traced two of them): the far selection's lag, issue #398, which closing would also let the quads come down to 2.7 (at 2.7 one such split lands on a pixel in every run, PR #442).

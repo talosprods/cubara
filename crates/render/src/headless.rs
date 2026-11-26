@@ -278,6 +278,25 @@ pub fn render_with_far(
     far_params: Option<crate::far::FarParams>,
     shot: Shot,
 ) -> Option<Frame> {
+    render_with_far_culled(
+        meshed,
+        far,
+        far_params,
+        crate::far::FarCulling::default(),
+        shot,
+    )
+}
+
+/// [`render_with_far`] with the far terrain culled as `culling` says, not as
+/// the game culls it -- for a test that every level of culling draws the
+/// same pixels (`golden.rs`).
+pub fn render_with_far_culled(
+    meshed: impl IntoIterator<Item = MeshedNode>,
+    far: &[crate::far::FarPatch<'_>],
+    far_params: Option<crate::far::FarParams>,
+    culling: crate::far::FarCulling,
+    shot: Shot,
+) -> Option<Frame> {
     // Collected rather than left as the iterator `ChunkArena::from_meshed`
     // wants: trees (issue #332, R2) are a *second* GPU-side arena
     // (`TreeArena`), built from the same nodes before they are moved into
@@ -287,7 +306,7 @@ pub fn render_with_far(
     let tree_data: Vec<NodeTrees> = nodes.iter().map(NodeTrees::of).collect();
     render_arena(
         shot,
-        (far, far_params),
+        (far, far_params, culling),
         tree_data,
         |device, queue, multi_draw, anchor, _ctx| {
             ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
@@ -304,7 +323,7 @@ pub fn render_with_far(
 pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame> {
     render_arena(
         shot,
-        (&[], None),
+        (&[], None, crate::far::FarCulling::default()),
         Vec::new(),
         |device, queue, multi_draw, anchor, ctx| {
             let mut arena = ChunkArena::new(device, multi_draw, anchor);
@@ -369,7 +388,11 @@ impl NodeTrees {
 /// `cubara_world::mesh::BuiltNode`s to have carried any.
 fn render_arena(
     shot: Shot,
-    (far, far_params): (&[crate::far::FarPatch<'_>], Option<crate::far::FarParams>),
+    (far, far_params, culling): (
+        &[crate::far::FarPatch<'_>],
+        Option<crate::far::FarParams>,
+        crate::far::FarCulling,
+    ),
     tree_data: Vec<NodeTrees>,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, Anchor, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
@@ -475,6 +498,7 @@ fn render_arena(
         // one-shot path then runs the same `FarTerrain::rebase` the window
         // runs at a grid line, so a shot far from the origin tests it.
         let mut terrain = crate::far::FarTerrain::holding(&device, &queue, far, anchor::ORIGIN);
+        terrain.set_culling(culling);
         if let Some(params) = far_params {
             terrain.set_params(&queue, params);
         }

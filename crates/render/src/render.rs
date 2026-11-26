@@ -2155,12 +2155,14 @@ pub fn build_tree_pipeline(
 /// parameters, its faces and the runs of them drawn this frame
 /// (`crate::far::FarTerrain` owns all four).
 pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage = |binding| wgpu::BindGroupLayoutEntry {
+    // The runs (binding 3) are bound at each class's own offset
+    // (`far::FarTerrain::encode`).
+    let storage = |binding, has_dynamic_offset| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::VERTEX,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
+            has_dynamic_offset,
             min_binding_size: None,
         },
         count: None,
@@ -2168,9 +2170,9 @@ pub fn far_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("far-bind-group-layout"),
         entries: &[
-            storage(0),
-            storage(2),
-            storage(3),
+            storage(0, false),
+            storage(2, false),
+            storage(3, true),
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::VERTEX,

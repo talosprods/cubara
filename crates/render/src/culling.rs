@@ -71,6 +71,16 @@ impl Frustum {
         }
         true
     }
+
+    /// Whether all of `aabb` is inside every plane: then no part of it is
+    /// culled by this frustum, and its parts need not be tested again (the
+    /// far terrain's tiles, `far::cull_runs`).
+    pub fn contains_aabb(&self, aabb: &Aabb) -> bool {
+        self.planes.iter().all(|plane| {
+            let normal = Vec3::new(plane.x, plane.y, plane.z);
+            normal.dot(aabb.positive_vertex(-normal)) + plane.w >= 0.0
+        })
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +121,21 @@ mod tests {
         let f = test_frustum();
         let b = Aabb::new(Vec3::new(-50.0, -50.0, -50.0), Vec3::new(50.0, 50.0, 50.0));
         assert!(f.intersects_aabb(&b));
+    }
+
+    /// A box inside every plane is contained; one that reaches past any
+    /// plane is not, though it intersects.
+    #[test]
+    fn a_box_is_contained_only_when_wholly_inside() {
+        let f = test_frustum();
+        let inside = Aabb::new(Vec3::new(-0.5, -0.5, -20.5), Vec3::new(0.5, 0.5, -19.5));
+        assert!(f.contains_aabb(&inside));
+        let across = Aabb::new(Vec3::new(-0.5, -0.5, -20.5), Vec3::new(50.0, 0.5, -19.5));
+        assert!(f.intersects_aabb(&across) && !f.contains_aabb(&across));
+        let around = Aabb::new(Vec3::splat(-50.0), Vec3::splat(50.0));
+        assert!(!f.contains_aabb(&around));
+        let away = Aabb::new(Vec3::new(100.0, -0.5, -20.5), Vec3::new(101.0, 0.5, -19.5));
+        assert!(!f.contains_aabb(&away));
     }
 
     #[test]

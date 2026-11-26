@@ -116,15 +116,34 @@ const RESELECT_BLOCKS: f64 = 1.0;
 ///
 /// Above 1 because the far terrain is blocks now (issue #422): a block
 /// surface costs about nine vertices a quad where the smooth one shared one
-/// among four, and the M3 spends about 0.4 ns on each of them whatever the
-/// shader does. That cost follows the triangles: a mesh with fewer vertices
-/// but more triangles was slower (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1
-/// the gate is not met at any quality. **Chosen, not derived**: 3 is the
-/// smallest size measured on a quiet M3 to hold 1,000 FPS at Medium with room
-/// to spare (hill eye 1,121 / 1,130 FPS against main's 1,049 / 1,055; 2.5
-/// held by 3.5% and stood below main there, `BENCHMARKS.md` footnote 96). The
-/// owner left the size to the engine ("as long as it is good", 2026-11-21);
-/// the candidates' numbers are in §9.8.
+/// among four, and the far pass's cost follows the triangles it draws
+/// (`docs/PHASE3_ARCHITECTURE.md` §9.8). At 1 the gate is not met at any
+/// quality. **Chosen, not derived**: 3 was the smallest size a quiet M3 held
+/// 1,000 FPS at Medium with, with room to spare (`BENCHMARKS.md` footnote
+/// 96). Culled by tiles (`cubara_render::far::cull_runs`), the far terrain
+/// sends fewer triangles -- but the ones tiles leave out are those the GPU
+/// threw away early (facing away, off screen), about 1 ns each on the quiet
+/// M3, and a finer scale adds ones that face the eye on screen, about 2 ns
+/// each. 2.7 is the smallest size whose step in the gate's hill eye's
+/// selection (47 patches, from 2.688 to 2.86) is expected to cost no more
+/// there than 3 did before tiles, by more than the bench's noise: 146,586
+/// triangles, 133,833 of them facing the eye on screen, against 193,641 and
+/// 122,962 (`far_census_scale_scan`, `far_census_by_kind`): 3.6 to 4.3%
+/// faster than that, by the two costs above. The steps below it -- 50
+/// patches from 2.676, 52 from 2.62 -- come out 1.0 to 2.4% faster and 0.7%
+/// slower to 1.1% faster, inside the bench's noise; 2.09 measured 1.6 and
+/// 4.2% slower. The owner left the size to the engine ("as long as it is
+/// good", 2026-11-21); the numbers are in §9.8.
+///
+/// **Held at 3 for now (the lead, 2026-11-26).** At 2.7 the quiet low flight
+/// showed a hole in every run (2 pixels at (542, 388), t 11.29 to 11.36 s):
+/// the selection splits a level-4 patch into level 3 right after the voxels'
+/// strip hand-over opened that pixel, and the live frame keeps the parent
+/// for the 2 to 5 frames the children take to generate, while the finished
+/// frame has them at once. Not the tiles' doing (they draw the same pixels as
+/// whole patches in every state); it is the far terrain's selection lag
+/// (#398), which a scale only moves to another moment. 2.7 comes back when
+/// that lag is closed; at 3 the tiles keep their +6.5% at the hill eye.
 pub const FAR_QUAD_SCALE: f64 = 3.0;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
