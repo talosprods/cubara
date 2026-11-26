@@ -134,7 +134,17 @@ const RESELECT_BLOCKS: f64 = 1.0;
 /// slower to 1.1% faster, inside the bench's noise; 2.09 measured 1.6 and
 /// 4.2% slower. The owner left the size to the engine ("as long as it is
 /// good", 2026-11-21); the numbers are in §9.8.
-pub const FAR_QUAD_SCALE: f64 = 2.7;
+///
+/// **Held at 3 for now (the lead, 2026-11-26).** At 2.7 the quiet low flight
+/// showed a hole in every run (2 pixels at (542, 388), t 11.29 to 11.36 s):
+/// the selection splits a level-4 patch into level 3 right after the voxels'
+/// strip hand-over opened that pixel, and the live frame keeps the parent
+/// for the 2 to 5 frames the children take to generate, while the finished
+/// frame has them at once. Not the tiles' doing (they draw the same pixels as
+/// whole patches in every state); it is the far terrain's selection lag
+/// (#398), which a scale only moves to another moment. 2.7 comes back when
+/// that lag is closed; at 3 the tiles keep their +6.5% at the hill eye.
+pub const FAR_QUAD_SCALE: f64 = 3.0;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
 /// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from

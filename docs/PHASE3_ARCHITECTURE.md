@@ -1816,7 +1816,7 @@ against 515. The far pass is the
 GPU's and the CPU has room (`BENCHMARKS.md`: about 0.42 ms a frame at the
 ground eye, of about 0.9), so 4 (chosen, not derived).
 
-**The quad scale is now 2.7.** Fewer triangles was not the measure.
+**The quad scale: 2.7 chosen, 3 shipped for now.** At 2.7 the quiet low flight showed a hole in every run, from the far selection's lag (#398) and not from the tiles (`FAR_QUAD_SCALE`'s comment says how); 2.7 comes back when that lag is closed. Fewer triangles was not the measure.
 The quiet M3 bench of the tiles (`BENCHMARKS.md`; Medium, two runs, hill eye,
 FPS): main at x3 1,043 and 1,043; the tiles at x3 1,111 (+6.5%); the tiles
 at x2.09 -- fewer triangles than main's x3, 182,132 against 193,641 -- 1,026
