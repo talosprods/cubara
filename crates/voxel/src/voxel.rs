@@ -449,17 +449,21 @@ impl Chunk {
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
-        self.build_mesh_morph(ctx, occluded, may_be_solid, None)
+        self.build_mesh_morph(ctx, occluded, may_be_solid, |_, _, _| false, None)
     }
 
     /// [`build_mesh_with_neighbours`](Self::build_mesh_with_neighbours),
     /// with the distance morph baked in where `morph` is given (issue #380's
-    /// study, [`MorphColumns`]).
+    /// study, [`MorphColumns`]), and the ambient occlusion shaded across the
+    /// chunk's border by `outside_solid(x, y, z)`: whether the neighbour holds
+    /// a solid block at that cell, one step outside the chunk on one axis or
+    /// several (issue #430).
     pub fn build_mesh_morph(
         &self,
         ctx: &MeshContext,
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
+        outside_solid: impl Fn(i32, i32, i32) -> bool,
         morph: Option<&MorphColumns>,
     ) -> Mesh {
         greedy_mesh_morph(
@@ -468,6 +472,7 @@ impl Chunk {
             |x, y, z| self.block_at(x, y, z),
             occluded,
             may_be_solid,
+            outside_solid,
             ctx,
             morph,
         )
@@ -572,7 +577,16 @@ pub(crate) fn greedy_mesh(
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ctx: &MeshContext,
 ) -> Mesh {
-    greedy_mesh_morph(dims, scale, block_at, occluded, may_be_solid, ctx, None)
+    greedy_mesh_morph(
+        dims,
+        scale,
+        block_at,
+        occluded,
+        may_be_solid,
+        |_, _, _| false,
+        ctx,
+        None,
+    )
 }
 
 /// [`greedy_mesh`], baking the distance morph into every vertex when
@@ -593,6 +607,7 @@ pub(crate) fn greedy_mesh_morph(
     block_at: impl Fn(i32, i32, i32) -> BlockId,
     occluded: impl Fn(i32, i32, i32) -> bool,
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
+    outside_solid: impl Fn(i32, i32, i32) -> bool,
     ctx: &MeshContext,
     morph: Option<&MorphColumns>,
 ) -> Mesh {
@@ -602,6 +617,20 @@ pub(crate) fn greedy_mesh_morph(
     );
     let morph_level = morph.map_or(0, |m| m.level);
     let mut mesh = Mesh::default();
+
+    // Whether a cell solidly shades its neighbours' faces: the lattice's own
+    // blocks inside it, and across its edge -- on one axis or several, for a
+    // corner diagonal to the node -- what `outside_solid` says the neighbour
+    // holds (issue #430): a block's shade does not depend on where a node's
+    // border runs. A caller with no neighbour says no, and is shaded as an
+    // edge of open air. This is what every AO rule below reads.
+    let solid = |x: i32, y: i32, z: i32| -> bool {
+        if x < 0 || y < 0 || z < 0 || x >= dims[0] || y >= dims[1] || z >= dims[2] {
+            outside_solid(x, y, z)
+        } else {
+            ctx.registry.is_solid(block_at(x, y, z))
+        }
+    };
 
     for d in 0..3usize {
         let u = (d + 1) % 3;
@@ -666,20 +695,11 @@ pub(crate) fn greedy_mesh_morph(
                         // is still the pre-advance boundary here.
                         let air_d = if sign == 1 { pos[d] + 1 } else { pos[d] };
                         let block = if sign == 1 { a_id } else { b_id };
-                        let ao = face_ao(&block_at, ctx.registry, d, u, v, air_d, uu, vv);
+                        let ao = face_ao_of(&solid, d, u, v, air_d, uu, vv);
                         let (ao, ao_width) = if d == 1 {
-                            top_ao(&block_at, ctx.registry, scale, air_d, sign, uu, vv, ao)
+                            top_ao(&solid, scale, air_d, sign, uu, vv, ao)
                         } else {
-                            let ao = wall_ao(
-                                &block_at,
-                                ctx.registry,
-                                scale,
-                                (d, u, v),
-                                air_d,
-                                sign,
-                                (uu, vv),
-                                ao,
-                            );
+                            let ao = wall_ao(&solid, scale, (d, u, v), air_d, sign, (uu, vv), ao);
                             (ao, [0; 4])
                         };
                         MaskCell {
@@ -1018,42 +1038,19 @@ fn key_morph(
 }
 
 /// The four corners' AO for the face cell at (`uu`,`vv`) whose empty side is the
-/// `air_d` layer along axis `d`. Corner order matches `push_quad`'s c0..c3:
-/// (0,0), (1,0), (1,1), (0,1) in the (`u`,`v`) axes.
+/// `air_d` layer along axis `d`, asked of anything that can say whether a cell
+/// is solid. Corner order matches `push_quad`'s c0..c3: (0,0), (1,0), (1,1),
+/// (0,1) in the (`u`,`v`) axes.
+///
+/// The one corner rule: the mesher bakes it, and a caller with no blocks to
+/// look up -- `cubara_world`'s `WorldGen::ground_faces` works out how open
+/// level 0's faces are from the height field alone -- must use it rather than
+/// a copy (`ARCHITECTURE.md` Rule 5).
 ///
 /// On a coarse lattice this is where a corner's AO starts, not what is
 /// baked: [`top_ao`] and [`wall_ao`] take it from here (issue #423). What a
 /// node shows is measured from its mesh
-/// (`crates/render/tests/lod_consistency`), which is why this is no longer
-/// `pub`: the test that called it from outside re-implemented R1c's
-/// scaling on top of it, a second copy of a rule that has since changed.
-#[allow(clippy::too_many_arguments)]
-fn face_ao(
-    block_at: &impl Fn(i32, i32, i32) -> BlockId,
-    registry: &BlockRegistry,
-    d: usize,
-    u: usize,
-    v: usize,
-    air_d: i32,
-    uu: i32,
-    vv: i32,
-) -> [u8; 4] {
-    face_ao_of(
-        &|x, y, z| registry.is_solid(block_at(x, y, z)),
-        d,
-        u,
-        v,
-        air_d,
-        uu,
-        vv,
-    )
-}
-
-/// [`face_ao`], asked of anything that can say whether a cell is solid --
-/// the one corner rule, for a caller with no blocks to look up:
-/// `cubara_world`'s `WorldGen::ground_faces` works out how open level 0's
-/// faces are from the height field alone, and must use the rule the mesher
-/// bakes rather than a copy of it (`ARCHITECTURE.md` Rule 5).
+/// (`crates/render/tests/lod_consistency`).
 pub fn face_ao_of(
     solid: &impl Fn(i32, i32, i32) -> bool,
     d: usize,
@@ -1080,8 +1077,8 @@ pub fn face_ao_of(
 }
 
 /// For a top or bottom face cell at (`uu`, `vv`) = (z, x) whose empty side is
-/// the layer `air_d`: per corner (in [`face_ao`]'s order), its AO on a
-/// coarse lattice (`own` is what [`face_ao`] says of the cell), and log2 of
+/// the layer `air_d`: per corner (in [`face_ao_of`]'s order), its AO on a
+/// coarse lattice (`own` is what [`face_ao_of`] says of the cell), and log2 of
 /// how many times wider the cell is than the shade the corner's occluders
 /// cast on it. `mesh.wgsl` lightens the corner's AO by that factor.
 ///
@@ -1113,27 +1110,25 @@ pub fn face_ao_of(
 ///   goes down** (a riser of 3 beside a 4-block cell shades 2, not 4).
 ///   Up left level 2's tops 2.6 to 3.4/255 too dark on every kind of slope;
 ///   down, 1.3 to 2.2.
-/// - **an occluder darkens a corner's band only if it is at least half as
-///   tall as the riser that sets the band.** A corner between a riser of
-///   eight and one of two is, at level 0, eight columns each shaded by the
-///   first and two of them by the second as well; counted as two occluders
-///   over the whole band it came out as dark as a corner in a pit. Measured
-///   by riser height (`top_shade_by_riser_report`): under a riser as tall
-///   as the cell is wide the tops kept 0.72 to 0.75 of their light where
-///   level 0's keep 0.77 to 0.80, and the two worst level-3 footprints
-///   (4.4 and 4.1/255 too dark) were almost wholly such cells. Worst tops
-///   per level with every occluder counted, 1.44, 2.21, 4.38; this way,
-///   1.44, 1.93, 3.40. (Half, because the corner's shade comes in thirds:
-///   an occluder over under half the band is nearer to none than to one.)
+/// - **every occluder darkens a corner's band, however short** (issue #430;
+///   issue #423 had it count only if at least half as tall as the riser that
+///   sets the band). #423 chose that against a level 0 that left the next
+///   chunk out of its ambient occlusion -- lighter than its own blocks at
+///   every chunk edge -- so a coarse top had to be lighter than the blocks
+///   too. #430 gave level 0 its neighbours, and a coarse top then came out
+///   lighter than level 0 by 0.01 to 0.03 of its light on gentle ground.
+///   Counting every occluder: worst
+///   tops per level 0.99, 2.01, 2.60 (per footprint, /255; 1.96, 2.75, 3.45
+///   with the half rule and level 0 as it now is; 1.48, 1.93, 2.98 before
+///   #430 against the old level 0).
 ///
 /// An open corner keeps log2 of `W`, as before: its AO is full whatever the
 /// factor, and one value across open corners keeps the greedy merge whole.
-/// At `W = 1` (level 0) `own` -- [`face_ao`]'s corners -- comes back as it
+/// At `W = 1` (level 0) `own` -- [`face_ao_of`]'s corners -- comes back as it
 /// is, with every width zero.
 #[allow(clippy::too_many_arguments)]
 fn top_ao(
-    block_at: &impl Fn(i32, i32, i32) -> BlockId,
-    registry: &BlockRegistry,
+    solid: &impl Fn(i32, i32, i32) -> bool,
     scale: [i32; 3],
     air_d: i32,
     sign: i8,
@@ -1157,7 +1152,7 @@ fn top_ao(
     let rise = |z: i32, x: i32| -> i32 {
         let cells = (width + scale[1] - 1) / scale[1];
         let mut n = 0;
-        while n < cells && registry.is_solid(block_at(x, air_d + n * sign as i32, z)) {
+        while n < cells && solid(x, air_d + n * sign as i32, z) {
             n += 1;
         }
         n * scale[1]
@@ -1175,7 +1170,7 @@ fn top_ao(
             continue;
         }
         // Which of the three darken the corner over that band.
-        let counts = |rise: i32| rise > 0 && 2 * rise >= riser;
+        let counts = |rise: i32| rise > 0;
         ao[k] = vertex_ao(counts(sides[0]), counts(sides[1]), counts(diagonal));
         // log2 of the band, to the nearer power of two: up only when the
         // riser is past the middle of the two, so a tie goes down.
@@ -1189,11 +1184,15 @@ fn top_ao(
 }
 
 /// The darkest a coarse wall's shade band is above its foot row
-/// ([`wall_ao`]): one occluder, `vertex_ao(true, false, false)`.
-const WALL_BAND_SHADE: u8 = 2;
+/// ([`wall_ao`]): two occluders, `vertex_ao(true, false, true)` -- the tread
+/// and the corner of it. **It was one (the tread alone) in issue #423**, chosen
+/// against a level 0 blind at chunk edges; against level 0 as #430 made it,
+/// worst side per level 1.21 / 1.20 / 3.22 at two, against 1.70 / 2.26 / 3.41
+/// at one (/255 per footprint and direction, measured, not derived).
+const WALL_BAND_SHADE: u8 = 1;
 
 /// A wall face cell's corner AO on a coarse lattice: `own` -- what
-/// [`face_ao`] says of the cell itself -- with **the shade of the riser's
+/// [`face_ao_of`] says of the cell itself -- with **the shade of the riser's
 /// foot carried up the wall, as many rows as the riser is tall and no
 /// further than the cell is wide** (issue #423).
 ///
@@ -1239,8 +1238,7 @@ const WALL_BAND_SHADE: u8 = 2;
 /// under the wall, the node's floor -- keeps `own`.
 #[allow(clippy::too_many_arguments)]
 fn wall_ao(
-    block_at: &impl Fn(i32, i32, i32) -> BlockId,
-    registry: &BlockRegistry,
+    solid_at: &impl Fn(i32, i32, i32) -> bool,
     scale: [i32; 3],
     (d, u, v): (usize, usize, usize),
     air_d: i32,
@@ -1266,7 +1264,7 @@ fn wall_ao(
         p[d] = if behind { air_d - sign as i32 } else { air_d };
         p[u] = uu - up.0 * down;
         p[v] = vv - up.1 * down;
-        registry.is_solid(block_at(p[0], p[1], p[2]))
+        solid_at(p[0], p[1], p[2])
     };
     for down in 1..=rows {
         if solid(false, down) {
@@ -1281,16 +1279,7 @@ fn wall_ao(
                 }
                 own
             } else {
-                face_ao(
-                    block_at,
-                    registry,
-                    d,
-                    u,
-                    v,
-                    air_d,
-                    uu - up.0 * foot,
-                    vv - up.1 * foot,
-                )
+                face_ao_of(solid_at, d, u, v, air_d, uu - up.0 * foot, vv - up.1 * foot)
             };
             let mut ao = own;
             for k in low {
@@ -2234,6 +2223,58 @@ mod tests {
         );
     }
 
+    /// **A face is shaded by the blocks across the chunk's border as by the
+    /// ones inside it** (issue #430): a pillar standing in the neighbour
+    /// chunk, beside a floor's edge, darkens the corners of the floor next to
+    /// it -- and nothing else moves.
+    #[test]
+    fn ambient_occlusion_reads_the_neighbour_across_the_border() {
+        let registry = registry();
+        let mut chunk = empty();
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 0..8 {
+                    set(&mut chunk, x, y, z);
+                }
+            }
+        }
+        let mesh_with = |outside: &dyn Fn(i32, i32, i32) -> bool| {
+            chunk.build_mesh_morph(
+                &ctx(&registry),
+                |_, _, _| false,
+                |_, _, _| true,
+                outside,
+                None,
+            )
+        };
+        let tops = |m: &Mesh| -> Vec<(i32, i32, u32)> {
+            m.vertices
+                .iter()
+                .filter(|v| v.face() == Face::PosY)
+                .map(|v| (v.x() as i32, v.z() as i32, v.ao()))
+                .collect()
+        };
+        let alone = mesh_with(&|_, _, _| false);
+        assert!(
+            tops(&alone).iter().all(|t| t.2 == 3),
+            "an open floor is fully lit"
+        );
+        // A pillar one block outside the -x edge, level with the air above
+        // the floor, at z = 5.
+        let pillar = mesh_with(&|x, y, z| x == -1 && y == 8 && z == 5);
+        assert_ne!(tops(&pillar), tops(&alone), "the neighbour was not read");
+        let dark: Vec<_> = tops(&pillar).into_iter().filter(|t| t.2 < 3).collect();
+        assert!(!dark.is_empty());
+        assert!(
+            dark.iter().all(|t| t.0 == 0 && (5..=6).contains(&t.1)),
+            "only the floor's corners beside the pillar darken: {dark:?}"
+        );
+        // And what the neighbour holds below the floor's plane is not an
+        // occluder of it.
+        let below = mesh_with(&|x, y, _| x == -1 && y < 8);
+        assert_eq!(tops(&below), tops(&alone));
+    }
+
     /// A covered cell is only covered where it covers: half a border.
     #[test]
     fn only_the_covered_part_of_a_border_is_dropped() {
@@ -2473,6 +2514,7 @@ mod tests {
             },
             |_, _, _| false,
             |_, _, _| true,
+            |_, _, _| false,
             &ctx(&registry),
             Some(&morph),
         );
@@ -3077,21 +3119,21 @@ mod tests {
         assert_eq!(diagonal.ao_width_log2(), 0, "the 4-row column, alone");
     }
 
-    /// Issue #423: an occluder darkens a coarse top's corner, over the band,
-    /// only if it is at least half as tall as the riser that sets the band.
-    /// A slab of 8-block cells; beside cell (1, 1) a column 8 rows tall on
-    /// one side and a `short` one on the other. At the corner between them
-    /// the tall one sets the band (the whole cell) and the short one counts
-    /// from four rows up: under that the corner is shaded by one occluder,
-    /// from there by two. At the short column's own far corner its shade is
-    /// its own band's, whatever it is beside.
+    /// Issue #430 (it was issue #423's "only if it is at least half as tall as
+    /// the riser that sets the band"): an occluder of any height darkens a
+    /// coarse top's corner, over the band. A slab of 8-block cells; beside cell
+    /// (1, 1) a column 8 rows tall on one side and a `short` one on the other.
+    /// At the corner between them the tall one sets the band (the whole cell)
+    /// and the short one counts too, however short: two occluders, the corner
+    /// fully shaded. At the short column's own far corner its shade is its
+    /// own band's, whatever it is beside.
     #[test]
-    fn an_occluder_under_half_the_band_does_not_darken_the_corner() {
+    fn an_occluder_of_any_height_darkens_the_corner() {
         let registry = registry();
         let c = ctx(&registry);
         // Rows of the short column; AO at the corner between the two; log2
         // of (cell width / the short column's own band).
-        for (short, between, own_width) in [(2, 2u32, 2u32), (3, 2, 2), (4, 0, 1), (8, 0, 0)] {
+        for (short, between, own_width) in [(2, 0u32, 2u32), (3, 0, 2), (4, 0, 1), (8, 0, 0)] {
             let mesh = greedy_mesh(
                 [4, 12, 4],
                 [8, 1, 8],
@@ -3163,7 +3205,7 @@ mod tests {
     /// foot, so nothing is carried.
     #[test]
     fn a_coarse_risers_foot_shade_is_carried_up_the_wall() {
-        assert_eq!(WALL_BAND_SHADE, vertex_ao(true, false, false));
+        assert_eq!(WALL_BAND_SHADE, vertex_ao(true, false, true));
         let registry = registry();
         let c = ctx(&registry);
         // (bottom, top, AO at the lower corners, AO at the upper corners),
@@ -3174,17 +3216,17 @@ mod tests {
         const FLOATING: u8 = 2;
         let cases: [([i32; 3], i32, u8, Bands); 10] = [
             ([4, 1, 4], 1, STANDING, &[(1, 2, 1, 3)]),
-            ([4, 1, 4], 2, STANDING, &[(1, 3, 2, 3)]),
-            ([4, 1, 4], 3, STANDING, &[(1, 4, 2, 3)]),
-            ([4, 1, 4], 4, STANDING, &[(1, 5, 2, 3)]),
+            ([4, 1, 4], 2, STANDING, &[(1, 3, 1, 3)]),
+            ([4, 1, 4], 3, STANDING, &[(1, 4, 1, 3)]),
+            ([4, 1, 4], 4, STANDING, &[(1, 5, 1, 3)]),
             // Taller than the cell is wide: four rows of band, then none.
-            ([4, 1, 4], 6, STANDING, &[(1, 5, 2, 3), (5, 7, 3, 3)]),
+            ([4, 1, 4], 6, STANDING, &[(1, 5, 1, 3), (5, 7, 3, 3)]),
             // A cell two blocks wide: a band of two rows.
-            ([2, 1, 2], 4, STANDING, &[(1, 3, 2, 3), (3, 5, 3, 3)]),
+            ([2, 1, 2], 4, STANDING, &[(1, 3, 1, 3), (3, 5, 3, 3)]),
             // Level 0: the foot row and nothing else.
             ([1, 1, 1], 3, STANDING, &[(1, 2, 1, 3), (2, 4, 3, 3)]),
             // Rows of four under a cell of eight: two rows are eight blocks.
-            ([8, 4, 8], 3, STANDING, &[(1, 3, 2, 3), (3, 4, 3, 3)]),
+            ([8, 4, 8], 3, STANDING, &[(1, 3, 1, 3), (3, 4, 3, 3)]),
             // Hanging from a ceiling: shaded where it meets it, as any wall.
             ([4, 1, 4], 3, HANGING, &[(8, 10, 3, 3), (10, 11, 3, 1)]),
             // Floating two rows above the slab: the slab is no tread of
