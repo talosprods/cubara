@@ -33,7 +33,8 @@ use cubara_world::{TerrainBlocks, World, WorldGen};
 
 use crate::far_streaming::{
     far_materials, far_stand, far_view_scaled, hole_in_blocks, standin_faces, to_far_faces,
-    to_far_params, to_far_patch, FarQuality, VoxelBox, FAR_QUAD_SCALE, FAR_VIEW_RADIUS,
+    to_far_params, to_far_patch, FarQuality, FarStreaming, VoxelBox, FAR_QUAD_SCALE,
+    FAR_VIEW_RADIUS,
 };
 use crate::flight::{
     confirm_holes, eye_at, inside_land, land_of, pose, screen_box, split_stale, stale_pixels,
@@ -553,6 +554,88 @@ fn the_strip_stands_in_as_the_finished_frame_draws_it() {
         ));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// **The game's far streaming draws the strip by the rule**: a
+/// [`FarStreaming`] settled at an eye on the low flight with the voxels' box
+/// as it was before the move, then told the box has moved and its strip
+/// waits, settles on what [`far_stand`] says -- the far terrain holed at the
+/// box the voxels want and the stand-in over the strip, cut by
+/// [`standin_faces`] -- frame for frame with a renderer handed exactly that
+/// (`View::far`). What this holds is the wiring: the hole the far streaming
+/// hands the renderer, and the stand-in's patches as stand-ins. No voxel
+/// node is drawn, so the whole frame is the far terrain's.
+#[test]
+fn the_games_far_streaming_draws_the_strip_by_the_rule() {
+    let flight = low_flight();
+    let eye = eye_at(&flight, 5.50);
+    let camera = pose(&flight, eye);
+    let (Some((mut game, _)), Some((mut rule, _))) =
+        (View::new(&flight, eye), View::new(&flight, eye))
+    else {
+        cubara_render::headless::skip_or_require_gpu(
+            "the_games_far_streaming_draws_the_strip_by_the_rule",
+        );
+        return;
+    };
+    let world = World::new();
+    let before = covered_box_3d(ChunkCoord::new(7, 6, 2), DEFAULT_RING_SCHEDULE);
+    let want = covered_box_3d(ChunkCoord::new(8, 6, 2), DEFAULT_RING_SCHEDULE);
+    let voxels = VoxelBox {
+        wanted: hole_in_blocks(want),
+        drawn: hole_in_blocks(next_far_hole(before, want, |_| false)),
+    };
+    let mut far =
+        FarStreaming::new(world.seed(), flight.quality).with_quad_scale(flight.far_quad_scale);
+    let settle = |far: &mut FarStreaming, view: &mut View, voxels: VoxelBox| {
+        let started = std::time::Instant::now();
+        loop {
+            far.update(&mut view.renderer, eye, voxels);
+            view.frame(camera);
+            if far.settled() {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "the far terrain never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Once more, so what arrived last is drawn.
+        far.update(&mut view.renderer, eye, voxels);
+    };
+    settle(&mut far, &mut game, VoxelBox::settled(hole_in_blocks(before)));
+    settle(&mut far, &mut game, voxels);
+    let shown = game.frame(camera);
+
+    let gen = WorldGen::new(world.seed());
+    let (hole, standin) = far_stand(voxels, |_| true);
+    assert!(!standin.is_empty(), "nothing stands in: the test tells nothing");
+    let mut have = HashMap::new();
+    let view = far_view_scaled(
+        eye.map(f64::from),
+        SIZE.1,
+        Some(hole),
+        flight.quality,
+        flight.far_quad_scale,
+    )
+    .expect("the flight's quality draws the far terrain");
+    let keys = far::build_where(&gen, &view, &mut have, |_| true);
+    for &k in &standin {
+        have.entry(k).or_insert_with(|| far::generate(&gen, k));
+    }
+    rule.far(&have, (hole, &keys), (&standin, voxels));
+    let expected = rule.frame(camera);
+    let differ = shown
+        .pixels
+        .chunks_exact(4)
+        .zip(expected.pixels.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differ, 0,
+        "the game's far streaming draws {differ} pixels otherwise than the rule says"
+    );
 }
 
 /// **The cut changes nothing in the region**: the live frames and the
