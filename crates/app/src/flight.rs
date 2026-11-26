@@ -66,11 +66,12 @@ fn land_of(frame: &Frame) -> Vec<bool> {
 /// stale pixel on the finished frame ([`confirm_holes`], [`stale_pixels`]).
 fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
     let w = width.max(1);
-    let x = i % w;
+    let (x, y) = (i % w, i / w);
+    let rows = land.len() / w;
     x > 0
         && x + 1 < w
-        && i >= w
-        && i + w < land.len()
+        && y > 0
+        && y + 1 < rows
         && land[i]
         && land[i - 1]
         && land[i + 1]
@@ -2578,6 +2579,28 @@ mod tests {
         assert_eq!(t.candidates[1], vec![12]);
         assert_eq!(confirm_holes(&t.candidates[1], &full), vec![12]);
         assert_eq!(t.counts(), vec![0, 1, 0]);
+    }
+
+    /// `inside_land` is land on the pixel and on each of its four sides, and
+    /// never a pixel on the screen's border, whose side is off screen -- not
+    /// the first pixel of the next row, which is not its right-hand
+    /// neighbour. Every condition in it changes the answer for one of these
+    /// pixels (found by `check-tests-can-fail.sh`: the right border's bound
+    /// survived).
+    #[test]
+    fn inside_land_is_land_on_the_pixel_and_its_four_sides_off_the_border() {
+        let inside = |land: &[bool], width: usize| -> Vec<usize> {
+            (0..land.len())
+                .filter(|&i| inside_land(land, width, i))
+                .collect()
+        };
+        // 4 x 3, all land: only the two pixels off every border.
+        assert_eq!(inside(&[true; 12], 4), vec![5, 6]);
+        // 5 x 5, all land but the middle: the middle is not inside, nor is
+        // any pixel it is a side of; the four corners of the middle 3 x 3 are.
+        let mut land = [true; 25];
+        land[12] = false;
+        assert_eq!(inside(&land, 5), vec![6, 8, 16, 18]);
     }
 
     /// **A sliver on the finished frame's skyline is a pop, not a hole** (the
