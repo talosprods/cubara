@@ -44,6 +44,41 @@ fn shows_nothing(p: &[u8]) -> bool {
     p[0] >= 250 && p[1] <= 5 && p[2] >= 250
 }
 
+/// Per pixel of `frame`, whether it shows land: anything but [`NOTHING`].
+fn land_of(frame: &Frame) -> Vec<bool> {
+    frame
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| !shows_nothing(&p[..]))
+        .collect()
+}
+
+/// Whether pixel `i` of a frame `width` pixels wide lies **inside land**:
+/// `land` on it and on all four sides of it. The screen's border has a side
+/// off screen, so it never does.
+///
+/// **The one rule for "not on a skyline"** (`BENCHMARKS.md` ⁸⁰): a stepped
+/// ridge slides across pixel boundaries as the eye moves, and the pixels on
+/// its edge go land, sky, land with nothing missing. A hole candidate is
+/// judged by it on the frame before ([`HoleTracker`]), and a hole and a
+/// stale pixel on the finished frame ([`confirm_holes`], [`stale_pixels`]).
+fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
+    let w = width.max(1);
+    let (x, y) = (i % w, i / w);
+    let rows = land.len() / w;
+    x > 0
+        && x + 1 < w
+        && y > 0
+        && y + 1 < rows
+        && land[i]
+        && land[i - 1]
+        && land[i + 1]
+        && land[i - w]
+        && land[i + w]
+}
+
 /// The longest run of frames, at the flight's 60 Hz, that a pixel may show
 /// nothing between two frames of land and still count as a hole rather than
 /// sky it really looks at: half a second. Longer gaps are caught by the kept
@@ -67,7 +102,7 @@ const HOLE_MAX_FRAMES: u32 = 30;
 /// *previous* frame, so a ridge whose silhouette drops two pixels at a detail
 /// swap flips a row of pixels whose upper neighbour was land a frame ago --
 /// a pop, with nothing missing. A candidate counts as a hole only when the
-/// finished frame at that frame's eye shows land at the pixel
+/// finished frame at that frame's eye shows the pixel inside land
 /// ([`confirm_holes`]).
 pub struct HoleTracker {
     width: usize,
@@ -102,24 +137,11 @@ impl HoleTracker {
     pub fn push(&mut self, nothing: impl IntoIterator<Item = bool>) -> Vec<u32> {
         self.candidates.push(Vec::new());
         let before = self.land.clone();
-        let (w, n) = (self.width, before.len());
-        // Land last frame on all four sides: inside land, not on its edge.
-        // The screen's border has a side off screen, so it never counts.
-        let inside = |i: usize| {
-            let x = i % w;
-            x > 0
-                && x + 1 < w
-                && i >= w
-                && i + w < n
-                && before[i - 1]
-                && before[i + 1]
-                && before[i - w]
-                && before[i + w]
-        };
         let mut newly = Vec::new();
         for (i, empty) in nothing.into_iter().enumerate() {
             if empty {
-                if before[i] && inside(i) {
+                // Inside land last frame, not on its edge ([`inside_land`]).
+                if inside_land(&before, self.width, i) {
                     self.run_start[i] = self.frame;
                 }
                 self.land[i] = false;
@@ -151,15 +173,30 @@ impl HoleTracker {
 }
 
 /// Of `candidates` (pixel indices of one frame, [`HoleTracker`]), the ones
-/// that are holes: the finished frame at that frame's eye shows land there
-/// (issue #384 decision 1). A candidate the finished frame shows sky at was
-/// a silhouette moving -- a pop -- not geometry missing.
+/// that are holes: the finished frame at that frame's eye shows the pixel
+/// **inside land** -- land on it and on all four sides ([`inside_land`]).
+/// Issue #384 decision 1, whose goal is that a silhouette change is never
+/// counted as a hole: a hole is geometry missing. A candidate the finished
+/// frame shows sky at was a silhouette moving -- a pop -- not geometry
+/// missing.
+///
+/// **So is one on the finished frame's own silhouette edge**: a pop (what
+/// `POPS:` measures), not a hole -- the rule the stale pixels were already
+/// judged by (`BENCHMARKS.md` ⁸⁰). Found on the low flight (frame 326 of a
+/// run of PR #441): while the far terrain stands in for a strip of ground
+/// the voxels are taking over (`NodeStreaming::far_hole`), a frame shows
+/// that strip's skyline as the far terrain draws it, and a sliver of sky a
+/// fifth of a pixel wide between two ridges there slid across a pixel the
+/// voxels' skyline covers in the finished frame -- with sky directly above
+/// it. Nothing was missing; the frame drew the same ground at another level
+/// of detail (the test `a_sliver_on_the_finished_frames_skyline_is_not_a_hole`).
 pub fn confirm_holes(candidates: &[u32], finished: &Frame) -> Vec<u32> {
-    let px = finished.pixels.as_chunks::<4>().0;
+    let land = land_of(finished);
+    let width = finished.width as usize;
     candidates
         .iter()
         .copied()
-        .filter(|&i| px.get(i as usize).is_some_and(|p| !shows_nothing(&p[..])))
+        .filter(|&i| inside_land(&land, width, i as usize))
         .collect()
 }
 
@@ -646,32 +683,14 @@ struct Loading {
 /// skyline drawn a pixel differently (the live pass's far terrain was
 /// selected a little behind the eye) is not counted. See [`HoleTracker`].
 pub fn stale_pixels(live: &Frame, settled: &Frame) -> Vec<u32> {
-    let w = settled.width as usize;
-    let land: Vec<bool> = settled
-        .pixels
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|p| !shows_nothing(&p[..]))
-        .collect();
-    let n = land.len();
-    let inside = |i: usize| {
-        !i.is_multiple_of(w)
-            && i % w + 1 < w
-            && i >= w
-            && i + w < n
-            && land[i]
-            && land[i - 1]
-            && land[i + 1]
-            && land[i - w]
-            && land[i + w]
-    };
+    let land = land_of(settled);
+    let width = settled.width as usize;
     live.pixels
         .as_chunks::<4>()
         .0
         .iter()
         .enumerate()
-        .filter(|(i, l)| shows_nothing(&l[..]) && inside(*i))
+        .filter(|(i, l)| shows_nothing(&l[..]) && inside_land(&land, width, *i))
         .map(|(i, _)| i as u32)
         .collect()
 }
@@ -2560,6 +2579,90 @@ mod tests {
         assert_eq!(t.candidates[1], vec![12]);
         assert_eq!(confirm_holes(&t.candidates[1], &full), vec![12]);
         assert_eq!(t.counts(), vec![0, 1, 0]);
+    }
+
+    /// `inside_land` is land on the pixel and on each of its four sides, and
+    /// never a pixel on the screen's border, whose side is off screen -- not
+    /// the first pixel of the next row, which is not its right-hand
+    /// neighbour. Every condition in it changes the answer for one of these
+    /// pixels (found by `check-tests-can-fail.sh`: the right border's bound
+    /// survived).
+    #[test]
+    fn inside_land_is_land_on_the_pixel_and_its_four_sides_off_the_border() {
+        let inside = |land: &[bool], width: usize| -> Vec<usize> {
+            (0..land.len())
+                .filter(|&i| inside_land(land, width, i))
+                .collect()
+        };
+        // 4 x 3, all land: only the two pixels off every border.
+        assert_eq!(inside(&[true; 12], 4), vec![5, 6]);
+        // 5 x 5, all land but the middle: the middle is not inside, nor is
+        // any pixel it is a side of; the four corners of the middle 3 x 3 are.
+        let mut land = [true; 25];
+        land[12] = false;
+        assert_eq!(inside(&land, 5), vec![6, 8, 16, 18]);
+    }
+
+    /// **A sliver on the finished frame's skyline is a pop, not a hole** (the
+    /// low flight's frame 326 on PR #441). The pixels are that frame,
+    /// reproduced: x 206..=216 by y 354..=361 at 1920 x 1080 of the game's
+    /// renderer at the flight's eyes, cleared to its magenta (`#` land, `.`
+    /// nothing), in the state the live pass was in -- the far terrain
+    /// standing in for a strip the level-3 nodes were taking over -- at
+    /// t 5.47, 5.48 and 5.50 s, and the finished frame at 5.48 s, which draws
+    /// that strip with the nodes.
+    /// A sliver of sky between two ridges, a fifth of a pixel wide, slides
+    /// down across (211, 358): land all round the frame before, nothing,
+    /// land again -- a candidate, and land in the finished frame, but with
+    /// sky directly above it there. Judged by the pixel alone it was the
+    /// flight's one hole.
+    #[test]
+    fn a_sliver_on_the_finished_frames_skyline_is_not_a_hole() {
+        let before = picture(&[
+            "###########",
+            "###########",
+            "#####.#####",
+            "###########",
+            "###########",
+            "###########",
+            "###########",
+            "###########",
+        ]);
+        let sliver = picture(&[
+            "###########",
+            "###########",
+            "###########",
+            "#####.#####",
+            "#####.#####",
+            "###########",
+            "###########",
+            "###########",
+        ]);
+        let after = picture(&["###########"; 8]);
+        let finished = picture(&[
+            ".....######",
+            ".....######",
+            ".....######",
+            "......#####",
+            "....#######",
+            "###########",
+            "###########",
+            "###########",
+        ]);
+        let t = track(&[before, sliver, after]);
+        // (211, 358) is (5, 4) here; (211, 357) above it had nothing on its
+        // own upper side the frame before, so it is not a candidate.
+        let pixel = 4 * 11 + 5;
+        assert_eq!(t.candidates[1], vec![pixel]);
+        assert!(
+            !shows_nothing(&finished.pixels[pixel as usize * 4..][..4]),
+            "the finished frame shows land at the candidate itself"
+        );
+        assert_eq!(
+            confirm_holes(&t.candidates[1], &finished),
+            Vec::<u32>::new(),
+            "a pixel the finished frame has on its skyline is not a hole"
+        );
     }
 
     /// Issue #384 done-when (c): two frames differing by a 3-pixel silhouette
