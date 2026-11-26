@@ -2895,8 +2895,21 @@ fn every_level_of_far_culling_draws_the_same_pixels() {
                     save_png(&golden_dir().join(file), SIZE.0, SIZE.1, &frame.pixels);
                 }
             }
+            // A lone pixel where three or more faces meet can resolve to a
+            // face neither picture has beside it, on CI's software
+            // rasterizers only (PR #442: one pixel in one view each on
+            // Linux and Windows, none on the M3). **Chosen, not derived**:
+            // at most `MOST_LONE` such pixels a view, none touching another;
+            // a face the cull left out shows as a patch of many pixels
+            // (defect D3: 33,576).
+            const MOST_LONE: usize = 2;
+            let lone = other.iter().all(|&(x, y)| {
+                !other
+                    .iter()
+                    .any(|&(u, v)| (u, v) != (x, y) && u.abs_diff(x) <= 1 && v.abs_diff(y) <= 1)
+            });
             assert!(
-                other.is_empty(),
+                other.len() <= MOST_LONE && lone,
                 "{name}, looking {look}: culled by tiles, {} pixels show what whole patches do \
                  not show beside them, e.g. {:?}",
                 other.len(),
