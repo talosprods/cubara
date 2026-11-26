@@ -1909,19 +1909,30 @@ mod tests {
         let eye = [133.0, 101.0, 45.0];
         assert_eq!(ChunkCoord::from_world_pos(eye), after);
         let waiting = s.voxel_box_after(0, eye);
-        assert_eq!(waiting.wanted, hole_in_blocks(new), "the box the nodes want");
+        assert_eq!(
+            waiting.wanted,
+            hole_in_blocks(new),
+            "the box the nodes want"
+        );
         assert_eq!(
             waiting.drawn,
             hole_in_blocks(next_far_hole(old, new, |_| false)),
             "the part they draw while the strip's nodes are not searched for"
         );
-        assert_ne!(waiting.drawn, waiting.wanted, "no strip waits: the test tells nothing");
+        assert_ne!(
+            waiting.drawn, waiting.wanted,
+            "no strip waits: the test tells nothing"
+        );
         // The search has answered and sees nothing in the strip undrawn; one
         // mesh still on its way to the renderer, then none.
         s.searched = Some(after);
         assert_eq!(s.voxel_box_after(1, eye), waiting, "a mesh still to go up");
         let done = s.voxel_box_after(0, eye);
-        assert_eq!(done, VoxelBox::settled(hole_in_blocks(new)), "all of it drawn");
+        assert_eq!(
+            done,
+            VoxelBox::settled(hole_in_blocks(new)),
+            "all of it drawn"
+        );
     }
 
     #[test]

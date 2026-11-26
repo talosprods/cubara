@@ -41,8 +41,7 @@ use crate::flight::{
     Flight, HoleTracker, FLY_SPEED,
 };
 use crate::streaming::{
-    morph_params, next_far_hole, to_node_id, tree_model_for, tree_placements,
-    VERTICAL_LOD_SQUASH,
+    morph_params, next_far_hole, to_node_id, tree_model_for, tree_placements, VERTICAL_LOD_SQUASH,
 };
 
 /// The flight's screen.
@@ -284,7 +283,9 @@ impl Scene {
         // The box the voxels want, and what of it they draw while the
         // strip's nodes load: the game's own rule for it.
         let want = covered_box_3d(after, DEFAULT_RING_SCHEDULE);
-        let drawn = next_far_hole(covered_box_3d(before, DEFAULT_RING_SCHEDULE), want, |_| false);
+        let drawn = next_far_hole(covered_box_3d(before, DEFAULT_RING_SCHEDULE), want, |_| {
+            false
+        });
         assert_ne!(drawn, want, "the box did not move");
         let voxels = VoxelBox {
             wanted: hole_in_blocks(want),
@@ -405,8 +406,11 @@ impl Scene {
                 .far(&self.patches, (hole, &far), (&standin, self.voxels));
             let shown = crop(&self.live.frame(camera));
             let far = self.far_at(eye, self.voxels.wanted);
-            self.finished
-                .far(&self.patches, (self.voxels.wanted, &far), (&[], self.voxels));
+            self.finished.far(
+                &self.patches,
+                (self.voxels.wanted, &far),
+                (&[], self.voxels),
+            );
             let fin = crop(&self.finished.frame(camera));
 
             // The owner's flicker, as the flight counts it: a kept frame's
@@ -414,7 +418,8 @@ impl Scene {
             tracker.push(land_of(&shown).iter().map(|l| !l));
             let stale = stale_pixels(&shown, &fin);
             let drawn_before = split_stale(&stale, &tracker.drawn_and_missing()).flicker;
-            out.flicker.extend(drawn_before.iter().map(|&i| (f, at(i as usize))));
+            out.flicker
+                .extend(drawn_before.iter().map(|&i| (f, at(i as usize))));
             // ... where the finished frame's own skyline does not pass.
             let (live_land, fin_land) = (land_of(&shown), land_of(&fin));
             let fin_sky: Vec<bool> = fin_land.iter().map(|l| !l).collect();
@@ -565,8 +570,7 @@ fn the_strip_stands_in_as_the_finished_frame_draws_it() {
         unreachable!("a GPU a moment ago")
     };
     let covered = drawn.fly(|_| usize::MAX);
-    if !(covered.recoloured.is_empty() && covered.unlike.is_empty() && covered.flicker.is_empty())
-    {
+    if !(covered.recoloured.is_empty() && covered.unlike.is_empty() && covered.flicker.is_empty()) {
         wrong.push(format!(
             "with every node of the strip drawn over the stand-in: {} pixels inside the \
              finished frame's land of another colour (the first at {:?}), {} unlike, {} flicker",
@@ -627,13 +631,20 @@ fn the_games_far_streaming_draws_the_strip_by_the_rule() {
         // Once more, so what arrived last is drawn.
         far.update(&mut view.renderer, eye, voxels);
     };
-    settle(&mut far, &mut game, VoxelBox::settled(hole_in_blocks(before)));
+    settle(
+        &mut far,
+        &mut game,
+        VoxelBox::settled(hole_in_blocks(before)),
+    );
     settle(&mut far, &mut game, voxels);
     let shown = game.frame(camera);
 
     let gen = WorldGen::new(world.seed());
     let (hole, standin) = far_stand(voxels, |_| true);
-    assert!(!standin.is_empty(), "nothing stands in: the test tells nothing");
+    assert!(
+        !standin.is_empty(),
+        "nothing stands in: the test tells nothing"
+    );
     let mut have = HashMap::new();
     let view = far_view_scaled(
         eye.map(f64::from),
@@ -690,9 +701,11 @@ fn the_cut_draws_the_region_as_the_whole_scene_does() {
                 .far(&scene.patches, (hole, &far), (&standin, scene.voxels));
             let live = crop(&scene.live.frame(camera));
             let far = scene.far_at(eye, scene.voxels.wanted);
-            scene
-                .finished
-                .far(&scene.patches, (scene.voxels.wanted, &far), (&[], scene.voxels));
+            scene.finished.far(
+                &scene.patches,
+                (scene.voxels.wanted, &far),
+                (&[], scene.voxels),
+            );
             out.push((live, crop(&scene.finished.frame(camera))));
         }
         Some(out)
@@ -751,8 +764,14 @@ fn standin_cost_report() {
             );
             let eye_v = glam::Vec3::from(eye);
             let view = |hole| {
-                far_view_scaled(eye.map(f64::from), SIZE.1, Some(hole), FarQuality::High, scale)
-                    .expect("High")
+                far_view_scaled(
+                    eye.map(f64::from),
+                    SIZE.1,
+                    Some(hole),
+                    FarQuality::High,
+                    scale,
+                )
+                .expect("High")
             };
             let count = |hole: far::Hole,
                          keys: &[PatchKey],

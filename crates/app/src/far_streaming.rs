@@ -360,7 +360,8 @@ fn finest_patches_between(outer: Hole, inner: Hole) -> Vec<PatchKey> {
     let level = far::FINEST_LEVEL;
     let size = (far::PATCH_QUADS as i64) << level;
     let span = |a: usize| {
-        (outer.min[a].floor() as i64).div_euclid(size)..=(outer.max[a].ceil() as i64 - 1).div_euclid(size)
+        (outer.min[a].floor() as i64).div_euclid(size)
+            ..=(outer.max[a].ceil() as i64 - 1).div_euclid(size)
     };
     let mut keys = Vec::new();
     for z in span(2) {
@@ -946,7 +947,10 @@ impl FarPlan {
         } else {
             (voxels.drawn, Vec::new())
         };
-        self.show_standin((!standin.is_empty()).then_some((voxels, standin)), &mut step);
+        self.show_standin(
+            (!standin.is_empty()).then_some((voxels, standin)),
+            &mut step,
+        );
         let mut step = self.select(eye, screen_height, hole, drawn, step);
         // Last, so nothing the eye wants now is asked for behind it.
         if on {
@@ -1565,7 +1569,10 @@ mod tests {
     /// `NodeStreaming`'s own rule.
     fn low_flight_move() -> VoxelBox {
         let box_at = |c: [i32; 3]| {
-            node::covered_box_3d(ChunkCoord::new(c[0], c[1], c[2]), node::DEFAULT_RING_SCHEDULE)
+            node::covered_box_3d(
+                ChunkCoord::new(c[0], c[1], c[2]),
+                node::DEFAULT_RING_SCHEDULE,
+            )
         };
         let want = box_at([8, 6, 2]);
         let drawn = crate::streaming::next_far_hole(box_at([7, 6, 2]), want, |_| false);
@@ -1614,18 +1621,27 @@ mod tests {
             ..b
         };
         for (what, cut) in [
-            ("a floor at the lowest top", VoxelBox {
-                wanted: with_floor(voxels.wanted, lo),
-                drawn: with_floor(voxels.drawn, lo),
-            }),
-            ("a ceiling under the highest top", VoxelBox {
-                wanted: with_ceiling(voxels.wanted, hi - 1.0),
-                drawn: with_ceiling(voxels.drawn, hi - 1.0),
-            }),
-            ("the drawn box's floor at the lowest top", VoxelBox {
-                drawn: with_floor(voxels.drawn, lo),
-                ..voxels
-            }),
+            (
+                "a floor at the lowest top",
+                VoxelBox {
+                    wanted: with_floor(voxels.wanted, lo),
+                    drawn: with_floor(voxels.drawn, lo),
+                },
+            ),
+            (
+                "a ceiling under the highest top",
+                VoxelBox {
+                    wanted: with_ceiling(voxels.wanted, hi - 1.0),
+                    drawn: with_ceiling(voxels.drawn, hi - 1.0),
+                },
+            ),
+            (
+                "the drawn box's floor at the lowest top",
+                VoxelBox {
+                    drawn: with_floor(voxels.drawn, lo),
+                    ..voxels
+                },
+            ),
         ] {
             assert_eq!(standin_keys(cut), None, "{what}");
             assert_eq!(far_stand(cut, |_| true), (cut.drawn, Vec::new()), "{what}");
@@ -1635,7 +1651,10 @@ mod tests {
             wanted: with_ceiling(with_floor(voxels.wanted, lo - 1.0), hi),
             drawn: with_ceiling(with_floor(voxels.drawn, lo - 1.0), hi),
         };
-        assert!(standin_keys(clear).is_some_and(|k| !k.is_empty()), "clear of the ground");
+        assert!(
+            standin_keys(clear).is_some_and(|k| !k.is_empty()),
+            "clear of the ground"
+        );
     }
 
     /// **The far terrain is the finished frame's only with every patch of
@@ -1669,7 +1688,16 @@ mod tests {
         let ring: HashSet<PatchKey> = standin_ring(voxels.wanted).into_iter().collect();
         let node = coarsest_node_blocks();
         let mut needed = 0;
-        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        for (dx, dz) in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ] {
             let moved = Hole {
                 min: [
                     voxels.wanted.min[0] + dx as f64 * node,
@@ -1693,7 +1721,10 @@ mod tests {
             }
             needed += strip.len();
         }
-        assert!(needed >= 8 * 9, "{needed} patches over the eight moves' strips");
+        assert!(
+            needed >= 8 * 9,
+            "{needed} patches over the eight moves' strips"
+        );
         // The ring is the box's edge, not its ground: none of it wholly
         // inside the box.
         let inside = |k: &PatchKey| {
@@ -1704,7 +1735,10 @@ mod tests {
                 && voxels.wanted.min[2] <= z
                 && z + size <= voxels.wanted.max[2]
         };
-        assert!(!ring.iter().any(inside), "a patch inside the box is in the ring");
+        assert!(
+            !ring.iter().any(inside),
+            "a patch inside the box is in the ring"
+        );
     }
 
     /// **Each face of the strip is the stand-in's exactly when the strip's
@@ -1738,7 +1772,10 @@ mod tests {
         }
         // Not vacuous: both of the strip's sides have walls of its own.
         let count = |dir, i0| faces.iter().filter(|f| f.dir == dir && f.i0 == i0).count();
-        assert!(count(FarDir::NegX, 16) > 0, "no wall faces the drawn voxels");
+        assert!(
+            count(FarDir::NegX, 16) > 0,
+            "no wall faces the drawn voxels"
+        );
         assert!(count(FarDir::PosX, 32) > 0, "no wall faces out of the box");
         let all = to_far_faces(&patch);
         assert!(
@@ -1794,8 +1831,16 @@ mod tests {
         // beyond the ring round `drawn`.
         let node = coarsest_node_blocks();
         let wanted = Hole {
-            min: [voxels.drawn.min[0] + 2.0 * node, voxels.drawn.min[1], voxels.drawn.min[2]],
-            max: [voxels.drawn.max[0] + 2.0 * node, voxels.drawn.max[1], voxels.drawn.max[2]],
+            min: [
+                voxels.drawn.min[0] + 2.0 * node,
+                voxels.drawn.min[1],
+                voxels.drawn.min[2],
+            ],
+            max: [
+                voxels.drawn.max[0] + 2.0 * node,
+                voxels.drawn.max[1],
+                voxels.drawn.max[2],
+            ],
         };
         sim.voxels = VoxelBox {
             wanted,
@@ -1803,8 +1848,15 @@ mod tests {
         };
         let strip = standin_keys(sim.voxels).expect("a strip across the ground");
         let ring = standin_ring(voxels.drawn);
-        let beyond: Vec<PatchKey> = strip.iter().copied().filter(|k| !ring.contains(k)).collect();
-        assert!(!beyond.is_empty(), "the ring holds the strip: the test tells nothing");
+        let beyond: Vec<PatchKey> = strip
+            .iter()
+            .copied()
+            .filter(|k| !ring.contains(k))
+            .collect();
+        assert!(
+            !beyond.is_empty(),
+            "the ring holds the strip: the test tells nothing"
+        );
         let step = sim.frame(eye, Vec::new());
         for k in &beyond {
             assert!(
@@ -1813,7 +1865,11 @@ mod tests {
             );
         }
         assert!(sim.standin.is_empty(), "stood in before it was generated");
-        assert_eq!(sim.plan.hole(), Some(sim.voxels.drawn), "holed at the box they want too soon");
+        assert_eq!(
+            sim.plan.hole(),
+            Some(sim.voxels.drawn),
+            "holed at the box they want too soon"
+        );
         // The pool brings it; then the stand-in stands.
         for _ in 0..200 {
             let done = sim.pool.tick();
@@ -1822,7 +1878,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(sim.standin, strip.iter().copied().collect(), "the strip never stood in");
+        assert_eq!(
+            sim.standin,
+            strip.iter().copied().collect(),
+            "the strip never stood in"
+        );
         assert_eq!(sim.plan.hole(), Some(sim.voxels.wanted));
     }
 
@@ -2210,9 +2270,8 @@ mod tests {
                 let mut wanted: Vec<_> = exact.difference(&sim.shown).copied().collect();
                 drawn.sort();
                 wanted.sort();
-                out.behind.push(format!(
-                    "{at}: drawn {drawn:?}, the eye's own {wanted:?}"
-                ));
+                out.behind
+                    .push(format!("{at}: drawn {drawn:?}, the eye's own {wanted:?}"));
             }
             // ...and over the strip the box still loads, level 3.
             let strip: HashSet<PatchKey> = standin_keys(sim.voxels)
@@ -2299,7 +2358,11 @@ mod tests {
                 found.changes
             );
             assert!(found.asked > 0, "x{scale}: nothing was asked for in flight");
-            assert!(found.moves >= 3, "x{scale}: the box moved {} times", found.moves);
+            assert!(
+                found.moves >= 3,
+                "x{scale}: the box moved {} times",
+                found.moves
+            );
             assert!(
                 found.waiting >= 12 * found.moves,
                 "x{scale}: a strip waited in {} frames",
@@ -2717,7 +2780,10 @@ mod tests {
         sorted.sort();
         assert_eq!(step.leave, sorted);
         assert!(step.request.is_empty() && step.prefetch.is_empty() && step.arrive.is_empty());
-        assert!(step.standin_arrive.is_empty() && step.promote.is_empty(), "a stand-in");
+        assert!(
+            step.standin_arrive.is_empty() && step.promote.is_empty(),
+            "a stand-in"
+        );
     }
 
     /// A patch asked for is not asked for again while it is generating, and

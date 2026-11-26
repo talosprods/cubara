@@ -1038,12 +1038,18 @@ pub(crate) mod tests {
         let part = build_where(&gen, &view, &mut have, quarter);
         let expected: Vec<PatchKey> = whole.iter().copied().filter(|&k| quarter(k)).collect();
         assert_eq!(part, expected);
-        assert!(have.keys().all(|&k| quarter(k)), "a patch outside the part was generated");
+        assert!(
+            have.keys().all(|&k| quarter(k)),
+            "a patch outside the part was generated"
+        );
         let by_distance: Vec<PatchKey> = select(&view, |_| None)
             .into_iter()
             .filter(|&k| quarter(k))
             .collect();
-        assert_ne!(part, by_distance, "nothing here was split for its roughness");
+        assert_ne!(
+            part, by_distance,
+            "nothing here was split for its roughness"
+        );
     }
 
     /// **No ground any level draws stands outside [`ground_range`]**: every

@@ -2687,7 +2687,13 @@ mod tests {
         //           inside  crosses  clear     clear     crosses
         let boxes = [b(0.0), b(95.0), b(300.0), b(150.0), b(-105.0)];
         let terrain = |_| FarRole::Terrain;
-        let order = draw_order(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO, terrain);
+        let order = draw_order(
+            &boxes,
+            vec![0, 1, 2, 3, 4],
+            Some(&hole),
+            Vec3::ZERO,
+            terrain,
+        );
         assert_eq!(order, vec![1, 4, 3, 2]);
         let order = draw_order(&boxes, vec![2, 0, 1], None, Vec3::ZERO, terrain);
         assert_eq!(order, vec![0, 1, 2], "no hole: everything, nearest first");
@@ -2737,7 +2743,11 @@ mod tests {
                 .map(|&(_, _, count)| count as usize)
                 .sum()
         };
-        assert_eq!(drawn(FarRole::Terrain, above), 0, "the far terrain inside the box");
+        assert_eq!(
+            drawn(FarRole::Terrain, above),
+            0,
+            "the far terrain inside the box"
+        );
         // The stand-in: exactly the tops of the tiles the frustum sees.
         let cull = PatchCull::of(&stored_order(&faces), patch.skirt);
         let input = CullPatch {
@@ -2758,7 +2768,11 @@ mod tests {
             seen > 0 && seen < faces.len(),
             "{seen} faces in view tests nothing"
         );
-        assert_eq!(drawn(FarRole::StandIn, above), seen, "the stand-in's tiles in view");
+        assert_eq!(
+            drawn(FarRole::StandIn, above),
+            seen,
+            "the stand-in's tiles in view"
+        );
         // An eye under the tops sees none of them.
         let below = Vec3::new(64.0, 60.0, -40.0);
         assert_eq!(drawn(FarRole::StandIn, below), 0, "tops above the eye");
