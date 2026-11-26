@@ -2709,21 +2709,35 @@ type Pixels = Vec<(u32, u32)>;
 
 /// Where frames `a` and `b` differ, split in two: pixels where each frame's
 /// colour is one the other frame has in the 3 x 3 pixels around -- an edge
-/// between two faces moved by a pixel -- and the rest.
+/// between two faces moved by a pixel -- and the rest. "Has" within
+/// `TIE_TOLERANCE` per channel: a face's colour changes a little from one
+/// pixel to the next (the haze is per pixel), and a software rasterizer
+/// (CI's Linux and Windows runners) rounds it differently from the M3, so an
+/// exact match missed real ties there (PR #442's first CI run: 1 and 4
+/// pixels). A face the cull left out shows what is behind it -- sky, or a
+/// face far away -- many times this tolerance off.
 fn edge_ties(a: &Frame, b: &Frame) -> (Pixels, Pixels) {
+    /// **Chosen, not derived**: the goldens' own per-channel tolerance.
+    const TIE_TOLERANCE: u8 = 12;
     fn at(f: &Frame, x: u32, y: u32) -> &[u8] {
         &f.pixels[((y * f.width + x) * 4) as usize..][..4]
     }
+    fn close(p: &[u8], q: &[u8]) -> bool {
+        p.iter()
+            .zip(q)
+            .all(|(a, b)| a.abs_diff(*b) <= TIE_TOLERANCE)
+    }
     let (w, h) = (a.width, a.height);
     let near = |f: &Frame, x: u32, y: u32, colour: &[u8]| {
-        (x.saturating_sub(1)..=(x + 1).min(w - 1))
-            .any(|nx| (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|ny| at(f, nx, ny) == colour))
+        (x.saturating_sub(1)..=(x + 1).min(w - 1)).any(|nx| {
+            (y.saturating_sub(1)..=(y + 1).min(h - 1)).any(|ny| close(at(f, nx, ny), colour))
+        })
     };
     let (mut ties, mut other) = (Vec::new(), Vec::new());
     for y in 0..h {
         for x in 0..w {
             let (pa, pb) = (at(a, x, y), at(b, x, y));
-            if pa == pb {
+            if close(pa, pb) {
                 continue;
             }
             if near(a, x, y, pb) && near(b, x, y, pa) {
