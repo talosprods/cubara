@@ -120,7 +120,12 @@ fn sorted_batch_gives_the_same_arena_layout_regardless_of_arrival_order() {
             })
             .collect();
 
-        let mut arena = ChunkArena::new(&device, false, cubara_render::anchor::ORIGIN);
+        let mut arena = ChunkArena::new(
+            &device,
+            false,
+            cubara_render::anchor::ORIGIN,
+            cubara_render::ArenaCapacity::FLOOR,
+        );
         for built in sort_batch(batch) {
             if let Some(geometry) = built.geometry {
                 let id = cubara_render::NodeId {
@@ -184,7 +189,12 @@ fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
     let schedule = [(0u32, 3i32)];
     let nodes = desired_nodes(ChunkCoord::new(0, 0, 0), 0..=1, &schedule);
 
-    let mut arena = ChunkArena::new(&device, false, cubara_render::anchor::ORIGIN);
+    let mut arena = ChunkArena::new(
+        &device,
+        false,
+        cubara_render::anchor::ORIGIN,
+        cubara_render::ArenaCapacity::FLOOR,
+    );
     for node in nodes {
         let built = cubara_world::mesh::build_node(
             &world,
@@ -240,5 +250,59 @@ fn prepare_emits_at_most_two_draws_per_visible_node_from_outside() {
         "a corner view must see more than one face direction on at least one node; \
          draw_count == visible_nodes ({visible_nodes}) means prepare stopped splitting \
          by face direction"
+    );
+}
+
+/// Issue #434: an arena built for a whole scene (`from_meshed`, what the
+/// bench and the golden scenes use) is as big as the scene, over the floor,
+/// and not so exactly full that it reads as `exhausted` -- a scene this large
+/// used to be refused by a constant. One unit of room is the whole margin:
+/// `+ 1` against `+ 2` is not a difference worth a test.
+#[test]
+fn a_scene_arena_is_as_big_as_its_scene() {
+    let _gpu = gpu_lifecycle::lock();
+    let Some((device, queue)) = test_device() else {
+        cubara_render::headless::skip_or_require_gpu("a_scene_arena_is_as_big_as_its_scene");
+        return;
+    };
+    let node = |pos: i32, vertices: usize| {
+        let v = cubara_voxel::Vertex::new(0, 0, 0, 0, cubara_voxel::Face::DRAW_ORDER[0], 0, 0, 0);
+        cubara_render::MeshedNode {
+            id: cubara_render::NodeId {
+                level: 0,
+                pos: [pos, 0, 0],
+            },
+            origin: [pos * 16, 0, 0],
+            scale: 1.0,
+            mesh: cubara_voxel::Mesh {
+                vertices: vec![v; vertices],
+                indices: vec![0, 1, 2, 0, 2, 3],
+                ..Default::default()
+            },
+            local_aabb: cubara_render::culling::Aabb::new(
+                glam::Vec3::ZERO,
+                glam::Vec3::splat(16.0),
+            ),
+            trees: Vec::new(),
+            tree_model: cubara_render::TreeModel::Oak,
+        }
+    };
+    // More vertices than the floor holds, in two nodes.
+    let big = cubara_render::ArenaCapacity::FLOOR.vertices as usize + 5;
+    let arena = ChunkArena::from_meshed(
+        &device,
+        &queue,
+        false,
+        cubara_render::anchor::ORIGIN,
+        [node(0, big), node(1, 100)],
+    );
+    let usage = arena.usage();
+    assert_eq!(arena.len(), 2, "a scene arena took its whole scene");
+    assert_eq!(usage.refused_inserts, 0);
+    assert!(usage.vertices_capacity as usize > big + 100);
+    assert!(
+        usage.exhausted().is_empty(),
+        "a scene that fits to the unit reads as exhausted: {:?}",
+        usage.exhausted()
     );
 }

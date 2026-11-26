@@ -2282,3 +2282,38 @@ the forest at levels 1 to 3, `lod_boundary`, `ring_edge_288m`,
 pits as dents with stone walls where it showed flat ground, or flat paint
 (#438) -- and `a_fully_morphed_level_draws_its_parents_colours` and
 `a_forest_swaps_nothing_at_its_ring_edges` pass unchanged.
+
+## §10 The chunk arena's capacity follows from the selection (block 3.0b, [#434](../../issues/434))
+
+The arena had two constants, 8 million vertices and 12 million indices,
+tried once at the default settings (#432). What it has to hold depends on the
+render distance and the vertical squash, which the start-up check is meant to
+choose per PC, so a constant can overflow at a setting nobody tried, with a
+hole and a log line as the only symptom.
+
+**The rule** (`crates/app/src/arena_capacity.rs`): the capacity is the
+selection the streamer picks for the active settings
+(`node::desired_nodes_3d`, the one selection code, Rule 5), costed per
+*column of nodes* of each level (`COLUMN_COST`), at the worst alignment of
+the eye in the octree, times `SWAP_OVERLAP` (1.25: a node and its replacement
+are resident together while levels swap), from `ArenaCapacity::FLOOR`
+(1 M vertices, 1.5 M indices) up to `ArenaCapacity::CEILING` (what one 256 MiB
+buffer is). It is computed when settings are set, never per frame;
+`Renderer::set_arena_capacity` makes the arena over for a new one (the
+resident nodes are gone, the caller streams them in again).
+
+**Why a column and not a node.** A node's mean cost moves with the squash
+(level 0: 293 vertices at squash 1, 514 at squash 4) because the squash only
+changes how many empty nodes stand above and below the ground. The ground is
+a surface and crosses a column of nodes about once, so a column's cost is the
+quantity that stays put. The table is conservative for the coarse squashes
+(level 0 at squash 4 costs half its entry).
+
+**What holds it honest** is `the_capacity_holds_the_worst_selection_at_every_setting`:
+it meshes the whole selection around the steepest seeded mountains at the
+extreme settings (64 chunks at squash 1 is the largest; the first ring alone
+the smallest) and holds the capacity the game builds its arena with against
+the vertices, indices and node slots found. An overflow that still happens is
+counted (`ArenaUsage::refused_inserts`, `refused_nodes`) and reported by
+`--bench flight` as `ARENA OVERFLOWS:`, apart from `HOLES:` -- a hole from a
+full arena is not a hole from a mesh that is still loading.

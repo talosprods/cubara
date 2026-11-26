@@ -753,7 +753,12 @@ fn study(name: &str, schedule: &RingSchedule) -> String {
         eye: glam::DVec3::ZERO,
         look_dir: glam::Vec3::X,
     };
-    let Some((mut renderer, assets)) = Renderer::offscreen(SIZE.0, SIZE.1, camera) else {
+    let Some((mut renderer, assets)) = Renderer::offscreen(
+        SIZE.0,
+        SIZE.1,
+        camera,
+        crate::arena_capacity::capacity_for(schedule, VERTICAL_LOD_SQUASH),
+    ) else {
         return "no GPU adapter: nothing measured".to_string();
     };
     renderer.set_clear_color(wgpu::Color {
