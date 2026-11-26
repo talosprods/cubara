@@ -173,7 +173,8 @@ bench_line() {
 # flight_gate <label> <flight args...> -- one of block 3.0a's flights (#318):
 # the frame terms on the work per frame, and the three terms of issue #384
 # read from the same line: HOLES = 0 (a pixel that showed land, then nothing,
-# then land again, where the finished frame shows land), POPS' silhouette
+# then land again, where the finished frame shows land on it and on all four
+# sides -- on the finished frame's skyline it is a pop), POPS' silhouette
 # p99 <= POP_P99_PX, and STALE's kept frames <= STALE_KEPT_FRAMES. A term
 # missing from the line (the wording changed, or an older binary) fails the
 # item rather than passing it: every parse must produce a number.
@@ -320,15 +321,16 @@ if [ "$phase" = "3" ]; then
     # walk` (#323) to print; the flights are #318's four, at the eyes
     # BENCHMARKS.md's flight rows use. The flight line's three other terms
     # (#384): HOLES counts frames in which a pixel inside land showed nothing
-    # for under half a second and the finished frame at that eye shows land
-    # there -- geometry missing. POPS measures, per detail swap, how many
-    # pixels inside the swapped nodes' screen boxes changed and how far the
-    # land/sky boundary there moved between the frame before and the frame of
-    # the swap -- a silhouette moving. STALE counts kept frames showing
-    # nothing where the finished frame has land inside land -- a coarse node
-    # still drawn late -- and says how much of it lay under a swap whose lag
-    # (#378) was open, under a visible node not yet resident (#398: still
-    # loading), or under neither.
+    # for under half a second and the finished frame at that eye shows it
+    # inside land too -- geometry missing; a pixel on the finished frame's
+    # skyline is a silhouette moving, not a hole. POPS measures, per detail
+    # swap, how many pixels inside the swapped nodes' screen boxes changed
+    # and how far the land/sky boundary there moved between the frame before
+    # and the frame of the swap -- a silhouette moving. STALE counts kept
+    # frames showing nothing where the finished frame has land inside land --
+    # a coarse node still drawn late -- and says how much of it lay under a
+    # swap whose lag (#378) was open, under a visible node not yet resident
+    # (#398: still loading), or under neither.
     # T1 and T4 are both CPU-only (T4 on the M4 ray-marching harness, #381 as
     # amended); T4's one GPU golden (`golden.rs`,
     # `the_288_m_edge_matches_a_finer_ring_on_screen`) counts in the normal
