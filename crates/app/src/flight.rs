@@ -235,7 +235,7 @@ pub fn split_stale(stale: &[u32], drawn_and_missing: &[u32]) -> StaleSplit {
 /// `POPS:` measures), not a hole -- the rule the stale pixels were already
 /// judged by (`BENCHMARKS.md` ⁸⁰). Found on the low flight (frame 326 of a
 /// run of PR #441): while the far terrain stands in for a strip of ground
-/// the voxels are taking over (`NodeStreaming::far_hole`), a frame shows
+/// the voxels are taking over (`NodeStreaming::voxel_box`), a frame shows
 /// that strip's skyline as the far terrain draws it, and a sliver of sky a
 /// fifth of a pixel wide between two ridges there slid across a pixel the
 /// voxels' skyline covers in the finished frame -- with sky directly above

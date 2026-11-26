@@ -224,7 +224,7 @@ fn node_box(node: NodeKey) -> ([i32; 3], [i32; 3]) {
 /// The far terrain's next hole: `prev` cut down to `want` at once, and grown
 /// to all of `want` only once `drawn(kept)` says the voxels draw what lies
 /// outside `kept` -- or at once when nothing of `prev` is kept (a first frame,
-/// a jump). See [`NodeStreaming::far_hole`].
+/// a jump). See [`NodeStreaming::voxel_box`].
 pub(crate) fn next_far_hole(
     prev: ([i32; 3], [i32; 3]),
     want: ([i32; 3], [i32; 3]),
@@ -372,9 +372,9 @@ pub struct NodeStreaming {
     /// The centre of the last search applied: what `visible` was worked out
     /// around.
     searched: Option<ChunkCoord>,
-    /// The box, in chunks, the far terrain currently leaves to these nodes
-    /// ([`far_hole`](Self::far_hole)), and the box it should leave once they
-    /// are drawn. Empty (`min == max`) before the first frame.
+    /// The box, in chunks, every node of which is drawn now, and the box the
+    /// nodes draw once loaded ([`voxel_box`](Self::voxel_box)). Empty
+    /// (`min == max`) before the first frame.
     far_hole: ([i32; 3], [i32; 3]),
     far_want: ([i32; 3], [i32; 3]),
     /// The nodes the camera could see ([`visibility::search`]); the only
@@ -994,13 +994,14 @@ impl NodeStreaming {
         self.center.is_some() && self.searched != self.center
     }
 
-    /// The box, in blocks, the far terrain currently leaves to the voxel
-    /// nodes, and the box it should leave once they are drawn
-    /// ([`far_hole`](Self::far_hole)); `None` while the two agree. Where
-    /// they differ, the far terrain stands in for nodes not drawn yet --
-    /// requested, in flight, or not even searched for -- so ground seen
-    /// there in a kept frame is land still loading (issue #398 decision 1,
-    /// share (b)), whichever list the node is or is not in yet.
+    /// The box, in blocks, every node of which is drawn now, and the box the
+    /// nodes draw once loaded ([`voxel_box`](Self::voxel_box)); `None` while
+    /// the two agree. Where they differ, the far terrain stands in for nodes
+    /// not drawn yet -- requested, in flight, or not even searched for; as
+    /// level 3 draws them once its stand-in is generated
+    /// (`crate::far_streaming::far_stand`) -- so ground seen there in a kept
+    /// frame is land still loading (issue #398 decision 1, share (b)),
+    /// whichever list the node is or is not in yet.
     pub fn far_strip(&self) -> Option<(BlockBox, BlockBox)> {
         (self.far_hole != self.far_want).then(|| {
             let blocks = |(min, max): ([i32; 3], [i32; 3])| {

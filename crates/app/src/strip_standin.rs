@@ -602,3 +602,107 @@ fn the_cut_draws_the_region_as_the_whole_scene_does() {
         assert!(b.pixels == d.pixels, "the finished frame {n} differs");
     }
 }
+
+/// **What the stand-in costs** (`docs/PHASE3_ARCHITECTURE.md` §9.11), in
+/// the far terrain's triangles -- what the far pass's cost follows (§9.8) --
+/// counted as `FarTerrain::prepare` sends them (`far::runs_of_roles`), with
+/// no GPU: at every frame of the low flight's first box move while its strip
+/// waits (t 5.28 to 5.70 s), the far terrain as it was (selected and holed
+/// at the box the voxels draw, standing in for the strip itself) against
+/// the far terrain now (holed at the box they want) and the stand-in. At
+/// the gate's standing eyes nothing waits and the far terrain is what it
+/// was: no stand-in, the same selection, the same triangles.
+///
+/// ```text
+/// cargo test -p cubara --bin cubara standin_cost_report -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement, not a check: prints the stand-in's triangles"]
+fn standin_cost_report() {
+    use cubara_render::far::{runs_of_roles, FarCulling, FarRole};
+    let flight = low_flight();
+    let gen = WorldGen::new(World::new().seed());
+    let before = covered_box_3d(ChunkCoord::new(7, 6, 2), DEFAULT_RING_SCHEDULE);
+    let want = covered_box_3d(ChunkCoord::new(8, 6, 2), DEFAULT_RING_SCHEDULE);
+    let voxels = VoxelBox {
+        wanted: hole_in_blocks(want),
+        drawn: hole_in_blocks(next_far_hole(before, want, |_| false)),
+    };
+    let (_, standin) = far_stand(voxels, |_| true);
+    let aspect = SIZE.0 as f32 / SIZE.1 as f32;
+    for scale in [FAR_QUAD_SCALE, 3.0] {
+        let mut have = HashMap::new();
+        for &k in &standin {
+            have.entry(k).or_insert_with(|| far::generate(&gen, k));
+        }
+        let (mut was, mut now, mut stood, mut frames) = (0u64, 0u64, 0u64, 0u64);
+        let mut t = T0;
+        while t <= T1 + 1e-4 {
+            let eye = eye_at(&flight, t);
+            let camera = pose(&flight, eye);
+            let frustum = cubara_render::Frustum::from_view_proj(
+                camera.view_proj(aspect, cubara_render::anchor::ORIGIN),
+            );
+            let eye_v = glam::Vec3::from(eye);
+            let view = |hole| {
+                far_view_scaled(eye.map(f64::from), SIZE.1, Some(hole), FarQuality::High, scale)
+                    .expect("High")
+            };
+            let count = |hole: far::Hole,
+                         keys: &[PatchKey],
+                         standin: &[PatchKey],
+                         have: &HashMap<PatchKey, PatchHeights>|
+             -> (u64, u64) {
+                let faces: Vec<Vec<cubara_render::FarFace>> = keys
+                    .iter()
+                    .map(|k| to_far_faces(&have[k]))
+                    .chain(standin.iter().map(|k| standin_faces(&have[k], voxels)))
+                    .collect();
+                let patches: Vec<(cubara_render::FarPatch<'_>, FarRole)> = keys
+                    .iter()
+                    .chain(standin)
+                    .zip(&faces)
+                    .enumerate()
+                    .map(|(n, (k, f))| {
+                        let role = if n < keys.len() {
+                            FarRole::Terrain
+                        } else {
+                            FarRole::StandIn
+                        };
+                        (to_far_patch(&have[k], f), role)
+                    })
+                    .collect();
+                let holed = Some((hole.min.map(|v| v as i32), hole.max.map(|v| v as i32)));
+                let runs = runs_of_roles(&patches, holed, FarCulling::Tiles, (&frustum, eye_v));
+                let (mut all, mut of_standin) = (0, 0);
+                for (n, _, count) in runs {
+                    all += 2 * count as u64;
+                    if n >= keys.len() {
+                        of_standin += 2 * count as u64;
+                    }
+                }
+                (all, of_standin)
+            };
+            let old = far::build_where(&gen, &view(voxels.drawn), &mut have, |_| true);
+            let new = far::build_where(&gen, &view(voxels.wanted), &mut have, |_| true);
+            was += count(voxels.drawn, &old, &[], &have).0;
+            let (all, of_standin) = count(voxels.wanted, &new, &standin, &have);
+            now += all;
+            stood += of_standin;
+            frames += 1;
+            t += 1.0 / FPS;
+        }
+        let per = |v: u64| v / frames;
+        println!(
+            "STANDIN_COST x{scale}, High, the low flight's strip at t {T0}..{T1} ({frames} frames): \
+             far triangles a frame as it was {}, now {} ({:+}), of which the stand-in {} \
+             ({} patches of level 3; the ring round the box generated ahead: {} patches)",
+            per(was),
+            per(now),
+            per(now) as i64 - per(was) as i64,
+            per(stood),
+            standin.len(),
+            crate::far_streaming::standin_ring(voxels.wanted).len()
+        );
+    }
+}

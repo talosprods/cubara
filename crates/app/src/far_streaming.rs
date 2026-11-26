@@ -133,7 +133,7 @@ fn coarsest_node_blocks() -> f64 {
 /// would split a little further on, and reaches a little further out --
 /// and its hole one coarsest node smaller on every side: the ground the
 /// voxels' box hands back when it moves on, which the far terrain must draw
-/// the frame it does (`NodeStreaming::far_hole` shrinks the hole at once).
+/// the frame it does (`NodeStreaming::voxel_box` shrinks the hole at once).
 ///
 /// Every patch the eye's own view keeps or splits, this one keeps or
 /// splits too: each of its tests to split is the eye's or looser, and its
@@ -257,7 +257,7 @@ pub fn hole_in_blocks((min, max): ([i32; 3], [i32; 3])) -> Hole {
 /// The box the voxel nodes around `eye` draw once loaded, in blocks
 /// ([`node::covered_box_3d`] for the game's own schedule). What the hole
 /// becomes; the game hands it over as the nodes arrive
-/// (`NodeStreaming::far_hole`).
+/// (`NodeStreaming::voxel_box`).
 #[cfg(test)]
 pub fn voxel_hole(eye: [f32; 3]) -> Hole {
     hole_in_blocks(node::covered_box_3d(
@@ -441,7 +441,7 @@ pub fn far_stand(voxels: VoxelBox, generated: impl Fn(PatchKey) -> bool) -> (Hol
 /// (`node::covered_box_3d` moves it a node at a time), whichever way --
 /// generated before it moves, so the far terrain stands in for the strip
 /// the frame it does ([`standin_keys`]).
-fn standin_ring(wanted: Hole) -> Vec<PatchKey> {
+pub(crate) fn standin_ring(wanted: Hole) -> Vec<PatchKey> {
     wanted
         .grown_across(coarsest_node_blocks())
         .map_or_else(Vec::new, |grown| finest_patches_between(grown, wanted))
@@ -1745,6 +1745,85 @@ mod tests {
             all.iter().any(|f| f.dir == FarDir::PosX && f.i0 == 16),
             "the drawn voxels never stand higher here: the test tells nothing"
         );
+        // The strip's end, where it meets the box's side z = 1,152 halfway
+        // across its last patch: nothing beyond it, and the walls on it the
+        // strip's only where it is the higher (facing out).
+        let end = far::generate(&gen, PatchKey::new(3, 4, 4));
+        let faces = standin_faces(&end, voxels);
+        let tops: u32 = faces
+            .iter()
+            .filter(|f| f.dir == FarDir::Top)
+            .map(|f| (f.i1 - f.i0) as u32 * (f.j1 - f.j0) as u32)
+            .sum();
+        assert_eq!(tops, 16 * 16, "the end patch's quads in the strip");
+        for f in &faces {
+            let [i, j] = f.owner();
+            assert!(i >= 16 && j < 16, "{f:?} is not the strip's");
+            assert!(
+                !(f.dir == FarDir::NegZ && f.j0 == 16),
+                "{f:?}: the far terrain's wall beyond the box"
+            );
+        }
+        // Not vacuous: the ground beyond the box stands higher somewhere
+        // along it, and the patch has the walls the stand-in leaves out.
+        assert!(
+            to_far_faces(&end)
+                .iter()
+                .any(|f| f.dir == FarDir::NegZ && f.j0 == 16),
+            "nothing beyond the box stands higher: the test tells nothing"
+        );
+    }
+
+    /// **A strip the ring does not hold is asked for at once**, and stood in
+    /// for as soon as it is generated: the voxels' box moved twice before
+    /// its first strip was drawn, so the second strip is a node beyond the
+    /// ring round the box the plan last saw. Until it arrives the far
+    /// terrain stands in itself, holed at the box the voxels draw.
+    #[test]
+    fn a_strip_the_ring_does_not_hold_is_asked_for_at_once() {
+        let voxels = low_flight_move();
+        let mut sim = Sim::at_scale(
+            TEST_RADIUS,
+            voxels.drawn,
+            PoolModel::new(4, 2),
+            FAR_QUAD_SCALE,
+        );
+        let eye = [133.0, 101.0, 45.0];
+        sim.settle(eye);
+        // Two nodes on in +x at once: a strip two nodes wide, the outer one
+        // beyond the ring round `drawn`.
+        let node = coarsest_node_blocks();
+        let wanted = Hole {
+            min: [voxels.drawn.min[0] + 2.0 * node, voxels.drawn.min[1], voxels.drawn.min[2]],
+            max: [voxels.drawn.max[0] + 2.0 * node, voxels.drawn.max[1], voxels.drawn.max[2]],
+        };
+        sim.voxels = VoxelBox {
+            wanted,
+            drawn: overlap(voxels.drawn, wanted).expect("a move keeps most of the box"),
+        };
+        let strip = standin_keys(sim.voxels).expect("a strip across the ground");
+        let ring = standin_ring(voxels.drawn);
+        let beyond: Vec<PatchKey> = strip.iter().copied().filter(|k| !ring.contains(k)).collect();
+        assert!(!beyond.is_empty(), "the ring holds the strip: the test tells nothing");
+        let step = sim.frame(eye, Vec::new());
+        for k in &beyond {
+            assert!(
+                step.request.contains(k) || step.promote.contains(k),
+                "{k:?} of the strip was not asked for at once"
+            );
+        }
+        assert!(sim.standin.is_empty(), "stood in before it was generated");
+        assert_eq!(sim.plan.hole(), Some(sim.voxels.drawn), "holed at the box they want too soon");
+        // The pool brings it; then the stand-in stands.
+        for _ in 0..200 {
+            let done = sim.pool.tick();
+            sim.frame(eye, done);
+            if !sim.standin.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(sim.standin, strip.iter().copied().collect(), "the strip never stood in");
+        assert_eq!(sim.plan.hole(), Some(sim.voxels.wanted));
     }
 
     // --- The plan without a GPU (#398, rule 6) --------------------------
