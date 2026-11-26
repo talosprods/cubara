@@ -17,7 +17,7 @@
 //! both quiet x3 runs of #442 counted it at t 5.49 s. Only what reaches the
 //! region is meshed and generated -- a node or a patch whose box lands on
 //! the screen within [`MARGIN`] of it from some eye of the flight
-//! (`flight::screen_box`): 67 of the selection's 13,663 nodes and 26 far
+//! (`flight::screen_box`): 71 of the selection's 13,663 nodes and 36 far
 //! patches, which draw the region exactly as the whole scene does
 //! (`the_cut_draws_the_region_as_the_whole_scene_does`, ignored: it meshes
 //! everything).
@@ -485,7 +485,10 @@ struct Flown {
 ///
 /// The strip's four nodes in the region arrive as they do in the game,
 /// some at a time: none for the first 22 frames (to t 5.63 s), two for the
-/// next five, all four for the last five.
+/// next five, all four for the last five. Then the flight again with all of
+/// them drawn from the first frame, for the push on every frame (at 2^-14
+/// instead of 2^-12 one pixel showed the stand-in, on a frame the first
+/// flight has no node drawn in).
 ///
 /// Red before the stand-in, when the far terrain stood in for the strip at
 /// its own quads, selected and holed at the box the voxels draw: flicker at
@@ -512,9 +515,12 @@ fn the_strip_stands_in_as_the_finished_frame_draws_it() {
         _ => usize::MAX,
     });
     println!(
-        "{} stand-in patches and {} of the strip's nodes reach the region; {} skyline pixels",
-        found.standin,
+        "{} nodes ({} of them the strip's) and {} far patches ({} standing in) reach the region; \
+         {} skyline pixels",
+        scene.built.len(),
         scene.strip.len(),
+        scene.patches.len(),
+        found.standin,
         found.skyline_px
     );
     // Every way it can be wrong, reported together.
@@ -551,6 +557,23 @@ fn the_strip_stands_in_as_the_finished_frame_draws_it() {
         wrong.push(format!(
             "{} pixels of skyline over the flight: the region shows no ridge",
             found.skyline_px
+        ));
+    }
+    // The push, on every frame: the same flight with every node of the
+    // strip drawn over the stand-in from the first frame.
+    let Some(mut drawn) = Scene::new(true) else {
+        unreachable!("a GPU a moment ago")
+    };
+    let covered = drawn.fly(|_| usize::MAX);
+    if !(covered.recoloured.is_empty() && covered.unlike.is_empty() && covered.flicker.is_empty())
+    {
+        wrong.push(format!(
+            "with every node of the strip drawn over the stand-in: {} pixels inside the \
+             finished frame's land of another colour (the first at {:?}), {} unlike, {} flicker",
+            covered.recoloured.len(),
+            covered.recoloured.first(),
+            covered.unlike.len(),
+            covered.flicker.len()
         ));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

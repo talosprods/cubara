@@ -776,10 +776,16 @@ impl NodeStreaming {
     /// leaves the old box behind entirely -- the new box is taken at once, as
     /// it always was: that is a loading moment, not a flight.
     pub fn voxel_box(&mut self, renderer: &Renderer, eye: [f32; 3]) -> VoxelBox {
+        self.voxel_box_after(renderer.uploads_pending(), eye)
+    }
+
+    /// [`voxel_box`](Self::voxel_box), with `uploads` meshes still on their
+    /// way to the renderer.
+    fn voxel_box_after(&mut self, uploads: usize, eye: [f32; 3]) -> VoxelBox {
         let center = ChunkCoord::from_world_pos(eye);
         let want = node::covered_box_3d(center, node::DEFAULT_RING_SCHEDULE);
         let hole = next_far_hole(self.far_hole, want, |kept| {
-            self.drawn_within(renderer, center, want, kept)
+            self.drawn_within(uploads, center, want, kept)
         });
         self.far_hole = hole;
         self.far_want = want;
@@ -791,16 +797,16 @@ impl NodeStreaming {
 
     /// Whether every node the search around `center` wants inside `want` and
     /// not wholly inside `have` is drawn: arrived from the mesh workers and
-    /// through the renderer's upload queue.
+    /// through the renderer's upload queue (`uploads` still in it).
     fn drawn_within(
         &self,
-        renderer: &Renderer,
+        uploads: usize,
         center: ChunkCoord,
         want: ([i32; 3], [i32; 3]),
         have: ([i32; 3], [i32; 3]),
     ) -> bool {
         self.searched == Some(center)
-            && renderer.uploads_pending() == 0
+            && uploads == 0
             && self
                 .visible
                 .iter()
@@ -1887,6 +1893,37 @@ mod tests {
 
     /// The far terrain's strip is the two boxes, in blocks, while the hole
     /// it leaves lags behind what the voxels want; nothing while they agree.
+    /// **The voxels' box hands the far terrain both boxes**: after the eye
+    /// crosses into a new box, the box the nodes want and -- until the
+    /// search for the new chunk has answered and every node it sees in the
+    /// strip is drawn -- the part of it they draw, which the far terrain
+    /// stands in for the rest of (`crate::far_streaming::far_stand`). Then
+    /// the two agree.
+    #[test]
+    fn the_voxel_box_hands_over_the_strip_only_once_its_nodes_are_drawn() {
+        let mut s = real_streaming();
+        let (before, after) = (ChunkCoord::new(7, 6, 2), ChunkCoord::new(8, 6, 2));
+        let old = node::covered_box_3d(before, node::DEFAULT_RING_SCHEDULE);
+        let new = node::covered_box_3d(after, node::DEFAULT_RING_SCHEDULE);
+        (s.far_hole, s.far_want) = (old, old);
+        let eye = [133.0, 101.0, 45.0];
+        assert_eq!(ChunkCoord::from_world_pos(eye), after);
+        let waiting = s.voxel_box_after(0, eye);
+        assert_eq!(waiting.wanted, hole_in_blocks(new), "the box the nodes want");
+        assert_eq!(
+            waiting.drawn,
+            hole_in_blocks(next_far_hole(old, new, |_| false)),
+            "the part they draw while the strip's nodes are not searched for"
+        );
+        assert_ne!(waiting.drawn, waiting.wanted, "no strip waits: the test tells nothing");
+        // The search has answered and sees nothing in the strip undrawn; one
+        // mesh still on its way to the renderer, then none.
+        s.searched = Some(after);
+        assert_eq!(s.voxel_box_after(1, eye), waiting, "a mesh still to go up");
+        let done = s.voxel_box_after(0, eye);
+        assert_eq!(done, VoxelBox::settled(hole_in_blocks(new)), "all of it drawn");
+    }
+
     #[test]
     fn the_far_strip_is_the_hole_and_the_want_while_they_differ() {
         let mut s = real_streaming();

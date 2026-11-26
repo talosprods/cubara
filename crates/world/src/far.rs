@@ -1079,6 +1079,9 @@ pub(crate) mod tests {
             lo <= lowest && highest <= hi,
             "tops from {lowest} to {highest}, outside {lo}..={hi}"
         );
+        // Its top is the highest surface's top face, as the far terrain's
+        // patches are assumed to span before their heights are known.
+        assert_eq!(hi, surface_bounds().1, "the highest top");
     }
 
     /// What a streaming caller does: select, generate what is new, select
