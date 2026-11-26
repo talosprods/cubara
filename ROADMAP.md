@@ -496,8 +496,18 @@ the same day:
      scripted walk, after loading:
      - no frame exceeds 2× the refresh interval at 60 Hz, and p99.9 stays
        under the interval;
-     - **no frame shows sky where the finished frame shows terrain** (a hole
-       during a detail swap).
+     - **land that has been drawn never shows through again** (flicker =
+       0): no frame shows sky where it showed land before and the finished
+       frame shows terrain -- a hole during a detail swap, a far patch drawn
+       a level coarse, a strip handed between the far terrain and the
+       voxels. Land never drawn yet may show through once while it first
+       loads (first load: printed, not gated). *The owner's rule,
+       2026-11-25 (#398): "het mag bij het orginele inladen 1 keer
+       doorschijnend zijn, dat je dus ziet dat het nog niet geladen is.
+       als het eenmaal ingeladen is, blijft het wel consistent. het is heel
+       hinderlijk als terrein lijkt te flikkeren". It replaced "no frame
+       shows sky where the finished frame shows terrain", which counted
+       both.*
      Measured on each machine and recorded in `BENCHMARKS.md`.
      *Which surface (written down 2026-11-11, #388 — not a change to the terms):*
      `scripts/check-phase-gate.sh` measures these frame terms offscreen at
