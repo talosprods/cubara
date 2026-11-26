@@ -170,6 +170,57 @@ impl HoleTracker {
     pub fn counts(&self) -> Vec<u32> {
         self.candidates.iter().map(|c| c.len() as u32).collect()
     }
+
+    /// **The pixels showing land that was drawn, and is missing now**: each
+    /// shows nothing, and has since a frame in which it was inside land
+    /// ([`inside_land`]) -- however long ago. In order. What a stale pixel
+    /// of the last frame pushed is split by ([`split_stale`]): the owner's
+    /// flicker, where it is in this list, and first load where it is not.
+    ///
+    /// Judged per pixel -- per line of sight -- because that is what the
+    /// owner sees flicker: a pixel that showed land, then sky, then land.
+    /// Ground can go missing from a pixel while every patch and node that
+    /// was drawn stays drawn: on the low flight at t 11.29 s the voxels'
+    /// strip took over from the far terrain in front of a far patch, and
+    /// that patch, a level coarser than the finished frame's for two
+    /// frames, did not reach up to the pixel the strip had covered. No
+    /// column, patch or node was "drawn, then missing" there, and the
+    /// pixel blinked. A line of sight moves with the eye, so a long run
+    /// may end on other ground than it began on; the finished frame's
+    /// inside-land test is what keeps a moving skyline out.
+    pub fn drawn_and_missing(&self) -> Vec<u32> {
+        self.run_start
+            .iter()
+            .enumerate()
+            .filter(|(_, &start)| start != u32::MAX)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+}
+
+/// A frame's stale pixels ([`stale_pixels`]), split by the owner's rule of
+/// 2026-11-25 (#398): "het mag bij het orginele inladen 1 keer doorschijnend
+/// zijn ... als het eenmaal ingeladen is, blijft het wel consistent".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaleSplit {
+    /// Land that was drawn and is missing now -- **flicker**, which must
+    /// never happen.
+    pub flicker: Vec<u32>,
+    /// Land not drawn yet -- **first load**, which may show through once
+    /// while it loads.
+    pub first_load: Vec<u32>,
+}
+
+/// Split `stale` by whether each pixel is in `drawn_and_missing`
+/// ([`HoleTracker::drawn_and_missing`] of the same frame). Both in order.
+pub fn split_stale(stale: &[u32], drawn_and_missing: &[u32]) -> StaleSplit {
+    let (flicker, first_load) = stale
+        .iter()
+        .partition(|i| drawn_and_missing.binary_search(i).is_ok());
+    StaleSplit {
+        flicker,
+        first_load,
+    }
 }
 
 /// Of `candidates` (pixel indices of one frame, [`HoleTracker`]), the ones
@@ -546,6 +597,8 @@ pub fn loading_fraction(live: &Frame, settled: &Frame) -> f64 {
 /// One kept frame: when, where, and how much of it was still loading.
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
+    /// Its frame of the real-time pass.
+    pub frame: u32,
     pub t: f32,
     pub eye: [f32; 3],
     pub loading: f64,
@@ -561,6 +614,9 @@ pub struct Sample {
     /// yet ([`attribute_stale`], share (b)): land still loading, with the far
     /// terrain or a coarser node standing in.
     pub stale_loading: f64,
+    /// The share of its pixels that are stale and showed land drawn before
+    /// ([`split_stale`]'s flicker); the rest of `stale` is first load.
+    pub flicker: f64,
 }
 
 /// Where a kept frame's stale pixels fall (issue #398 decision 1): under a
@@ -937,12 +993,14 @@ impl FlightReport {
     /// term's wording and the script's pattern together.
     pub fn line(&self) -> String {
         let worst = self.worst().unwrap_or(Sample {
+            frame: 0,
             t: 0.0,
             eye: [0.0; 3],
             loading: 0.0,
             stale: 0.0,
             stale_late: 0.0,
             stale_loading: 0.0,
+            flicker: 0.0,
         });
         let tail = WorkTail::of(&self.work_times);
         let (any, worst_px) = self.hole_frames();
@@ -955,6 +1013,15 @@ impl FlightReport {
         };
         let stale_frames = self.samples.iter().filter(|s| s.stale > 0.0).count();
         let stale_worst = self.samples.iter().map(|s| s.stale).fold(0.0, f64::max);
+        let Flicker {
+            frames: flicker_frames,
+            with_hole: flicker_holes,
+            kept: flicker_kept,
+            worst: flicker_worst,
+        } = self.flicker_frames();
+        let first_load = |s: &Sample| s.stale - s.flicker;
+        let first_frames = self.samples.iter().filter(|s| first_load(s) > 0.0).count();
+        let first_worst = self.samples.iter().map(first_load).fold(0.0, f64::max);
         let p = PopStats::of(&self.pops);
         let s = &self.swap_lags;
         format!(
@@ -969,6 +1036,11 @@ impl FlightReport {
              STALE: {stale_frames} kept frames with nothing where the finished frame \
              has land, worst {:.3}%, of which under a late swap {:.0}%, under a node \
              still loading {:.0}%, neither {:.0}% | \
+             FLICKER: {flicker_frames} frames show land drawn before as nothing where \
+             the finished frame has it inside land ({flicker_holes} with a hole, \
+             {flicker_kept} kept frames), worst {flicker_worst} px | \
+             FIRST LOAD: {first_frames} kept frames show land not drawn yet as nothing, \
+             worst {:.3}% | \
              SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
              ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {}",
             self.mean() * 100.0,
@@ -996,6 +1068,7 @@ impl FlightReport {
             self.stale_under_late_swap() * 100.0,
             self.stale_under_loading() * 100.0,
             self.stale_under_neither() * 100.0,
+            first_worst * 100.0,
             s.count,
             s.p50_ms,
             s.p90_ms,
@@ -1007,6 +1080,35 @@ impl FlightReport {
             s.max_blocks,
             self.world_clones.term(),
         )
+    }
+
+    /// **The owner's flicker over the flight** (#398): the frames that
+    /// showed land drawn before as nothing where the finished frame has it
+    /// inside land -- every frame with a hole, and every kept frame with a
+    /// stale pixel drawn before ([`split_stale`]), each frame once -- how
+    /// many of them had a hole and how many were such kept frames (a frame
+    /// can be both: a kept frame's holes are among its stale pixels drawn
+    /// before), and the most such pixels in one frame. Gate item 0 wants
+    /// none.
+    pub fn flicker_frames(&self) -> Flicker {
+        let mut pixels: BTreeMap<u32, u32> = self
+            .holes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(f, &n)| (f as u32, n))
+            .collect();
+        for s in self.samples.iter().filter(|s| s.flicker > 0.0) {
+            let n = (s.flicker * self.pixels as f64).round() as u32;
+            let at = pixels.entry(s.frame).or_default();
+            *at = (*at).max(n);
+        }
+        Flicker {
+            frames: pixels.len(),
+            with_hole: self.holes.iter().filter(|&&n| n > 0).count(),
+            kept: self.samples.iter().filter(|s| s.flicker > 0.0).count(),
+            worst: pixels.values().copied().max().unwrap_or(0),
+        }
     }
 
     /// Frames of the real-time pass with any confirmed hole pixel, and the
@@ -1059,6 +1161,15 @@ impl FlightReport {
         }
         self.samples.iter().map(part).sum::<f64>() / stale
     }
+}
+
+/// [`FlightReport::flicker_frames`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flicker {
+    pub frames: usize,
+    pub with_hole: usize,
+    pub kept: usize,
+    pub worst: u32,
 }
 
 /// The slow end of the work per frame, in seconds -- what a player feels as a
@@ -1423,6 +1534,10 @@ const REJECTED_DUMPS: usize = 10;
 /// (issue #398): what the three shares attribute, read rather than guessed.
 const STALE_DUMPS: usize = 10;
 
+/// Kept frames with flicker -- stale pixels that showed land before
+/// ([`split_stale`]) -- written as frame dumps, those pixels ringed.
+const FLICKER_DUMPS: usize = 10;
+
 /// How far a stale pixel's ray is marched for ground ([`surface_hit`]), in
 /// blocks, and how far each step is. Eight times the voxel nodes' reach: far
 /// enough to tell "beyond the voxels" from "sky" for any ridge big enough to
@@ -1572,9 +1687,10 @@ impl VideoDump {
 /// 1% loading as `tNN.NN-live.png`/`-settled.png`, the first [`HOLE_DUMPS`]
 /// counted holes as `hole-fNNNN-live.png`/`-finished.png` with the pixels
 /// ringed in red ([`mark_pixels`]), the first [`REJECTED_DUMPS`] rejected
-/// candidate frames as `pop-fNNNN-...`, and the first [`STALE_DUMPS`] kept
+/// candidate frames as `pop-fNNNN-...`, the first [`STALE_DUMPS`] kept
 /// frames with stale pixels as `stale-tNN.NN-live.png`/`-settled.png`, the
-/// pixels ringed. `None` without a GPU.
+/// pixels ringed, and the first [`FLICKER_DUMPS`] kept frames with flicker
+/// as `flicker-tNN.NN-...`, its pixels ringed. `None` without a GPU.
 pub fn fly(
     flight: &Flight,
     frames: Option<&Path>,
@@ -1602,6 +1718,10 @@ pub fn fly(
     // stale pixel under no open swap is laid under (issue #398 decision 1,
     // share (b)).
     let mut kept_loading: BTreeMap<u32, Loading> = BTreeMap::new();
+    // Per kept frame: its pixels showing land drawn before as nothing
+    // (`HoleTracker::drawn_and_missing`) -- what splits its stale pixels
+    // into flicker and first load (#398, the owner's rule).
+    let mut kept_drawn: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     // The last `HOLE_MAX_FRAMES + 1` frames, oldest first: a candidate run
     // closes at most that far back, and a pop compares with the frame before.
     let mut recent: VecDeque<Frame> = VecDeque::new();
@@ -1691,6 +1811,7 @@ pub fn fly(
             );
             let shown = recent.back()?.clone();
             kept.insert(frame, shown);
+            kept_drawn.insert(frame, tracker.drawn_and_missing());
             kept_loading.insert(
                 frame,
                 Loading {
@@ -1741,6 +1862,7 @@ pub fn fly(
     let mut worst: Option<(f64, (Frame, Frame))> = None;
     let mut confirmed = vec![0u32; eyes.len()];
     let mut confirmed_late = vec![0u32; eyes.len()];
+    let mut flicker_dumps = 0usize;
     let mut candidate_frames = 0usize;
     let (mut hole_dumps, mut rejected_dumps, mut stale_dumps) = (0usize, 0usize, 0usize);
     let gen = cubara_world::WorldGen::new(settled.world.seed());
@@ -1811,6 +1933,7 @@ pub fn fly(
         if let Some(shown) = kept_here {
             let loading = loading_fraction(&shown, &reference);
             let stale = stale_pixels(&shown, &reference);
+            let split = split_stale(&stale, &kept_drawn.remove(&frame).unwrap_or_default());
             let still = kept_loading.remove(&frame).unwrap_or_default();
             let loading_boxes: Vec<ScreenBox> = still
                 .nodes
@@ -1846,12 +1969,18 @@ pub fn fly(
             });
             let n = shown.pixels.len() as f64 / 4.0;
             log::info!(
-                "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading, {} stale px ({:.3}%): \
-                 {} under one of {} late swaps, {} under one of {} loading nodes, {} under \
-                 neither{}",
+                "flight: t {t:5.2} s at {eye:.0?}: {:.2}% loading, {} stale px ({:.3}%; {} \
+                 flicker, drawn before{}; {} first load): {} under one of {} late swaps, {} \
+                 under one of {} loading nodes, {} under neither{}",
                 loading * 100.0,
                 stale.len(),
                 stale.len() as f64 * 100.0 / n,
+                split.flicker.len(),
+                split.flicker.first().map_or(String::new(), |&i| format!(
+                    ", the first at {:?}",
+                    (i % width, i / width)
+                )),
+                split.first_load.len(),
                 shares.late,
                 open.len(),
                 shares.loading,
@@ -1904,13 +2033,28 @@ pub fn fly(
                     save(&dir.join(format!("stale-t{:05.2}-{kind}.png", t)), &marked);
                 }
             }
+            if let Some(dir) =
+                frames.filter(|_| !split.flicker.is_empty() && flicker_dumps < FLICKER_DUMPS)
+            {
+                flicker_dumps += 1;
+                for (kind, f) in [("live", &shown), ("settled", &reference)] {
+                    let mut marked = f.clone();
+                    mark_pixels(&mut marked, &split.flicker);
+                    save(
+                        &dir.join(format!("flicker-t{:05.2}-{kind}.png", t)),
+                        &marked,
+                    );
+                }
+            }
             samples.push(Sample {
+                frame,
                 t,
                 eye,
                 loading,
                 stale: stale.len() as f64 / n,
                 stale_late: shares.late as f64 / n,
                 stale_loading: shares.loading as f64 / n,
+                flicker: split.flicker.len() as f64 / n,
             });
             keep_worst(&mut worst, loading, (shown, reference));
         }
@@ -2233,12 +2377,14 @@ mod tests {
     #[test]
     fn the_report_counts_the_frames_over_a_share() {
         let sample = |loading| Sample {
+            frame: 0,
             t: 0.0,
             eye: [0.0; 3],
             loading,
             stale: 0.0,
             stale_late: 0.0,
             stale_loading: 0.0,
+            flicker: 0.0,
         };
         let r = FlightReport {
             samples: vec![sample(0.0), sample(0.02), sample(0.005), sample(0.1)],
@@ -2601,6 +2747,118 @@ mod tests {
         let mut land = [true; 25];
         land[12] = false;
         assert_eq!(inside(&land, 5), vec![6, 8, 16, 18]);
+    }
+
+    /// **Land drawn, then missing, is flicker; land never drawn yet is
+    /// first load** (the owner's rule of 2026-11-25, #398). On a 5 x 5
+    /// screen, pixel 8 is inside land and then shows nothing for good;
+    /// pixel 16 shows nothing from the start; pixel 6 was land on a skyline
+    /// (sky above it) when it went; and pixel 12 showed nothing for a frame
+    /// and land again. Only pixel 8 is land drawn and missing now, and it
+    /// stays so however long it lasts -- past `HOLE_MAX_FRAMES`, where the
+    /// hole tracker gives up on it.
+    #[test]
+    fn land_drawn_then_missing_is_flicker_and_land_never_drawn_is_first_load() {
+        let first = picture(&["#.###", "#####", "#####", "#.###", "#####"]);
+        let gone = picture(&["#.###", "#.#.#", "##.##", "#.###", "#####"]);
+        let back = picture(&["#.###", "#.#.#", "#####", "#.###", "#####"]);
+        let mut frames = vec![first, gone];
+        frames.extend(std::iter::repeat_n(back, HOLE_MAX_FRAMES as usize + 5));
+        let t = track(&frames);
+        assert_eq!(
+            t.drawn_and_missing(),
+            vec![8],
+            "8 was inside land and is missing; 16 never showed land, 6 was on \
+             a skyline, 12 came back"
+        );
+        // The finished frame has land at all three: 8 is flicker, 6 and 16
+        // first load.
+        assert_eq!(
+            split_stale(&[6, 8, 16], &t.drawn_and_missing()),
+            StaleSplit {
+                flicker: vec![8],
+                first_load: vec![6, 16],
+            }
+        );
+        // Land again: no longer missing.
+        frames.push(picture(&["#####"; 5]));
+        assert!(track(&frames).drawn_and_missing().is_empty());
+    }
+
+    /// **The two ways a far mountain shows sky where the finished frame has
+    /// land, told apart.** A ridge drawn a level too coarse while its finer
+    /// patch generates is lower: the pixels between the two outlines were
+    /// sky all along, and show the finer ridge for the first time when it
+    /// comes -- first load. The low flight's hole at t 11.29 s was land (the
+    /// voxels' strip in front) and then sky (the strip taken over, the far
+    /// patch behind still a level coarse): flicker.
+    #[test]
+    fn a_late_finer_ridge_is_first_load_and_land_lost_in_front_of_it_is_flicker() {
+        let coarse = picture(&[".....", ".....", ".....", "#####", "#####"]);
+        let finer = picture(&[".....", ".###.", ".###.", "#####", "#####"]);
+        let stale = stale_pixels(&coarse, &finer);
+        assert_eq!(stale, vec![12], "the finer ridge's inside");
+        let waiting = track(&[coarse.clone(), coarse.clone()]);
+        assert_eq!(
+            split_stale(&stale, &waiting.drawn_and_missing()),
+            StaleSplit {
+                flicker: Vec::new(),
+                first_load: vec![12],
+            },
+            "never drawn: first load"
+        );
+        // The strip in front covered (2, 2) and went; the far patch behind
+        // does not reach it yet.
+        let strip = picture(&["#####"; 5]);
+        let lost = track(&[strip, coarse.clone()]);
+        assert_eq!(
+            split_stale(&stale, &lost.drawn_and_missing()),
+            StaleSplit {
+                flicker: vec![12],
+                first_load: Vec::new(),
+            },
+            "drawn, then missing: flicker"
+        );
+    }
+
+    /// The report's flicker: every frame with a hole and every kept frame
+    /// with a stale pixel drawn before, each frame once, and the most such
+    /// pixels in one frame. Here frames 0 and 3 have holes, kept frames 2
+    /// and 3 have 2 and 5 drawn stale pixels, kept frame 4 none: frame 3 is
+    /// both, and its 5 are more than its hole's 1.
+    #[test]
+    fn flicker_frames_count_each_frame_once() {
+        let sample = |frame, flicker| Sample {
+            frame,
+            t: 0.0,
+            eye: [0.0; 3],
+            loading: 0.0,
+            stale: flicker,
+            stale_late: 0.0,
+            stale_loading: 0.0,
+            flicker,
+        };
+        let r = FlightReport {
+            samples: vec![sample(2, 0.002), sample(3, 0.005), sample(4, 0.0)],
+            work_times: Vec::new(),
+            holes: vec![3, 0, 0, 1, 0],
+            holes_late: vec![0; 5],
+            candidates: vec![3, 0, 0, 1, 0],
+            checked_every: 1,
+            pixels: 1000,
+            pops: Vec::new(),
+            swap_lags: SwapLagStats::default(),
+            world_clones: WorldClones::default(),
+        };
+        assert_eq!(
+            r.flicker_frames(),
+            Flicker {
+                frames: 3,
+                with_hole: 2,
+                kept: 2,
+                worst: 5,
+            }
+        );
     }
 
     /// **A sliver on the finished frame's skyline is a pop, not a hole** (the
@@ -2973,12 +3231,14 @@ mod tests {
     #[test]
     fn the_three_stale_shares_sum_to_one_over_the_kept_frames() {
         let sample = |stale, stale_late, stale_loading| Sample {
+            frame: 0,
             t: 0.0,
             eye: [0.0; 3],
             loading: 0.0,
             stale,
             stale_late,
             stale_loading,
+            flicker: 0.0,
         };
         let report = |samples| FlightReport {
             samples,
@@ -3057,24 +3317,31 @@ mod tests {
         assert_eq!(surface_hit(wall, eye, [1.0, 0.0, 0.0], 4.0, 1.0), None);
     }
 
-    /// The summary line carries the three terms gate item 0 parses
+    /// The summary line carries the terms gate item 0 parses
     /// (`scripts/check-phase-gate.sh`), in the words its patterns look for,
     /// and the stale shares are shares of stale pixels, not of the screen.
+    /// FLICKER counts the frames with a hole or a kept frame's stale pixel
+    /// drawn before, each frame once; FIRST LOAD the kept frames with a
+    /// stale pixel not drawn before.
     #[test]
-    fn the_line_prints_holes_pops_and_stale_as_three_terms() {
-        let sample = |stale, stale_late, stale_loading| Sample {
+    fn the_line_prints_holes_pops_stale_flicker_and_first_load() {
+        let sample = |frame, stale, stale_late, stale_loading, flicker| Sample {
+            frame,
             t: 0.0,
             eye: [0.0; 3],
             loading: 0.0,
             stale,
             stale_late,
             stale_loading,
+            flicker,
         };
         let r = FlightReport {
+            // Frame 1 is a kept frame with a hole among its four stale
+            // pixels drawn before: one frame, not two.
             samples: vec![
-                sample(0.0, 0.0, 0.0),
-                sample(0.004, 0.003, 0.0),
-                sample(0.002, 0.0, 0.0015),
+                sample(0, 0.0, 0.0, 0.0, 0.0),
+                sample(1, 0.004, 0.003, 0.0, 0.004),
+                sample(3, 0.002, 0.0, 0.0015, 0.0),
             ],
             work_times: vec![0.002; 10],
             holes: vec![0, 4, 0, 0],
@@ -3108,6 +3375,16 @@ mod tests {
         );
         assert!(
             line.contains("STALE: 2 kept frames with nothing where the finished frame has land, worst 0.400%, of which under a late swap 50%, under a node still loading 25%, neither 25%"),
+            "{line}"
+        );
+        assert!(
+            line.contains("FLICKER: 1 frames show land drawn before as nothing where the finished frame has it inside land (1 with a hole, 1 kept frames), worst 4 px"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "FIRST LOAD: 1 kept frames show land not drawn yet as nothing, worst 0.200%"
+            ),
             "{line}"
         );
         assert!(!line.contains("sampled"));

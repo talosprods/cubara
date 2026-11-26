@@ -253,6 +253,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-26 | Gate eye: hill at #442, 2 runs, same conditions¹⁰⁰ | -- | -- | 1,094 / 1,094 (+6.7%) | 0.439 / 0.439 ms | 1.303 / 1.237 ms | `458a2be` |
 | 2026-11-26 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws¹⁰⁰ | 0 | far only | 3,910 / 3,860 | 0.114 / 0.116 ms | 0.330 / 0.307 ms | `2715b30` |
 | 2026-11-26 | Gate eye: flight at #442, 2 runs, same conditions; 0 draws¹⁰⁰ | 0 | far only | 4,154 / 4,086 (+6.0%) | 0.109 / 0.106 ms | 0.261 / 0.238 ms | `458a2be` |
+| 2026-11-26 | **Gate eye: ground** at main (#442 merged: far tiles at x3), A of the A/B for #444 (flicker = 0: the far selection's slack and prefetch, the measure split into FLICKER and FIRST LOAD, far quads back to x2.7), 2 runs (`GATE: MET at Medium` each; High missed: 1,044 / 1,046), alternating with #444 and #444+#445 (footnote 101); AC power, charging 98-100%, no thermal or performance warning recorded, no input for half an hour, no agents running here or in the other sessions on this Mac (they held still for the hour), 5 quiet minutes before the first run¹⁰¹ | -- | -- | 1,149 / 1,146 | 0.417 / 0.418 ms | 0.963 / 0.976 ms | `5f5fea7` |
+| 2026-11-26 | **Gate eye: ground** at #444 (x2.7), B, 2 runs (`GATE: MET at Medium` each; High missed: 1,009 / 1,010), same conditions¹⁰¹ | -- | -- | 1,134 / 1,135 (−1.1%) | 0.427 / 0.427 ms | 0.981 / 0.969 ms | `4831a0f` |
+| 2026-11-26 | Gate eye: hill at main (A), 2 runs, same conditions¹⁰¹ | -- | -- | 1,113 / 1,112 | 0.432 / 0.433 ms | 0.983 / 1.003 ms | `5f5fea7` |
+| 2026-11-26 | Gate eye: hill at #444, 2 runs, same conditions¹⁰¹ | -- | -- | 1,091 / 1,088 (−2.1%) | 0.450 / 0.448 ms | 1.033 / 1.015 ms | `4831a0f` |
+| 2026-11-26 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws¹⁰¹ | 0 | far only | 4,251 / 4,211 | 0.106 / 0.106 ms | 0.259 / 0.257 ms | `5f5fea7` |
+| 2026-11-26 | Gate eye: flight at #444, 2 runs, same conditions; 0 draws¹⁰¹ | 0 | far only | 4,287 / 4,152 (−0.3%) | 0.106 / 0.103 ms | 0.258 / 0.244 ms | `4831a0f` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3401,3 +3407,19 @@ The pits cost 2.8% at the ground eye and 1.6% at the hill eye (4% more voxel tri
 | toward a mountain, #442 | 0 of 1,782; 0 of 1,780 | 0; 0 | 270; 271 | 1,713 / 19,702 / 28,263; 2,013 / 20,328 / 26,081 | 84 / 101 / 152 / 236; 84 / 101 / 169 / 236 |
 
 The tiles give the hill eye 6.7% (1,094 against 1,024 / 1,026 FPS) at the same quad size: main had 2.5% left above the gate after #441's pits, #442 leaves 9.4%. The low flight's holes are the far terrain's hand-over class on both sides (main 3 and 0, #442 1 and 1, one pixel or two for a few frames where the voxels' strip hand-over or a late far split leaves a notch; PR #442's probe and #443's hunt traced two of them): the far selection's lag, issue #398, which closing would also let the quads come down to 2.7 (at 2.7 one such split lands on a pixel in every run, PR #442).
+
+¹⁰¹ **#444's quiet A/B, and the first high and down flights on the M3** (main `5f5fea7`, #444 `4831a0f`, and the two merged locally with #445 as a third build; built in release that afternoon and checked distinct; the other Claude sessions on this Mac held still for the hour, as CLAUDE.md asks; 5 quiet minutes, gate A, B, C twice, then each flight A, B, C twice, then on #444 the low flight at `--far-quad-scale 3` and the high (`--eye 8,400,8 --look 1,-0.35,0.3 --seconds 20`) and down (`--eye 8,450,8 --look 0.4,-0.8,0.2 --seconds 15`) flights on main and #444, twice each). Main's binary prints #443's HOLES and STALE; #444's adds FLICKER (land drawn before, missing now, inside land in the finished frame -- the owner's rule) and FIRST LOAD.
+
+| Flight | HOLES (frames) | FLICKER (frames) | FIRST LOAD / STALE kept frames | POPS swaps | POPS px p50 / p99 / max | work p99 ms |
+|---|---|---|---|---|---|---|
+| low, main | 0 of 1,185; 1 of 1,183 | -- | STALE 3; 4 | 292; 290 | 1,323 / 32,831 / 42,057; 1,570 / 38,413 / 41,931 | 3.1; 3.0 |
+| low, #444 (x2.7) | 1 of 1,182; 0 of 1,184 | **1; 0** | 2; 2 | 295; 285 | 1,370 / 37,098 / 43,225; 1,412 / 32,816 / 40,649 | 3.1; 2.9 |
+| low, #444 at x3 | 0 of 1,184; 0 of 1,183 | **0; 0** | 2; 2 | 294; 297 | 1,344 / 33,051 / 41,672; 1,161 / 40,371 / 45,351 | 3.0; 3.1 |
+| toward a mountain, main | 0 of 1,783; 0 of 1,779 | -- | STALE 0; 0 | 272; 271 | 1,694 / 23,128 / 27,832; 1,945 / 19,887 / 34,940 | 2.0; 2.0 |
+| toward a mountain, #444 | 0 of 1,781; 0 of 1,782 | 0; 0 | 0; 0 | 276; 268 | 1,654 / 18,239 / 27,858; 1,593 / 22,425 / 29,376 | 1.9; 1.9 |
+| high, main | 0 of 1,193; 0 of 1,191 | -- | STALE 0; 0 | 94; 92 | 14 / 7,738 / 8,267; 25 / 8,628 / 11,395 | 2.5; 2.5 |
+| high, #444 | 0 of 1,192; 0 of 1,193 | 0; 0 | 0; 0 | 93; 93 | 0 / 7,507 / 8,200; 0 / 10,471 / 10,475 | 2.5; 2.5 |
+| down, main | 0 of 890; 0 of 894 | -- | STALE 0; 0 | 106; 108 | 2,103 / 32,031 / 74,294; 1,199 / 33,110 / 79,395 | 3.6; 3.5 |
+| down, #444 | 0 of 895; 0 of 893 | 0; 0 | 0; 0 | 105; 108 | 1,565 / 33,243 / 70,661; 1,651 / 32,719 / 79,833 | 3.5; 3.7 |
+
+#444 brings the far quads back to x2.7 for 1.1% at the ground eye and 2.1% at the hill eye; the far selection no longer lags (its replay: 0 of 1,200 frames behind). The one flicker frame left at x2.7 on the low flight is the strip hand-over sliver (§9.10: a far ridge pair 0.2 px apart standing in for a voxels' strip until its nodes are drawn), which the follow-up branch `feat/strip-standin` closes; at x3 the low flight shows none. The high and down flights, gate item 0's other two, run clean on both sides -- their first record on this M3.
