@@ -22,6 +22,8 @@ mod capture;
 mod far_census;
 #[cfg(test)]
 mod far_census_horizon;
+#[cfg(test)]
+mod far_trees_census;
 mod far_streaming;
 mod flight;
 mod game;

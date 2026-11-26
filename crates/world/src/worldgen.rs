@@ -1090,15 +1090,50 @@ impl WorldGen {
     /// sampled, as their tops are: over many cells a pit's floor still shows
     /// in the share the sampled columns are pit.
     pub fn top_layer(&self, x0: i32, z0: i32, w: i32, n: i32, top: i32) -> GroundLayer {
+        self.top_cover(x0, z0, w, n, top, None).0
+    }
+
+    /// [`top_layer`](Self::top_layer), and **the share of the same columns
+    /// a tree may grow on** ([`tree_may_grow`](Self::tree_may_grow)), 0 to
+    /// 1 -- 0 for a world without trees (`blocks` `None`, or no oak). One
+    /// pass over the columns for both: the far terrain asks for each quad's
+    /// (issue #433 item 1), and a column's surface and pit are what both
+    /// read.
+    ///
+    /// Where a tree may grow, one grows in a chunk column in `oak.density`
+    /// ([`tree_site`](Self::tree_site)): this share times that chance is
+    /// how densely the cell is wooded, in expectation -- what the far
+    /// terrain's tint of a quad stands for where its trees are no longer
+    /// drawn one by one.
+    pub fn top_cover(
+        &self,
+        x0: i32,
+        z0: i32,
+        w: i32,
+        n: i32,
+        top: i32,
+        blocks: Option<TerrainBlocks>,
+    ) -> (GroundLayer, f32) {
         let mut columns: Vec<(i32, i32, i32, i32)> = Self::sample_columns(x0, z0, w, n)
             .map(|(x, z)| {
                 let column = self.column(x, z);
                 (column.top, z, x, column.surface)
             })
             .collect();
+        let grows = blocks.map_or(0, |blocks| {
+            columns
+                .iter()
+                .filter(|&&(floor, z, x, surface)| {
+                    // `column`'s top is under its surface exactly where a
+                    // cave has carved the surface block away (`pit_floor`).
+                    self.tree_may_grow(x, z, surface, floor < surface, blocks)
+                })
+                .count()
+        });
+        let share = grows as f32 / columns.len() as f32;
         columns.sort_unstable();
         let (floor, _, _, surface) = columns[self.top_pick(x0, z0, top, columns.len())];
-        Self::ground_layer(surface - floor)
+        (Self::ground_layer(surface - floor), share)
     }
 
     /// What level 0 shows from directly above `column`, the column at
@@ -1833,9 +1868,13 @@ impl WorldGen {
         //
         // The density check is the second half: a cave can carve the ground
         // out from under a surface height, and a tree must not grow on air.
-        if self.material_at(x, surface, z, surface, blocks) != oak.grows_on
-            || self.density_at(x, surface, z, surface) <= 0.0
-        {
+        if !self.tree_may_grow(
+            x,
+            z,
+            surface,
+            self.density_at(x, surface, z, surface) <= 0.0,
+            blocks,
+        ) {
             return None;
         }
 
@@ -1846,6 +1885,26 @@ impl WorldGen {
             z,
             base: surface + 1,
             height,
+        })
+    }
+
+    /// **Whether a tree may grow on the column `(x, z)`** whose surface
+    /// block is at `surface`, `carved` whether a cave has carved that block
+    /// away: on the block the oak grows on, and on ground that is there.
+    /// The one rule: the placement asks it of the column a tree's hash
+    /// picks ([`tree_in_column`](Self::tree_in_column)), and the far
+    /// terrain of the columns a quad's top is judged on
+    /// ([`top_cover`](Self::top_cover)). `false` in a world without trees.
+    fn tree_may_grow(
+        &self,
+        x: i32,
+        z: i32,
+        surface: i32,
+        carved: bool,
+        blocks: TerrainBlocks,
+    ) -> bool {
+        blocks.oak.is_some_and(|oak| {
+            !carved && self.material_at(x, surface, z, surface, blocks) == oak.grows_on
         })
     }
 
