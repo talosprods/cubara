@@ -348,9 +348,10 @@ impl VoxelBox {
     }
 }
 
-/// Whether the column `(x, z)` is inside `hole` across the ground.
-fn over(hole: Hole, x: f64, z: f64) -> bool {
-    hole.min[0] <= x && x < hole.max[0] && hole.min[2] <= z && z < hole.max[2]
+/// Whether the square of ground from `(x, z)` to `(x + side, z + side)` is
+/// inside `hole` across the ground (edges included).
+fn within(hole: Hole, [x, z]: [f64; 2], side: f64) -> bool {
+    hole.min[0] <= x && x + side <= hole.max[0] && hole.min[2] <= z && z + side <= hole.max[2]
 }
 
 /// The patches of the finest far level ([`far::FINEST_LEVEL`]) with ground
@@ -366,19 +367,18 @@ fn finest_patches_between(outer: Hole, inner: Hole) -> Vec<PatchKey> {
         for x in span(0) {
             let key = PatchKey::new(level, x as i32, z as i32);
             let [ox, oz] = key.origin().map(|o| o as f64);
-            // The patch's ground in `outer`, and whether all of it is in
-            // `inner` too.
+            // The patch's ground in `outer` (some: the span is of patches
+            // that reach into it), and whether all of that is in `inner`.
             let lo = [ox.max(outer.min[0]), oz.max(outer.min[2])];
             let hi = [
                 (ox + size as f64).min(outer.max[0]),
                 (oz + size as f64).min(outer.max[2]),
             ];
-            let some = lo[0] < hi[0] && lo[1] < hi[1];
             let all_inner = inner.min[0] <= lo[0]
                 && hi[0] <= inner.max[0]
                 && inner.min[2] <= lo[1]
                 && hi[1] <= inner.max[2];
-            if some && !all_inner {
+            if !all_inner {
                 keys.push(key);
             }
         }
@@ -465,8 +465,8 @@ pub fn standin_faces(patch: &PatchHeights, voxels: VoxelBox) -> Vec<FarFace> {
         .into_iter()
         .filter(|face| {
             let [i, j] = face.owner();
-            let (x, z) = (ox + (i as f64 + 0.5) * quad, oz + (j as f64 + 0.5) * quad);
-            over(voxels.wanted, x, z) && !over(voxels.drawn, x, z)
+            let at = [ox + i as f64 * quad, oz + j as f64 * quad];
+            within(voxels.wanted, at, quad) && !within(voxels.drawn, at, quad)
         })
         .collect()
 }
@@ -2700,7 +2700,7 @@ mod tests {
     }
 
     /// `Off` draws nothing beyond the voxels: everything shown leaves, and
-    /// nothing is asked for.
+    /// nothing is asked for -- nor stood in for a strip still loading.
     #[test]
     fn off_removes_everything_and_asks_for_nothing() {
         let mut plan = FarPlan::new(FarQuality::Off, TEST_RADIUS);
@@ -2710,17 +2710,14 @@ mod tests {
             PatchKey::new(4, 0, 0),
         ]
         .into();
-        let hole = voxel_hole([8.0, 120.0, 8.0]);
-        let step = plan.step(
-            [8.0, 120.0, 8.0],
-            1080,
-            VoxelBox::settled(hole),
-            || drawn.clone(),
-        );
+        let step = plan.step([133.0, 101.0, 45.0], 1080, low_flight_move(), || {
+            drawn.clone()
+        });
         let mut sorted: Vec<_> = drawn.into_iter().collect();
         sorted.sort();
         assert_eq!(step.leave, sorted);
         assert!(step.request.is_empty() && step.prefetch.is_empty() && step.arrive.is_empty());
+        assert!(step.standin_arrive.is_empty() && step.promote.is_empty(), "a stand-in");
     }
 
     /// A patch asked for is not asked for again while it is generating, and
