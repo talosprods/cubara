@@ -295,9 +295,16 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     }
     let to_eye = frame.eye.xyz - p;
     let dist = length(to_eye);
-    // The shortest trees fade first (`TintGpu`'s heights are in order): while
-    // they are whole, every tree here is.
-    if tree_scale(params.tree_height[0].y, dist, params.tree_fade) >= 1.0 {
+    // What each trunk height no longer draws of its trees here; nothing to
+    // tint while every one is whole (all the far terrain the trees cover).
+    var missing: array<f32, 8>;
+    var any_missing = false;
+    for (var k = 0u; k < heights; k++) {
+        let s = tree_scale(params.tree_height[k].y, dist, params.tree_fade);
+        missing[k] = 1.0 - s * s;
+        any_missing = any_missing || missing[k] > 0.0;
+    }
+    if !any_missing {
         return vec4<f32>(0.0);
     }
     // The line of sight, or straight up for the share the canopies cover
@@ -331,9 +338,7 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     var colour = vec3<f32>(0.0);
     for (var k = 0u; k < heights; k++) {
         let h = params.tree_height[k];
-        let s = tree_scale(h.y, dist, params.tree_fade);
-        let missing = 1.0 - s * s;
-        if missing <= 0.0 {
+        if missing[k] <= 0.0 {
             continue;
         }
         // The share of the sides' shadows that falls on the top, `quad`
@@ -354,7 +359,7 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
             area += c.w * w;
             seen += w * lit[d] * shaded;
         }
-        let n = h.x * wooded * missing;
+        let n = h.x * wooded * missing[k];
         hidden += n * area;
         colour += n * seen;
     }
