@@ -7,15 +7,15 @@
 //! away before what replaces it exists. A patch the view no longer wants stays
 //! drawn while any patch covering the same ground is still being generated.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{Receiver, Sender};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Condvar, Mutex};
 
 use cubara_render::aggregate::Materials;
 use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
-#[cfg(test)]
 use cubara_world::node;
 use cubara_world::WorldGen;
 
@@ -89,22 +89,69 @@ impl FarQuality {
 /// The camera's vertical field of view (`render.rs`'s projection).
 const FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 
-/// How far the eye moves before the selection is worked out again, in blocks.
+/// **The selection is worked out again once the eye has moved this share of
+/// its slack** ([`far::Selection::slack`]: how far the eye can move before
+/// any decision of the walk could change), which makes the drawn selection
+/// the one the eye itself selects on every frame (#398's plan A). It was a
+/// fixed distance -- 32 blocks, then one -- and for up to that long a far
+/// mountain stood a level coarser than the eye asks for: with blocks
+/// (#422) a level coarser is quads twice as wide, and at the foot of a far
+/// mountain a pixel of land turned to sky until the finer patch came (the
+/// low flight's holes at t 3.0 s, and at t 11.29 s at a quad scale of 2.7).
+/// **Chosen, not derived**: 99%, against rounding in the distances.
+const RESELECT_SAFETY: f64 = 0.99;
+
+/// **How much nearer than the eye the prefetch selects, as a share of each
+/// distance** (#398's plan B): the far terrain's patches are generated for
+/// a view in which everything is this much nearer, so the children a split
+/// will want exist before the eye gets there. At 1,024 blocks it is 60
+/// blocks ahead (2.5 s of flight); a patch takes 6 to 9 ms to generate,
+/// 18 to 20 ms at the 99th percentile while flying (#398 step 1).
+/// **Chosen, not derived**: the issue's starting value, which covers that
+/// latency many times over.
+const PREFETCH_MARGIN: f64 = 1.0 / 16.0;
+
+/// **How far the eye moves before the prefetch is worked out again**, in
+/// blocks -- a small part of the margin above at the distances the far
+/// terrain starts at, and a walk saved on most frames. Also worked out
+/// again when a patch it asked for arrives (its error may split more),
+/// and when the voxels' box changes. **Chosen, not derived** (#398's plan).
+const PREFETCH_RESELECT_BLOCKS: f64 = 8.0;
+
+/// One coarsest voxel node across, in blocks: how far the voxels' box moves
+/// at once (`cubara_world::node::covered_box_3d`), and so how much ground
+/// round its edge the far terrain draws again when it moves on.
+fn coarsest_node_blocks() -> f64 {
+    let (level, _) = *node::DEFAULT_RING_SCHEDULE
+        .last()
+        .expect("the ring schedule has a coarsest ring");
+    (16i64 << level) as f64
+}
+
+/// The view the prefetch walks ([`PREFETCH_MARGIN`]): `view` with every
+/// distance that much nearer -- so it splits wherever the eye's own view
+/// would split a little further on, and reaches a little further out --
+/// and its hole one coarsest node smaller on every side: the ground the
+/// voxels' box hands back when it moves on, which the far terrain must draw
+/// the frame it does (`NodeStreaming::far_hole` shrinks the hole at once).
 ///
-/// One block. It was 32 -- "well inside the finest patch" -- which let the
-/// drawn selection trail the eye's own by up to 1.3 s of flight: a far
-/// mountain stood a level coarser than it should for that long (#398's
-/// stale terrain). With the smooth far surface that moved an outline by
-/// less than the error bound; with blocks (#422) a level coarser is quads
-/// twice as wide, and at the foot of a far mountain a pixel of land turned
-/// to sky until the finer patch came: 26 frames of the low flight showed a
-/// hole at [`FAR_QUAD_SCALE`] 2.5 and 7 at 3, none at either with this.
-/// **Chosen, not derived**: #398's "tiny" variant, a third of a second of
-/// walking and two or three frames of flight. It is not that issue's fix --
-/// its plan replaces this constant by the slack `select` can report, and
-/// generates ahead -- and the cost is a `select` that often
-/// (`far_plan_cost_report`).
-const RESELECT_BLOCKS: f64 = 1.0;
+/// Every patch the eye's own view keeps or splits, this one keeps or
+/// splits too: each of its tests to split is the eye's or looser, and its
+/// hole is inside the eye's. So what it walks holds every patch a nearby
+/// eye selects.
+fn ahead_view(view: &FarView) -> FarView {
+    let grow = 1.0 + PREFETCH_MARGIN;
+    FarView {
+        split_ratio: view.split_ratio * grow,
+        max_error: view.max_error / grow,
+        min_quad: view.min_quad / grow,
+        radius: view.radius * grow,
+        hole: view
+            .hole
+            .and_then(|h| h.grown_across(-coarsest_node_blocks())),
+        ..*view
+    }
+}
 
 /// **How large the far terrain's quads are on screen**, as a factor on the
 /// pixel sizes a quality names ([`FarQuality::detail`]): its quads, its
@@ -135,16 +182,18 @@ const RESELECT_BLOCKS: f64 = 1.0;
 /// 4.2% slower. The owner left the size to the engine ("as long as it is
 /// good", 2026-11-21); the numbers are in §9.8.
 ///
-/// **Held at 3 for now (the lead, 2026-11-26).** At 2.7 the quiet low flight
-/// showed a hole in every run (2 pixels at (542, 388), t 11.29 to 11.36 s):
-/// the selection splits a level-4 patch into level 3 right after the voxels'
-/// strip hand-over opened that pixel, and the live frame keeps the parent
-/// for the 2 to 5 frames the children take to generate, while the finished
-/// frame has them at once. Not the tiles' doing (they draw the same pixels as
-/// whole patches in every state); it is the far terrain's selection lag
-/// (#398), which a scale only moves to another moment. 2.7 comes back when
-/// that lag is closed; at 3 the tiles keep their +6.5% at the hill eye.
-pub const FAR_QUAD_SCALE: f64 = 3.0;
+/// **2.7 again since #398 closed the far selection's lag.** It was held at
+/// 3 for a day (the lead, 2026-11-26): at 2.7 the quiet low flight showed a
+/// hole in every run (2 pixels at (542, 388), t 11.29 to 11.36 s), the
+/// selection splitting a level-4 patch into level 3 right after the
+/// voxels' strip hand-over opened that pixel, and the live frame keeping
+/// the parent for the 2 to 5 frames the children took to generate while the
+/// finished frame had them at once. The plan now works its selection out
+/// again within its slack and generates the patches a little ahead of the
+/// eye ([`PREFETCH_MARGIN`]): on the low flight replayed without a GPU it
+/// draws the eye's own selection on every frame at 2.7 and at 3
+/// (`the_live_selection_is_the_exact_one_on_every_frame`).
+pub const FAR_QUAD_SCALE: f64 = 2.7;
 
 /// `--far-quad-scale F`: a factor for [`far_view_scaled`] in place of
 /// [`FAR_QUAD_SCALE`], for measuring another size. Only a finite number from
@@ -351,10 +400,61 @@ fn to_keep(wanted: &[PatchKey], draw: HashSet<PatchKey>, root_level: u32) -> Has
     keep
 }
 
+/// How soon a patch asked for is wanted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Urgency {
+    /// The selection at the eye wants it: drawn ground waits for it.
+    Now,
+    /// The prefetch walked it: wanted a little further on, if at all.
+    Ahead,
+}
+
+/// One patch to generate, and the generation (of [`FarStreaming`]) it was
+/// asked for in.
+type Job = (u64, WorldGen, PatchKey);
+
+/// The pool's two queues: a worker takes from `now` while it has anything,
+/// so a patch the eye wants never waits behind the prefetch.
+#[derive(Default)]
+struct Queues {
+    now: VecDeque<Job>,
+    ahead: VecDeque<Job>,
+    closed: bool,
+}
+
+impl Queues {
+    /// Generate `job`'s patch, after everything asked for as urgently.
+    fn push(&mut self, job: Job, urgency: Urgency) {
+        match urgency {
+            Urgency::Now => self.now.push_back(job),
+            Urgency::Ahead => self.ahead.push_back(job),
+        }
+    }
+
+    /// A patch the prefetch asked for is wanted now: to the back of the
+    /// urgent queue, if no worker has taken it yet.
+    fn promote(&mut self, key: PatchKey) {
+        if let Some(at) = self.ahead.iter().position(|j| j.2 == key) {
+            let job = self.ahead.remove(at).expect("found it");
+            self.now.push_back(job);
+        }
+    }
+
+    /// The oldest urgent job, else the oldest prefetch.
+    fn take(&mut self) -> Option<Job> {
+        self.now.pop_front().or_else(|| self.ahead.pop_front())
+    }
+
+    fn clear(&mut self) {
+        self.now.clear();
+        self.ahead.clear();
+    }
+}
+
 /// A pool of threads generating patches. Each job carries the generation it
 /// was asked for in, so a result from before a reset (a new world) is dropped.
 struct Pool {
-    jobs: Sender<(u64, WorldGen, PatchKey)>,
+    queues: Arc<(Mutex<Queues>, Condvar)>,
     done: Receiver<(u64, PatchHeights)>,
     _workers: Vec<std::thread::JoinHandle<()>>,
 }
@@ -367,32 +467,70 @@ impl Pool {
             .map(|n| n.get() / 2)
             .unwrap_or(1)
             .max(1);
-        let (jobs, job_rx) = std::sync::mpsc::channel::<(u64, WorldGen, PatchKey)>();
+        let queues = Arc::new((Mutex::new(Queues::default()), Condvar::new()));
         let (done_tx, done) = std::sync::mpsc::channel();
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
         let _workers = (0..workers)
             .map(|_| {
-                let jobs = std::sync::Arc::clone(&job_rx);
+                let queues = Arc::clone(&queues);
                 let done = done_tx.clone();
                 std::thread::Builder::new()
                     .name("cubara-far".into())
-                    .spawn(move || loop {
-                        let job = jobs.lock().expect("far job lock").recv();
-                        let Ok((generation, gen, key)) = job else {
-                            break;
-                        };
-                        if done.send((generation, far::generate(&gen, key))).is_err() {
-                            break;
+                    .spawn(move || {
+                        while let Some((generation, gen, key)) = next_job(&queues) {
+                            if done.send((generation, far::generate(&gen, key))).is_err() {
+                                break;
+                            }
                         }
                     })
                     .expect("spawn far-terrain worker")
             })
             .collect();
         Self {
-            jobs,
+            queues,
             done,
             _workers,
         }
+    }
+
+    fn with_queues(&self, change: impl FnOnce(&mut Queues)) {
+        let (lock, wake) = &*self.queues;
+        change(&mut lock.lock().expect("far queues"));
+        wake.notify_all();
+    }
+
+    fn ask(&self, job: Job, urgency: Urgency) {
+        self.with_queues(|q| q.push(job, urgency));
+    }
+
+    fn promote(&self, key: PatchKey) {
+        self.with_queues(|q| q.promote(key));
+    }
+
+    /// Forget everything not taken yet (a reset: a new world).
+    fn clear(&self) {
+        self.with_queues(Queues::clear);
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.with_queues(|q| q.closed = true);
+    }
+}
+
+/// A worker's next job: the oldest urgent one, else the oldest prefetch,
+/// waiting for one; `None` once the pool is closed.
+fn next_job(queues: &(Mutex<Queues>, Condvar)) -> Option<Job> {
+    let (lock, wake) = queues;
+    let mut q = lock.lock().expect("far queues");
+    loop {
+        if q.closed {
+            return None;
+        }
+        if let Some(job) = q.take() {
+            return Some(job);
+        }
+        q = wake.wait(q).expect("far queues");
     }
 }
 
@@ -400,7 +538,14 @@ impl Pool {
 /// upload. Empty when nothing changed.
 #[derive(Debug, Default, PartialEq)]
 struct Step {
+    /// What the selection at the eye wants and nobody is generating:
+    /// generated before anything else.
     request: Vec<PatchKey>,
+    /// What the prefetch walked and nobody is generating: generated when
+    /// nothing is wanted now.
+    prefetch: Vec<PatchKey>,
+    /// Asked for by the prefetch, wanted now ([`Pool::promote`]).
+    promote: Vec<PatchKey>,
     leave: Vec<PatchKey>,
     arrive: Vec<PatchKey>,
 }
@@ -411,6 +556,13 @@ struct Step {
 ///
 /// The plan does not hold what is drawn: [`FarStreaming`]'s `slots` is the one
 /// source of truth for that, and is handed to [`step`](Self::step) each time.
+///
+/// **What is drawn is the selection the eye itself makes, on every frame**
+/// (#398): the selection is worked out again before the eye can have moved
+/// far enough to change it ([`RESELECT_SAFETY`]), and what it will want is
+/// generated before it wants it ([`PREFETCH_MARGIN`]). A patch asked for
+/// late still takes its frames to generate, and #262's rule holds while it
+/// does ([`draw_set`]) -- the prefetch is what keeps that from happening.
 struct FarPlan {
     quality: FarQuality,
     /// [`FAR_VIEW_RADIUS`] in the game; tests use less.
@@ -418,21 +570,43 @@ struct FarPlan {
     /// The quality's pixel sizes times this ([`far_view_scaled`]):
     /// [`FAR_QUAD_SCALE`] unless `--far-quad-scale` says otherwise.
     quad_scale: f64,
-    /// Every patch generated and still of use: the ones drawn, and the ones
-    /// whose error decides whether their area is split.
+    /// Every patch generated and still of use: the ones drawn, the ones
+    /// whose error decides whether their area is split, and the ones the
+    /// prefetch walked.
     heights: HashMap<PatchKey, PatchHeights>,
-    in_flight: HashSet<PatchKey>,
-    /// Where the eye was when the selection was last worked out.
+    /// Asked for and not arrived yet, and how urgently.
+    in_flight: HashMap<PatchKey, Urgency>,
+    /// Where the eye was when the selection was last worked out, and how far
+    /// it could move from there before the selection could change
+    /// ([`far::Selection::slack`]).
     selected_at: Option<[f64; 3]>,
+    slack: f64,
+    /// The last selection.
+    wanted: HashSet<PatchKey>,
+    /// Where the eye was when the prefetch was last worked out, and every
+    /// patch it walked: the ones it keeps and the ones it splits
+    /// ([`ahead_view`]).
+    ahead_at: Option<[f64; 3]>,
+    ahead: HashSet<PatchKey>,
     /// The hole the last selection left to the voxels.
     hole: Option<Hole>,
     /// The screen height the last selection was made for.
     screen_height: u32,
-    /// New patches arrived since the last selection.
+    /// A patch the selection wants arrived since it was last worked out.
     arrived: bool,
-    /// How many times [`far::select`] has run, for tests of what a frame costs.
+    /// A patch the prefetch walked arrived since it was last worked out.
+    ahead_arrived: bool,
+    /// How many times the selection and the prefetch have been worked out,
+    /// for tests of what a frame costs.
     #[cfg(test)]
     selects: u64,
+    #[cfg(test)]
+    prefetches: u64,
+}
+
+/// How far apart two eyes are, in blocks.
+fn eye_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
 }
 
 impl FarPlan {
@@ -442,13 +616,20 @@ impl FarPlan {
             radius,
             quad_scale: FAR_QUAD_SCALE,
             heights: HashMap::new(),
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
             selected_at: None,
+            slack: 0.0,
+            wanted: HashSet::new(),
+            ahead_at: None,
+            ahead: HashSet::new(),
             hole: None,
             screen_height: 0,
             arrived: false,
+            ahead_arrived: false,
             #[cfg(test)]
             selects: 0,
+            #[cfg(test)]
+            prefetches: 0,
         }
     }
 
@@ -458,20 +639,30 @@ impl FarPlan {
         self.heights.clear();
         self.in_flight.clear();
         self.selected_at = None;
+        self.wanted.clear();
+        self.ahead_at = None;
+        self.ahead.clear();
         self.arrived = false;
+        self.ahead_arrived = false;
     }
 
-    /// A patch finished generating.
+    /// A patch finished generating. The selection is worked out again only
+    /// if it wants this patch: a patch it does not want changes none of its
+    /// decisions (each reads the error of a patch it keeps, and those are
+    /// the patches it wants), so nothing else can move it (#398 §6.2's
+    /// lever). The prefetch is worked out again for one it walked.
     fn take(&mut self, patch: PatchHeights) {
-        self.in_flight.remove(&patch.key);
-        self.heights.insert(patch.key, patch);
-        self.arrived = true;
+        let key = patch.key;
+        let urgency = self.in_flight.remove(&key);
+        self.heights.insert(key, patch);
+        self.arrived |= self.wanted.contains(&key);
+        self.ahead_arrived |= urgency == Some(Urgency::Ahead) || self.ahead.contains(&key);
     }
 
-    /// Nothing generating, and the selection up to date with what has
-    /// arrived.
+    /// Nothing generating, and the selection and the prefetch up to date
+    /// with what has arrived.
     fn settled(&self) -> bool {
-        self.in_flight.is_empty() && !self.arrived
+        self.in_flight.is_empty() && !self.arrived && !self.ahead_arrived
     }
 
     /// Work the selection out again on the next [`step`](Self::step), however
@@ -486,9 +677,11 @@ impl FarPlan {
     }
 
     /// Decide what this frame changes for an eye at `eye`: work the selection
-    /// out again if the eye has moved or new patches arrived, and say what to
-    /// ask for, free and upload. `drawn` is what the renderer holds now; it is
-    /// called only if the selection is worked out.
+    /// out again if the eye has moved as far as its slack, the hole or the
+    /// screen changed, or a patch it wants arrived -- the prefetch likewise,
+    /// on its own cadence -- and say what to ask for, free and upload.
+    /// `drawn` is what the renderer holds now; it is called only if either
+    /// is worked out.
     fn step(
         &mut self,
         eye: [f64; 3],
@@ -496,21 +689,27 @@ impl FarPlan {
         hole: Hole,
         drawn: impl FnOnce() -> HashSet<PatchKey>,
     ) -> Step {
-        let moved = self.selected_at.is_none_or(|at| {
-            let d = (0..3).map(|a| (at[a] - eye[a]).powi(2)).sum::<f64>().sqrt();
-            d > RESELECT_BLOCKS
-        });
         // The hole is the voxels' to say (`NodeStreaming::far_hole`): where it
         // shrinks, patches it used to swallow are wanted at once.
         let hole_moved = self.hole != Some(hole);
         self.hole = Some(hole);
         let screen_moved = self.screen_height != screen_height;
         self.screen_height = screen_height;
-        if !(moved || hole_moved || screen_moved || self.arrived) {
+        let changed = hole_moved || screen_moved;
+        let select_due = changed
+            || self.arrived
+            || self.selected_at.is_none_or(|at| {
+                let moved = eye_distance(at, eye);
+                moved > 0.0 && moved >= self.slack * RESELECT_SAFETY
+            });
+        let prefetch_due = changed
+            || self.ahead_arrived
+            || self
+                .ahead_at
+                .is_none_or(|at| eye_distance(at, eye) > PREFETCH_RESELECT_BLOCKS);
+        if !(select_due || prefetch_due) {
             return Step::default();
         }
-        self.selected_at = Some(eye);
-        self.arrived = false;
         let drawn = drawn();
 
         let Some(view) = far_view_scaled(
@@ -521,6 +720,10 @@ impl FarPlan {
             self.quad_scale,
         ) else {
             // Off: nothing beyond the voxels.
+            self.selected_at = Some(eye);
+            self.ahead_at = Some(eye);
+            self.wanted.clear();
+            self.ahead.clear();
             let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
             leave.sort();
             return Step {
@@ -532,32 +735,75 @@ impl FarPlan {
             radius: self.radius,
             ..view
         };
-        #[cfg(test)]
-        {
-            self.selects += 1;
-        }
-        let wanted = far::select(&view, |k| self.heights.get(&k).map(|p| p.error));
+        let mut step = Step::default();
+        let error_of = |heights: &HashMap<PatchKey, PatchHeights>, k: PatchKey| {
+            heights.get(&k).map(|p| p.error)
+        };
 
-        // Ask for what is missing, nearest first: the ground under the eye
-        // matters more than the horizon.
-        let mut request: Vec<PatchKey> = wanted
-            .iter()
-            .copied()
-            .filter(|k| !self.heights.contains_key(k) && !self.in_flight.contains(k))
-            .collect();
-        request.sort_by_key(|k| k.level);
-        self.in_flight.extend(request.iter().copied());
+        // The selection first, so what it wants is asked for urgently.
+        let wanted = select_due.then(|| {
+            self.selected_at = Some(eye);
+            self.arrived = false;
+            #[cfg(test)]
+            {
+                self.selects += 1;
+            }
+            let walk = far::select_walk(&view, |k| error_of(&self.heights, k));
+            self.slack = walk.slack;
+            // Ask for what is missing, nearest first: the ground under the
+            // eye matters more than the horizon. What the prefetch asked
+            // for and no worker has started moves to the urgent queue.
+            for &k in &walk.patches {
+                if self.heights.contains_key(&k) {
+                    continue;
+                }
+                match self.in_flight.get(&k) {
+                    None => step.request.push(k),
+                    Some(Urgency::Ahead) => step.promote.push(k),
+                    Some(Urgency::Now) => {}
+                }
+            }
+            step.request.sort();
+            step.promote.sort();
+            for &k in step.request.iter().chain(&step.promote) {
+                self.in_flight.insert(k, Urgency::Now);
+            }
+            walk.patches
+        });
 
-        // Swap the drawn set, never leaving ground uncovered.
-        let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
-        let (leave, arrive) = swap(&drawn, &draw);
-        let keep = to_keep(&wanted, draw, far::root_level_for(view.radius));
-        self.heights.retain(|k, _| keep.contains(k));
-        Step {
-            request,
-            leave,
-            arrive,
+        if prefetch_due {
+            self.ahead_at = Some(eye);
+            self.ahead_arrived = false;
+            #[cfg(test)]
+            {
+                self.prefetches += 1;
+            }
+            let walk = far::select_walk(&ahead_view(&view), |k| error_of(&self.heights, k));
+            self.ahead = walk.patches.into_iter().chain(walk.split).collect();
+            step.prefetch = self
+                .ahead
+                .iter()
+                .copied()
+                .filter(|k| !self.heights.contains_key(k) && !self.in_flight.contains_key(k))
+                .collect();
+            // Finest first, then in key order, so the order is a function of
+            // the plan's state and not of the set's (rule 1).
+            step.prefetch.sort();
+            for &k in &step.prefetch {
+                self.in_flight.insert(k, Urgency::Ahead);
+            }
         }
+
+        if let Some(wanted) = wanted {
+            // Swap the drawn set, never leaving ground uncovered.
+            let draw = draw_set(&wanted, &|k| self.heights.contains_key(&k), &drawn);
+            (step.leave, step.arrive) = swap(&drawn, &draw);
+            let mut keep = to_keep(&wanted, draw, far::root_level_for(view.radius));
+            keep.extend(self.ahead.iter().copied());
+            self.heights.retain(|k, _| keep.contains(k));
+            self.wanted = wanted.into_iter().collect();
+        }
+        step
     }
 }
 
@@ -621,6 +867,7 @@ impl FarStreaming {
             renderer.far_remove(slot);
         }
         self.plan.clear();
+        self.pool.clear();
         self.generation += 1;
         self.gen = WorldGen::new(seed);
         self.seed = seed;
@@ -633,16 +880,17 @@ impl FarStreaming {
     }
 
     /// Work the selection out again on the next [`update`](Self::update),
-    /// however little the eye has moved: what a finished frame at a new eye
-    /// needs, which [`RESELECT_BLOCKS`] would otherwise leave to the last
-    /// eye's.
+    /// however little the eye has moved. The slack already makes it the
+    /// eye's own; a finished frame asks anyway, so that what it compares
+    /// against does not rest on that.
     pub fn reselect(&mut self) {
         self.plan.reselect();
     }
 
     /// Bring the far terrain in line with the camera at `eye`: take in what
     /// has been generated, work the selection out again if the eye has moved
-    /// or new patches arrived, and ask for what is missing.
+    /// or new patches arrived, and ask for what is missing -- and, a little
+    /// ahead, for what will be.
     pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3], hole: Hole) {
         while let Ok((generation, patch)) = self.pool.done.try_recv() {
             if generation != self.generation {
@@ -657,8 +905,16 @@ impl FarStreaming {
             slots.keys().copied().collect()
         });
 
+        for key in step.promote {
+            self.pool.promote(key);
+        }
         for key in step.request {
-            let _ = self.pool.jobs.send((self.generation, self.gen, key));
+            self.pool
+                .ask((self.generation, self.gen, key), Urgency::Now);
+        }
+        for key in step.prefetch {
+            self.pool
+                .ask((self.generation, self.gen, key), Urgency::Ahead);
         }
         for key in step.leave {
             if let Some(slot) = self.slots.remove(&key) {
@@ -993,10 +1249,11 @@ mod tests {
     // --- The plan without a GPU (#398, rule 6) --------------------------
 
     use std::cell::RefCell;
-    use std::collections::VecDeque;
 
-    /// Smaller than the game's radius so a flight of 600 frames runs in
-    /// seconds; the cost report uses the game's.
+    /// Smaller than the game's radius so a flight runs in seconds; the cost
+    /// report uses the game's. Far enough for what changes along the low
+    /// flight -- the splits within 1 to 3 km -- to be the game's: a patch is
+    /// split by its own distance and error, whatever the radius.
     const TEST_RADIUS: f64 = 4096.0;
 
     /// The gate's low flight: from (8, 120, 8) along (1, -0.15, 0.3) at the
@@ -1012,12 +1269,14 @@ mod tests {
             .collect()
     }
 
-    /// What the worker pool does, in frames: `workers` workers over one FIFO
-    /// in request order, each patch taking `service_frames` frames.
+    /// What the worker pool does, in frames: `workers` workers over the
+    /// pool's two queues ([`Queues`]) in request order, the urgent one
+    /// first, each patch taking `service_frames` frames.
     struct PoolModel {
         workers: usize,
         service_frames: u32,
-        queue: VecDeque<PatchKey>,
+        now: VecDeque<PatchKey>,
+        ahead: VecDeque<PatchKey>,
         busy: Vec<(PatchKey, u32)>,
     }
 
@@ -1026,7 +1285,8 @@ mod tests {
             Self {
                 workers,
                 service_frames,
-                queue: VecDeque::new(),
+                now: VecDeque::new(),
+                ahead: VecDeque::new(),
                 busy: Vec::new(),
             }
         }
@@ -1039,16 +1299,29 @@ mod tests {
 
         fn fill(&mut self) {
             while self.busy.len() < self.workers {
-                let Some(key) = self.queue.pop_front() else {
+                let Some(key) = self.now.pop_front().or_else(|| self.ahead.pop_front()) else {
                     break;
                 };
                 self.busy.push((key, self.service_frames));
             }
         }
 
-        fn request(&mut self, keys: &[PatchKey]) {
-            self.queue.extend(keys.iter().copied());
+        /// What a [`Step`] asks of the pool, as [`FarStreaming::update`]
+        /// asks it of [`Pool`].
+        fn apply(&mut self, step: &Step) {
+            for key in &step.promote {
+                if let Some(at) = self.ahead.iter().position(|k| k == key) {
+                    self.ahead.remove(at);
+                    self.now.push_back(*key);
+                }
+            }
+            self.now.extend(step.request.iter().copied());
+            self.ahead.extend(step.prefetch.iter().copied());
             self.fill();
+        }
+
+        fn queued(&self) -> usize {
+            self.now.len() + self.ahead.len()
         }
 
         /// One frame passes: what finished.
@@ -1070,7 +1343,8 @@ mod tests {
         /// Everything asked for, finished now.
         fn flush(&mut self) -> Vec<PatchKey> {
             let mut all: Vec<PatchKey> = self.busy.drain(..).map(|(k, _)| k).collect();
-            all.extend(self.queue.drain(..));
+            all.extend(self.now.drain(..));
+            all.extend(self.ahead.drain(..));
             all
         }
     }
@@ -1098,10 +1372,9 @@ mod tests {
     /// the scenario these tests were written on. What they pin -- what is
     /// asked for, kept, swapped and dropped, and when -- does not depend on
     /// the scale; whether anything happens in three seconds of flight inside
-    /// [`TEST_RADIUS`] does, and at [`FAR_QUAD_SCALE`] nothing would (the
-    /// tests' own guards against proving nothing say so).
-    /// `a_plan_at_the_games_quad_scale_settles_on_the_exact_selection` is the
-    /// one that flies the game's.
+    /// [`TEST_RADIUS`] does, and at [`FAR_QUAD_SCALE`] little would (the
+    /// tests' own guards against proving nothing say so). The tests of what
+    /// is drawn while flying fly the game's.
     const SIM_QUAD_SCALE: f64 = 1.0;
 
     /// Is the ground of `key` covered by `shown`: by `key` itself, by a
@@ -1186,7 +1459,7 @@ mod tests {
                 );
                 assert!(self.shown.insert(*key), "{key:?} arrived twice");
             }
-            self.pool.request(&step.request);
+            self.pool.apply(&step);
             step
         }
 
@@ -1225,7 +1498,7 @@ mod tests {
             for _ in 0..500 {
                 let done = self.pool.flush();
                 let step = self.frame(eye, done);
-                if step == Step::default() && self.plan.settled() && self.pool.queue.is_empty() {
+                if step == Step::default() && self.plan.settled() && self.pool.queued() == 0 {
                     return;
                 }
             }
@@ -1239,44 +1512,127 @@ mod tests {
         (Sim::new(TEST_RADIUS, hole, pool), start)
     }
 
-    /// **Flying, what is shown is seldom behind the exact selection**: with
-    /// patches that arrive at once, the frames of three seconds of low
-    /// flight that show something other than the selection at their own eye
-    /// are few -- the plan works its selection out again every
-    /// [`RESELECT_BLOCKS`], and the eye flies 0.4 block a frame. Measured:
-    /// 21 of 180. At 32 blocks (what the constant was until blocks turned
-    /// the lag into holes, #422) it was 132, which this is red on. Not
-    /// none: #398's plan (the slack `select` can report) is what makes the
-    /// live selection the exact one on every frame, and
-    /// `the_live_selection_is_the_exact_one_on_every_frame` there replaces
-    /// this.
+    /// The overlap of two boxes, `None` when they do not overlap.
+    fn overlap(a: Hole, b: Hole) -> Option<Hole> {
+        let min = [0, 1, 2].map(|i| a.min[i].max(b.min[i]));
+        let max = [0, 1, 2].map(|i| a.max[i].min(b.max[i]));
+        (0..3).all(|i| min[i] < max[i]).then_some(Hole { min, max })
+    }
+
+    /// The far terrain's hole as `NodeStreaming::far_hole` hands it over
+    /// while the eye flies: the voxels want the box round the eye's chunk;
+    /// when it moves, the hole is cut down to what the old and new boxes
+    /// share at once, and grows to the new box `lag` frames later -- the
+    /// frames its nodes take to be searched for, meshed and drawn.
+    struct HoleLag {
+        hole: Hole,
+        wanted: Hole,
+        since: usize,
+        lag: usize,
+        moves: usize,
+    }
+
+    impl HoleLag {
+        fn new(eye: [f64; 3], lag: usize) -> Self {
+            let hole = voxel_hole(eye.map(|v| v as f32));
+            Self {
+                hole,
+                wanted: hole,
+                since: 0,
+                lag,
+                moves: 0,
+            }
+        }
+
+        fn at(&mut self, eye: [f64; 3]) -> Hole {
+            let want = voxel_hole(eye.map(|v| v as f32));
+            if want != self.wanted {
+                self.moves += 1;
+                self.since = 0;
+                self.hole = overlap(self.hole, want).unwrap_or(want);
+                self.wanted = want;
+            } else {
+                self.since += 1;
+                if self.since >= self.lag {
+                    self.hole = want;
+                }
+            }
+            self.hole
+        }
+    }
+
+    /// The low flight's frames whose drawn far terrain is not the exact
+    /// selection at their own eye, flown at `scale` through a pool of 4
+    /// workers taking 2 frames a patch (the M3's `cores / 2`, slower than
+    /// the 6 to 9 ms a patch #398 step 1 measured), the voxels' box handed
+    /// over 12 frames after each move. Also how often what was drawn
+    /// changed, and how many patches were asked for, to show it was tried.
+    fn frames_behind(scale: f64, frames: usize) -> (Vec<String>, usize, usize, usize) {
+        let eyes = low_flight(frames);
+        let mut holes = HoleLag::new(eyes[0], 12);
+        let mut sim = Sim::at_scale(TEST_RADIUS, holes.hole, PoolModel::new(4, 2), scale);
+        sim.settle(eyes[0]);
+        let (mut behind, mut changes, mut asked) = (Vec::new(), 0, 0);
+        for (f, &eye) in eyes.iter().enumerate() {
+            sim.hole = holes.at(eye);
+            let before = sim.shown.clone();
+            let done = sim.pool.tick();
+            let step = sim.frame(eye, done);
+            asked += step.request.len() + step.prefetch.len();
+            changes += usize::from(sim.shown != before);
+            let exact = sim.exact(eye);
+            if sim.shown != exact {
+                let mut drawn: Vec<_> = sim.shown.difference(&exact).copied().collect();
+                let mut wanted: Vec<_> = exact.difference(&sim.shown).copied().collect();
+                drawn.sort();
+                wanted.sort();
+                behind.push(format!(
+                    "frame {f} (t {:.2} s): drawn {drawn:?}, the eye's own {wanted:?}",
+                    f as f64 / 60.0
+                ));
+            }
+        }
+        (behind, changes, asked, holes.moves)
+    }
+
+    /// **What is drawn is the far terrain the eye itself selects, on every
+    /// frame of the low flight** (#398), at the game's quad scale and at
+    /// 3. The low flight's holes were frames where it was not: at 3 a
+    /// level-5 patch split at t 2.98 s and was drawn whole for two more
+    /// frames while its children were generated (the quiet M3's hole at
+    /// (1804, 352) and 600 stale pixels at t 3.0); at 2.7 a level-4 patch at
+    /// t 11.30 s ((542, 388)); and at every move of the voxels' box the
+    /// patches the hole had swallowed behind it were drawn a frame late.
+    /// The plan as it was showed 21 such frames at 3 and 10 at 2.7 (the
+    /// game's radius, four workers at a frame a patch). The selection is
+    /// now worked out again within its slack and the patches a little
+    /// ahead of the eye are generated before it wants them.
     #[test]
-    fn the_live_selection_is_seldom_behind_the_exact_one() {
-        /// **Chosen, not derived**: the measured 21 with room.
-        const MOST: usize = 30;
-        let (mut sim, start) = sim_at_start(PoolModel::instant());
-        sim.settle(start);
-        let eyes = low_flight(180);
-        let shown = sim.fly(&eyes);
-        let behind = eyes
-            .iter()
-            .zip(&shown)
-            .filter(|(eye, shown)| **shown != sim.exact(**eye))
-            .count();
-        println!(
-            "{behind} of {} frames show something other than the exact selection",
-            eyes.len()
-        );
-        assert!(
-            behind > 0,
-            "the live selection never differed from the exact one in 3 s: \
-             this test no longer says what it was written to"
-        );
-        assert!(
-            behind <= MOST,
-            "{behind} of {} frames show something other than the exact selection, allowed {MOST}",
-            eyes.len()
-        );
+    fn the_live_selection_is_the_exact_one_on_every_frame() {
+        for scale in [FAR_QUAD_SCALE, 3.0] {
+            let (behind, changes, asked, moves) = frames_behind(scale, 1200);
+            println!(
+                "x{scale}: {} of 1200 frames behind; drawn set changed in {changes}; \
+                 {asked} patches asked for; the voxels' box moved {moves} times",
+                behind.len()
+            );
+            assert!(
+                behind.is_empty(),
+                "x{scale}: {} frames draw other far terrain than their eye selects:\n{}",
+                behind.len(),
+                behind.join("\n")
+            );
+            // Not vacuous: the far terrain changed under the eye, patches
+            // had to be generated on the way (most were generated ahead,
+            // while the plan settled at the start), and the voxels' box
+            // moved.
+            assert!(
+                changes >= 8,
+                "x{scale}: the drawn set changed {changes} times"
+            );
+            assert!(asked > 0, "x{scale}: nothing was asked for in flight");
+            assert!(moves >= 3, "x{scale}: the box moved {moves} times");
+        }
     }
 
     /// With everything arrived and the eye where it was, what is shown is the
@@ -1309,25 +1665,33 @@ mod tests {
             "a root is drawn whole, so no root's heights were needed"
         );
         // And it stays settled: nothing more is selected, asked for or moved.
-        let selects = sim.plan.selects;
+        let (selects, prefetches) = (sim.plan.selects, sim.plan.prefetches);
         for _ in 0..20 {
             let done = sim.pool.tick();
             assert_eq!(sim.frame(start, done), Step::default());
         }
-        assert_eq!(sim.plan.selects, selects);
+        assert_eq!(
+            (sim.plan.selects, sim.plan.prefetches),
+            (selects, prefetches)
+        );
     }
 
-    /// A settled plan at a standing eye costs nothing: no step, no select.
+    /// A settled plan at a standing eye costs nothing: no step, no select,
+    /// no prefetch.
     #[test]
     fn standing_still_selects_nothing() {
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
-        let selects = sim.plan.selects;
+        let (selects, prefetches) = (sim.plan.selects, sim.plan.prefetches);
         for _ in 0..100 {
             let done = sim.pool.tick();
             assert_eq!(sim.frame(start, done), Step::default());
         }
         assert_eq!(sim.plan.selects, selects, "a standing eye selected again");
+        assert_eq!(
+            sim.plan.prefetches, prefetches,
+            "a standing eye prefetched again"
+        );
     }
 
     /// The things that make the plan work again besides the eye: a new hole,
@@ -1351,6 +1715,260 @@ mod tests {
         assert_eq!(sim.plan.selects, n + 3, "a new hole did nothing");
         sim.plan.step(start, 720, hole, || shown.clone());
         assert_eq!(sim.plan.selects, n + 3, "nothing changed but it selected");
+    }
+
+    /// **The selection is worked out again only once the eye has moved as
+    /// far as its slack**, and then at once: half the slack away nothing is
+    /// selected, a little past it the plan selects. A standing eye whose
+    /// slack is nothing at all selects nothing either.
+    #[test]
+    fn the_selection_is_worked_out_again_once_the_eye_has_moved_its_slack() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let slack = sim.plan.slack;
+        assert!(
+            slack > 0.5 && slack.is_finite(),
+            "a slack of {slack} blocks tests nothing"
+        );
+        let n = sim.plan.selects;
+        let (hole, shown) = (sim.hole, sim.shown.clone());
+        let at = |d: f64| [start[0] + d, start[1], start[2]];
+        sim.plan.step(at(slack * 0.5), 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n, "half the slack away it selected");
+        sim.plan
+            .step(at(slack * 1.01), 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "past the slack it did not select");
+        sim.plan.slack = 0.0;
+        let here = at(slack * 1.01);
+        sim.plan.step(here, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "a standing eye selected");
+    }
+
+    /// **A patch the selection does not want selects nothing when it
+    /// arrives** (#398 §6.2's lever): none of the selection's decisions read
+    /// its error. One it wants does, and one the prefetch walked works the
+    /// prefetch out again.
+    #[test]
+    fn only_an_arrival_the_selection_wants_works_it_out_again() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let (n, p) = (sim.plan.selects, sim.plan.prefetches);
+        let (hole, shown) = (sim.hole, sim.shown.clone());
+        // A patch nobody wants, far off.
+        let stray = PatchKey::new(5, 40, 40);
+        sim.plan.take(sim.heights(stray));
+        sim.plan.step(start, 1080, hole, || shown.clone());
+        assert_eq!(
+            (sim.plan.selects, sim.plan.prefetches),
+            (n, p),
+            "a stray arrival"
+        );
+        // One the selection wants, generated again. (The prefetch walks
+        // every patch the selection does, so it is worked out again too.)
+        let wanted = *sim.plan.wanted.iter().min().expect("something is wanted");
+        sim.plan.take(sim.heights(wanted));
+        sim.plan.step(start, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "a wanted arrival selected nothing");
+        let p = sim.plan.prefetches;
+        // One the prefetch walked and the selection does not want.
+        let ahead = *sim
+            .plan
+            .ahead
+            .iter()
+            .filter(|k| !sim.plan.wanted.contains(k))
+            .min()
+            .expect("the prefetch walks more than is wanted");
+        sim.plan.take(sim.heights(ahead));
+        sim.plan.step(start, 1080, hole, || shown.clone());
+        assert_eq!(sim.plan.selects, n + 1, "a prefetch arrival selected");
+        assert_eq!(
+            sim.plan.prefetches,
+            p + 1,
+            "a prefetch arrival did not prefetch"
+        );
+    }
+
+    /// **The prefetch walks every patch a nearby eye selects** -- the
+    /// promise [`ahead_view`] makes. By distance alone (no errors known, so
+    /// every split is the split distance's or the width floor's), at the low
+    /// flight's start and halfway, the patches the eye selects from 24
+    /// blocks away in each of eight directions are all among the patches the
+    /// prefetch walks from here, kept or split; and from a point a whole
+    /// margin further on they are not, which is what makes the margin the
+    /// thing tested.
+    #[test]
+    fn the_prefetch_walks_every_patch_a_nearby_eye_selects() {
+        let view_at = |eye: [f64; 3]| FarView {
+            radius: TEST_RADIUS,
+            ..far_view_scaled(
+                eye,
+                1080,
+                Some(voxel_hole([8.0, 120.0, 8.0])),
+                FarQuality::High,
+                SIM_QUAD_SCALE,
+            )
+            .unwrap()
+        };
+        let mut missed_far_off = 0;
+        for eye in [[8.0, 120.0, 8.0], [240.0, 85.0, 75.0]] {
+            let ahead = far::select_walk(&ahead_view(&view_at(eye)), |_| None);
+            let walked: HashSet<PatchKey> = ahead.patches.into_iter().chain(ahead.split).collect();
+            for (dx, dz) in [
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (0.0, 1.0),
+                (0.0, -1.0),
+                (0.7, 0.7),
+                (-0.7, 0.7),
+                (0.7, -0.7),
+                (-0.7, -0.7),
+            ] {
+                let near = [eye[0] + 24.0 * dx, eye[1], eye[2] + 24.0 * dz];
+                for k in far::select(&view_at(near), |_| None) {
+                    assert!(
+                        walked.contains(&k),
+                        "{k:?}, selected 24 blocks from {eye:?}, was not prefetched there"
+                    );
+                }
+                let far_off = [eye[0] + 400.0 * dx, eye[1], eye[2] + 400.0 * dz];
+                missed_far_off += far::select(&view_at(far_off), |_| None)
+                    .into_iter()
+                    .filter(|k| !walked.contains(k))
+                    .count();
+            }
+        }
+        assert!(
+            missed_far_off > 0,
+            "the prefetch held every patch even 400 blocks off: the margin tests nothing"
+        );
+    }
+
+    /// **The prefetch waits behind what the eye wants**: the pool's workers
+    /// take the urgent queue first, and a patch the prefetch asked for that
+    /// the eye now wants moves to it.
+    #[test]
+    fn the_prefetch_waits_behind_what_the_eye_wants() {
+        let (a, b, c) = (
+            PatchKey::new(4, 0, 0),
+            PatchKey::new(4, 1, 0),
+            PatchKey::new(4, 2, 0),
+        );
+        let mut pool = PoolModel::new(1, 1);
+        // The worker is busy with `a`; `b` and `c` wait for the prefetch.
+        pool.apply(&Step {
+            request: vec![a],
+            prefetch: vec![b, c],
+            ..Step::default()
+        });
+        // `c` is wanted now.
+        pool.apply(&Step {
+            promote: vec![c],
+            ..Step::default()
+        });
+        assert_eq!(pool.tick(), vec![a]);
+        assert_eq!(pool.tick(), vec![c], "the promoted patch did not go first");
+        assert_eq!(pool.tick(), vec![b]);
+        // And the plan asks so: a wanted patch already asked for by the
+        // prefetch is promoted, not asked for twice.
+        let (mut sim, start) = sim_at_start(PoolModel::new(1, 50));
+        let first = sim.frame(start, Vec::new());
+        assert!(!first.request.is_empty() && !first.prefetch.is_empty());
+        assert!(
+            first.request.iter().all(|k| !first.prefetch.contains(k)),
+            "a patch was asked for urgently and for the prefetch at once"
+        );
+    }
+
+    /// The real pool's queues: the urgent one first, a promoted prefetch
+    /// at its back, each queue in the order asked; and a closed pool hands
+    /// its workers nothing.
+    #[test]
+    fn the_pool_takes_the_urgent_queue_first() {
+        let gen = WorldGen::new(1);
+        let job = |x: i32| (0u64, gen, PatchKey::new(4, x, 0));
+        let mut q = Queues::default();
+        q.push(job(1), Urgency::Ahead);
+        q.push(job(2), Urgency::Ahead);
+        q.push(job(3), Urgency::Now);
+        q.push(job(4), Urgency::Ahead);
+        q.promote(PatchKey::new(4, 2, 0));
+        q.promote(PatchKey::new(4, 9, 0));
+        let order: Vec<i32> = std::iter::from_fn(|| q.take()).map(|j| j.2.x).collect();
+        assert_eq!(order, vec![3, 2, 1, 4]);
+        q.push(job(5), Urgency::Now);
+        q.clear();
+        assert!(q.take().is_none(), "clear left a job");
+        let closed = (
+            Mutex::new(Queues {
+                closed: true,
+                ..Queues::default()
+            }),
+            Condvar::new(),
+        );
+        assert!(
+            next_job(&closed).is_none(),
+            "a closed pool handed out a job"
+        );
+        let open = (Mutex::new(Queues::default()), Condvar::new());
+        open.0.lock().unwrap().push(job(6), Urgency::Ahead);
+        assert_eq!(next_job(&open).map(|j| j.2.x), Some(6));
+    }
+
+    /// **A patch the prefetch asked for and the eye now wants is promoted**,
+    /// not asked for a second time; the plan then counts it as urgent.
+    #[test]
+    fn a_wanted_patch_the_prefetch_asked_for_is_promoted() {
+        let (mut sim, start) = sim_at_start(PoolModel::instant());
+        sim.settle(start);
+        let k = *sim.plan.wanted.iter().min().expect("something is wanted");
+        sim.plan.heights.remove(&k);
+        sim.plan.in_flight.insert(k, Urgency::Ahead);
+        sim.plan.reselect();
+        let shown = sim.shown.clone();
+        let step = sim.plan.step(start, 1080, sim.hole, || shown.clone());
+        assert_eq!(step.promote, vec![k], "not promoted");
+        assert!(!step.request.contains(&k), "asked for twice");
+        assert_eq!(sim.plan.in_flight.get(&k), Some(&Urgency::Now));
+    }
+
+    /// **When the voxels' box moves, the far terrain it hands back is
+    /// already generated**: the patches its hole swallowed on the side it
+    /// leaves are drawn on the frame of the move, and nothing is asked for
+    /// urgently. The plan as it was drew that side a frame or more late,
+    /// with nothing in its place (behind the eye on the low flight; in sight
+    /// of anyone looking back).
+    #[test]
+    fn a_box_move_finds_what_it_hands_back_generated() {
+        // x crosses 128 between these two eyes: the box moves +x by a
+        // coarsest node.
+        let (before, after) = ([127.0, 102.0, 44.0], [129.0, 102.0, 44.0]);
+        let mut holes = HoleLag::new(before, 1000);
+        let mut sim = Sim::at_scale(
+            TEST_RADIUS,
+            holes.hole,
+            PoolModel::new(4, 2),
+            FAR_QUAD_SCALE,
+        );
+        sim.settle(before);
+        let old = sim.hole;
+        sim.hole = holes.at(after);
+        assert_eq!(holes.moves, 1, "the box did not move");
+        let step = sim.frame(after, Vec::new());
+        assert!(
+            step.request.is_empty() && step.promote.is_empty(),
+            "the move needed {:?} and {:?}",
+            step.request,
+            step.promote
+        );
+        assert_eq!(sim.shown, sim.exact(after), "the move drew late");
+        // Not vacuous: ground the old hole swallowed arrived.
+        assert!(
+            step.arrive
+                .iter()
+                .any(|k| (k.origin()[0] as f64) < old.min[0] + coarsest_node_blocks()),
+            "nothing arrived on the side the box left: {:?}",
+            step.arrive
+        );
     }
 
     /// **The plan selects at the quad scale it is given** -- the game's
@@ -1414,7 +2032,7 @@ mod tests {
         let mut sorted: Vec<_> = drawn.into_iter().collect();
         sorted.sort();
         assert_eq!(step.leave, sorted);
-        assert!(step.request.is_empty() && step.arrive.is_empty());
+        assert!(step.request.is_empty() && step.prefetch.is_empty() && step.arrive.is_empty());
     }
 
     /// A patch asked for is not asked for again while it is generating, and
@@ -1424,14 +2042,21 @@ mod tests {
         let (mut sim, start) = sim_at_start(PoolModel::new(4, 2));
         let step = sim.frame(start, Vec::new());
         assert!(!step.request.is_empty());
-        assert!(
-            step.request.windows(2).all(|w| w[0].level <= w[1].level),
-            "not finest first"
-        );
+        for asked in [&step.request, &step.prefetch] {
+            assert!(
+                asked.windows(2).all(|w| w[0].level <= w[1].level),
+                "not finest first"
+            );
+        }
         sim.plan.reselect();
         let again = sim.frame(start, Vec::new());
+        let before: HashSet<_> = step.request.iter().chain(&step.prefetch).collect();
         assert!(
-            again.request.iter().all(|k| !step.request.contains(k)),
+            again
+                .request
+                .iter()
+                .chain(&again.prefetch)
+                .all(|k| !before.contains(k)),
             "a patch still generating was asked for again"
         );
     }
@@ -1444,18 +2069,20 @@ mod tests {
     /// ```
     ///
     /// The game's radius, the low flight at 60 Hz for 600 frames, the pool
-    /// modelled as 4 workers (the M3's `cores / 2`) at 2 frames a patch (a
-    /// placeholder until #398 step 1's measured service time is applied:
-    /// 6-9 ms, i.e. one frame). The memo is warmed by a first, untimed
-    /// flight so generation is not in the numbers.
+    /// modelled as 4 workers (the M3's `cores / 2`) at 2 frames a patch. The
+    /// memo is warmed by a first, untimed flight so generation is not in the
+    /// numbers.
     #[test]
     #[ignore = "a measurement, not a check: prints what the plan's step costs"]
     fn far_plan_cost_report() {
         let eyes = low_flight(600);
         let start = eyes[0];
         let hole = voxel_hole(start.map(|v| v as f32));
-        // At the game's quad scale: what the game's own plan costs.
-        let game = |pool| Sim::at_scale(FAR_VIEW_RADIUS, hole, pool, FAR_QUAD_SCALE);
+        let scale = std::env::var("FAR_PLAN_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(FAR_QUAD_SCALE);
+        let game = |pool| Sim::at_scale(FAR_VIEW_RADIUS, hole, pool, scale);
         let mut sim = game(PoolModel::new(4, 2));
         sim.settle(start);
         sim.fly(&eyes);
@@ -1464,9 +2091,11 @@ mod tests {
         let mut sim = game(PoolModel::new(4, 2));
         sim.memo = memo;
         sim.settle(start);
-        let selects_before = sim.plan.selects;
+        let (selects_before, prefetches_before) = (sim.plan.selects, sim.plan.prefetches);
+        let mut holes = HoleLag::new(start, 12);
         let mut times = Vec::new();
         for &eye in &eyes {
+            sim.hole = holes.at(eye);
             let finished = sim.pool.tick();
             for key in finished {
                 let patch = sim.heights(key);
@@ -1474,13 +2103,13 @@ mod tests {
             }
             let shown = &sim.shown;
             let t = std::time::Instant::now();
-            let step = sim.plan.step(eye, 1080, hole, || shown.clone());
+            let step = sim.plan.step(eye, 1080, sim.hole, || shown.clone());
             times.push(t.elapsed());
             for key in &step.leave {
                 sim.shown.remove(key);
             }
             sim.shown.extend(step.arrive.iter().copied());
-            sim.pool.request(&step.request);
+            sim.pool.apply(&step);
         }
         let ms = |d: &std::time::Duration| d.as_secs_f64() * 1e3;
         let sum: f64 = times.iter().map(ms).sum();
@@ -1488,39 +2117,16 @@ mod tests {
         sorted.sort_by(f64::total_cmp);
         let p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
         println!(
-            "FAR_PLAN_COST frames {} sum {sum:.2} ms mean {:.4} ms p99 {p99:.3} ms max {:.3} ms; \
-             selects {} (exact; no prefetch in this version); shown {}",
+            "FAR_PLAN_COST x{scale} frames {} sum {sum:.2} ms mean {:.4} ms p99 {p99:.3} ms \
+             max {:.3} ms; selects {} prefetches {}; shown {}; held {}",
             times.len(),
             sum / times.len() as f64,
             sorted.last().unwrap(),
             sim.plan.selects - selects_before,
+            sim.plan.prefetches - prefetches_before,
             sim.shown.len(),
+            sim.plan.heights.len(),
         );
-    }
-
-    /// Past `RESELECT_BLOCKS` the selection is worked out again; within it,
-    /// with nothing arrived, it is not.
-    #[test]
-    fn the_eye_moving_past_the_reselect_distance_selects_again() {
-        let (mut sim, start) = sim_at_start(PoolModel::instant());
-        sim.settle(start);
-        let n = sim.plan.selects;
-        let (hole, shown) = (sim.hole, sim.shown.clone());
-        let near = [start[0] + RESELECT_BLOCKS * 0.5, start[1], start[2]];
-        sim.plan.step(near, 1080, hole, || shown.clone());
-        assert_eq!(sim.plan.selects, n, "a small move selected");
-        // Exactly the distance is not past it (a move of 32 is exact in f64).
-        let edge = [start[0] + RESELECT_BLOCKS, start[1], start[2]];
-        let from = [start[0], start[1], start[2]];
-        sim.plan.selected_at = Some(from);
-        sim.plan.step(edge, 1080, hole, || shown.clone());
-        assert_eq!(
-            sim.plan.selects, n,
-            "a move of exactly the distance selected"
-        );
-        let far = [start[0] + RESELECT_BLOCKS * 2.0, start[1], start[2]];
-        sim.plan.step(far, 1080, hole, || shown.clone());
-        assert_eq!(sim.plan.selects, n + 1, "a move past the distance did not");
     }
 
     /// A patch taken in is not "settled" until a selection has seen it; and
@@ -1532,14 +2138,28 @@ mod tests {
         assert!(!sim.plan.settled(), "patches are generating");
         sim.plan.clear();
         assert!(sim.plan.settled(), "clear kept what was generating");
+        // A wanted patch arriving, which no selection has seen yet.
+        sim.plan.wanted.insert(step.request[0]);
         let patch = sim.heights(step.request[0]);
         sim.plan.take(patch);
         assert!(!sim.plan.settled(), "an arrival no selection has seen");
+        // A patch the prefetch walked, arriving: its error may split more
+        // of what the prefetch walks, so not settled until it has seen it.
+        sim.plan.clear();
+        let ahead = step.prefetch[0];
+        sim.plan.ahead.insert(ahead);
+        let patch = sim.heights(ahead);
+        sim.plan.take(patch);
+        assert!(
+            !sim.plan.settled(),
+            "a prefetch arrival no prefetch has seen"
+        );
     }
 
     /// Patches nothing wants any more are dropped: after moving far away and
-    /// settling, the plan holds the exact selection's patches and their
-    /// ancestors, not everything it ever generated.
+    /// settling, the plan holds the exact selection's patches, their
+    /// ancestors and what the prefetch walked -- not everything it ever
+    /// generated.
     #[test]
     fn what_is_no_longer_wanted_is_dropped() {
         let (mut sim, start) = sim_at_start(PoolModel::instant());

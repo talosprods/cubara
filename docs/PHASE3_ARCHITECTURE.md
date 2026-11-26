@@ -1816,7 +1816,10 @@ against 515. The far pass is the
 GPU's and the CPU has room (`BENCHMARKS.md`: about 0.42 ms a frame at the
 ground eye, of about 0.9), so 4 (chosen, not derived).
 
-**The quad scale: 2.7 chosen, 3 shipped for now.** At 2.7 the quiet low flight showed a hole in every run, from the far selection's lag (#398) and not from the tiles (`FAR_QUAD_SCALE`'s comment says how); 2.7 comes back when that lag is closed. Fewer triangles was not the measure.
+**The quad scale: 2.7.** It was shipped at 3 for a day: at 2.7 the quiet
+low flight showed a hole in every run, from the far selection's lag (#398)
+and not from the tiles. #398 closed that lag (§9.10), and 2.7 came back
+with it. Fewer triangles was not the measure.
 The quiet M3 bench of the tiles (`BENCHMARKS.md`; Medium, two runs, hill eye,
 FPS): main at x3 1,043 and 1,043; the tiles at x3 1,111 (+6.5%); the tiles
 at x2.09 -- fewer triangles than main's x3, 182,132 against 193,641 -- 1,026
@@ -1910,15 +1913,10 @@ Measured on the low flight (`--bench flight --eye 8,120,8 --look
 The 26 are one event of 0.4 s, a pixel or two at the foot of one mountain;
 the flight toward the mountain shows none at either distance.
 
-So `RESELECT_BLOCKS` is 1 (chosen, not derived: #398's "tiny" variant; the
-eye flies 0.4 block a frame). It is not #398's fix -- its plan replaces the
-constant with the slack `select` can report, and generates ahead -- and it
-does not make the live selection exact: a patch asked for still takes its
-frames to generate. What the plan costs the main thread
-(`far_plan_cost_report`, 600 frames of the low flight at the game's radius
-and quad scale, 232 patches shown): 200 selections where 32 blocks made 25,
-0.013 ms a frame in the mean, 0.041 ms at the 99th percentile and 0.046 at
-most. A standing eye selects nothing, as before.
+So `RESELECT_BLOCKS` became 1 (#398's "tiny" variant). It was not #398's
+fix, and it did not make the live selection exact: a patch asked for still
+took its frames to generate. #398 replaced it with the slack and the
+prefetch (§9.10).
 
 **What the zoom test found in the far terrain, and what became of it**
 (2026-11-21; `far_study.rs`'s `summit_lift_report` and
@@ -2282,3 +2280,137 @@ the forest at levels 1 to 3, `lod_boundary`, `ring_edge_288m`,
 pits as dents with stone walls where it showed flat ground, or flat paint
 (#438) -- and `a_fully_morphed_level_draws_its_parents_colours` and
 `a_forest_swaps_nothing_at_its_ring_edges` pass unchanged.
+
+### 9.10 Flicker and first load: the far selection on every frame (#398)
+
+**The owner's rule (2026-11-25).** *"het mag bij het orginele inladen 1
+keer doorschijnend zijn, dat je dus ziet dat het nog niet geladen is. als
+het eenmaal ingeladen is, blijft het wel consistent. het is heel
+hinderlijk als terrein lijkt te flikkeren."* Land never drawn yet may show
+through once while it first loads; land that has been drawn never shows
+through again, for any reason. Gate item 0 reads the second as a term that
+must be 0, in place of `STALE_KEPT_FRAMES`, which counted both
+(`scripts/check-phase-gate.sh`, `ROADMAP.md`).
+
+**The measure: per line of sight.** `--bench flight` prints `FLICKER:` --
+the frames showing land drawn before as nothing where the finished frame
+has it inside land -- and `FIRST LOAD:` -- the kept frames showing land not
+drawn yet as nothing. Every hole is flicker (land all round the frame
+before, nothing, land again, the finished frame agreeing). A kept frame's
+stale pixel is flicker when its run of nothing began right after a frame in
+which it was inside land (`HoleTracker::drawn_and_missing`), however long
+ago, and first load otherwise (`split_stale`). One rule for "not on a
+skyline" judges all of it (`inside_land`, #443).
+
+Per pixel and not per world column, far patch or node, although a line of
+sight moves with the eye: what the owner sees flicker is a pixel showing
+land, then sky, then land, and ground can go missing from a pixel while
+everything that was drawn stays drawn. The low flight's hole at t 11.29 s
+at a quad scale of 2.7 is the case: the voxels' strip took over from the
+far terrain in front of a far patch, and that patch, a level coarser than
+the finished frame's for two frames, did not reach up to the pixel the
+strip had covered. Every column there stayed covered, no patch or node was
+drawn and then dropped, and the pixel blinked. Bookkeeping by columns,
+patches or nodes would have called it first load. The cost of the per-pixel
+rule is a long run: the eye moves 0.4 block a frame, and over half a second
+a pixel's line of sight can move off the ground it began on; the finished
+frame's inside-land test keeps a moving skyline out, and what is left is
+ground revealed by a ridge passing in front of it while it is not drawn --
+which only happens while something lags.
+
+The same quiet runs of main that showed holes would have shown, split this
+way (`run-442x3`, low flight, M3): the holes at t 2.98 to 3.01 s and t 5.49 s
+are flicker; the kept frames at t 5.50, 11.0 and 16.75 s (stale pixels under
+loading nodes and late swaps where the voxels' box had just moved) are the
+voxels loading, flicker or first load by their pixels' runs -- the lead's
+flights of this PR give the split.
+
+**The far selection's lag, closed.** Two holes of the low flight were the
+far terrain drawn a level coarser than the eye selects, for the frames its
+finer patches took to come: at x3 a level-5 patch split at t 2.98 s and
+drawn whole for two more frames (the hole at (1804, 352), 600 stale pixels
+at t 3.01); at 2.7 a level-4 patch at t 11.30 s ((542, 388)). Replayed
+without a GPU (the plan, a modelled pool of 4 workers, the voxels' box
+moving with the eye): the plan as it was drew another selection than the
+eye's on 21 frames of 1,200 at x3 and 10 at 2.7 (the game's radius, a frame
+a patch), every one of them a split or merge late, or a patch the hole had
+swallowed drawn late behind a moving box. Now on none, at either scale
+(`the_live_selection_is_the_exact_one_on_every_frame`, 4 workers at 2 frames
+a patch -- slower than the M3 -- the box handed over 12 frames after each
+move). Three changes:
+
+- **The selection is worked out again within its slack** (#398's plan A).
+  `far::select_walk` returns, beside the patches, how far the eye can move
+  before any decision of the walk could change: each decision compares a
+  distance from the eye to a box with a fixed threshold -- the radius, the
+  split distance, the width floor, the error's -- and such a distance
+  changes by at most what the eye moves. The plan selects again once the
+  eye has moved 99% of it (`RESELECT_SAFETY`, chosen, not derived), so the
+  drawn selection is the one the eye itself makes on every frame. An error
+  of 0 has no threshold (`e > max_error * d` never holds). Which roots the
+  walk starts from was a decision too, made from the eye cut to whole
+  blocks, and a root within the radius by less than the eye's fraction of a
+  block was not walked: the walk now starts from every root within reach
+  and one more on every side, which the radius test drops, so that range
+  decides nothing (two of `select_output_is_pinned`'s twelve pins moved, by
+  four roots each, all 262 km off and past the fog).
+  `following_the_slack_keeps_the_selection_exact_at_every_step` holds it on
+  five flights of 1,500 steps, one for each threshold (the gate's three
+  lines, rough ground everywhere for the width floor, a radius of 1,500 the
+  flight crosses), with 82 to 251 selections; it was green on three lines
+  and blind to the width floor and the radius, and the two flights added
+  for them found the root range. A patch arriving selects again only if the
+  selection wants it -- none of its decisions read another's error (#398
+  §6.2's lever).
+- **What a nearby eye will want is generated before it wants it** (#398's
+  plan B). The plan walks a second view, everything 1/16 nearer
+  (`PREFETCH_MARGIN`, chosen, not derived: 60 blocks ahead at 1,024, where a
+  patch takes 6 to 9 ms), reaching 1/16 further, with a hole one coarsest
+  node smaller on every side -- the ground a moving voxels' box hands back,
+  which `NodeStreaming::far_hole` gives the far terrain at once. Every test
+  to split in it is the eye's or looser and its hole is inside the eye's,
+  so it keeps or splits every patch the eye's view does; it asks for every
+  patch it walks, the ones it keeps and the ones it splits, because a
+  nearer eye keeps the one and a farther eye the other. Worked out again
+  every 8 blocks (`PREFETCH_RESELECT_BLOCKS`, chosen, not derived), when the
+  hole changes, and when a patch it asked for arrives (its error may split
+  more). Held on the CPU; nothing is uploaded until the selection asks.
+- **The prefetch waits behind what the eye wants.** The worker pool has two
+  queues, and a patch the prefetch asked for that the eye now wants moves
+  to the urgent one (`the_prefetch_waits_behind_what_the_eye_wants`).
+
+What it costs the main thread (`far_plan_cost_report`, 600 frames of the low
+flight at the game's radius, a busy machine): at x3 92 selections and 30
+prefetch walks where 200 selections were made, 0.0072 ms a frame in the
+mean (was 0.013), 0.056 ms at the 99th percentile (was 0.041) and 0.063 at
+most; at 2.7 58 and 31, 0.0055 / 0.052 / 0.070 ms. #398 §6.2's budget is a
+sum within 3x and no step over 1 ms. The plan holds the heights of 304
+patches at x3 and 328 at 2.7, of which 206 and 227 are drawn.
+
+**Not closed: the strip's sliver.** While the voxels' box has moved and the
+nodes of the strip it gained are not all drawn, the far terrain stands in
+for the strip (`NodeStreaming::far_hole`), drawn as the far terrain draws
+there -- quads of 16 to 32 -- where the finished frame has level 3's cells.
+A sliver of sky between two of its ridges that slides over a pixel level 3
+covers is flicker (#443's frame 326; t 5.49 s at (211, 358) on both quiet
+x3 runs of #442). Two ways of closing it were measured and are not built:
+
+- *A far terrain of level 3 round the voxels' box*, one coarsest node wide,
+  so that the strip is level 3's outline before the box moves (#443's
+  option B): `far_census_scale_scan` puts it at 221,136 far triangles at the
+  hill eye at 2.7 where the far terrain draws 146,586 (+51%; x3 216,783
+  against 135,424, +60%; the flight eye, which does not look at the box's
+  edge, +0.3%). At 1.6 to 2.2 ns a triangle that faces the eye, the gate's
+  hill eye does not hold it.
+- *Level 3 only while a strip waits.* A quad of 8 is a patch of 256 blocks,
+  wider than the strip, and the patches above it in the quadtree split with
+  it: for those frames the far terrain beyond the box is a level finer than
+  the finished frame's, over a band of 256 to 512 blocks along the whole
+  edge. Where the finer outline is lower, land drawn goes missing: flicker
+  over a band, to remove a sliver.
+
+What would close it: the strip's level-3 stand-in drawn by the far terrain
+*in addition* to a selection holed at the box the voxels want, clipped to
+the strip -- the far terrain the finished frame draws, plus level 3 where it
+draws nodes. A renderer change (a second box, kept where the hole is cut),
+left for its own issue.
