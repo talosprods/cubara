@@ -81,6 +81,7 @@ use cubara_render::materials::mean_color;
 use cubara_render::{FarDir, Lighting};
 use cubara_voxel::{BlockRegistry, Face, MeshContext, NodeChunk};
 use cubara_world::far::{self, PatchKey};
+use cubara_world::mesh::NeighbourBlocks;
 use cubara_world::node::NodeKey;
 use cubara_world::{TerrainBlocks, World, WorldGen, SOIL_DEPTH};
 use glam::Vec3;
@@ -561,7 +562,17 @@ pub fn draw_voxels(setup: &Setup, fp: Footprint, level: u32, source: NodeSource)
                 // Every border face drawn and no skirts: what a neighbour
                 // covers is decided below, from the tops, for every face
                 // alike.
-                let mesh = chunk.build_mesh_with_neighbours(&ctx, |_, _, _| false, |_, _, _| false);
+                // The AO across a chunk border is the game's too: its neighbour
+                // blocks, from the one place that says them.
+                let neighbours =
+                    NeighbourBlocks::new(&setup.world, &setup.registry, node, setup.blocks);
+                let mesh = chunk.build_mesh_morph(
+                    &ctx,
+                    |_, _, _| false,
+                    |_, _, _| false,
+                    |x, y, z| neighbours.solid(x, y, z),
+                    None,
+                );
                 meshes.push((origin, mesh));
             }
         }

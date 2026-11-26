@@ -108,6 +108,21 @@ impl Hole {
     fn contains_box(&self, min: [f64; 3], max: [f64; 3]) -> bool {
         (0..3).all(|a| self.min[a] <= min[a] && max[a] <= self.max[a])
     }
+
+    /// The same box with its ground -- `x` and `z`, not `y` -- grown by
+    /// `by` blocks on every side (shrunk, for a negative `by`; `None` when
+    /// that leaves nothing).
+    pub fn grown_across(self, by: f64) -> Option<Hole> {
+        let mut out = self;
+        for a in [0, 2] {
+            out.min[a] -= by;
+            out.max[a] += by;
+        }
+        [0, 2]
+            .iter()
+            .all(|&a| out.min[a] < out.max[a])
+            .then_some(out)
+    }
 }
 
 /// Everything [`select`] needs: where the eye is, how finely to draw, how far,
@@ -165,13 +180,50 @@ pub fn surface_bounds() -> (f64, f64) {
 /// toward the answer: select, generate what is new, select again. A patch
 /// whose error is not known yet is judged by distance alone.
 pub fn select(view: &FarView, error_of: impl Fn(PatchKey) -> Option<f32>) -> Vec<PatchKey> {
+    select_walk(view, error_of).patches
+}
+
+/// What one walk of [`select`] found: the patches, the ones split on the
+/// way to them, and how far the eye may move before any of it can change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Selection {
+    /// What [`select`] returns.
+    pub patches: Vec<PatchKey>,
+    /// Every patch the walk split: the ancestors of `patches`, up to the
+    /// roots, that were not dropped. The patches a nearer or farther eye
+    /// could keep whole (`FarPlan`'s prefetch in the app).
+    pub split: Vec<PatchKey>,
+    /// **How far the eye may move, in blocks, before the walk could decide
+    /// anything differently** -- with the same errors known and the same
+    /// hole. Every decision compares a distance from the eye to a box
+    /// with a fixed threshold, and such a distance changes by at most what
+    /// the eye moves; this is the smallest gap between a distance and its
+    /// threshold the walk met (#398's plan A). An eye nearer than this to
+    /// `view.eye` selects the same patches.
+    pub slack: f64,
+}
+
+/// [`select`], with what else the walk found ([`Selection`]). One walk: the
+/// patches it returns are `select`'s.
+pub fn select_walk(view: &FarView, error_of: impl Fn(PatchKey) -> Option<f32>) -> Selection {
     let root_level = root_level_for(view.radius);
-    let root_size = (PATCH_QUADS as i64) << root_level;
-    let reach = view.radius.ceil() as i64;
+    let root_size = ((PATCH_QUADS as i64) << root_level) as f64;
     let [ex, _, ez] = view.eye;
-    let lo = |c: f64| ((c as i64) - reach).div_euclid(root_size);
-    let hi = |c: f64| ((c as i64) + reach).div_euclid(root_size);
-    let mut out = Vec::new();
+    // Every root that can reach within the radius, and one more on every
+    // side, which the radius test drops: so which roots are walked never
+    // decides anything, and a root coming within reach as the eye moves is
+    // one the walk already measured -- its gap to the radius is in the
+    // slack. (The range was worked out from the eye truncated to whole
+    // blocks, and a root within the radius by less than the eye's fraction
+    // of a block was not walked; at the edge of the far terrain, out of
+    // sight, but a decision the slack did not know about.)
+    let lo = |c: f64| ((c - view.radius) / root_size).floor() as i64 - 1;
+    let hi = |c: f64| ((c + view.radius) / root_size).floor() as i64 + 1;
+    let mut out = Selection {
+        patches: Vec::new(),
+        split: Vec::new(),
+        slack: f64::INFINITY,
+    };
     for x in lo(ex)..=hi(ex) {
         for z in lo(ez)..=hi(ez) {
             walk(
@@ -200,26 +252,47 @@ fn walk(
     view: &FarView,
     error_of: &impl Fn(PatchKey) -> Option<f32>,
     key: PatchKey,
-    out: &mut Vec<PatchKey>,
+    out: &mut Selection,
 ) {
     let (min, max) = patch_box(key);
-    if ground_distance(view.eye, min, max) > view.radius {
+    // Each threshold below is met by a distance from the eye, so the gap
+    // between the two is how far the eye can move before that decision
+    // flips: the walk's slack is the smallest of them. A decision the eye
+    // cannot move (the hole) has none.
+    let ground = ground_distance(view.eye, min, max);
+    out.slack = out.slack.min((ground - view.radius).abs());
+    if ground > view.radius {
         return;
     }
     if view.hole.is_some_and(|h| h.contains_box(min, max)) {
         return;
     }
+    let splittable = key.level > FINEST_LEVEL;
     let d = distance(view.eye, min, max);
-    let near = d < view.split_ratio * key.size() as f64;
+    let near_within = view.split_ratio * key.size() as f64;
+    let near = d < near_within;
     let children_wide_enough = (key.quad() as f64 / 2.0) >= view.min_quad * d;
-    let rough =
-        children_wide_enough && error_of(key).is_some_and(|e| e as f64 > view.max_error * d);
-    if key.level > FINEST_LEVEL && (near || rough) {
+    let error = error_of(key);
+    let rough = children_wide_enough && error.is_some_and(|e| e as f64 > view.max_error * d);
+    if splittable {
+        out.slack = out.slack.min((d - near_within).abs());
+        if view.min_quad > 0.0 {
+            let wide_within = key.quad() as f64 / 2.0 / view.min_quad;
+            out.slack = out.slack.min((d - wide_within).abs());
+        }
+        // An error of 0 is never "rough" at any distance (`e > max_error *
+        // d` with `d >= 0`), so it has no threshold to meet.
+        if let Some(e) = error.filter(|&e| e > 0.0 && view.max_error > 0.0) {
+            out.slack = out.slack.min((d - e as f64 / view.max_error).abs());
+        }
+    }
+    if splittable && (near || rough) {
+        out.split.push(key);
         for child in key.children() {
             walk(view, error_of, child, out);
         }
     } else {
-        out.push(key);
+        out.patches.push(key);
     }
 }
 
@@ -1417,9 +1490,18 @@ pub(crate) mod tests {
     /// (the origin, a half-block off it, far from it), is pinned as a count
     /// and a hash of the keys in order. The constants were recorded by
     /// running this on `main`'s `select`, before any change -- and re-recorded
-    /// once, deliberately, for #422: no patch is finer than the voxel rings'
-    /// coarsest cell ([`FINEST_LEVEL`]), which removes every level 0 to 2
-    /// patch (the counts fell from 3,000 and more to 1,300 and 2,100).
+    /// deliberately twice since. For #422: no patch is finer than the voxel
+    /// rings' coarsest cell ([`FINEST_LEVEL`]), which removes every level 0
+    /// to 2 patch (the counts fell from 3,000 and more to 1,300 and 2,100).
+    /// For #398: the walk starts from every root within reach of the eye
+    /// itself, not of the eye cut to whole blocks, and one more on every
+    /// side (the slack needs it, `following_the_slack_keeps_...`). Two pins
+    /// of twelve moved, both at the game's radius and the eye at the
+    /// origin, by four patches each: roots whose ground starts exactly at
+    /// the radius (the eye at 0) or half a block inside it (the eye at
+    /// -0.5), which the old range left out -- 262 km off, past where the
+    /// fog ends (`fog_finishes_inside_the_far_terrain`), so nothing on
+    /// screen changes.
     #[test]
     fn select_output_is_pinned() {
         let eyes = [
@@ -1441,6 +1523,214 @@ pub(crate) mod tests {
         assert_eq!(got, PINNED.to_vec());
     }
 
+    /// The sizes the game draws at (High, quads of 16 pixels, an error
+    /// bound of 2 and a floor of 4, three times as wide: the app's
+    /// `FAR_QUAD_SCALE`), which this crate cannot read (Rule 3). Coarser
+    /// than [`view`]'s: fewer patches, and thresholds further apart.
+    fn game_view(eye: [f64; 3], radius: f64) -> FarView {
+        FarView {
+            split_ratio: split_ratio_for(48.0, 1080.0, std::f64::consts::FRAC_PI_3),
+            max_error: 6.0 * PIXEL,
+            min_quad: 12.0 * PIXEL,
+            hole: Some(voxel_box()),
+            ..view(eye, radius)
+        }
+    }
+
+    /// The voxels' box around the low flight's start, in blocks.
+    fn voxel_box() -> Hole {
+        Hole {
+            min: [-1024.0, -1024.0, -1024.0],
+            max: [1152.0, 1024.0, 1152.0],
+        }
+    }
+
+    /// **Holding a selection until the eye has moved its slack keeps it
+    /// exact at every step** (#398's plan A): along lines of flight at the
+    /// flight's 0.4 block a frame, a selection is worked out again only
+    /// once the eye has moved as far as the last one's slack, and at every
+    /// step in between the held one is what the eye there selects. Each of
+    /// the walk's thresholds gets a flight that crosses it: three of the
+    /// gate's lines with the errors pinned (the split distance and the
+    /// error's), the low flight over ground rough everywhere (the width
+    /// floor decides every split beyond the split distance), and a radius
+    /// of 1,500 blocks the flight moves across. Not vacuous: the selection
+    /// changes on the way, and fewer selections are made than steps.
+    #[test]
+    fn following_the_slack_keeps_the_selection_exact_at_every_step() {
+        fn rough_everywhere(_: PatchKey) -> Option<f32> {
+            Some(1e9)
+        }
+        type ErrorOf = fn(PatchKey) -> Option<f32>;
+        type ViewAt<'a> = &'a dyn Fn([f64; 3]) -> FarView;
+        type Flight<'a> = ([f64; 3], [f64; 3], ViewAt<'a>, ErrorOf);
+        let gate = |eye: [f64; 3]| game_view(eye, 20_000.0);
+        let small = |eye: [f64; 3]| FarView {
+            hole: None,
+            ..game_view(eye, 1_500.0)
+        };
+        let flights: [Flight; 5] = [
+            ([8.0, 120.0, 8.0], [1.0, -0.15, 0.3], &gate, pinned_error),
+            (
+                [300.5, 90.0, -41.25],
+                [-0.7, 0.2, 0.68],
+                &gate,
+                pinned_error,
+            ),
+            ([8.0, 450.0, 8.0], [0.4, -0.8, 0.2], &gate, pinned_error),
+            (
+                [8.0, 120.0, 8.0],
+                [1.0, -0.15, 0.3],
+                &gate,
+                rough_everywhere,
+            ),
+            ([8.0, 120.0, 8.0], [1.0, 0.0, 0.0], &small, pinned_error),
+        ];
+        for (start, dir, at_eye, error_of) in flights {
+            let n = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let eye_at = |step: usize| [0, 1, 2].map(|a| start[a] + dir[a] / n * 0.4 * step as f64);
+            let mut held = select_walk(&at_eye(start), error_of);
+            let mut held_at = start;
+            let (mut selects, mut changes) = (1, 0);
+            let steps = 1500;
+            for step in 1..=steps {
+                let eye = eye_at(step);
+                let moved = (0..3)
+                    .map(|a| (eye[a] - held_at[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if moved >= held.slack {
+                    let new = select_walk(&at_eye(eye), error_of);
+                    changes += usize::from(new.patches != held.patches);
+                    selects += 1;
+                    held = new;
+                    held_at = eye;
+                }
+                assert_eq!(
+                    held.patches,
+                    select(&at_eye(eye), error_of),
+                    "{start:?} along {dir:?}, step {step}: the held selection is not the \
+                     eye's own ({moved} blocks from where it was made, slack {})",
+                    held.slack
+                );
+            }
+            println!(
+                "{start:?} along {dir:?}: {selects} selections in {steps} steps, {changes} \
+                 changes"
+            );
+            assert!(
+                selects < steps / 2,
+                "{start:?}: {selects} selections in {steps} steps -- a slack this small \
+                 holds nothing, and the test tests nothing"
+            );
+            assert!(
+                changes >= 1,
+                "{start:?} along {dir:?}: the selection never changed"
+            );
+        }
+    }
+
+    /// **The slack is the smallest gap of a decision that can change, and
+    /// no other**: with a radius of 200 blocks every root is a level-3
+    /// patch, which no distance splits, so the walk's only decisions are
+    /// which roots the radius drops, and its slack is the nearest root's
+    /// gap to the radius -- worked out here by hand. The eye stands 0.1
+    /// block from the split distance of the root beside it: a slack that
+    /// counted a level-3 patch's split thresholds would be 0.1 (found by
+    /// `check-tests-can-fail.sh`: nothing saw `if splittable` go).
+    #[test]
+    fn the_slack_counts_only_decisions_that_can_change() {
+        let eye = [84.0, 100.0, 128.0];
+        let radius = 200.0;
+        let v = FarView {
+            hole: None,
+            ..game_view(eye, radius)
+        };
+        assert_eq!(root_level_for(radius), FINEST_LEVEL, "roots of level 3");
+        let near_within = v.split_ratio * PatchKey::new(FINEST_LEVEL, 1, 0).size() as f64;
+        assert!(
+            (256.0 - eye[0] - near_within).abs() < 0.2,
+            "the root at +x is not at its split distance ({near_within})"
+        );
+        let (lo, hi) = surface_bounds();
+        assert!(
+            (lo..hi).contains(&eye[1]),
+            "the eye is outside the roots' height"
+        );
+        let mut gap = f64::INFINITY;
+        for x in -2i64..=2 {
+            for z in -2i64..=2 {
+                let (x0, z0) = ((x * 256) as f64, (z * 256) as f64);
+                let dx = (x0 - eye[0]).max(eye[0] - (x0 + 256.0)).max(0.0);
+                let dz = (z0 - eye[2]).max(eye[2] - (z0 + 256.0)).max(0.0);
+                gap = gap.min(((dx * dx + dz * dz).sqrt() - radius).abs());
+            }
+        }
+        let s = select_walk(&v, pinned_error);
+        assert!(
+            (s.slack - gap).abs() < 1e-9,
+            "slack {} where the nearest root is {gap} from the radius",
+            s.slack
+        );
+        assert!(
+            gap > 10.0,
+            "the radius's gap {gap} hides the split distance's"
+        );
+    }
+
+    /// The patches a walk split are exactly the ancestors of its patches
+    /// that it did not drop: every patch's parent is among them (but for the
+    /// roots), each of them has its four children among the patches, the
+    /// split or the dropped, and no patch is both.
+    #[test]
+    fn the_split_patches_are_the_ancestors_the_walk_kept() {
+        let v = FarView {
+            hole: Some(voxel_box()),
+            ..view([8.0, 120.0, 8.0], 20_000.0)
+        };
+        let s = select_walk(&v, pinned_error);
+        let root = root_level_for(v.radius);
+        let split: std::collections::HashSet<PatchKey> = s.split.iter().copied().collect();
+        let patches: std::collections::HashSet<PatchKey> = s.patches.iter().copied().collect();
+        assert_eq!(split.len(), s.split.len(), "a patch split twice");
+        assert!(split.is_disjoint(&patches), "a patch both kept and split");
+        let parent = |k: PatchKey| PatchKey::new(k.level + 1, k.x >> 1, k.z >> 1);
+        for k in s.patches.iter().chain(&s.split) {
+            if k.level < root {
+                assert!(split.contains(&parent(*k)), "{k:?}'s parent was not split");
+            }
+        }
+        let dropped = |k: PatchKey| {
+            let (min, max) = patch_box(k);
+            ground_distance(v.eye, min, max) > v.radius
+                || v.hole.is_some_and(|h| h.contains_box(min, max))
+        };
+        for k in &s.split {
+            for c in k.children() {
+                assert!(
+                    patches.contains(&c) || split.contains(&c) || dropped(c),
+                    "{c:?}, a child of the split {k:?}, is nowhere"
+                );
+            }
+        }
+        assert!(s.split.len() > 20, "{} split", s.split.len());
+    }
+
+    /// `Hole::grown_across` moves `x` and `z` and never `y`, and a box shrunk
+    /// to nothing is none.
+    #[test]
+    fn a_box_grows_across_the_ground_only() {
+        let b = Hole {
+            min: [0.0, 5.0, 10.0],
+            max: [100.0, 50.0, 30.0],
+        };
+        let g = b.grown_across(8.0).unwrap();
+        assert_eq!((g.min, g.max), ([-8.0, 5.0, 2.0], [108.0, 50.0, 38.0]));
+        let s = b.grown_across(-5.0).unwrap();
+        assert_eq!((s.min, s.max), ([5.0, 5.0, 15.0], [95.0, 50.0, 25.0]));
+        assert_eq!(b.grown_across(-10.0), None, "z shrinks to nothing");
+    }
+
     const PINNED: [(usize, u64); 12] = [
         (1354, 0x978e180d13ca8d0c),
         (1351, 0x5eb0a082c904d27f),
@@ -1451,8 +1741,8 @@ pub(crate) mod tests {
         (2106, 0xa6596bd608972c34),
         (2103, 0x35464759fed1d207),
         (2094, 0x1cc170268a38e04a),
-        (2094, 0x63ddf75f6059ad7c),
-        (2090, 0xdaff0432f4f908e4),
+        (2098, 0x8e80c3edccb13d74),
+        (2094, 0x0edd665fec8c136c),
         (2097, 0x18b30fa785776798),
     ];
 }

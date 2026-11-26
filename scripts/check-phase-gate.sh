@@ -19,19 +19,23 @@ export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
 phase="${1:-1}"
 
-# Item 0's thresholds for the two terms that are not simply zero (issue
-# #384 decision 4). PROVISIONAL: chosen, not derived -- they are the owner's
-# to set (review question 1: "when the detail level of a hill changes while
-# you fly, its outline moves by a pixel or two -- acceptable if it slides
+# Item 0's threshold for the term that is not simply zero (issue #384
+# decision 4). PROVISIONAL: chosen, not derived -- it is the owner's to set
+# (review question 1: "when the detail level of a hill changes while you
+# fly, its outline moves by a pixel or two -- acceptable if it slides
 # smoothly over a quarter of a second, or must it never move at all?"), and
-# these stand in until he answers.
+# this stands in until he answers.
 #   POP_P99_PX: the largest allowed p99, over a flight's swaps, of the
 #   vertical shift in pixels of the land/sky boundary inside the swapped
 #   nodes' screen boxes (`POPS: ... silhouette px p50/p99/max`).
-#   STALE_KEPT_FRAMES: the most kept frames that may show nothing where the
-#   finished frame has land (`STALE: N kept frames ...`).
-POP_P99_PX=2
-STALE_KEPT_FRAMES=0
+# Stale terrain is no longer a threshold of its own: the owner decided it
+# on 2026-11-25 (#398) -- "het mag bij het orginele inladen 1 keer
+# doorschijnend zijn, dat je dus ziet dat het nog niet geladen is. als het
+# eenmaal ingeladen is, blijft het wel consistent. het is heel hinderlijk
+# als terrein lijkt te flikkeren". Land never drawn yet may show through
+# once while it first loads (`FIRST LOAD:`, printed, not gated); land that
+# has been drawn never shows through again (`FLICKER:`, which must be 0).
+# That replaced STALE_KEPT_FRAMES (PROVISIONAL 0), which counted both.
 
 pass=0
 fail=0
@@ -171,15 +175,16 @@ bench_line() {
 }
 
 # flight_gate <label> <flight args...> -- one of block 3.0a's flights (#318):
-# the frame terms on the work per frame, and the three terms of issue #384
-# read from the same line: HOLES = 0 (a pixel that showed land, then nothing,
-# then land again, where the finished frame shows land on it and on all four
-# sides -- on the finished frame's skyline it is a pop), POPS' silhouette
-# p99 <= POP_P99_PX, and STALE's kept frames <= STALE_KEPT_FRAMES. A term
-# missing from the line (the wording changed, or an older binary) fails the
-# item rather than passing it: every parse must produce a number.
+# the frame terms on the work per frame, and from the same line: FLICKER = 0
+# (#398, the owner's rule: a pixel that showed land inside land, then
+# nothing, where the finished frame has it inside land -- every hole is one,
+# and so is a kept frame's stale pixel that was drawn before; on the
+# finished frame's skyline it is a pop) and POPS' silhouette p99 <=
+# POP_P99_PX. HOLES and FIRST LOAD are printed beside them. A term missing
+# from the line (the wording changed, or an older binary) fails the item
+# rather than passing it: every parse must produce a number.
 flight_gate() {
-    local label="$1" line p999 over2 holes pops stale
+    local label="$1" line p999 over2 holes pops flicker first
     shift
     if [ -n "${GATE_ONLY_TESTS:-}" ]; then
         return
@@ -189,12 +194,13 @@ flight_gate() {
     over2=$(printf '%s' "$line" | sed -nE 's/.*over 33\.3 ms ([0-9]+) \(.*/\1/p')
     holes=$(printf '%s' "$line" | sed -nE 's/.*HOLES: ([0-9]+) of [0-9]+ frames.*/\1/p')
     pops=$(printf '%s' "$line" | sed -nE 's/.*POPS: .*silhouette px p50\/p99\/max [0-9]+\/([0-9]+)\/[0-9]+.*/\1/p')
-    stale=$(printf '%s' "$line" | sed -nE 's/.*STALE: ([0-9]+) kept frames.*/\1/p')
-    local numbers="p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?}, holes ${holes:-?} frames, pop silhouette p99 ${pops:-?} px (<= $POP_P99_PX), stale ${stale:-?} kept frames (<= $STALE_KEPT_FRAMES)"
+    flicker=$(printf '%s' "$line" | sed -nE 's/.*FLICKER: ([0-9]+) frames.*/\1/p')
+    first=$(printf '%s' "$line" | sed -nE 's/.*FIRST LOAD: ([0-9]+) kept frames.*/\1/p')
+    local numbers="p99.9 ${p999:-?} ms, over 33.3 ms ${over2:-?}, flicker ${flicker:-?} frames (= 0; holes ${holes:-?}), pop silhouette p99 ${pops:-?} px (<= $POP_P99_PX), first load ${first:-?} kept frames (allowed)"
     if frame_terms "$p999" "$over2" \
-        && [ "${holes:-x}" = 0 ] \
-        && [ -n "$pops" ] && [ "$pops" -le "$POP_P99_PX" ] \
-        && [ -n "$stale" ] && [ "$stale" -le "$STALE_KEPT_FRAMES" ]; then
+        && [ "${flicker:-x}" = 0 ] \
+        && [ -n "$holes" ] && [ -n "$first" ] \
+        && [ -n "$pops" ] && [ "$pops" -le "$POP_P99_PX" ]; then
         echo "PASS  $label ($numbers)"
         pass=$((pass + 1))
     else
@@ -319,18 +325,21 @@ if [ "$phase" = "3" ]; then
     # Item 0: block 3.0's own criterion, checked before 3.1 starts. The frame
     # terms are what #318 built `--bench flight` (#319-#322) and `--bench
     # walk` (#323) to print; the flights are #318's four, at the eyes
-    # BENCHMARKS.md's flight rows use. The flight line's three other terms
-    # (#384): HOLES counts frames in which a pixel inside land showed nothing
+    # BENCHMARKS.md's flight rows use. The flight line's other terms (#384,
+    # #398): HOLES counts frames in which a pixel inside land showed nothing
     # for under half a second and the finished frame at that eye shows it
     # inside land too -- geometry missing; a pixel on the finished frame's
     # skyline is a silhouette moving, not a hole. POPS measures, per detail
     # swap, how many pixels inside the swapped nodes' screen boxes changed
     # and how far the land/sky boundary there moved between the frame before
     # and the frame of the swap -- a silhouette moving. STALE counts kept
-    # frames showing nothing where the finished frame has land inside land --
-    # a coarse node still drawn late -- and says how much of it lay under a
-    # swap whose lag (#378) was open, under a visible node not yet resident
-    # (#398: still loading), or under neither.
+    # frames showing nothing where the finished frame has land inside land,
+    # and says how much of it lay under a swap whose lag (#378) was open,
+    # under a visible node not yet resident (#398: still loading), or under
+    # neither. The owner split it (#398, 2026-11-25): FLICKER is land drawn
+    # before shown as nothing -- every hole, and a kept frame's stale pixel
+    # whose run of nothing began after it was inside land -- and must be 0;
+    # FIRST LOAD is the rest, land not drawn yet, allowed once.
     # T1 and T4 are both CPU-only (T4 on the M4 ray-marching harness, #381 as
     # amended); T4's one GPU golden (`golden.rs`,
     # `the_288_m_edge_matches_a_finer_ring_on_screen`) counts in the normal
