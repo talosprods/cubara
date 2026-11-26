@@ -434,6 +434,13 @@ impl WorldSnapshot {
         self.worldgen.cell_surface_height(x, z, step)
     }
 
+    /// [`WorldGen::column`]: the generated column at `(x, z)` -- its surface,
+    /// and the highest block of ground the sky sees in it. Before trees and
+    /// edits.
+    pub fn column(&self, x: i32, z: i32) -> crate::worldgen::GroundColumn {
+        self.worldgen.column(x, z)
+    }
+
     /// The seed this world's terrain is generated from.
     pub fn seed(&self) -> u64 {
         self.worldgen.seed()

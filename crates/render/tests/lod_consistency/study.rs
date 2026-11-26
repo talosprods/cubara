@@ -309,7 +309,9 @@ pub fn top(rule: Rule, h: &[i32], w: i32, crest: bool, summit: bool) -> i32 {
     }
 }
 
-/// The level-0 surface over a window of [`SIDE`] blocks around a footprint.
+/// Level 0's tops -- what the sky sees of each column, the floor of a pit
+/// under one a cave has opened (`WorldGen::column_top`) -- over a window of
+/// [`SIDE`] blocks around a footprint.
 pub struct Window {
     x0: i32,
     z0: i32,
@@ -321,7 +323,7 @@ impl Window {
         let (x0, z0) = (fp.x0 - PAD, fp.z0 - PAD);
         let h = (0..SIDE)
             .flat_map(|j| (0..SIDE).map(move |i| (i, j)))
-            .map(|(i, j)| gen.surface_height(x0 + i, z0 + j))
+            .map(|(i, j)| gen.column_top(x0 + i, z0 + j))
             .collect();
         Self { x0, z0, h }
     }
