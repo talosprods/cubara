@@ -2493,7 +2493,8 @@ was free; with the world's density per trunk height
 (`cubara_world::far_trees::density`, held to what the world grows within
 3% by `the_density_is_what_the_world_grows`) that is trees per square
 block. **The share is measured along the line of sight** (the lead's
-decision, 2026-11-26, after the first measurement below): a stand-in seen
+decision, 2026-11-26, on the estimate that the share canopies cover from
+above -- 0.7% -- would leave a fading wood lighter; measured below): a stand-in seen
 along `v` hides its top's area of the ground under it and its sides'
 facing area over `v.y` behind it -- a shadow as long as the tree is tall
 over the slope of the line of sight -- and trees standing at random leave
@@ -2563,7 +2564,10 @@ blocks, `TILE_BLOCKS`) and the trees in reach uploaded when they change. The
 tint adds a loop of the trunk heights to every far top vertex beyond where
 every tree is whole. No FPS here: the gate and flight rows are the lead's,
 on a quiet machine (`--bench gate`, `--bench flight`); the counts above are
-what they will show, and `--bench` logs the far trees drawn.
+what they will show, and `--bench` logs the far trees drawn. `--far-trees
+off` draws the same commit's bare far ground -- the window, the benches, a
+flight and `--screenshot` -- for an A/B without a second build, as `--fog
+off` does.
 
 **What is left, and why.**
 

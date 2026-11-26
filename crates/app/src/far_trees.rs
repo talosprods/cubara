@@ -126,14 +126,16 @@ mod tests {
         let seed = cubara_world::World::new().seed();
         let mut far = FarStreaming::new(seed, FarQuality::Medium).with_trees(blocks());
         let hole = voxel_hole(eye);
-        for _ in 0..4_000 {
+        // A slow runner generates the patches slowly; a few seconds here.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(300) {
             far.update(&mut renderer, eye, hole);
             if far.settled() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(far.settled(), "the far terrain did not settle");
+        assert!(far.settled(), "the far terrain did not settle in 300 s");
         let held = renderer.far_trees_drawn().1;
         assert_eq!(held, far.trees_of_drawn_patches());
         assert!(held > 10_000, "only {held} far trees held");

@@ -320,7 +320,9 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
             frame.ambient.y,
             frame.sun_color.w,
         );
-        facing[d] = max(dot(n, v), 0.0);
+        // How much of a face this way the line of sight sees: its
+        // projected area, not a light (that is `face_brightness`'s, above).
+        facing[d] = max(dot(v, n), 0.0);
     }
     // How far behind it a tree's side hides the ground, per block of its
     // height: the line of sight's run over its rise.

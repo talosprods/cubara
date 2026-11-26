@@ -281,7 +281,11 @@ impl StandIn {
 /// set to its plane.
 fn face_corners(min: [f32; 3], max: [f32; 3], d: usize) -> [[f32; 3]; 2] {
     let axis = d / 2;
-    let plane = if d.is_multiple_of(2) { max[axis] } else { min[axis] };
+    let plane = if d.is_multiple_of(2) {
+        max[axis]
+    } else {
+        min[axis]
+    };
     let (mut p, mut q) = (min, max);
     p[axis] = plane;
     q[axis] = plane;
@@ -1196,10 +1200,11 @@ mod tests {
             &mut out,
         );
         assert_eq!(out.len(), trees.len());
-        // The voxels' box over the first 1,000 blocks: those are theirs. A
-        // tree whose ground block is in the box is the voxels', one standing
-        // on the box's top is not.
-        set.set_hole(Some(([-16, 0, -16], [1000, 40, 16])));
+        // The voxels' box over the first 1,000 blocks. A tree whose ground
+        // block (39, under its base at 40) is in the box is the voxels': they
+        // draw that block and the tree on it. One standing on ground above
+        // the box is the far terrain's.
+        set.set_hole(Some(([-16, 0, -16], [1000, 39, 16])));
         set.visible(
             &looking(eye, Vec3::X),
             (eye, [0; 3]),
@@ -1209,9 +1214,9 @@ mod tests {
         assert_eq!(
             out.len(),
             near,
-            "a tree standing on the box's top is the far terrain's"
+            "a tree standing above the box is the far terrain's"
         );
-        set.set_hole(Some(([-16, 0, -16], [1000, 41, 16])));
+        set.set_hole(Some(([-16, 0, -16], [1000, 40, 16])));
         set.visible(
             &looking(eye, Vec3::X),
             (eye, [0; 3]),
