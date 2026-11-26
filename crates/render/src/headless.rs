@@ -287,17 +287,49 @@ pub fn render_with_far(
     )
 }
 
+/// The trees on the far terrain of a one-shot render (issue #433 item 1).
+#[derive(Clone, Copy, Debug)]
+pub struct FarTreesShot<'a> {
+    /// The trees the far patches carry.
+    pub trees: &'a [crate::far_trees::FarTreePlacement],
+    /// How densely trees stand per trunk height where every column may grow
+    /// one (`cubara_world::far_trees::density`): what the tops' tint shows
+    /// of the trees no longer drawn one by one. Empty: no tint.
+    pub density: &'a [f32],
+    /// The game's ([`crate::far_trees::Fade::GAME`]), or a measurement's.
+    pub fade: crate::far_trees::Fade,
+    /// The game's ([`crate::far_trees::TintView::LineOfSight`]), or a
+    /// measurement's.
+    pub view: crate::far_trees::TintView,
+}
+
+impl<'a> FarTreesShot<'a> {
+    /// `trees` and `density`, drawn as the game draws them.
+    pub fn game(trees: &'a [crate::far_trees::FarTreePlacement], density: &'a [f32]) -> Self {
+        Self {
+            trees,
+            density,
+            fade: crate::far_trees::Fade::GAME,
+            view: crate::far_trees::TintView::LineOfSight,
+        }
+    }
+
+    /// No trees and no tint: bare far ground.
+    pub const NONE: FarTreesShot<'static> = FarTreesShot {
+        trees: &[],
+        density: &[],
+        fade: crate::far_trees::Fade::GAME,
+        view: crate::far_trees::TintView::LineOfSight,
+    };
+}
+
 /// [`render_with_far`] with the trees on the far terrain (issue #433 item
-/// 1): `trees` are the trees its patches carry, `density` how densely
-/// trees stand per trunk height where every column may grow one
-/// (`cubara_world::far_trees::density`), what its tops' tint shows of the
-/// trees no longer drawn one by one. Empty slices: no trees, bare ground --
-/// [`render_with_far`].
+/// 1, [`FarTreesShot`]). [`FarTreesShot::NONE`] is [`render_with_far`].
 pub fn render_with_far_trees(
     meshed: impl IntoIterator<Item = MeshedNode>,
     far: &[crate::far::FarPatch<'_>],
     far_params: Option<crate::far::FarParams>,
-    (trees, density): (&[crate::far_trees::FarTreePlacement], &[f32]),
+    far_trees: FarTreesShot<'_>,
     shot: Shot,
 ) -> Option<Frame> {
     let nodes: Vec<MeshedNode> = meshed.into_iter().collect();
@@ -305,7 +337,7 @@ pub fn render_with_far_trees(
     render_arena(
         shot,
         (far, far_params, crate::far::FarCulling::default()),
-        (trees, density),
+        far_trees,
         tree_data,
         |device, queue, multi_draw, anchor, _ctx| {
             ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
@@ -333,7 +365,7 @@ pub fn render_with_far_culled(
     render_arena(
         shot,
         (far, far_params, culling),
-        (&[], &[]),
+        FarTreesShot::NONE,
         tree_data,
         |device, queue, multi_draw, anchor, _ctx| {
             ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
@@ -351,7 +383,7 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
     render_arena(
         shot,
         (&[], None, crate::far::FarCulling::default()),
-        (&[], &[]),
+        FarTreesShot::NONE,
         Vec::new(),
         |device, queue, multi_draw, anchor, ctx| {
             let mut arena = ChunkArena::new(device, multi_draw, anchor);
@@ -421,7 +453,7 @@ fn render_arena(
         Option<crate::far::FarParams>,
         crate::far::FarCulling,
     ),
-    (far_trees, far_tree_density): (&[crate::far_trees::FarTreePlacement], &[f32]),
+    far_trees: FarTreesShot<'_>,
     tree_data: Vec<NodeTrees>,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, Anchor, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
@@ -538,17 +570,21 @@ fn render_arena(
     // The trees on the far terrain (issue #433 item 1), as the window draws
     // them: one patch of them is as good as many here.
     let mut far_tree_set = None;
-    if !far_trees.is_empty() || !far_tree_density.is_empty() {
+    if !far_trees.trees.is_empty() || !far_trees.density.is_empty() {
         let mut set = crate::render::load_far_trees(&device, &queue, &mesh_assets, anchor);
-        set.insert(0, far_trees.to_vec());
+        set.insert(0, far_trees.trees.to_vec());
         set.set_hole(far_params.and_then(|p| p.hole));
+        set.set_fade(far_trees.fade);
         set.prepare(&device, &queue, &frustum, eye_rel, anchor, height);
         far_tree_set = Some(set);
     }
     let mut far_terrain = far_terrain;
     if let (Some(terrain), Some(set)) = (far_terrain.as_mut(), far_tree_set.as_ref()) {
-        let tint = (!far_tree_density.is_empty())
-            .then(|| crate::far_trees::FarTreeTint::new(far_tree_density, set.stand_ins()));
+        let tint = (!far_trees.density.is_empty()).then(|| crate::far_trees::FarTreeTint {
+            fade: far_trees.fade,
+            view: far_trees.view,
+            ..crate::far_trees::FarTreeTint::new(far_trees.density, set.stand_ins())
+        });
         terrain.set_tree_tint(
             &queue,
             tint.as_ref(),

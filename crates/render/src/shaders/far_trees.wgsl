@@ -2,8 +2,9 @@
 // instance a tree, drawn as its stand-in -- a few axis-aligned boxes in the
 // flat colours the level-3 silhouette has per face direction -- of which
 // each box draws the face of each axis that faces the eye. There is no
-// vertex buffer of the model's own: a vertex index is a face slot (box,
-// axis) and one of its four corners.
+// vertex buffer of the model's own: a vertex index is a face slot (a box and
+// an axis it has faces along, `far_trees.rs`'s `StandIn::slots`) and one of
+// its four corners.
 //
 // Lit as `trees.wgsl` lights a silhouette face (the same sun, ambient and
 // `mix(ao_floor, 1, open)`) and fogged as it is, per vertex: a far tree is a
@@ -43,8 +44,10 @@ struct Box {
 
 // `far_trees.rs`'s `ParamsGpu`.
 struct Params {
-    // .x boxes a stand-in has, .y/.z/.w the fade (`fade.wgsl`).
+    // .x the face slots a tree draws, .y/.z/.w the fade (`fade.wgsl`).
     fade: vec4<f32>,
+    // Per face slot, `.x` the box, `.y` the axis.
+    slots: array<vec4<u32>, 9>,
     // Per trunk height, `.x` the stand-in's height in blocks.
     tall: array<vec4<f32>, 8>,
     // Per trunk height, `MAX_BOXES` boxes.
@@ -85,11 +88,11 @@ fn vs_main(in: VsIn) -> VsOut {
     out.color = vec3<f32>(0.0);
     let slot = in.vertex / 4u;
     let corner = in.vertex % 4u;
-    let b = slot / 3u;
-    let axis = slot % 3u;
-    if b >= u32(params.fade.x) {
+    if slot >= u32(params.fade.x) {
         return out;
     }
+    let b = params.slots[slot].x;
+    let axis = params.slots[slot].y;
     let tall = params.tall[in.height].x;
     let middle = in.foot + vec3<f32>(0.0, 0.5 * tall, 0.0);
     let s = tree_scale(tall, distance(middle, frame.eye.xyz), params.fade);

@@ -4,7 +4,7 @@
 //! `cubara_render::far_trees` draws them; this crate is the one that knows
 //! both (`ARCHITECTURE.md` Rule 3).
 
-use cubara_render::far_trees::{px_per_block, reach, FarTreePlacement};
+use cubara_render::far_trees::{px_per_block, reach, Fade, FarTreePlacement};
 use cubara_world::far::{FarView, PatchHeights, PatchKey, WithTrees, FINEST_LEVEL};
 use cubara_world::TerrainBlocks;
 
@@ -39,7 +39,7 @@ fn tallest(blocks: TerrainBlocks) -> Option<f32> {
 pub fn tree_level(view: &FarView, screen_height: u32, tallest: f32) -> u32 {
     // A tree stands up to its height above its patch's box (which reaches
     // the terrain's highest top), and a little further is no harm.
-    let reach = reach(tallest, px_per_block(screen_height)) + 2.0 * tallest;
+    let reach = reach(tallest, px_per_block(screen_height), Fade::GAME) + 2.0 * tallest;
     let mut level = FINEST_LEVEL;
     while view.split_ratio * (PatchKey::new(level + 1, 0, 0).size() as f64) < reach as f64 {
         level += 1;
@@ -68,18 +68,18 @@ mod tests {
             .with_oak(&crate::game::load_structure_registry(), &registry)
     }
 
-    /// At the game's quad scale a tree is drawn out to about 3.3 km at
-    /// 1080 rows, and patches of quads of 128 (level 7) are kept from about
-    /// 3.1 km: they carry trees, and the next level (from 6.1 km) none.
-    /// Low splits less, so a level more carries them there.
+    /// At the game's quad scale the tallest tree is drawn out to about
+    /// 2.6 km at 1080 rows, and patches of quads of 64 (level 6) are kept
+    /// from about 1.5 km and of 128 from 3.1 km: level 6 carries trees, 7
+    /// none. Low splits less, so a level more carries them there.
     #[test]
     fn the_tree_level_is_where_patches_come_within_reach() {
         let blocks = blocks();
         let view = |quality, height| far_view([0.0; 3], height, None, quality).expect("drawn");
         let level = |quality| with_trees(blocks, &view(quality, 1080), 1080).map(|t| t.up_to_level);
-        assert_eq!(level(FarQuality::Medium), Some(7));
-        assert_eq!(level(FarQuality::High), Some(7));
-        assert_eq!(level(FarQuality::Low), Some(8));
+        assert_eq!(level(FarQuality::Medium), Some(6));
+        assert_eq!(level(FarQuality::High), Some(6));
+        assert_eq!(level(FarQuality::Low), Some(7));
         let bare = TerrainBlocks { oak: None, ..blocks };
         assert_eq!(with_trees(bare, &view(FarQuality::Medium, 1080), 1080), None);
     }

@@ -638,6 +638,96 @@ fn the_tree_harness_sees_a_wrong_tree() {
     }
 }
 
+/// **The far tree check is seen to fail** (issue #433 item 1): far trees
+/// drawn wrong on purpose, in the ways a far tree could go wrong -- standing
+/// a block off its ground or on another quad's top, one height for every
+/// tree, a canopy a block wider, unshaded, in another texture's colour --
+/// each make [`trees::check`] report something at the 1,024 m edge.
+#[test]
+fn the_far_tree_check_sees_a_wrong_far_tree() {
+    let setup = Setup::new();
+    let snapshot = setup.world.snapshot();
+    let sample = trees::draw_trees(&setup, trees::TREE_SEED, TREES_PER_KIND);
+    let names = trees::comparisons();
+    let edge = names
+        .iter()
+        .position(|(_, _, b)| matches!(b, trees::Rep::Far { .. }))
+        .expect("the far trees are compared");
+    // The far tree of every tree of the sample, drawn by `wrong`.
+    let measure_with = |wrong: &dyn Fn(cubara_world::TreeSite) -> trees::DrawnTree| {
+        let mut out = vec![Vec::new(); names.len()];
+        let (_, a, _) = names[edge];
+        for &(g, site) in &sample {
+            let level3 = trees::draw(&setup, &snapshot, site, a);
+            out[edge].push((g, trees::compare_trees(site, &level3, &wrong(site))));
+        }
+        out
+    };
+    let at = |site: cubara_world::TreeSite, level: u32| {
+        let p = trees::far_placed(&setup, level, site);
+        Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)
+    };
+    let stand_in = |site| trees::far_stand_in(&setup, site);
+    let right = |site| trees::model_tree(&setup, &stand_in(site), at(site, 3));
+    // The right far tree first: the check passes it, so what follows is
+    // the wrong thing and nothing else.
+    let failures = trees::check(&setup, &measure_with(&right));
+    assert!(failures.is_empty(), "{failures:?}");
+    let shapes = cubara_render::TreeShapes::of(&setup.structures);
+    let layer_of = |name: &str| setup.layer_of(name);
+    let all = cubara_render::far_trees::stand_ins(&setup.registry, &setup.structures, &layer_of);
+    let up = |site| right(site).moved(Vec3::Y);
+    // A quad of 32's top where level 3 has its cell's: some of the trees.
+    let on_32 = |site| trees::model_tree(&setup, &stand_in(site), at(site, 5));
+    let one_height = |site: cubara_world::TreeSite| {
+        let h = if site.height == 5 { 4 } else { 5 };
+        trees::model_tree(&setup, &all[shapes.index(h)].mesh(), at(site, 3))
+    };
+    let wider = |site| {
+        let mut m = stand_in(site);
+        for v in &mut m.vertices {
+            for a in [0, 2] {
+                v.position[a] += if v.position[a] > 0.5 { 0.5 } else { -0.5 };
+            }
+        }
+        trees::model_tree(&setup, &m, at(site, 3))
+    };
+    let unshaded = |site| {
+        let mut m = stand_in(site);
+        for v in &mut m.vertices {
+            v.open = 1.0;
+        }
+        trees::model_tree(&setup, &m, at(site, 3))
+    };
+    let log_colour = cubara_render::materials::mean_color("oak_log_side").expect("a texture");
+    let all_log = |site| {
+        let mut m = stand_in(site);
+        for v in &mut m.vertices {
+            v.color = log_colour;
+        }
+        trees::model_tree(&setup, &m, at(site, 3))
+    };
+    for (what, wrong) in [
+        (
+            "a block up",
+            &up as &dyn Fn(cubara_world::TreeSite) -> trees::DrawnTree,
+        ),
+        ("on a quad of 32's top", &on_32),
+        ("one height for every tree", &one_height),
+        ("a canopy a block wider", &wider),
+        ("no AO", &unshaded),
+        ("the log's colour all over", &all_log),
+    ] {
+        let failures = trees::check(&setup, &measure_with(wrong));
+        eprintln!(
+            "{what}: {} failures, e.g. {:?}",
+            failures.len(),
+            failures.first()
+        );
+        assert!(!failures.is_empty(), "the check did not see {what}");
+    }
+}
+
 /// **A tree rides the ground under it through the morph band** (#433):
 /// for trees of the sample on sloping ground, at levels 1 and 2, the top
 /// face the game's own mesh of the node draws under the trunk (the

@@ -39,16 +39,20 @@ use crate::trees::{oak_shades, TreeModelMesh, TreeShapes, TreeVertex};
 /// **A far tree is drawn whole while it stands this many pixels tall or
 /// more** (its own height, at the screen's height in pixels). **Chosen, not
 /// derived**: the voxel rings end at 1,024 blocks, where a tree is 4.6 to
-/// 6.4 pixels tall at 1080 rows; whole to 3 pixels (1.6 to 2.2 km) is
-/// most of the band the census puts trees in view in
-/// (`far_trees_census`).
-pub const FULL_PX: f32 = 3.0;
+/// 6.4 pixels tall at 1080 rows; whole to 3.5 pixels is 1.3 to 1.9 km, and
+/// a pixel of fade above [`GONE_PX`] lets a tree shrink over some hundred
+/// blocks of flight rather than a few.
+pub const FULL_PX: f32 = 3.5;
 
 /// **...and is gone at this many pixels**: shrunk to nothing about the foot
-/// of its trunk, its ground's colour then wholly the tint's. **Chosen, not
-/// derived**: the issue's "about 1 to 2 pixels", at the end that keeps the
-/// trees in view at the gate's hill eye to about 1,500 (2.3 to 3.3 km).
-pub const GONE_PX: f32 = 2.0;
+/// of its trunk, its ground's colour then wholly the tint's (which keeps a
+/// wood's colour, `golden.rs`'s `a_fading_wood_keeps_its_colour`).
+/// **Chosen, not derived**: the issue asks for "about 1 to 2 pixels"; at 2
+/// the gate's hill eye draws about 1,590 far trees a frame (25,400
+/// triangles with the crossed canopy), at 2.5 about 880 (14,100) -- the
+/// count the 5 to 7% the hill eye has left over 1,000 FPS can take
+/// (`far_trees_census`, §9.12). Gone at 1.9 to 2.6 km.
+pub const GONE_PX: f32 = 2.5;
 
 /// How many pixels tall one block stands at a distance of one block, on a
 /// screen `screen_height` pixels tall with the game's vertical field of view
@@ -58,20 +62,63 @@ pub fn px_per_block(screen_height: u32) -> f32 {
     screen_height as f32 / 2.0 / (crate::render::FOV_Y_DEGREES.to_radians() / 2.0).tan()
 }
 
+/// The pixel sizes a far tree fades between: whole from `full_px` up, gone
+/// from `gone_px` down. The game's is [`Fade::GAME`]; a measurement may ask
+/// for another to see what the fade changes (`golden.rs`: every tree whole,
+/// or none and all of it tint), as [`crate::far::FarCulling`] is asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fade {
+    pub full_px: f32,
+    pub gone_px: f32,
+}
+
+impl Fade {
+    /// [`FULL_PX`] and [`GONE_PX`].
+    pub const GAME: Fade = Fade {
+        full_px: FULL_PX,
+        gone_px: GONE_PX,
+    };
+    /// Every tree whole wherever it stands: no tint.
+    pub const WHOLE: Fade = Fade {
+        full_px: 0.0,
+        gone_px: -1.0,
+    };
+    /// No tree drawn one by one: all of them tint.
+    pub const GONE: Fade = Fade {
+        full_px: f32::MAX,
+        gone_px: f32::MAX / 2.0,
+    };
+}
+
 /// **How large a far tree is drawn, 0 to 1** (`far_trees.wgsl`'s
 /// `tree_scale` is this, and the tint's fade is too): a tree `tall` blocks
 /// tall at `distance` blocks from the eye stands `tall * px_per_block /
-/// distance` pixels tall; it is drawn whole from [`FULL_PX`] up, not at all
-/// from [`GONE_PX`] down, and between them at the share of the way it is.
-pub fn tree_scale(tall: f32, distance: f32, px_per_block: f32) -> f32 {
+/// distance` pixels tall; it is drawn whole from `fade.full_px` up, not at
+/// all from `fade.gone_px` down, and between them at the share of the way
+/// it is.
+pub fn tree_scale(tall: f32, distance: f32, px_per_block: f32, fade: Fade) -> f32 {
     let px = tall * px_per_block / distance.max(1e-3);
-    ((px - GONE_PX) / (FULL_PX - GONE_PX)).clamp(0.0, 1.0)
+    ((px - fade.gone_px) / (fade.full_px - fade.gone_px)).clamp(0.0, 1.0)
 }
 
 /// The farthest a tree `tall` blocks tall is drawn at all: where it is
-/// [`GONE_PX`] tall.
-pub fn reach(tall: f32, px_per_block: f32) -> f32 {
-    tall * px_per_block / GONE_PX
+/// `fade.gone_px` tall -- everywhere, for a fade that never takes a tree.
+pub fn reach(tall: f32, px_per_block: f32, fade: Fade) -> f32 {
+    if fade.gone_px <= 0.0 {
+        return f32::INFINITY;
+    }
+    tall * px_per_block / fade.gone_px
+}
+
+/// Which way the tint measures the ground the missing trees hide: the
+/// game's, along the line of sight; or as seen from straight above, the
+/// share their canopies cover -- what #433 first asked for, kept so that a
+/// test can show what it does to a fading wood (`golden.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TintView {
+    #[default]
+    LineOfSight,
+    FromAbove,
 }
 
 /// One tree on the far terrain, as this crate needs it: its trunk's base
@@ -127,6 +174,9 @@ const FACES: [Face; 6] = [
 
 /// The most boxes a stand-in has: `far_trees.wgsl`'s `MAX_BOXES`.
 pub const MAX_BOXES: usize = 3;
+/// The most face slots a stand-in draws -- a box and an axis along which it
+/// has a face: `far_trees.wgsl`'s `MAX_SLOTS`.
+pub const MAX_SLOTS: usize = 3 * MAX_BOXES;
 /// The most trunk heights a far tree can have: `far_trees.wgsl`'s
 /// `MAX_HEIGHTS`. The oak has three (`oak.ron`).
 pub const MAX_HEIGHTS: usize = 8;
@@ -180,6 +230,23 @@ impl StandIn {
         out
     }
 
+    /// **The faces a tree draws**, as `(box, axis)`: every axis along which
+    /// a box has a face. Of each, the face facing the eye is drawn, so this
+    /// is what a tree costs: two triangles a slot.
+    pub fn slots(&self) -> Vec<(usize, usize)> {
+        self.boxes
+            .iter()
+            .enumerate()
+            .flat_map(|(b, bx)| {
+                (0..3)
+                    .filter(move |&axis| {
+                        bx.faces[2 * axis].is_some() || bx.faces[2 * axis + 1].is_some()
+                    })
+                    .map(move |axis| (b, axis))
+            })
+            .collect()
+    }
+
     /// Per face direction (`Face` order): the area of the stand-in's faces
     /// that way, the sum of area times colour, and of area times colour
     /// times openness -- what the tint lights the missing trees with
@@ -223,13 +290,14 @@ fn face_corners(min: [f32; 3], max: [f32; 3], d: usize) -> [[f32; 3]; 2] {
 /// ([`oak_shades`]): what the level-3 silhouette shades that direction and
 /// texture by, so a stand-in face is a silhouette face's colour.
 ///
-/// One box for the canopy, not the oak's rounded outline: **chosen, not
-/// derived** -- five faces a tree where the silhouette draws 55. Its outline
-/// is the oak's exactly from along an axis and up to 8.4 square blocks
-/// larger diagonally (its corners, which the oak trims), at the voxel
-/// rings' edge 7 square pixels on a tree of 20 (`lod_consistency`'s far
-/// tree check measures and holds it). Two crossed boxes would halve that
-/// for a third more triangles (§9.12).
+/// **The canopy as two crossed boxes, not the oak's own outline nor one
+/// box: chosen, not derived** -- eight faces a tree where the silhouette
+/// draws 55. Their outline is the oak's exactly from along an axis and from
+/// above, and up to 3.5 square blocks larger at the diagonals of its upper
+/// canopy, which the oak narrows (`lod_consistency`'s far tree check holds
+/// it): at the voxel rings' edge 12.6% of the trees' pixels change where one
+/// box -- its corners, which the oak trims -- changed 33%, for 16 triangles a
+/// tree where one box is 10 (§9.12).
 pub fn build_stand_in(
     registry: &BlockRegistry,
     structures: &StructureRegistry,
@@ -276,8 +344,18 @@ pub fn build_stand_in(
         max: [1.0, canopy_from as f32, 1.0],
         faces: std::array::from_fn(|d| if d / 2 == 1 { None } else { face_of(log, d) }),
     };
+    // The canopy as two crossed arms, each its bounds a block narrower on
+    // one side of the trunk and the other: the oak's lower canopy (the
+    // bounds without their four corner columns) exactly, and its upper one
+    // a block wider at the diagonals.
+    let arm = |a: usize| {
+        let mut b = canopy;
+        b.min[a] += 1.0;
+        b.max[a] -= 1.0;
+        b
+    };
     Some(StandIn {
-        boxes: vec![canopy, trunk],
+        boxes: vec![arm(2), arm(0), trunk],
         tall: max[1] as f32 + 1.0,
     })
 }
@@ -318,6 +396,9 @@ pub struct FarTreeTint {
     /// Per trunk height: trees per square block where every column may grow
     /// one, the stand-in, in [`TreeShapes::heights`] order.
     pub heights: Vec<(f32, StandIn)>,
+    /// The fade the trees are drawn with: the tint is what it leaves out.
+    pub fade: Fade,
+    pub view: TintView,
 }
 
 impl FarTreeTint {
@@ -332,6 +413,8 @@ impl FarTreeTint {
                 .zip(stand_ins.iter().cloned())
                 .take(MAX_HEIGHTS)
                 .collect(),
+            fade: Fade::GAME,
+            view: TintView::LineOfSight,
         }
     }
 }
@@ -343,9 +426,11 @@ impl FarTreeTint {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TintGpu {
-    /// `.x` the heights in use; `.y` [`FULL_PX`], `.z` [`GONE_PX`], `.w`
-    /// pixels a block is tall at a distance of one block.
+    /// `.x` the heights in use; `.y` and `.z` the fade's pixel sizes
+    /// ([`Fade`]), `.w` pixels a block is tall at a distance of one block.
     pub fade: [f32; 4],
+    /// `.x` 1 to measure from straight above ([`TintView::FromAbove`]).
+    pub view: [f32; 4],
     pub height: [[f32; 4]; MAX_HEIGHTS],
     pub colour: [[[f32; 4]; 5]; MAX_HEIGHTS],
     pub open: [[[f32; 4]; 5]; MAX_HEIGHTS],
@@ -358,6 +443,7 @@ impl TintGpu {
     /// No tint: no trees, or a far terrain drawn for a world without them.
     pub const NONE: TintGpu = TintGpu {
         fade: [0.0; 4],
+        view: [0.0; 4],
         height: [[0.0; 4]; MAX_HEIGHTS],
         colour: [[[0.0; 4]; 5]; MAX_HEIGHTS],
         open: [[[0.0; 4]; 5]; MAX_HEIGHTS],
@@ -368,7 +454,13 @@ impl TintGpu {
             return Self::NONE;
         };
         let mut out = Self::NONE;
-        out.fade = [tint.heights.len() as f32, FULL_PX, GONE_PX, px_per_block];
+        out.fade = [
+            tint.heights.len() as f32,
+            tint.fade.full_px,
+            tint.fade.gone_px,
+            px_per_block,
+        ];
+        out.view[0] = f32::from(u8::from(tint.view == TintView::FromAbove));
         for (k, (density, stand_in)) in tint.heights.iter().enumerate() {
             out.height[k] = [*density, stand_in.tall, 0.0, 0.0];
             let dirs = stand_in.by_direction();
@@ -566,23 +658,22 @@ impl FarTreeSet {
 
     /// **The trees a frame draws**, as instances relative to `anchor`, in
     /// patch, square and tree order: every tree the frustum can see whose
-    /// size on screen is over [`GONE_PX`] -- by its own height, from `eye`
-    /// (anchor-relative), at `px_per_block` -- and whose ground is not the
-    /// voxels'. Squares and patches out of the frustum or out of reach are
+    /// size on screen is over `fade`'s gone size -- by its own height, from
+    /// `eye` (anchor-relative), at `px_per_block` -- and whose ground is not
+    /// the voxels'. Squares and patches out of the frustum or out of reach are
     /// passed over whole.
     pub fn visible(
         &self,
         frustum: &Frustum,
-        eye: Vec3,
-        anchor: Anchor,
-        px_per_block: f32,
+        (eye, anchor): (Vec3, Anchor),
+        (px_per_block, fade): (f32, Fade),
         out: &mut Vec<FarTreeInstance>,
     ) {
         out.clear();
         let farthest = self
             .talls
             .iter()
-            .map(|&t| reach(t, px_per_block))
+            .map(|&t| reach(t, px_per_block, fade))
             .fold(0.0, f32::max);
         for patch in self.by_patch.values() {
             let b = relative_box(patch.min, patch.max, anchor);
@@ -599,7 +690,7 @@ impl FarTreeSet {
                     let tall = self.talls[k];
                     let foot = anchor::offset(t.base, anchor) + Vec3::new(0.5, 0.0, 0.5);
                     let middle = foot + Vec3::Y * (tall / 2.0);
-                    if tree_scale(tall, middle.distance(eye), px_per_block) <= 0.0
+                    if tree_scale(tall, middle.distance(eye), px_per_block, fade) <= 0.0
                         || self.in_hole(t)
                     {
                         continue;
@@ -629,28 +720,34 @@ struct BoxGpu {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct ParamsGpu {
-    /// `.x` boxes a stand-in has, `.y` [`FULL_PX`], `.z` [`GONE_PX`], `.w`
-    /// pixels a block is tall at one block.
+    /// `.x` the face slots a tree draws, `.y` [`FULL_PX`], `.z` [`GONE_PX`],
+    /// `.w` pixels a block is tall at one block.
     fade: [f32; 4],
+    /// The face slots ([`StandIn::slots`]): `.x` the box, `.y` the axis.
+    slots: [[u32; 4]; MAX_SLOTS],
     /// Per trunk height, the stand-in's height in blocks.
     tall: [[f32; 4]; MAX_HEIGHTS],
     boxes: [[BoxGpu; MAX_BOXES]; MAX_HEIGHTS],
 }
 
 impl ParamsGpu {
-    fn new(stand_ins: &[StandIn], px_per_block: f32) -> Self {
+    fn new(stand_ins: &[StandIn], px_per_block: f32, fade: Fade) -> Self {
         let none = BoxGpu {
             min: [0.0; 4],
             max: [0.0; 4],
             faces: [[0.0, 0.0, 0.0, -1.0]; 6],
         };
         let mut out = ParamsGpu {
-            fade: [0.0, FULL_PX, GONE_PX, px_per_block],
+            fade: [0.0, fade.full_px, fade.gone_px, px_per_block],
+            slots: [[0; 4]; MAX_SLOTS],
             tall: [[0.0; 4]; MAX_HEIGHTS],
             boxes: [[none; MAX_BOXES]; MAX_HEIGHTS],
         };
-        let boxes = stand_ins.iter().map(|s| s.boxes.len()).max().unwrap_or(0);
-        out.fade[0] = boxes.min(MAX_BOXES) as f32;
+        let slots = slots_of(stand_ins);
+        out.fade[0] = slots.len() as f32;
+        for (k, &(b, axis)) in slots.iter().enumerate() {
+            out.slots[k] = [b as u32, axis as u32, 0, 0];
+        }
         for (k, s) in stand_ins.iter().take(MAX_HEIGHTS).enumerate() {
             out.tall[k][0] = s.tall;
             for (slot, b) in s.boxes.iter().take(MAX_BOXES).enumerate() {
@@ -669,11 +766,24 @@ impl ParamsGpu {
     }
 }
 
-/// The indices of one tree: per box, per axis, the face of that axis that
-/// faces the eye, four corners `far_trees.wgsl` makes from the vertex
-/// index, drawn as two triangles.
+/// The face slots every stand-in draws: the first one's
+/// ([`StandIn::slots`]). Every trunk height's stand-in is the same boxes of
+/// other sizes, so they are every one's.
+fn slots_of(stand_ins: &[StandIn]) -> Vec<(usize, usize)> {
+    let slots = stand_ins.first().map(StandIn::slots).unwrap_or_default();
+    debug_assert!(
+        stand_ins.iter().all(|s| s.slots() == slots),
+        "the stand-ins of the trunk heights draw different faces"
+    );
+    debug_assert!(slots.len() <= MAX_SLOTS);
+    slots.into_iter().take(MAX_SLOTS).collect()
+}
+
+/// The indices of one tree: per face slot, the face that faces the eye,
+/// four corners `far_trees.wgsl` makes from the vertex index, drawn as two
+/// triangles.
 fn tree_indices() -> Vec<u16> {
-    (0..(MAX_BOXES * 3) as u16)
+    (0..MAX_SLOTS as u16)
         .flat_map(|face| [0, 2, 1, 1, 2, 3].map(|i| face * 4 + i))
         .collect()
 }
@@ -688,7 +798,7 @@ pub struct FarTrees {
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     indices: wgpu::Buffer,
-    /// Indices a tree is drawn with: six a face, three faces a box.
+    /// Indices a tree is drawn with: six a face slot.
     index_count: u32,
     instances: Option<wgpu::Buffer>,
     capacity: usize,
@@ -698,6 +808,9 @@ pub struct FarTrees {
     /// What the instances were made relative to, and for what screen.
     anchor: Anchor,
     px_per_block: f32,
+    /// How the trees fade: the game's, unless a measurement says otherwise
+    /// ([`set_fade`](Self::set_fade)).
+    fade: Fade,
 }
 
 impl FarTrees {
@@ -717,7 +830,7 @@ impl FarTrees {
         queue.write_buffer(
             &params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(&stand_ins, 0.0)),
+            bytemuck::bytes_of(&ParamsGpu::new(&stand_ins, 0.0, Fade::GAME)),
         );
         let layout = crate::render::far_trees_bind_group_layout(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -736,21 +849,31 @@ impl FarTrees {
             mapped_at_creation: false,
         });
         queue.write_buffer(&indices, 0, bytemuck::cast_slice(&list));
-        let boxes = stand_ins.iter().map(|s| s.boxes.len()).max().unwrap_or(0);
+        let slots = slots_of(&stand_ins).len();
         Self {
             set: FarTreeSet::new(shapes, &stand_ins),
             stand_ins,
             params,
             bind_group,
             indices,
-            index_count: (boxes.min(MAX_BOXES) * 18) as u32,
+            index_count: (slots * 6) as u32,
             instances: None,
             capacity: 0,
             drawn: Vec::new(),
             uploaded: Vec::new(),
             anchor,
             px_per_block: 0.0,
+            fade: Fade::GAME,
         }
+    }
+
+    /// Fade the trees as `fade` says from the next
+    /// [`prepare`](Self::prepare): for a measurement of what the fade
+    /// changes; the game's is [`Fade::GAME`].
+    pub fn set_fade(&mut self, fade: Fade) {
+        self.fade = fade;
+        // Written again by the next `prepare`.
+        self.px_per_block = 0.0;
     }
 
     /// The trees a far patch carries (the caller's key, `id`), replacing any
@@ -792,8 +915,7 @@ impl FarTrees {
 
     /// What this frame's far trees cost: `(draws, triangles, vertices)` --
     /// one instanced draw, and per tree two triangles and four vertices a
-    /// face drawn, the faces a box does not draw included (they are
-    /// degenerate on the GPU, and its vertices are shaded all the same).
+    /// face slot ([`StandIn::slots`]).
     pub fn drawn_cost(&self) -> (u32, u64, u64) {
         let trees = self.drawn.len() as u64;
         let faces = self.index_count as u64 / 6;
@@ -826,12 +948,13 @@ impl FarTrees {
             queue.write_buffer(
                 &self.params,
                 0,
-                bytemuck::bytes_of(&ParamsGpu::new(&self.stand_ins, px)),
+                bytemuck::bytes_of(&ParamsGpu::new(&self.stand_ins, px, self.fade)),
             );
         }
         self.anchor = anchor;
         let mut drawn = std::mem::take(&mut self.drawn);
-        self.set.visible(frustum, eye, anchor, px, &mut drawn);
+        self.set
+            .visible(frustum, (eye, anchor), (px, self.fade), &mut drawn);
         self.drawn = drawn;
         if self.drawn == self.uploaded || self.drawn.is_empty() {
             return;
@@ -880,15 +1003,191 @@ mod tests {
         assert!((k - 935.3).abs() < 0.1, "{k}");
         let tall = 6.0;
         let at = |px: f32| tall * k / px;
-        assert_eq!(tree_scale(tall, at(5.0), k), 1.0);
-        assert_eq!(tree_scale(tall, at(FULL_PX), k), 1.0);
-        assert!((tree_scale(tall, at(2.5), k) - 0.5).abs() < 1e-4);
-        assert_eq!(tree_scale(tall, at(GONE_PX), k), 0.0);
-        assert_eq!(tree_scale(tall, at(1.0), k), 0.0);
+        let game = Fade::GAME;
+        assert_eq!(tree_scale(tall, at(5.0), k, game), 1.0);
+        assert_eq!(tree_scale(tall, at(FULL_PX), k, game), 1.0);
+        let half = (FULL_PX + GONE_PX) / 2.0;
+        assert!((tree_scale(tall, at(half), k, game) - 0.5).abs() < 1e-4);
+        assert_eq!(tree_scale(tall, at(GONE_PX), k, game), 0.0);
+        assert_eq!(tree_scale(tall, at(1.0), k, game), 0.0);
         // A taller screen draws a tree whole further out.
         let k2 = px_per_block(2160);
-        assert_eq!(tree_scale(tall, at(FULL_PX) * 1.9, k2), 1.0);
+        assert_eq!(tree_scale(tall, at(FULL_PX) * 1.9, k2, game), 1.0);
         // How far: where it is gone.
-        assert!((reach(tall, k) - at(GONE_PX)).abs() < 1e-2);
+        assert!((reach(tall, k, game) - at(GONE_PX)).abs() < 1e-2);
+        // The measurements' fades: every tree whole, and none.
+        assert_eq!(tree_scale(tall, 1e6, k, Fade::WHOLE), 1.0);
+        assert_eq!(reach(tall, k, Fade::WHOLE), f32::INFINITY);
+        assert_eq!(tree_scale(tall, 1.0, k, Fade::GONE), 0.0);
+    }
+
+    fn the_oak() -> (BlockRegistry, StructureRegistry, crate::materials::TextureLayers) {
+        let registry = crate::render::load_registry();
+        let layers = crate::materials::TextureLayers::from_registry(&registry);
+        (registry, crate::render::load_structures(), layers)
+    }
+
+    fn the_stand_ins() -> Vec<StandIn> {
+        let (registry, structures, layers) = the_oak();
+        stand_ins(&registry, &structures, &|n: &str| layers.layer_of(n))
+    }
+
+    /// **The stand-in is the oak's bounds, in the silhouette's colours**:
+    /// one per trunk height; the canopy box is the oak's own bounds
+    /// (`tree_bounds`) from its lowest canopy row, the trunk below it; each
+    /// face the colour of its texture as the silhouette has it, shaded by
+    /// the oak's openness that way and in that texture (`oak_shades`); five
+    /// face slots, the trunk's top and foot never drawn.
+    #[test]
+    fn the_stand_in_is_the_oaks_bounds_in_the_silhouettes_colours() {
+        let (registry, structures, layers) = the_oak();
+        let layer_of = |n: &str| layers.layer_of(n);
+        let all = the_stand_ins();
+        let shapes = TreeShapes::of(&structures);
+        assert_eq!(all.len(), shapes.count());
+        let (oaks, silhouettes) = crate::trees::tree_model_meshes(&registry, &structures, &layer_of);
+        for ((h, s), (oak, silhouette)) in shapes.heights.clone().zip(&all).zip(oaks.iter().zip(&silhouettes)) {
+            let (min, max) = cubara_voxel::tree_bounds(h, shapes.canopy_radius);
+            assert_eq!(s.tall, max[1] as f32 + 1.0, "height {h}");
+            assert_eq!(
+                s.slots(),
+                vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 2)]
+            );
+            let [along_x, along_z, trunk] = [s.boxes[0], s.boxes[1], s.boxes[2]];
+            let bottom = (h - 1 - shapes.canopy_radius) as f32;
+            let (lo, hi) = (min[0] as f32, max[0] as f32 + 1.0);
+            // The oak's bounds, a block narrower each side across the arm.
+            assert_eq!(along_x.min, [lo, bottom, lo + 1.0]);
+            assert_eq!(along_x.max, [hi, max[1] as f32 + 1.0, hi - 1.0]);
+            assert_eq!(along_z.min, [lo + 1.0, bottom, lo]);
+            assert_eq!(along_z.max, [hi - 1.0, max[1] as f32 + 1.0, hi]);
+            assert_eq!(trunk.min, [0.0, 0.0, 0.0]);
+            assert_eq!(trunk.max, [1.0, bottom, 1.0]);
+            assert!(trunk.faces[2].is_none() && trunk.faces[3].is_none());
+            // Every face's colour and openness are a silhouette face's, of
+            // the same direction.
+            let shades = oak_shades(oak);
+            for b in [along_x, along_z, trunk] {
+                for (d, face) in b.faces.iter().enumerate() {
+                    let Some(face) = face else { continue };
+                    let found = silhouette.vertices.iter().any(|v| {
+                        let n = Vec3::from(v.normal);
+                        n.dot(Vec3::from(FACES[d].normal())) > 0.99
+                            && v.color == face.colour
+                            && (v.open - face.open).abs() < 1e-6
+                    });
+                    assert!(found, "height {h}: face {d} {face:?} is no silhouette face's");
+                    assert!(shades.values().any(|&o| (o - face.open).abs() < 1e-6));
+                }
+            }
+        }
+    }
+
+    /// A set of one patch of trees in a row along x, every 64 blocks from
+    /// the eye, all of trunk height 5.
+    fn a_row(eye: Vec3) -> (FarTreeSet, Vec<FarTreePlacement>) {
+        let (_, structures, _) = the_oak();
+        let mut set = FarTreeSet::new(&TreeShapes::of(&structures), &the_stand_ins());
+        let trees: Vec<_> = (1..80)
+            .map(|k| FarTreePlacement {
+                base: [eye.x as i32 + 64 * k, 40, eye.z as i32],
+                height: 5,
+            })
+            .collect();
+        set.insert(7, trees.clone());
+        (set, trees)
+    }
+
+    fn looking(eye: Vec3, dir: Vec3) -> Frustum {
+        Frustum::from_view_proj(crate::CameraUniform::look_view_proj(16.0 / 9.0, eye, dir))
+    }
+
+    /// **A frame draws the trees in view, near enough to show, and not the
+    /// voxels'**: of a row of trees running away from the eye, those up to
+    /// where a tree of their height is [`GONE_PX`] tall, from in front of
+    /// the eye; none when it looks away; none whose ground is in the
+    /// voxels' box; and every one with the fade that never takes a tree.
+    #[test]
+    fn a_frame_draws_the_trees_in_view_and_in_reach() {
+        let eye = Vec3::new(0.0, 60.0, 0.0);
+        let (mut set, trees) = a_row(eye);
+        let k = px_per_block(1080);
+        let mut out = Vec::new();
+        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        let tall = 6.0;
+        let near = trees
+            .iter()
+            .filter(|t| {
+                let middle = Vec3::new(t.base[0] as f32 + 0.5, 40.0 + tall / 2.0, 0.5);
+                tree_scale(tall, middle.distance(eye), k, Fade::GAME) > 0.0
+            })
+            .count();
+        assert!(near > 20 && near < trees.len(), "{near} of {}", trees.len());
+        assert_eq!(out.len(), near);
+        // Each at its foot, relative to the anchor, of its height's stand-in.
+        assert_eq!(out[0].foot, [64.5, 40.0, 0.5]);
+        assert_eq!(out[0].height, 1);
+        // Relative to another anchor, the same trees there.
+        let anchor = [4096, 0, 0];
+        let mut moved = Vec::new();
+        set.visible(
+            &looking(eye - Vec3::new(4096.0, 0.0, 0.0), Vec3::X),
+            (eye - Vec3::new(4096.0, 0.0, 0.0), anchor),
+            (k, Fade::GAME),
+            &mut moved,
+        );
+        assert_eq!(moved.len(), out.len());
+        assert_eq!(moved[0].foot, [64.5 - 4096.0, 40.0, 0.5]);
+        // Looking away: none.
+        set.visible(&looking(eye, -Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        assert!(out.is_empty());
+        // Every one, with the fade that takes none.
+        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::WHOLE), &mut out);
+        assert_eq!(out.len(), trees.len());
+        // The voxels' box over the first 1,000 blocks: those are theirs. A
+        // tree whose ground block is in the box is the voxels', one standing
+        // on the box's top is not.
+        set.set_hole(Some(([-16, 0, -16], [1000, 40, 16])));
+        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        assert_eq!(out.len(), near, "a tree standing on the box's top is the far terrain's");
+        set.set_hole(Some(([-16, 0, -16], [1000, 41, 16])));
+        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        let in_box = trees.iter().filter(|t| t.base[0] < 1000).count();
+        assert_eq!(out.len(), near - in_box);
+        assert!(out.iter().all(|t| t.foot[0] > 1000.0));
+        // Removed: nothing.
+        set.remove(7);
+        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::WHOLE), &mut out);
+        assert!(out.is_empty() && set.is_empty());
+    }
+
+    /// The tint's numbers for `far.wgsl`: per height the density and the
+    /// stand-in's height, per direction its area and colours; nothing for a
+    /// world without trees.
+    #[test]
+    fn the_tint_carries_the_stand_ins_by_direction() {
+        let all = the_stand_ins();
+        let density = [1.0e-4, 2.0e-4, 3.0e-4];
+        let tint = FarTreeTint::new(&density, &all);
+        let gpu = TintGpu::of(Some(&tint), 935.0);
+        assert_eq!(gpu.fade, [3.0, FULL_PX, GONE_PX, 935.0]);
+        assert_eq!(gpu.view[0], 0.0);
+        for (k, s) in all.iter().enumerate() {
+            assert_eq!(gpu.height[k], [density[k], s.tall, 0.0, 0.0]);
+            let dirs = s.by_direction();
+            // +Y: the canopy's tops, two arms of 15 square blocks of leaves.
+            assert_eq!(gpu.colour[k][2][3], 30.0);
+            for (slot, &d) in TINT_DIRECTIONS.iter().enumerate() {
+                assert_eq!(gpu.colour[k][slot][3], dirs[d].0);
+                assert_eq!(gpu.open[k][slot][..3], dirs[d].2);
+            }
+        }
+        let above = FarTreeTint {
+            view: TintView::FromAbove,
+            ..tint
+        };
+        assert_eq!(TintGpu::of(Some(&above), 935.0).view[0], 1.0);
+        assert_eq!(TintGpu::of(None, 935.0), TintGpu::NONE);
     }
 }
+

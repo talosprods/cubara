@@ -164,7 +164,13 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
         cubara_world::far_trees::density(blocks)
     };
     let Some(frame) =
-        headless::render_with_far_trees(meshed, &patches, far_params, (&trees, &density), shot)
+        headless::render_with_far_trees(
+            meshed,
+            &patches,
+            far_params,
+            headless::FarTreesShot::game(&trees, &density),
+            shot,
+        )
     else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
