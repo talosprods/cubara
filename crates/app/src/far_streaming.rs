@@ -1558,6 +1558,195 @@ mod tests {
         }
     }
 
+    // --- The stand-in for the voxels' strip (§9.11) ----------------------
+
+    /// The voxels' box on the low flight's move at t 5.27 s (x crosses 128):
+    /// the box it wants, and what of it it draws while the strip loads --
+    /// `NodeStreaming`'s own rule.
+    fn low_flight_move() -> VoxelBox {
+        let box_at = |c: [i32; 3]| {
+            node::covered_box_3d(ChunkCoord::new(c[0], c[1], c[2]), node::DEFAULT_RING_SCHEDULE)
+        };
+        let want = box_at([8, 6, 2]);
+        let drawn = crate::streaming::next_far_hole(box_at([7, 6, 2]), want, |_| false);
+        VoxelBox {
+            wanted: hole_in_blocks(want),
+            drawn: hole_in_blocks(drawn),
+        }
+    }
+
+    /// **The stand-in is the finest far level over the strip and nothing
+    /// else**: on the low flight's move, the strip x 1,152 to 1,280 the
+    /// length of the box takes the column of nine patches of 256 blocks at
+    /// x 1,024 -- none of the box's other edges, none beyond -- and nothing
+    /// stands in while nothing waits.
+    #[test]
+    fn the_stand_in_is_the_finest_patches_over_the_strip() {
+        let voxels = low_flight_move();
+        assert_eq!(
+            (voxels.wanted.max[0], voxels.drawn.max[0]),
+            (1280.0, 1152.0),
+            "the move's strip"
+        );
+        let keys = standin_keys(voxels).expect("the boxes differ across the ground only");
+        let column: Vec<PatchKey> = (-4..=4).map(|z| PatchKey::new(3, 4, z)).collect();
+        assert_eq!(keys, column);
+        assert_eq!(far::FINEST_LEVEL, 3, "level 3's cells are quads of 8");
+        let settled = VoxelBox::settled(voxels.wanted);
+        assert_eq!(standin_keys(settled), Some(Vec::new()), "nothing waits");
+    }
+
+    /// **The strip is stood in for only while every top it can hold is inside
+    /// both boxes**: a box whose floor or ceiling runs through the ground
+    /// (an eye some 900 blocks above it or 770 under it) leaves a slab of
+    /// ground under all of it to hand over, and the far terrain stands in
+    /// for that as it always did ([`far_stand`] falls back).
+    #[test]
+    fn a_box_whose_floor_cuts_the_ground_has_no_stand_in() {
+        let voxels = low_flight_move();
+        let (lo, hi) = far::ground_range();
+        let with_floor = |b: Hole, y: f64| Hole {
+            min: [b.min[0], y, b.min[2]],
+            ..b
+        };
+        let with_ceiling = |b: Hole, y: f64| Hole {
+            max: [b.max[0], y, b.max[2]],
+            ..b
+        };
+        for (what, cut) in [
+            ("a floor at the lowest top", VoxelBox {
+                wanted: with_floor(voxels.wanted, lo),
+                drawn: with_floor(voxels.drawn, lo),
+            }),
+            ("a ceiling under the highest top", VoxelBox {
+                wanted: with_ceiling(voxels.wanted, hi - 1.0),
+                drawn: with_ceiling(voxels.drawn, hi - 1.0),
+            }),
+            ("the drawn box's floor at the lowest top", VoxelBox {
+                drawn: with_floor(voxels.drawn, lo),
+                ..voxels
+            }),
+        ] {
+            assert_eq!(standin_keys(cut), None, "{what}");
+            assert_eq!(far_stand(cut, |_| true), (cut.drawn, Vec::new()), "{what}");
+        }
+        // Just clear of the ground on both sides, it stands in.
+        let clear = VoxelBox {
+            wanted: with_ceiling(with_floor(voxels.wanted, lo - 1.0), hi),
+            drawn: with_ceiling(with_floor(voxels.drawn, lo - 1.0), hi),
+        };
+        assert!(standin_keys(clear).is_some_and(|k| !k.is_empty()), "clear of the ground");
+    }
+
+    /// **The far terrain is the finished frame's only with every patch of
+    /// the stand-in generated** ([`far_stand`]): holed at the box the voxels
+    /// want and the stand-in drawn; with one patch missing, holed at the box
+    /// they draw and nothing standing in; with nothing waiting, the box
+    /// they want.
+    #[test]
+    fn the_far_terrain_is_the_finished_frames_once_the_stand_in_is_generated() {
+        let voxels = low_flight_move();
+        let keys = standin_keys(voxels).unwrap();
+        assert_eq!(far_stand(voxels, |_| true), (voxels.wanted, keys.clone()));
+        let missing = keys[4];
+        assert_eq!(
+            far_stand(voxels, |k| k != missing),
+            (voxels.drawn, Vec::new()),
+            "one patch of the stand-in still to come"
+        );
+        let settled = VoxelBox::settled(voxels.wanted);
+        assert_eq!(far_stand(settled, |_| false), (voxels.wanted, Vec::new()));
+    }
+
+    /// **The ring holds every strip one move of the box can gain**: whichever
+    /// way the eye crosses a chunk -- along x, along z, or both in one
+    /// frame -- the box moves a coarsest node on, and every patch the
+    /// stand-in then needs is in the ring round the box it left, so it was
+    /// generated before the move.
+    #[test]
+    fn the_ring_holds_every_strip_a_move_can_gain() {
+        let voxels = low_flight_move();
+        let ring: HashSet<PatchKey> = standin_ring(voxels.wanted).into_iter().collect();
+        let node = coarsest_node_blocks();
+        let mut needed = 0;
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let moved = Hole {
+                min: [
+                    voxels.wanted.min[0] + dx as f64 * node,
+                    voxels.wanted.min[1],
+                    voxels.wanted.min[2] + dz as f64 * node,
+                ],
+                max: [
+                    voxels.wanted.max[0] + dx as f64 * node,
+                    voxels.wanted.max[1],
+                    voxels.wanted.max[2] + dz as f64 * node,
+                ],
+            };
+            let drawn = overlap(voxels.wanted, moved).expect("a move keeps most of the box");
+            let strip = standin_keys(VoxelBox {
+                wanted: moved,
+                drawn,
+            })
+            .expect("a move across the ground");
+            for k in &strip {
+                assert!(ring.contains(k), "({dx}, {dz}): {k:?} is not in the ring");
+            }
+            needed += strip.len();
+        }
+        assert!(needed >= 8 * 9, "{needed} patches over the eight moves' strips");
+        // The ring is the box's edge, not its ground: none of it wholly
+        // inside the box.
+        let inside = |k: &PatchKey| {
+            let [x, z] = k.origin().map(|o| o as f64);
+            let size = k.size() as f64;
+            voxels.wanted.min[0] <= x
+                && x + size <= voxels.wanted.max[0]
+                && voxels.wanted.min[2] <= z
+                && z + size <= voxels.wanted.max[2]
+        };
+        assert!(!ring.iter().any(inside), "a patch inside the box is in the ring");
+    }
+
+    /// **Each face of the strip is the stand-in's exactly when the strip's
+    /// nodes will draw it** ([`standin_faces`]): every top of the strip's
+    /// quads, once; a wall on the strip's side towards the drawn voxels
+    /// only where the strip is the higher (facing them), and one on its far
+    /// side only where the strip is the higher (facing out) -- the rest are
+    /// the voxels' and the far terrain's. On the patch of the strip the
+    /// sliver looked through.
+    #[test]
+    fn the_stand_in_draws_each_face_the_strips_nodes_will_draw() {
+        let voxels = low_flight_move();
+        let gen = WorldGen::new(cubara_world::World::new().seed());
+        let patch = far::generate(&gen, PatchKey::new(3, 4, -2));
+        let faces = standin_faces(&patch, voxels);
+        let tops: u32 = faces
+            .iter()
+            .filter(|f| f.dir == FarDir::Top)
+            .map(|f| (f.i1 - f.i0) as u32 * (f.j1 - f.j0) as u32)
+            .sum();
+        // The strip is the patch's high half in x (i 16 to 32), all of z.
+        assert_eq!(tops, 16 * 32, "the strip's quads, each under one top");
+        for f in &faces {
+            let [i, _] = f.owner();
+            assert!(i >= 16, "{f:?} belongs to a drawn voxel's quad");
+            match (f.dir, f.i0) {
+                (FarDir::PosX, 16) => panic!("{f:?}: the drawn voxel's riser"),
+                (FarDir::NegX, 32) => panic!("{f:?}: the far terrain's wall beyond the box"),
+                _ => {}
+            }
+        }
+        // Not vacuous: both of the strip's sides have walls of its own.
+        let count = |dir, i0| faces.iter().filter(|f| f.dir == dir && f.i0 == i0).count();
+        assert!(count(FarDir::NegX, 16) > 0, "no wall faces the drawn voxels");
+        assert!(count(FarDir::PosX, 32) > 0, "no wall faces out of the box");
+        let all = to_far_faces(&patch);
+        assert!(
+            all.iter().any(|f| f.dir == FarDir::PosX && f.i0 == 16),
+            "the drawn voxels never stand higher here: the test tells nothing"
+        );
+    }
+
     // --- The plan without a GPU (#398, rule 6) --------------------------
 
     use std::cell::RefCell;

@@ -1386,16 +1386,7 @@ impl FarTerrain {
         // when the eye enters or leaves the box or the ground crosses its
         // floor, and is written only then.
         if let Some(hole) = self.hole.filter(|_| self.shown) {
-            // Of the far terrain only: a stand-in is not joined to the box,
-            // and with it left out the far terrain is placed exactly as in
-            // a frame with nothing standing in.
-            let terrain: Vec<Option<Aabb>> = self
-                .boxes
-                .iter()
-                .zip(&self.placed)
-                .map(|(b, p)| b.filter(|_| p.is_some_and(|p| p.role == FarRole::Terrain)))
-                .collect();
-            let lowest = lowest_over(&terrain, &hole);
+            let lowest = lowest_over(&self.boxes, &hole);
             let raised = hidden_height(hole.min, hole.max, eye, lowest) > hole.max.y;
             if raised != self.raised {
                 self.raised = raised;
@@ -2700,6 +2691,108 @@ mod tests {
         assert_eq!(order, vec![1, 4, 3, 2]);
         let order = draw_order(&boxes, vec![2, 0, 1], None, Vec3::ZERO, terrain);
         assert_eq!(order, vec![0, 1, 2], "no hole: everything, nearest first");
+        // A stand-in stands inside the hole: drawn, in its place by distance.
+        let role = |slot: u32| {
+            if slot == 0 {
+                FarRole::StandIn
+            } else {
+                FarRole::Terrain
+            }
+        };
+        let order = draw_order(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO, role);
+        assert_eq!(order, vec![0, 1, 4, 3, 2], "the stand-in inside the hole");
+    }
+
+    /// **A stand-in is drawn inside the voxels' box, and culled as it
+    /// stands** (`docs/PHASE3_ARCHITECTURE.md` §9.11): a patch wholly inside
+    /// the box draws nothing as the far terrain and draws as a stand-in --
+    /// but only the tiles the frustum sees, and none of the tops of a tile
+    /// above the eye. The far terrain's tiles the box reaches are let off
+    /// both tests (the join moves their corners); no join touches a
+    /// stand-in, so nothing lets it off.
+    #[test]
+    fn a_stand_in_is_drawn_inside_the_hole_and_culled_as_it_stands() {
+        let (origin, quad) = ([0i64, 0], 8.0);
+        let faces: Vec<FarFace> = (0..FAR_QUADS as u8)
+            .flat_map(|j| (0..FAR_QUADS as u8).map(move |i| unit_top(i, j, 100)))
+            .collect();
+        let patch = FarPatch {
+            origin,
+            quad,
+            faces: &faces,
+            skirt: 4.0,
+        };
+        let hole = Some(([-16, -1024, -16], [272, 1024, 272]));
+        // From inside the box, looking along +z over a quarter of the patch.
+        let looking = |eye: Vec3| {
+            let proj = glam::Mat4::perspective_rh(30f32.to_radians(), 1.0, 1.0, 1.0e6);
+            let at = Vec3::new(eye.x, 100.0, eye.z + 100.0);
+            Frustum::from_view_proj(proj * glam::Mat4::look_at_rh(eye, at, Vec3::Y))
+        };
+        let above = Vec3::new(64.0, 160.0, -40.0);
+        let frustum = looking(above);
+        let drawn = |role: FarRole, eye: Vec3| -> usize {
+            runs_of_roles(&[(patch, role)], hole, FarCulling::Tiles, (&frustum, eye))
+                .iter()
+                .map(|&(_, _, count)| count as usize)
+                .sum()
+        };
+        assert_eq!(drawn(FarRole::Terrain, above), 0, "the far terrain inside the box");
+        // The stand-in: exactly the tops of the tiles the frustum sees.
+        let cull = PatchCull::of(&stored_order(&faces), patch.skirt);
+        let input = CullPatch {
+            role: FarRole::StandIn,
+            aabb: patch_box(&patch),
+            origin: [0.0, 0.0],
+            quad,
+            dy: 0.0,
+            cull: &cull,
+        };
+        let seen: usize = (0..TILES)
+            .filter_map(|t| input.tile_box(t))
+            .filter(|b| frustum.intersects_aabb(b))
+            .count()
+            * TILE_QUADS
+            * TILE_QUADS;
+        assert!(
+            seen > 0 && seen < faces.len(),
+            "{seen} faces in view tests nothing"
+        );
+        assert_eq!(drawn(FarRole::StandIn, above), seen, "the stand-in's tiles in view");
+        // An eye under the tops sees none of them.
+        let below = Vec3::new(64.0, 60.0, -40.0);
+        assert_eq!(drawn(FarRole::StandIn, below), 0, "tops above the eye");
+    }
+
+    /// **The shader draws a stand-in as this module says**: a run carries
+    /// [`RUN_STANDIN`], the join is not the stand-in's, and its corners go
+    /// [`STANDIN_BEHIND`] times as far along their lines of sight -- and
+    /// the two constants are the shader's. A pin on its text, as for the
+    /// join; the GPU test of the strip (`cubara-app`'s `strip_standin`) is
+    /// what renders it.
+    #[test]
+    fn the_shader_draws_a_stand_in_as_this_module_does() {
+        let wgsl = crate::haze::FAR_WGSL;
+        let behind: f32 = wgsl
+            .lines()
+            .find_map(|l| l.strip_prefix("const STANDIN_BEHIND: f32 = "))
+            .and_then(|v| v.trim_end_matches(';').parse().ok())
+            .expect("far.wgsl has STANDIN_BEHIND");
+        assert_eq!(behind, STANDIN_BEHIND, "far.wgsl's STANDIN_BEHIND");
+        let flag = format!("const RUN_STANDIN: u32 = {RUN_STANDIN}u;");
+        for line in [
+            flag.as_str(),
+            "flags: u32,",
+            "let standin = (run.flags & RUN_STANDIN) != 0u;",
+            "if standin {",
+            "} else if wall {",
+            "let behind = frame.eye.xyz + (sealed - frame.eye.xyz) * STANDIN_BEHIND;",
+            "out.clip_pos = frame.view_proj * vec4<f32>(select(sealed, behind, standin), 1.0);",
+        ] {
+            assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
+        }
+        assert_eq!(run_flags(FarRole::StandIn), RUN_STANDIN);
+        assert_eq!(run_flags(FarRole::Terrain), 0);
     }
 
     /// `far.wgsl`'s `vs_main`, as far as a vertex's position: one patch of
