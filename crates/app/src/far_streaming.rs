@@ -12,7 +12,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 
 use cubara_render::aggregate::Materials;
-use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarSlot, Renderer};
+use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarRole, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
 use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
@@ -321,6 +321,140 @@ pub fn far_materials() -> Materials {
     cubara_render::far::ground_materials(cubara_world::SOIL_DEPTH as f32)
 }
 
+/// **The voxels' box, as the far terrain is told it each frame**
+/// (`NodeStreaming::voxel_box`): the box the voxel nodes round the eye draw
+/// once all of them are loaded, and the part of it they draw now. The two
+/// differ for the few frames after the box has moved on -- by a whole
+/// coarsest node on its far side, a kilometre ahead -- while the nodes of
+/// the strip it gained are searched for, meshed and drawn. The far terrain
+/// stands in for that strip ([`standin_keys`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoxelBox {
+    /// The box the voxel nodes draw once loaded: what a finished frame
+    /// leaves to them.
+    pub wanted: Hole,
+    /// The part of `wanted` every node of which is drawn now (inside it).
+    pub drawn: Hole,
+}
+
+impl VoxelBox {
+    /// A box whose nodes are all drawn.
+    #[cfg(test)]
+    pub fn settled(hole: Hole) -> Self {
+        Self {
+            wanted: hole,
+            drawn: hole,
+        }
+    }
+}
+
+/// Whether the column `(x, z)` is inside `hole` across the ground.
+fn over(hole: Hole, x: f64, z: f64) -> bool {
+    hole.min[0] <= x && x < hole.max[0] && hole.min[2] <= z && z < hole.max[2]
+}
+
+/// The patches of the finest far level ([`far::FINEST_LEVEL`]) with ground
+/// in `outer` and outside `inner`, across the ground -- in key order.
+fn finest_patches_between(outer: Hole, inner: Hole) -> Vec<PatchKey> {
+    let level = far::FINEST_LEVEL;
+    let size = (far::PATCH_QUADS as i64) << level;
+    let span = |a: usize| {
+        (outer.min[a].floor() as i64).div_euclid(size)..=(outer.max[a].ceil() as i64 - 1).div_euclid(size)
+    };
+    let mut keys = Vec::new();
+    for z in span(2) {
+        for x in span(0) {
+            let key = PatchKey::new(level, x as i32, z as i32);
+            let [ox, oz] = key.origin().map(|o| o as f64);
+            // The patch's ground in `outer`, and whether all of it is in
+            // `inner` too.
+            let lo = [ox.max(outer.min[0]), oz.max(outer.min[2])];
+            let hi = [
+                (ox + size as f64).min(outer.max[0]),
+                (oz + size as f64).min(outer.max[2]),
+            ];
+            let some = lo[0] < hi[0] && lo[1] < hi[1];
+            let all_inner = inner.min[0] <= lo[0]
+                && hi[0] <= inner.max[0]
+                && inner.min[2] <= lo[1]
+                && hi[1] <= inner.max[2];
+            if some && !all_inner {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// **Whether the far terrain can stand in for the strip as the voxels will
+/// draw it**: every height of ground any level draws ([`far::ground_range`])
+/// is inside both boxes -- so they differ across the ground only, where
+/// ground can be, and every top over the strip is one the strip's nodes
+/// will draw. Otherwise (an eye some 900 blocks above the ground or 770
+/// under it, the box's floor or ceiling through the hills) a move of the
+/// box up or down hands over a slab of ground under all of it, and the far
+/// terrain stands in for that as it always did: selected and holed at
+/// `drawn`.
+fn standin_possible(voxels: VoxelBox) -> bool {
+    let (lo, hi) = far::ground_range();
+    [voxels.wanted, voxels.drawn]
+        .iter()
+        .all(|b| b.min[1] < lo && hi <= b.max[1])
+}
+
+/// **The far terrain's stand-in for the strip** (`docs/PHASE3_ARCHITECTURE.md`
+/// §9.11): the patches of the finest far level -- level 3's cells, top for
+/// top and wall for wall (§9.8) -- over the ground inside `wanted` and
+/// outside `drawn`, while the voxel nodes that will draw it load. `None`
+/// when it cannot stand in ([`standin_possible`]); empty when nothing
+/// waits. In key order.
+///
+/// Until it was there the far terrain stood in for the strip as it draws
+/// it -- quads of 16 to 32 -- and a sliver of sky between two of its ridges
+/// that level 3 covers slid over a pixel: land, sky, land, the owner's
+/// flicker (the low flight's t 5.49 s at (211, 358), #443).
+pub fn standin_keys(voxels: VoxelBox) -> Option<Vec<PatchKey>> {
+    if voxels.wanted == voxels.drawn {
+        return Some(Vec::new());
+    }
+    standin_possible(voxels).then(|| finest_patches_between(voxels.wanted, voxels.drawn))
+}
+
+/// The finest far level's patches round `wanted`, one coarsest voxel node
+/// deep: the ground the voxels' box gains when it moves on
+/// (`node::covered_box_3d` moves it a node at a time), whichever way --
+/// generated before it moves, so the far terrain stands in for the strip
+/// the frame it does ([`standin_keys`]).
+fn standin_ring(wanted: Hole) -> Vec<PatchKey> {
+    wanted
+        .grown_across(coarsest_node_blocks())
+        .map_or_else(Vec::new, |grown| finest_patches_between(grown, wanted))
+}
+
+/// **The faces of `patch` the voxel nodes of the strip will draw**: those of
+/// a quad in it -- a top's own, a wall's the higher of the two it stands
+/// between ([`FarFace::owner`]), as a voxel mesher gives a riser to the
+/// column it is the side of. A wall on the strip's side towards the drawn
+/// voxels is the strip's where the strip is the higher, and theirs
+/// otherwise; one on its far side the strip's where it is the higher, and
+/// the far terrain's beyond. So every face is drawn once: by the stand-in,
+/// the voxels or the far terrain, as the finished frame draws it.
+///
+/// No face crosses a [`far::JOIN_GRID`] line and the boxes' sides are on
+/// them, so a face's first quad says where all of it is.
+pub fn standin_faces(patch: &PatchHeights, voxels: VoxelBox) -> Vec<FarFace> {
+    let [ox, oz] = patch.key.origin().map(|o| o as f64);
+    let quad = patch.key.quad() as f64;
+    to_far_faces(patch)
+        .into_iter()
+        .filter(|face| {
+            let [i, j] = face.owner();
+            let (x, z) = (ox + (i as f64 + 0.5) * quad, oz + (j as f64 + 0.5) * quad);
+            over(voxels.wanted, x, z) && !over(voxels.drawn, x, z)
+        })
+        .collect()
+}
+
 /// Every coarser patch holding `key`, up to `top_level`.
 fn ancestors(key: PatchKey, top_level: u32) -> impl Iterator<Item = PatchKey> {
     (key.level + 1..=top_level).map(move |level| {
@@ -548,6 +682,11 @@ struct Step {
     promote: Vec<PatchKey>,
     leave: Vec<PatchKey>,
     arrive: Vec<PatchKey>,
+    /// The stand-in for the strip to take away, and the one to draw, cut
+    /// for `standin_box` ([`standin_faces`]).
+    standin_leave: Vec<PatchKey>,
+    standin_arrive: Vec<PatchKey>,
+    standin_box: Option<VoxelBox>,
 }
 
 /// The far terrain's streaming decisions, with no GPU and no threads
@@ -588,8 +727,21 @@ struct FarPlan {
     /// ([`ahead_view`]).
     ahead_at: Option<[f64; 3]>,
     ahead: HashSet<PatchKey>,
-    /// The hole the last selection left to the voxels.
+    /// The hole the last selection left to the voxels: the box they want
+    /// while the stand-in can stand in for the strip, else the box they
+    /// draw ([`FarPlan::step`]).
     hole: Option<Hole>,
+    /// The finest level's patches round the voxels' box ([`standin_ring`]),
+    /// generated before the box moves on, and the box they were worked out
+    /// for.
+    ring: HashSet<PatchKey>,
+    ring_for: Option<Hole>,
+    /// The patches of the strip the voxels' box has now ([`standin_keys`]),
+    /// generated or not: kept while it waits.
+    strip: Vec<PatchKey>,
+    /// What stands in for the strip now: the box it was cut for and its
+    /// patches; `None` while nothing does.
+    standin: Option<(VoxelBox, Vec<PatchKey>)>,
     /// The screen height the last selection was made for.
     screen_height: u32,
     /// A patch the selection wants arrived since it was last worked out.
@@ -623,6 +775,10 @@ impl FarPlan {
             ahead_at: None,
             ahead: HashSet::new(),
             hole: None,
+            ring: HashSet::new(),
+            ring_for: None,
+            strip: Vec::new(),
+            standin: None,
             screen_height: 0,
             arrived: false,
             ahead_arrived: false,
@@ -642,6 +798,10 @@ impl FarPlan {
         self.wanted.clear();
         self.ahead_at = None;
         self.ahead.clear();
+        self.ring.clear();
+        self.ring_for = None;
+        self.strip.clear();
+        self.standin = None;
         self.arrived = false;
         self.ahead_arrived = false;
     }
@@ -656,7 +816,10 @@ impl FarPlan {
         let urgency = self.in_flight.remove(&key);
         self.heights.insert(key, patch);
         self.arrived |= self.wanted.contains(&key);
-        self.ahead_arrived |= urgency == Some(Urgency::Ahead) || self.ahead.contains(&key);
+        // A patch of the ring decides nothing the prefetch walks: it waits
+        // for the box to move.
+        self.ahead_arrived |= self.ahead.contains(&key)
+            || (urgency == Some(Urgency::Ahead) && !self.ring.contains(&key));
     }
 
     /// Nothing generating, and the selection and the prefetch up to date
@@ -676,21 +839,134 @@ impl FarPlan {
         self.heights.get(&key)
     }
 
+    /// The hole the far terrain is drawn with now ([`step`](Self::step)).
+    fn hole(&self) -> Option<Hole> {
+        self.hole
+    }
+
+    /// The stand-in for the strip `voxels` has, once every patch of it is
+    /// generated: `Some` and empty while nothing waits, `None` while it
+    /// cannot stand in ([`standin_keys`]) or a patch of it is still to
+    /// come -- asked for at once, since the strip is in sight now. (The ring
+    /// has them generated before the box moves; a box that moves twice
+    /// before its first strip is drawn can outrun it.)
+    fn standin_for(&mut self, voxels: VoxelBox, step: &mut Step) -> Option<Vec<PatchKey>> {
+        let Some(keys) = standin_keys(voxels) else {
+            self.strip.clear();
+            return None;
+        };
+        let mut ready = true;
+        for &k in &keys {
+            if self.heights.contains_key(&k) {
+                continue;
+            }
+            ready = false;
+            match self.in_flight.get(&k) {
+                None => step.request.push(k),
+                Some(Urgency::Ahead) => step.promote.push(k),
+                Some(Urgency::Now) => continue,
+            }
+            self.in_flight.insert(k, Urgency::Now);
+        }
+        self.strip.clone_from(&keys);
+        ready.then_some(keys)
+    }
+
+    /// Draw `now` as the stand-in from this frame on, if it is not what is
+    /// drawn already: the old one leaves and the new one arrives in the
+    /// same frame.
+    fn show_standin(&mut self, now: Option<(VoxelBox, Vec<PatchKey>)>, step: &mut Step) {
+        if now == self.standin {
+            return;
+        }
+        if let Some((_, old)) = self.standin.take() {
+            step.standin_leave = old;
+        }
+        if let Some((voxels, keys)) = &now {
+            step.standin_arrive.clone_from(keys);
+            step.standin_box = Some(*voxels);
+        }
+        self.standin = now;
+    }
+
+    /// Ask for the ring round `wanted` ([`standin_ring`]) when the box is a
+    /// new one, behind what the eye wants.
+    fn ring_round(&mut self, wanted: Hole, step: &mut Step) {
+        if self.ring_for == Some(wanted) {
+            return;
+        }
+        self.ring_for = Some(wanted);
+        self.ring = standin_ring(wanted).into_iter().collect();
+        let mut ask: Vec<PatchKey> = self
+            .ring
+            .iter()
+            .copied()
+            .filter(|k| !self.heights.contains_key(k) && !self.in_flight.contains_key(k))
+            .collect();
+        for &k in &ask {
+            self.in_flight.insert(k, Urgency::Ahead);
+        }
+        step.prefetch.extend(ask);
+        // Finest first, then in key order, with the prefetch's (rule 1).
+        step.prefetch.sort();
+    }
+
     /// Decide what this frame changes for an eye at `eye`: work the selection
     /// out again if the eye has moved as far as its slack, the hole or the
     /// screen changed, or a patch it wants arrived -- the prefetch likewise,
     /// on its own cadence -- and say what to ask for, free and upload.
     /// `drawn` is what the renderer holds now; it is called only if either
     /// is worked out.
+    ///
+    /// **While a strip of the voxels' box waits for its nodes** (`voxels`'
+    /// two boxes differ) the far terrain is what the finished frame draws --
+    /// selected and holed at the box the voxels want -- and the stand-in
+    /// draws the strip as level 3 will ([`standin_keys`]), as soon as all of
+    /// it is generated; until then the far terrain is selected and holed at
+    /// the box they draw, and stands in for the strip itself.
     fn step(
+        &mut self,
+        eye: [f64; 3],
+        screen_height: u32,
+        voxels: VoxelBox,
+        drawn: impl FnOnce() -> HashSet<PatchKey>,
+    ) -> Step {
+        let mut step = Step::default();
+        let on = self.quality.detail().is_some();
+        let standin = on
+            .then(|| self.standin_for(voxels, &mut step))
+            .flatten();
+        let hole = if standin.is_some() {
+            voxels.wanted
+        } else {
+            voxels.drawn
+        };
+        self.show_standin(
+            standin
+                .filter(|keys| !keys.is_empty())
+                .map(|keys| (voxels, keys)),
+            &mut step,
+        );
+        let mut step = self.select(eye, screen_height, hole, drawn, step);
+        // Last, so nothing the eye wants now is asked for behind it.
+        if on {
+            self.ring_round(voxels.wanted, &mut step);
+        }
+        step
+    }
+
+    /// [`step`](Self::step)'s far terrain: the selection and the prefetch
+    /// for the voxels' box `hole`, into `step`.
+    fn select(
         &mut self,
         eye: [f64; 3],
         screen_height: u32,
         hole: Hole,
         drawn: impl FnOnce() -> HashSet<PatchKey>,
+        mut step: Step,
     ) -> Step {
-        // The hole is the voxels' to say (`NodeStreaming::far_hole`): where it
-        // shrinks, patches it used to swallow are wanted at once.
+        // The hole is the voxels' to say (`NodeStreaming::voxel_box`): where
+        // it shrinks, patches it used to swallow are wanted at once.
         let hole_moved = self.hole != Some(hole);
         self.hole = Some(hole);
         let screen_moved = self.screen_height != screen_height;
@@ -708,7 +984,7 @@ impl FarPlan {
                 .ahead_at
                 .is_none_or(|at| eye_distance(at, eye) > PREFETCH_RESELECT_BLOCKS);
         if !(select_due || prefetch_due) {
-            return Step::default();
+            return step;
         }
         let drawn = drawn();
 
@@ -724,18 +1000,14 @@ impl FarPlan {
             self.ahead_at = Some(eye);
             self.wanted.clear();
             self.ahead.clear();
-            let mut leave: Vec<PatchKey> = drawn.into_iter().collect();
-            leave.sort();
-            return Step {
-                leave,
-                ..Step::default()
-            };
+            step.leave = drawn.into_iter().collect();
+            step.leave.sort();
+            return step;
         };
         let view = FarView {
             radius: self.radius,
             ..view
         };
-        let mut step = Step::default();
         let error_of = |heights: &HashMap<PatchKey, PatchHeights>, k: PatchKey| {
             heights.get(&k).map(|p| p.error)
         };
@@ -780,7 +1052,7 @@ impl FarPlan {
             }
             let walk = far::select_walk(&ahead_view(&view), |k| error_of(&self.heights, k));
             self.ahead = walk.patches.into_iter().chain(walk.split).collect();
-            step.prefetch = self
+            let mut ask: Vec<PatchKey> = self
                 .ahead
                 .iter()
                 .copied()
@@ -788,10 +1060,12 @@ impl FarPlan {
                 .collect();
             // Finest first, then in key order, so the order is a function of
             // the plan's state and not of the set's (rule 1).
-            step.prefetch.sort();
-            for &k in &step.prefetch {
+            ask.sort();
+            for &k in &ask {
                 self.in_flight.insert(k, Urgency::Ahead);
             }
+            step.prefetch.extend(ask);
+            step.prefetch.sort();
         }
 
         if let Some(wanted) = wanted {
@@ -800,6 +1074,8 @@ impl FarPlan {
             (step.leave, step.arrive) = swap(&drawn, &draw);
             let mut keep = to_keep(&wanted, draw, far::root_level_for(view.radius));
             keep.extend(self.ahead.iter().copied());
+            keep.extend(self.ring.iter().copied());
+            keep.extend(self.strip.iter().copied());
             self.heights.retain(|k, _| keep.contains(k));
             self.wanted = wanted.into_iter().collect();
         }
@@ -816,6 +1092,10 @@ pub struct FarStreaming {
     pool: Pool,
     plan: FarPlan,
     slots: HashMap<PatchKey, FarSlot>,
+    /// The stand-in for the strip the voxels' box is loading
+    /// ([`standin_keys`]): the same patches as the far terrain's when a key
+    /// is both, in slots of their own, cut to the strip.
+    standin_slots: HashMap<PatchKey, FarSlot>,
     materials: Materials,
     /// Said once when the renderer runs out of slots, not every frame.
     warned_full: bool,
@@ -830,6 +1110,7 @@ impl FarStreaming {
             pool: Pool::new(),
             plan: FarPlan::new(quality, FAR_VIEW_RADIUS),
             slots: HashMap::new(),
+            standin_slots: HashMap::new(),
             materials: far_materials(),
             warned_full: false,
         }
@@ -863,7 +1144,7 @@ impl FarStreaming {
     /// A different world -- New World, a load, joining a server: drop every
     /// patch, drawn or generating, and start again from `seed`.
     pub fn reset(&mut self, seed: u64, renderer: &mut Renderer) {
-        for (_, slot) in self.slots.drain() {
+        for (_, slot) in self.slots.drain().chain(self.standin_slots.drain()) {
             renderer.far_remove(slot);
         }
         self.plan.clear();
@@ -887,23 +1168,54 @@ impl FarStreaming {
         self.plan.reselect();
     }
 
-    /// Bring the far terrain in line with the camera at `eye`: take in what
-    /// has been generated, work the selection out again if the eye has moved
-    /// or new patches arrived, and ask for what is missing -- and, a little
-    /// ahead, for what will be.
-    pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3], hole: Hole) {
+    /// Bring the far terrain in line with the camera at `eye` and the
+    /// voxels' box: take in what has been generated, work the selection out
+    /// again if the eye has moved or new patches arrived, ask for what is
+    /// missing -- and, a little ahead, for what will be -- and stand in for
+    /// a strip of the box still loading ([`FarPlan::step`]).
+    pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3], voxels: VoxelBox) {
         while let Ok((generation, patch)) = self.pool.done.try_recv() {
             if generation != self.generation {
                 continue;
             }
             self.plan.take(patch);
         }
-        renderer.set_far_params(to_far_params(hole, self.materials));
         let eye64 = eye.map(|v| v as f64);
         let slots = &self.slots;
-        let step = self.plan.step(eye64, renderer.size().1, hole, || {
+        let step = self.plan.step(eye64, renderer.size().1, voxels, || {
             slots.keys().copied().collect()
         });
+        // The hole this frame's far terrain is drawn with: the box the
+        // voxels want while the stand-in draws the strip, else the box they
+        // draw.
+        let hole = self.plan.hole().unwrap_or(voxels.drawn);
+        renderer.set_far_params(to_far_params(hole, self.materials));
+        for key in step.standin_leave {
+            if let Some(slot) = self.standin_slots.remove(&key) {
+                renderer.far_remove(slot);
+            }
+        }
+        if let Some(strip) = step.standin_box {
+            for key in step.standin_arrive {
+                let Some(patch) = self.plan.patch(key) else {
+                    continue;
+                };
+                let faces = standin_faces(patch, strip);
+                match renderer.far_insert_as(to_far_patch(patch, &faces), FarRole::StandIn) {
+                    Some(slot) => {
+                        self.standin_slots.insert(key, slot);
+                    }
+                    None if !self.warned_full => {
+                        log::warn!(
+                            "far terrain: out of slots or vertices -- a strip of ground \
+                             still loading is not drawn"
+                        );
+                        self.warned_full = true;
+                    }
+                    None => {}
+                }
+            }
+        }
 
         for key in step.promote {
             self.pool.promote(key);
@@ -1349,17 +1661,22 @@ mod tests {
         }
     }
 
-    /// A plan, a pool, and what a renderer would hold. Tests compare `shown`,
-    /// never anything the plan believes.
+    /// A plan, a pool, and what a renderer would hold. Tests compare `shown`
+    /// and `standin`, never anything the plan believes.
     struct Sim {
         plan: FarPlan,
         pool: PoolModel,
         shown: HashSet<PatchKey>,
+        /// What the renderer holds as the stand-in for a strip, and the box
+        /// it was cut for.
+        standin: HashSet<PatchKey>,
+        standin_box: Option<VoxelBox>,
         /// Generated heights, shared by the pool and the reference (a
         /// per-test cache, not a static: rule 2).
         memo: RefCell<HashMap<PatchKey, PatchHeights>>,
         gen: WorldGen,
-        hole: Hole,
+        /// The voxels' box, as `NodeStreaming::voxel_box` hands it over.
+        voxels: VoxelBox,
         radius: f64,
         /// The quad scale the plan and the reference ([`Sim::exact`]) both
         /// select at.
@@ -1398,9 +1715,11 @@ mod tests {
                 plan,
                 pool,
                 shown: HashSet::new(),
+                standin: HashSet::new(),
+                standin_box: None,
                 memo: RefCell::new(HashMap::new()),
                 gen: WorldGen::new(seed),
-                hole,
+                voxels: VoxelBox::settled(hole),
                 radius,
                 scale,
                 check_coverage: false,
@@ -1415,13 +1734,19 @@ mod tests {
                 .clone()
         }
 
-        /// The converged selection at `eye`: select against what is known,
+        /// The converged selection at `eye`, holed at the box the voxels
+        /// want -- the finished frame's: select against what is known,
         /// generate what is missing, repeat (the loop of `far::build`, and of
         /// `keeping_the_ancestors_keeps_the_selection_still`).
         fn exact(&self, eye: [f64; 3]) -> HashSet<PatchKey> {
+            self.exact_holed(eye, self.voxels.wanted)
+        }
+
+        /// [`exact`](Self::exact) with the voxels' box `hole`.
+        fn exact_holed(&self, eye: [f64; 3], hole: Hole) -> HashSet<PatchKey> {
             let view = FarView {
                 radius: self.radius,
-                ..far_view_scaled(eye, 1080, Some(self.hole), FarQuality::High, self.scale).unwrap()
+                ..far_view_scaled(eye, 1080, Some(hole), FarQuality::High, self.scale).unwrap()
             };
             loop {
                 let wanted = far::select(&view, |k| self.memo.borrow().get(&k).map(|p| p.error));
@@ -1448,7 +1773,7 @@ mod tests {
                 self.plan.take(patch);
             }
             let shown = &self.shown;
-            let step = self.plan.step(eye, 1080, self.hole, || shown.clone());
+            let step = self.plan.step(eye, 1080, self.voxels, || shown.clone());
             for key in &step.leave {
                 assert!(self.shown.remove(key), "{key:?} left but was not shown");
             }
@@ -1458,6 +1783,26 @@ mod tests {
                     "{key:?} arrived without heights"
                 );
                 assert!(self.shown.insert(*key), "{key:?} arrived twice");
+            }
+            for key in &step.standin_leave {
+                assert!(
+                    self.standin.remove(key),
+                    "{key:?} left the stand-in but was not in it"
+                );
+            }
+            if !step.standin_leave.is_empty() && step.standin_arrive.is_empty() {
+                self.standin_box = None;
+            }
+            if let Some(strip) = step.standin_box {
+                assert!(self.standin.is_empty(), "a stand-in arrived over another");
+                for key in &step.standin_arrive {
+                    assert!(
+                        self.plan.patch(*key).is_some(),
+                        "{key:?} stood in without heights"
+                    );
+                    self.standin.insert(*key);
+                }
+                self.standin_box = Some(strip);
             }
             self.pool.apply(&step);
             step
@@ -1519,9 +1864,9 @@ mod tests {
         (0..3).all(|i| min[i] < max[i]).then_some(Hole { min, max })
     }
 
-    /// The far terrain's hole as `NodeStreaming::far_hole` hands it over
-    /// while the eye flies: the voxels want the box round the eye's chunk;
-    /// when it moves, the hole is cut down to what the old and new boxes
+    /// The voxels' box as `NodeStreaming::voxel_box` hands it over while the
+    /// eye flies: the voxels want the box round the eye's chunk; when it
+    /// moves, the part they draw is cut down to what the old and new boxes
     /// share at once, and grows to the new box `lag` frames later -- the
     /// frames its nodes take to be searched for, meshed and drawn.
     struct HoleLag {
@@ -1544,7 +1889,15 @@ mod tests {
             }
         }
 
-        fn at(&mut self, eye: [f64; 3]) -> Hole {
+        /// The two boxes now.
+        fn voxels(&self) -> VoxelBox {
+            VoxelBox {
+                wanted: self.wanted,
+                drawn: self.hole,
+            }
+        }
+
+        fn at(&mut self, eye: [f64; 3]) -> VoxelBox {
             let want = voxel_hole(eye.map(|v| v as f32));
             if want != self.wanted {
                 self.moves += 1;
@@ -1557,7 +1910,7 @@ mod tests {
                     self.hole = want;
                 }
             }
-            self.hole
+            self.voxels()
         }
     }
 
@@ -1567,32 +1920,67 @@ mod tests {
     /// the 6 to 9 ms a patch #398 step 1 measured), the voxels' box handed
     /// over 12 frames after each move. Also how often what was drawn
     /// changed, and how many patches were asked for, to show it was tried.
-    fn frames_behind(scale: f64, frames: usize) -> (Vec<String>, usize, usize, usize) {
+    fn frames_behind(scale: f64, frames: usize) -> Behind {
         let eyes = low_flight(frames);
         let mut holes = HoleLag::new(eyes[0], 12);
-        let mut sim = Sim::at_scale(TEST_RADIUS, holes.hole, PoolModel::new(4, 2), scale);
+        let mut sim = Sim::at_scale(TEST_RADIUS, holes.wanted, PoolModel::new(4, 2), scale);
         sim.settle(eyes[0]);
-        let (mut behind, mut changes, mut asked) = (Vec::new(), 0, 0);
+        let mut out = Behind::default();
         for (f, &eye) in eyes.iter().enumerate() {
-            sim.hole = holes.at(eye);
+            sim.voxels = holes.at(eye);
             let before = sim.shown.clone();
             let done = sim.pool.tick();
             let step = sim.frame(eye, done);
-            asked += step.request.len() + step.prefetch.len();
-            changes += usize::from(sim.shown != before);
+            out.asked += step.request.len() + step.prefetch.len();
+            out.changes += usize::from(sim.shown != before);
+            let at = format!("frame {f} (t {:.2} s)", f as f64 / 60.0);
+            // The finished frame's far terrain: the eye's own selection,
+            // holed at the box the voxels want.
             let exact = sim.exact(eye);
             if sim.shown != exact {
                 let mut drawn: Vec<_> = sim.shown.difference(&exact).copied().collect();
                 let mut wanted: Vec<_> = exact.difference(&sim.shown).copied().collect();
                 drawn.sort();
                 wanted.sort();
-                behind.push(format!(
-                    "frame {f} (t {:.2} s): drawn {drawn:?}, the eye's own {wanted:?}",
-                    f as f64 / 60.0
+                out.behind.push(format!(
+                    "{at}: drawn {drawn:?}, the eye's own {wanted:?}"
+                ));
+            }
+            // ...and over the strip the box still loads, level 3.
+            let strip: HashSet<PatchKey> = standin_keys(sim.voxels)
+                .expect("the low flight's boxes differ across the ground only")
+                .into_iter()
+                .collect();
+            out.waiting += usize::from(!strip.is_empty());
+            let cut_for = if strip.is_empty() {
+                None
+            } else {
+                Some(sim.voxels)
+            };
+            if sim.standin != strip || sim.standin_box != cut_for {
+                out.behind.push(format!(
+                    "{at}: the stand-in is {:?} cut for {:?}, the strip's {strip:?}",
+                    sim.standin, sim.standin_box
                 ));
             }
         }
-        (behind, changes, asked, holes.moves)
+        out.moves = holes.moves;
+        out
+    }
+
+    /// What [`frames_behind`] found.
+    #[derive(Default)]
+    struct Behind {
+        /// The frames whose far terrain is not the finished frame's, and why.
+        behind: Vec<String>,
+        /// Frames in which the drawn set changed.
+        changes: usize,
+        /// Patches asked for in flight.
+        asked: usize,
+        /// Frames with a strip of the voxels' box waiting for its nodes.
+        waiting: usize,
+        /// Moves of the voxels' box.
+        moves: usize,
     }
 
     /// **What is drawn is the far terrain the eye itself selects, on every
@@ -1607,31 +1995,48 @@ mod tests {
     /// game's radius, four workers at a frame a patch). The selection is
     /// now worked out again within its slack and the patches a little
     /// ahead of the eye are generated before it wants them.
+    ///
+    /// **And while a strip of the voxels' box waits for its nodes, the far
+    /// terrain is still the finished frame's**, holed at the box the voxels
+    /// want, with level 3's stand-in over the strip (§9.11) -- from the
+    /// frame the box moves, because the ring round it was generated before.
+    /// Until then the far terrain was selected and holed at the box the
+    /// voxels draw, and stood in for the strip at its own quads.
     #[test]
     fn the_live_selection_is_the_exact_one_on_every_frame() {
         for scale in [FAR_QUAD_SCALE, 3.0] {
-            let (behind, changes, asked, moves) = frames_behind(scale, 1200);
+            let found = frames_behind(scale, 1200);
             println!(
-                "x{scale}: {} of 1200 frames behind; drawn set changed in {changes}; \
-                 {asked} patches asked for; the voxels' box moved {moves} times",
-                behind.len()
+                "x{scale}: {} of 1200 frames behind; drawn set changed in {}; {} patches \
+                 asked for; the voxels' box moved {} times, a strip waited in {} frames",
+                found.behind.len(),
+                found.changes,
+                found.asked,
+                found.moves,
+                found.waiting,
             );
             assert!(
-                behind.is_empty(),
-                "x{scale}: {} frames draw other far terrain than their eye selects:\n{}",
-                behind.len(),
-                behind.join("\n")
+                found.behind.is_empty(),
+                "x{scale}: {} frames draw other far terrain than the finished frame:\n{}",
+                found.behind.len(),
+                found.behind.join("\n")
             );
             // Not vacuous: the far terrain changed under the eye, patches
             // had to be generated on the way (most were generated ahead,
-            // while the plan settled at the start), and the voxels' box
-            // moved.
+            // while the plan settled at the start), the voxels' box moved,
+            // and its strips waited (12 frames a move).
             assert!(
-                changes >= 8,
-                "x{scale}: the drawn set changed {changes} times"
+                found.changes >= 8,
+                "x{scale}: the drawn set changed {} times",
+                found.changes
             );
-            assert!(asked > 0, "x{scale}: nothing was asked for in flight");
-            assert!(moves >= 3, "x{scale}: the box moved {moves} times");
+            assert!(found.asked > 0, "x{scale}: nothing was asked for in flight");
+            assert!(found.moves >= 3, "x{scale}: the box moved {} times", found.moves);
+            assert!(
+                found.waiting >= 12 * found.moves,
+                "x{scale}: a strip waited in {} frames",
+                found.waiting
+            );
         }
     }
 
@@ -1701,19 +2106,20 @@ mod tests {
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
         let n = sim.plan.selects;
-        let (hole, shown) = (sim.hole, sim.shown.clone());
+        let (hole, shown) = (sim.voxels.wanted, sim.shown.clone());
         sim.plan.reselect();
-        sim.plan.step(start, 1080, hole, || shown.clone());
+        let settled = VoxelBox::settled;
+        sim.plan.step(start, 1080, settled(hole), || shown.clone());
         assert_eq!(sim.plan.selects, n + 1, "reselect did nothing");
-        sim.plan.step(start, 720, hole, || shown.clone());
+        sim.plan.step(start, 720, settled(hole), || shown.clone());
         assert_eq!(sim.plan.selects, n + 2, "a new screen height did nothing");
         let hole = Hole {
             min: [hole.min[0] + 16.0, hole.min[1], hole.min[2]],
             ..hole
         };
-        sim.plan.step(start, 720, hole, || shown.clone());
+        sim.plan.step(start, 720, settled(hole), || shown.clone());
         assert_eq!(sim.plan.selects, n + 3, "a new hole did nothing");
-        sim.plan.step(start, 720, hole, || shown.clone());
+        sim.plan.step(start, 720, settled(hole), || shown.clone());
         assert_eq!(sim.plan.selects, n + 3, "nothing changed but it selected");
     }
 
@@ -1731,7 +2137,7 @@ mod tests {
             "a slack of {slack} blocks tests nothing"
         );
         let n = sim.plan.selects;
-        let (hole, shown) = (sim.hole, sim.shown.clone());
+        let (hole, shown) = (sim.voxels, sim.shown.clone());
         let at = |d: f64| [start[0] + d, start[1], start[2]];
         sim.plan.step(at(slack * 0.5), 1080, hole, || shown.clone());
         assert_eq!(sim.plan.selects, n, "half the slack away it selected");
@@ -1753,7 +2159,7 @@ mod tests {
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
         let (n, p) = (sim.plan.selects, sim.plan.prefetches);
-        let (hole, shown) = (sim.hole, sim.shown.clone());
+        let (hole, shown) = (sim.voxels, sim.shown.clone());
         // A patch nobody wants, far off.
         let stray = PatchKey::new(5, 40, 40);
         sim.plan.take(sim.heights(stray));
@@ -1925,7 +2331,7 @@ mod tests {
         sim.plan.in_flight.insert(k, Urgency::Ahead);
         sim.plan.reselect();
         let shown = sim.shown.clone();
-        let step = sim.plan.step(start, 1080, sim.hole, || shown.clone());
+        let step = sim.plan.step(start, 1080, sim.voxels, || shown.clone());
         assert_eq!(step.promote, vec![k], "not promoted");
         assert!(!step.request.contains(&k), "asked for twice");
         assert_eq!(sim.plan.in_flight.get(&k), Some(&Urgency::Now));
@@ -1945,13 +2351,13 @@ mod tests {
         let mut holes = HoleLag::new(before, 1000);
         let mut sim = Sim::at_scale(
             TEST_RADIUS,
-            holes.hole,
+            holes.wanted,
             PoolModel::new(4, 2),
             FAR_QUAD_SCALE,
         );
         sim.settle(before);
-        let old = sim.hole;
-        sim.hole = holes.at(after);
+        let old = sim.voxels.wanted;
+        sim.voxels = holes.at(after);
         assert_eq!(holes.moves, 1, "the box did not move");
         let step = sim.frame(after, Vec::new());
         assert!(
@@ -1961,6 +2367,15 @@ mod tests {
             step.promote
         );
         assert_eq!(sim.shown, sim.exact(after), "the move drew late");
+        // ...and the strip the box gained stands in as level 3 from that
+        // frame (§9.11): the ring round the old box had it generated.
+        let strip = standin_keys(sim.voxels).expect("a strip across the ground only");
+        assert!(!strip.is_empty(), "the move gained no strip");
+        assert_eq!(
+            sim.standin,
+            strip.iter().copied().collect(),
+            "the strip did not stand in on the frame of the move"
+        );
         // Not vacuous: ground the old hole swallowed arrived.
         assert!(
             step.arrive
@@ -1985,7 +2400,7 @@ mod tests {
             if let Some(scale) = scale {
                 plan.quad_scale = scale;
             }
-            let step = plan.step(eye, 1080, hole, HashSet::new);
+            let step = plan.step(eye, 1080, VoxelBox::settled(hole), HashSet::new);
             step.request.into_iter().collect()
         };
         let selected = |scale: f64| -> HashSet<PatchKey> {
@@ -2028,7 +2443,12 @@ mod tests {
         ]
         .into();
         let hole = voxel_hole([8.0, 120.0, 8.0]);
-        let step = plan.step([8.0, 120.0, 8.0], 1080, hole, || drawn.clone());
+        let step = plan.step(
+            [8.0, 120.0, 8.0],
+            1080,
+            VoxelBox::settled(hole),
+            || drawn.clone(),
+        );
         let mut sorted: Vec<_> = drawn.into_iter().collect();
         sorted.sort();
         assert_eq!(step.leave, sorted);
@@ -2095,7 +2515,7 @@ mod tests {
         let mut holes = HoleLag::new(start, 12);
         let mut times = Vec::new();
         for &eye in &eyes {
-            sim.hole = holes.at(eye);
+            sim.voxels = holes.at(eye);
             let finished = sim.pool.tick();
             for key in finished {
                 let patch = sim.heights(key);
@@ -2103,7 +2523,7 @@ mod tests {
             }
             let shown = &sim.shown;
             let t = std::time::Instant::now();
-            let step = sim.plan.step(eye, 1080, sim.hole, || shown.clone());
+            let step = sim.plan.step(eye, 1080, sim.voxels, || shown.clone());
             times.push(t.elapsed());
             for key in &step.leave {
                 sim.shown.remove(key);
@@ -2165,7 +2585,7 @@ mod tests {
         let (mut sim, start) = sim_at_start(PoolModel::instant());
         sim.settle(start);
         let there = [start[0] + 3_000.0, start[1], start[2] + 900.0];
-        sim.hole = voxel_hole(there.map(|v| v as f32));
+        sim.voxels = VoxelBox::settled(voxel_hole(there.map(|v| v as f32)));
         sim.settle(there);
         assert_eq!(sim.shown, sim.exact(there));
         let ever = sim.memo.borrow().len();

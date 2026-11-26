@@ -19,6 +19,8 @@ use cubara_world::visibility;
 use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
+use crate::far_streaming::{hole_in_blocks, VoxelBox};
+
 /// How many times sooner detail coarsens with height and depth than with
 /// horizontal distance (`cubara_world::node::desired_nodes_3d`).
 ///
@@ -753,25 +755,27 @@ impl NodeStreaming {
         }
     }
 
-    /// The box the far terrain may leave to the voxel nodes this frame, for
-    /// an eye at `eye` -- the owner's holes while flying (2026-11-09: "laag
-    /// detail niveau, dan is het weg, heel kort daarna laadt het op een hoger
-    /// niveau").
+    /// The voxels' box this frame, for an eye at `eye`, as the far terrain
+    /// must know it (`crate::far_streaming::VoxelBox`): the box the nodes
+    /// draw once loaded, and the part of it they draw now -- the owner's
+    /// holes while flying (2026-11-09: "laag detail niveau, dan is het weg,
+    /// heel kort daarna laadt het op een hoger niveau").
     ///
     /// The nodes' own box ([`node::covered_box_3d`]) moves the moment the eye
     /// crosses a chunk, by a whole coarsest node on its far side -- 128 blocks
     /// of ground about a kilometre ahead. Handing that to the voxels at once
     /// sank the far terrain there while the nodes that draw it were still
-    /// being meshed: sky, then the finer ground. So the box the far terrain
-    /// leaves **shrinks at once** (where the voxels stop drawing, it draws
-    /// again) and **grows only when every node the search wants in the new
-    /// part is drawn**, which costs a few frames of both drawing that strip
-    /// and never a frame of neither.
+    /// being meshed: sky, then the finer ground. So the part they draw
+    /// **shrinks at once** (where the voxels stop drawing, the far terrain
+    /// draws again) and **grows only when every node the search wants in the
+    /// new part is drawn**; for those few frames the far terrain stands in
+    /// for the strip (`FarPlan::step`), and there is never a frame of
+    /// neither.
     ///
     /// With nothing kept -- the first frame, or a jump such as `/tp` that
     /// leaves the old box behind entirely -- the new box is taken at once, as
     /// it always was: that is a loading moment, not a flight.
-    pub fn far_hole(&mut self, renderer: &Renderer, eye: [f32; 3]) -> cubara_world::far::Hole {
+    pub fn voxel_box(&mut self, renderer: &Renderer, eye: [f32; 3]) -> VoxelBox {
         let center = ChunkCoord::from_world_pos(eye);
         let want = node::covered_box_3d(center, node::DEFAULT_RING_SCHEDULE);
         let hole = next_far_hole(self.far_hole, want, |kept| {
@@ -779,7 +783,10 @@ impl NodeStreaming {
         });
         self.far_hole = hole;
         self.far_want = want;
-        crate::far_streaming::hole_in_blocks(hole)
+        VoxelBox {
+            wanted: hole_in_blocks(want),
+            drawn: hole_in_blocks(hole),
+        }
     }
 
     /// Whether every node the search around `center` wants inside `want` and

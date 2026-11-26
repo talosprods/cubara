@@ -1336,8 +1336,8 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         let camera = game.camera_pose();
         let eye = camera.eye.as_vec3().to_array();
         nodes.update(renderer, game.world(), eye);
-        let hole = nodes.far_hole(renderer, eye);
-        far.update(renderer, eye, hole);
+        let voxels = nodes.voxel_box(renderer, eye);
+        far.update(renderer, eye, voxels);
         renderer.set_far_shown(nodes.far_in_sight(eye));
         renderer.render(
             camera,
@@ -1454,8 +1454,8 @@ impl Streamed {
     fn frame_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
         self.nodes
             .update(&mut self.renderer, &self.world, stream_eye);
-        let hole = self.nodes.far_hole(&self.renderer, stream_eye);
-        self.far.update(&mut self.renderer, stream_eye, hole);
+        let voxels = self.nodes.voxel_box(&self.renderer, stream_eye);
+        self.far.update(&mut self.renderer, stream_eye, voxels);
         self.renderer
             .set_far_shown(self.nodes.far_in_sight(stream_eye));
         self.renderer.render(

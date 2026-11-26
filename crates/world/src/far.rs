@@ -158,6 +158,16 @@ pub fn split_ratio_for(pixels: f64, screen_height: f64, fov_y: f64) -> f64 {
     1.0 / (pixels * pixel * PATCH_QUADS as f64)
 }
 
+/// The lowest and highest top any level draws, in blocks: one above the
+/// lowest and the highest ground a column can have
+/// ([`WorldGen::column_top_range`], pit floors included). Every far face's
+/// top, and a wall's foot, stands within it: a top is the mean of such
+/// columns, or a summit among them, plus one.
+pub fn ground_range() -> (f64, f64) {
+    let (lo, hi) = WorldGen::column_top_range();
+    (lo as f64 + 1.0, hi as f64 + 1.0)
+}
+
 /// The lowest and highest surface the generator can produce -- the vertical
 /// extent of a patch whose heights are not known yet.
 pub fn surface_bounds() -> (f64, f64) {

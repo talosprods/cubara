@@ -1044,6 +1044,17 @@ impl Renderer {
         self.far.insert(&self.queue, patch)
     }
 
+    /// Upload a patch drawn as `role` ([`crate::far::FarRole`]): a
+    /// stand-in for voxel nodes not drawn yet is drawn inside the voxels'
+    /// box, behind anything drawn there; `None` when every slot is taken.
+    pub fn far_insert_as(
+        &mut self,
+        patch: crate::far::FarPatch<'_>,
+        role: crate::far::FarRole,
+    ) -> Option<crate::far::FarSlot> {
+        self.far.insert_as(&self.queue, patch, role)
+    }
+
     /// Stop drawing a far-terrain patch and free its slot.
     pub fn far_remove(&mut self, slot: crate::far::FarSlot) {
         self.far.remove(slot);

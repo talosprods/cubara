@@ -345,6 +345,35 @@ pub struct FarPatch<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FarSlot(u32);
 
+/// What a patch is drawn as ([`FarTerrain::insert_as`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FarRole {
+    /// The far terrain: everything of it outside the voxels' box
+    /// ([`FarParams::hole`]), joined to them at its sides.
+    #[default]
+    Terrain,
+    /// **A stand-in for voxel nodes not drawn yet** (`docs/
+    /// PHASE3_ARCHITECTURE.md` §9.11): faces the caller has already cut to
+    /// the ground those nodes will draw, so the box's join does not touch
+    /// them -- every face is drawn where it stands, inside the box -- and
+    /// each a hair further along its line of sight than it stands
+    /// ([`STANDIN_BEHIND`]), so a node of the same ground drawn meanwhile
+    /// is what the depth test keeps.
+    StandIn,
+}
+
+/// How much further from the eye a [`FarRole::StandIn`] face is drawn than
+/// it stands: every corner moved along its own line of sight, to this many
+/// times its distance -- the same pixels, a little deeper. A stand-in is
+/// the very surface the voxel nodes it stands in for draw (`far.wgsl`), and
+/// where one of them is drawn already the two would fight over every pixel;
+/// pushed back, the node wins them all. **Chosen, not derived**: 2^-14 is
+/// about 6 cm at a kilometre, where the stand-ins stand -- a thousand times
+/// the depth buffer's rounding there (`Depth32Float`, reversed Z) and less
+/// than the crack seal moves a corner, so nothing else that meets a
+/// stand-in can come out from behind it.
+pub const STANDIN_BEHIND: f32 = 1.0 + 1.0 / 16_384.0;
+
 /// What `far.wgsl` reads besides the vertices.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarParams {
@@ -623,6 +652,9 @@ impl PatchCull {
 /// anchor).
 #[derive(Clone, Copy, Debug)]
 pub struct CullPatch<'a> {
+    /// What it is drawn as: a stand-in is untouched by the voxels' box, so
+    /// every tile of it is culled as it stands ([`tile_masks`]).
+    pub role: FarRole,
     /// The patch's box.
     pub aabb: Aabb,
     /// Its lowest `(x, z)` corner.
@@ -753,6 +785,12 @@ pub fn cull_runs(
     mut emit: impl FnMut(usize, u32, u32),
 ) {
     for (n, p) in patches.iter().enumerate() {
+        // A stand-in's corners stay where they are: no join, so no tile of
+        // it is let off the frustum test or the tops' height test.
+        let hole = match p.role {
+            FarRole::Terrain => hole,
+            FarRole::StandIn => None,
+        };
         let masks = tile_masks(p, view, hole);
         if masks.iter().any(|&m| m != 0) {
             segment_runs(&p.cull.starts, &masks, |first, count| emit(n, first, count));
@@ -799,24 +837,50 @@ pub fn runs_of(
     patches: &[FarPatch<'_>],
     hole: Option<([i32; 3], [i32; 3])>,
     culling: FarCulling,
+    view: (&Frustum, Vec3),
+) -> Vec<(usize, u32, u32)> {
+    let terrain: Vec<(FarPatch<'_>, FarRole)> =
+        patches.iter().map(|p| (*p, FarRole::Terrain)).collect();
+    runs_of_roles(&terrain, hole, culling, view)
+}
+
+/// [`runs_of`] for patches each drawn as its [`FarRole`]: a stand-in is
+/// drawn inside the hole, and its tiles culled as they stand.
+pub fn runs_of_roles(
+    patches: &[(FarPatch<'_>, FarRole)],
+    hole: Option<([i32; 3], [i32; 3])>,
+    culling: FarCulling,
     (frustum, eye): (&Frustum, Vec3),
 ) -> Vec<(usize, u32, u32)> {
-    let placed: Vec<PlacedPatch> = patches.iter().map(PlacedPatch::of).collect();
+    let placed: Vec<PlacedPatch> = patches
+        .iter()
+        .map(|(p, role)| PlacedPatch {
+            role: *role,
+            ..PlacedPatch::of(p)
+        })
+        .collect();
     let boxes: Vec<Option<Aabb>> = placed
         .iter()
         .map(|p| Some(p.aabb(anchor::ORIGIN)))
         .collect();
     let culls: Vec<PatchCull> = patches
         .iter()
-        .map(|p| PatchCull::of(&stored_order(p.faces), p.skirt))
+        .map(|(p, _)| PatchCull::of(&stored_order(p.faces), p.skirt))
         .collect();
     let hole = hole.map(|(min, max)| hole_aabb(min, max, anchor::ORIGIN));
-    let order = slots_to_draw(true, &boxes, frustum, hole.as_ref(), eye);
+    let order = slots_to_draw(
+        true,
+        &boxes,
+        |slot| placed[slot as usize].role,
+        frustum,
+        (hole.as_ref(), eye),
+    );
     let inputs: Vec<CullPatch> = order
         .iter()
         .map(|&slot| {
             let p = &placed[slot as usize];
             CullPatch {
+                role: p.role,
                 aabb: p.aabb(anchor::ORIGIN),
                 origin: p.origin_relative(anchor::ORIGIN),
                 quad: p.quad,
@@ -869,16 +933,29 @@ pub fn class_of(faces: u32) -> usize {
 }
 
 /// One run of faces to draw, as `far.wgsl` reads it: the patch's slot, the
-/// run's first face in the shared buffer, and how many faces it is. Sixteen
-/// bytes, so a class's runs start on a multiple of 256 with whole runs
-/// between them ([`RUN_ALIGN`]).
+/// run's first face in the shared buffer, how many faces it is, and what
+/// the patch is drawn as ([`RUN_STANDIN`]). Sixteen bytes, so a class's
+/// runs start on a multiple of 256 with whole runs between them
+/// ([`RUN_ALIGN`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 struct RunGpu {
     slot: u32,
     first: u32,
     count: u32,
-    pad: u32,
+    flags: u32,
+}
+
+/// [`RunGpu::flags`]: the run is of a [`FarRole::StandIn`]. `far.wgsl`'s
+/// `RUN_STANDIN`.
+const RUN_STANDIN: u32 = 1;
+
+/// [`RunGpu::flags`] for a patch drawn as `role`.
+fn run_flags(role: FarRole) -> u32 {
+    match role {
+        FarRole::Terrain => 0,
+        FarRole::StandIn => RUN_STANDIN,
+    }
 }
 
 /// Runs between two class starts: a dynamic offset into a storage buffer is
@@ -956,6 +1033,8 @@ pub struct FarTerrain {
 /// it.
 #[derive(Clone, Copy, Debug)]
 struct PlacedPatch {
+    /// What it is drawn as.
+    role: FarRole,
     origin: [i64; 2],
     quad: f32,
     skirt: f32,
@@ -972,6 +1051,7 @@ impl PlacedPatch {
     fn of(patch: &FarPatch<'_>) -> Self {
         let (lo, hi) = min_max(patch);
         Self {
+            role: FarRole::Terrain,
             origin: patch.origin,
             quad: patch.quad,
             skirt: patch.skirt,
@@ -1216,10 +1296,20 @@ impl FarTerrain {
         );
     }
 
-    /// Upload a patch. `None` when every slot is taken or its faces do not
-    /// fit -- the caller decides what gives way, since it is the one that
-    /// knows which patches matter.
+    /// Upload a patch of the far terrain. `None` when every slot is taken or
+    /// its faces do not fit -- the caller decides what gives way, since it
+    /// is the one that knows which patches matter.
     pub fn insert(&mut self, queue: &wgpu::Queue, patch: FarPatch<'_>) -> Option<FarSlot> {
+        self.insert_as(queue, patch, FarRole::Terrain)
+    }
+
+    /// [`insert`](Self::insert), drawn as `role`.
+    pub fn insert_as(
+        &mut self,
+        queue: &wgpu::Queue,
+        patch: FarPatch<'_>,
+        role: FarRole,
+    ) -> Option<FarSlot> {
         assert!(
             patch.faces.len() <= FAR_MAX_FACES,
             "a patch of {} faces",
@@ -1238,6 +1328,7 @@ impl FarTerrain {
             );
         }
         let placed = PlacedPatch {
+            role,
             first_face,
             ..PlacedPatch::of(&patch)
         };
@@ -1289,7 +1380,16 @@ impl FarTerrain {
         // when the eye enters or leaves the box or the ground crosses its
         // floor, and is written only then.
         if let Some(hole) = self.hole.filter(|_| self.shown) {
-            let lowest = lowest_over(&self.boxes, &hole);
+            // Of the far terrain only: a stand-in is not joined to the box,
+            // and with it left out the far terrain is placed exactly as in
+            // a frame with nothing standing in.
+            let terrain: Vec<Option<Aabb>> = self
+                .boxes
+                .iter()
+                .zip(&self.placed)
+                .map(|(b, p)| b.filter(|_| p.is_some_and(|p| p.role == FarRole::Terrain)))
+                .collect();
+            let lowest = lowest_over(&terrain, &hole);
             let raised = hidden_height(hole.min, hole.max, eye, lowest) > hole.max.y;
             if raised != self.raised {
                 self.raised = raised;
@@ -1300,7 +1400,14 @@ impl FarTerrain {
                 );
             }
         }
-        let order = slots_to_draw(self.shown, &self.boxes, frustum, self.hole.as_ref(), eye);
+        let placed = &self.placed;
+        let order = slots_to_draw(
+            self.shown,
+            &self.boxes,
+            |slot| placed[slot as usize].map_or(FarRole::Terrain, |p| p.role),
+            frustum,
+            (self.hole.as_ref(), eye),
+        );
         for class in &mut self.by_class {
             class.clear();
         }
@@ -1315,8 +1422,9 @@ impl FarTerrain {
             else {
                 continue;
             };
-            slots.push((slot, placed.first_face));
+            slots.push((slot, placed.first_face, placed.role));
             inputs.push(CullPatch {
+                role: placed.role,
                 aabb,
                 origin: placed.origin_relative(self.anchor),
                 quad: placed.quad,
@@ -1333,12 +1441,12 @@ impl FarTerrain {
             &mut runs,
         );
         for (n, first, count) in runs {
-            let (slot, first_face) = slots[n];
+            let (slot, first_face, role) = slots[n];
             self.by_class[class_of(count)].push(RunGpu {
                 slot,
                 first: first_face + first,
                 count,
-                pad: 0,
+                flags: run_flags(role),
             });
             self.drawn_triangles += count as u64 * 2;
         }
@@ -1624,18 +1732,19 @@ pub fn lowest_over(boxes: &[Option<Aabb>], hole: &Aabb) -> f32 {
 
 /// The slots drawn this frame, in the order they are drawn: none at all
 /// while the far terrain is out of sight ([`FarTerrain::set_shown`]), else
-/// what the frustum sees, nearest first, outside the hole.
+/// what the frustum sees, nearest first -- outside the hole, but for a
+/// stand-in, which is drawn there (`role`, by slot).
 fn slots_to_draw(
     shown: bool,
     boxes: &[Option<Aabb>],
+    role: impl Fn(u32) -> FarRole,
     frustum: &Frustum,
-    hole: Option<&Aabb>,
-    eye: Vec3,
+    (hole, eye): (Option<&Aabb>, Vec3),
 ) -> Vec<u32> {
     if !shown {
         return Vec::new();
     }
-    draw_order(boxes, visible_slots(boxes, frustum), hole, eye)
+    draw_order(boxes, visible_slots(boxes, frustum), hole, eye, role)
 }
 
 /// The occupied slots the frustum can see, in slot order.
@@ -1653,12 +1762,14 @@ fn visible_slots(boxes: &[Option<Aabb>], frustum: &Frustum) -> Vec<u32> {
 
 /// The visible slots to draw, nearest to `eye` first -- so near ground fills
 /// the depth buffer before the distant ground it hides -- leaving out any
-/// wholly inside the voxels' hole.
+/// of the far terrain wholly inside the voxels' hole (a stand-in stands
+/// there: `role`, by slot).
 fn draw_order(
     boxes: &[Option<Aabb>],
     visible: Vec<u32>,
     hole: Option<&Aabb>,
     eye: Vec3,
+    role: impl Fn(u32) -> FarRole,
 ) -> Vec<u32> {
     let bx = |slot: &u32| {
         boxes[*slot as usize]
@@ -1667,7 +1778,9 @@ fn draw_order(
     };
     let mut order: Vec<u32> = visible
         .into_iter()
-        .filter(|slot| !hole.is_some_and(|h| contains(h, bx(slot))))
+        .filter(|slot| {
+            role(*slot) == FarRole::StandIn || !hole.is_some_and(|h| contains(h, bx(slot)))
+        })
         .collect();
     let distance = |slot: &u32| {
         let b = bx(slot);
@@ -2161,6 +2274,7 @@ mod tests {
                 Frustum::from_view_proj(proj * glam::Mat4::look_at_rh(at, look, Vec3::Y))
             };
             let input = CullPatch {
+                role: FarRole::Terrain,
                 aabb,
                 origin,
                 quad,
@@ -2361,6 +2475,7 @@ mod tests {
         })
         .aabb(anchor::ORIGIN);
         let input = CullPatch {
+            role: FarRole::Terrain,
             aabb,
             origin,
             quad,
@@ -2574,9 +2689,10 @@ mod tests {
         };
         //           inside  crosses  clear     clear     crosses
         let boxes = [b(0.0), b(95.0), b(300.0), b(150.0), b(-105.0)];
-        let order = draw_order(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO);
+        let terrain = |_| FarRole::Terrain;
+        let order = draw_order(&boxes, vec![0, 1, 2, 3, 4], Some(&hole), Vec3::ZERO, terrain);
         assert_eq!(order, vec![1, 4, 3, 2]);
-        let order = draw_order(&boxes, vec![2, 0, 1], None, Vec3::ZERO);
+        let order = draw_order(&boxes, vec![2, 0, 1], None, Vec3::ZERO, terrain);
         assert_eq!(order, vec![0, 1, 2], "no hole: everything, nearest first");
     }
 
@@ -2889,11 +3005,12 @@ mod tests {
         let boxes = vec![Some(behind), None, Some(ahead), Some(ahead)];
         assert_eq!(visible_slots(&boxes, &frustum), vec![2, 3]);
         // Issue #424: out of sight, none of it is drawn, in view or not.
+        let terrain = |_| FarRole::Terrain;
         assert_eq!(
-            slots_to_draw(true, &boxes, &frustum, None, Vec3::ZERO),
+            slots_to_draw(true, &boxes, terrain, &frustum, (None, Vec3::ZERO)),
             vec![2, 3]
         );
-        assert!(slots_to_draw(false, &boxes, &frustum, None, Vec3::ZERO).is_empty());
+        assert!(slots_to_draw(false, &boxes, terrain, &frustum, (None, Vec3::ZERO)).is_empty());
     }
 
     /// The ground that decides where hidden vertices go is the ground over
