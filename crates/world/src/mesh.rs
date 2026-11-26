@@ -289,6 +289,80 @@ fn morph_columns(
     })
 }
 
+/// What lies beside a node, for the ambient occlusion across its border
+/// (issue #430): a block's face is shaded the same wherever a node border
+/// runs, so the mesher is told what the neighbour holds at the cells its
+/// corners read. **The one place that is decided**: the game's meshing
+/// ([`mesh_node`]) and the consistency harness that holds it to the height
+/// field both take it from here.
+///
+/// Coordinates are the node's lattice's, one step outside it on one axis or
+/// several (a corner diagonal to the node).
+///
+/// - **Level 0** reads the world's own blocks, edits and trees included, as
+///   the neighbouring chunk holds them.
+/// - **A coarse level** reads what a neighbour *of its own level* draws there
+///   (the rule [`border_samples`] decides covering by: the ground's cell top
+///   and rows). Which level the neighbour really is depends on the camera,
+///   which a mesh built once cannot know; at rest, rings are the same level
+///   across most of a border, and a node is shaded as if all were.
+///
+/// Each cell is looked up once -- a corner asks the same few cells again and
+/// again.
+pub struct NeighbourBlocks<'a> {
+    world: &'a WorldSnapshot,
+    registry: &'a BlockRegistry,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    seen: std::cell::RefCell<HashMap<[i32; 3], bool>>,
+    ground: std::cell::RefCell<BorderGround>,
+}
+
+impl<'a> NeighbourBlocks<'a> {
+    pub fn new(
+        world: &'a WorldSnapshot,
+        registry: &'a BlockRegistry,
+        node: NodeKey,
+        blocks: TerrainBlocks,
+    ) -> Self {
+        Self {
+            world,
+            registry,
+            node,
+            blocks,
+            seen: Default::default(),
+            ground: Default::default(),
+        }
+    }
+
+    /// Whether the neighbour is solid at lattice cell `(gx, gy, gz)` outside
+    /// the node.
+    pub fn solid(&self, gx: i32, gy: i32, gz: i32) -> bool {
+        *self
+            .seen
+            .borrow_mut()
+            .entry([gx, gy, gz])
+            .or_insert_with(|| {
+                let (level, origin) = (self.node.level, self.node.world_origin());
+                // The lattice's cells: `2^level` blocks wide and deep, one
+                // block tall at every level (`NodeChunk::mesh_dims`).
+                let w = self.node.extent_chunks();
+                let step = [w, self.node.drawn_row_blocks(), w];
+                let p = [
+                    origin[0] + gx * step[0],
+                    origin[1] + gy * step[1],
+                    origin[2] + gz * step[2],
+                ];
+                if level == 0 {
+                    self.registry
+                        .is_solid(self.world.block_at(p[0], p[1], p[2], self.blocks))
+                } else {
+                    coarse_cell_solid(self.world, &self.ground, p, level)
+                }
+            })
+    }
+}
+
 /// Mesh `node` from its already generated blocks.
 ///
 /// `scale` is always 1.0 now (R1b, issue #327 decision 3): a level-0
@@ -316,13 +390,21 @@ fn mesh_chunk_with(
     let ctx = MeshContext { registry, layer_of };
     let origin = node.world_origin();
     let scale = 1.0f32;
-    let ground = std::cell::RefCell::new(BorderGround::default());
-    let covered =
-        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::All);
+    let neighbours = NeighbourBlocks::new(world, registry, node, blocks);
+    // The ground both ask about is the same cells' (a coarse node's border
+    // is read for covering and for shading alike): made once.
+    let ground = &neighbours.ground;
+    let covered = |gx, gy, gz| border_samples(world, node, blocks, ground, [gx, gy, gz], Want::All);
     let may_be_solid =
-        |gx, gy, gz| border_samples(world, node, blocks, &ground, [gx, gy, gz], Want::Any);
-    let (mesh, local_aabb) =
-        build_mesh_bounded_occluded_node_morph(chunk, &ctx, covered, may_be_solid, columns)?;
+        |gx, gy, gz| border_samples(world, node, blocks, ground, [gx, gy, gz], Want::Any);
+    let (mesh, local_aabb) = build_mesh_bounded_occluded_node_morph(
+        chunk,
+        &ctx,
+        covered,
+        may_be_solid,
+        |gx, gy, gz| neighbours.solid(gx, gy, gz),
+        columns,
+    )?;
     Some(NodeGeometry {
         mesh,
         local_aabb,
@@ -331,12 +413,6 @@ fn mesh_chunk_with(
     })
 }
 
-/// Every chunk whose mesh can change when the block at `pos` changes: its own,
-/// and -- since a chunk leaves out border faces its neighbour covers -- the
-/// neighbour across each border `pos` sits on.
-///
-/// Without the neighbours, digging out a block at the edge of a chunk leaves
-/// the next chunk still hiding the face that now looks into the hole.
 /// The faces of `parent`, indexed for the colour morph of its children
 /// (`cubara_voxel::ParentFaces`, `docs/PHASE3_ARCHITECTURE.md` §9.6): the
 /// parent node generated and meshed by the game's own generator and mesher.
@@ -418,24 +494,47 @@ impl ParentCache {
     }
 }
 
+/// Every chunk whose mesh can change when the block at `pos` changes: its own,
+/// and -- since a chunk leaves out border faces its neighbour covers, and
+/// shades its faces by the blocks across the border (issue #430) -- every
+/// neighbour the block touches: across each border `pos` sits on, and
+/// diagonally across two or three of them.
+///
+/// Without the neighbours, digging out a block at the edge of a chunk leaves
+/// the next chunk still hiding the face that now looks into the hole, and
+/// shading it as if the block were still there.
 pub fn chunks_affected_by_edit(pos: [i32; 3]) -> Vec<ChunkCoord> {
     let size = cubara_voxel::Chunk::SIZE as i32;
-    let own = ChunkCoord::new(
+    let own = [
         pos[0].div_euclid(size),
         pos[1].div_euclid(size),
         pos[2].div_euclid(size),
-    );
-    let mut out = vec![own];
-    for axis in 0..3 {
-        let local = pos[axis].rem_euclid(size);
-        let step = match local {
-            0 => -1,
-            l if l == size - 1 => 1,
-            _ => continue,
-        };
-        let mut c = [own.x, own.y, own.z];
-        c[axis] += step;
-        out.push(ChunkCoord::new(c[0], c[1], c[2]));
+    ];
+    // The neighbour across each border `pos` sits on, per axis -- and, since
+    // a face's ambient occlusion reads the blocks around it (issue #430), the
+    // chunks diagonal across two or three of them as well.
+    let steps: [Option<i32>; 3] = std::array::from_fn(|axis| match pos[axis].rem_euclid(size) {
+        0 => Some(-1),
+        l if l == size - 1 => Some(1),
+        _ => None,
+    });
+    let mut out = vec![ChunkCoord::new(own[0], own[1], own[2])];
+    // Ascending by how many axes move: the face neighbours, then the edges,
+    // then the corner.
+    for mask in [0b001, 0b010, 0b100, 0b011, 0b101, 0b110, 0b111] {
+        let mut c = own;
+        let mut all = true;
+        for axis in 0..3 {
+            if mask >> axis & 1 == 1 {
+                match steps[axis] {
+                    Some(step) => c[axis] += step,
+                    None => all = false,
+                }
+            }
+        }
+        if all {
+            out.push(ChunkCoord::new(c[0], c[1], c[2]));
+        }
     }
     out
 }
@@ -456,6 +555,29 @@ enum Want {
     All,
     /// Solid for some neighbour: a skirt may be needed.
     Any,
+}
+
+/// Whether the node of the coarse level `at` that holds block `q` draws it
+/// solid: its cell's top and rows (`World::certainly_solid_at_v`), the cell's
+/// ground made once per node in `ground`. What a coarse neighbour draws, for
+/// [`border_samples`] and for [`NeighbourBlocks`] alike.
+fn coarse_cell_solid(
+    world: &WorldSnapshot,
+    ground: &std::cell::RefCell<BorderGround>,
+    q: [i32; 3],
+    at: u32,
+) -> bool {
+    let step_h = 1 << at;
+    let (x, z) = (
+        q[0].div_euclid(step_h) * step_h,
+        q[2].div_euclid(step_h) * step_h,
+    );
+    let mut ground = ground.borrow_mut();
+    let cell = ground
+        .cells
+        .entry((x, z, step_h))
+        .or_insert_with(|| world.cell_ground(x, z, step_h));
+    world.certainly_solid_at_v(q[1], at, cell)
 }
 
 /// What `node`'s neighbours draw at its outside cell `g` -- coordinates in
@@ -531,17 +653,7 @@ fn border_samples(
                 .or_insert_with(|| world.surface_height(q[0], q[2]));
             return world.certainly_solid_at(q[0], q[1], q[2], surface);
         }
-        let step_h = 1 << at;
-        let (x, z) = (
-            q[0].div_euclid(step_h) * step_h,
-            q[2].div_euclid(step_h) * step_h,
-        );
-        let mut ground = ground.borrow_mut();
-        let cell = ground
-            .cells
-            .entry((x, z, step_h))
-            .or_insert_with(|| world.cell_ground(x, z, step_h));
-        world.certainly_solid_at_v(q[1], at, cell)
+        coarse_cell_solid(world, ground, q, at)
     };
     // `All` stops at the first air, `Any` at the first solid.
     let decided = |is_solid: bool| match want {
@@ -1100,18 +1212,175 @@ mod tests {
         );
         assert_eq!(
             chunks_affected_by_edit([0, 5, 15]),
-            vec![c(0, 0, 0), c(-1, 0, 0), c(0, 0, 1)],
-            "on two borders"
+            vec![c(0, 0, 0), c(-1, 0, 0), c(0, 0, 1), c(-1, 0, 1)],
+            "on two borders: and the chunk diagonal to both"
+        );
+        assert_eq!(
+            chunks_affected_by_edit([0, 15, 0]),
+            vec![
+                c(0, 0, 0),
+                c(-1, 0, 0),
+                c(0, 1, 0),
+                c(0, 0, -1),
+                c(-1, 1, 0),
+                c(-1, 0, -1),
+                c(0, 1, -1),
+                c(-1, 1, -1)
+            ],
+            "in a corner: all eight chunks that meet there"
         );
         // Negative coordinates: block -1 is local 15 of chunk -1.
         assert_eq!(
             chunks_affected_by_edit([-1, -16, 7]),
-            vec![c(-1, -1, 0), c(0, -1, 0), c(-1, -2, 0)]
+            vec![c(-1, -1, 0), c(0, -1, 0), c(-1, -2, 0), c(0, -2, 0)]
         );
+    }
+
+    /// **What a node reads of its neighbour is what the neighbour draws**
+    /// (issue #430): for the same-level node beside it, across every border
+    /// cell, [`NeighbourBlocks`] says solid exactly where that node's own
+    /// drawn lattice is -- at every level, so a corner shaded across a node
+    /// border sees the cell the player sees there.
+    #[test]
+    fn a_node_reads_the_cells_its_neighbour_draws() {
+        let registry = test_registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = World::new();
+        let mut checked = 0usize;
+        for level in 0..=3u32 {
+            let size = 16 * (1i32 << level);
+            for (k, (nx, nz)) in [(-3, 2), (1, -4), (5, 5)].into_iter().enumerate() {
+                let h = world.surface_height(nx * size, nz * size);
+                let ny = h.div_euclid(size) - (k as i32 % 2);
+                let a = NodeKey::new(level, [nx, ny, nz]);
+                // The neighbour along +x, and along +z.
+                for (axis, b) in [
+                    (0usize, NodeKey::new(level, [nx + 1, ny, nz])),
+                    (2usize, NodeKey::new(level, [nx, ny, nz + 1])),
+                ] {
+                    let (Some(_), Some(beside)) =
+                        (world.node_at(a, blocks), world.node_at(b, blocks))
+                    else {
+                        continue;
+                    };
+                    let reads = NeighbourBlocks::new(&world, &registry, a, blocks);
+                    let dims = beside.mesh_dims().map(|n| n as i32);
+                    for gy in 0..dims[1] {
+                        for t in 0..dims[if axis == 0 { 2 } else { 0 }] {
+                            let (outside, inside) = if axis == 0 {
+                                ((dims[0], gy, t), (0, gy as usize, t as usize))
+                            } else {
+                                ((t, gy, dims[2]), (t as usize, gy as usize, 0))
+                            };
+                            let drawn = registry.is_solid(beside.drawn(
+                                inside.0 as usize,
+                                inside.1,
+                                inside.2,
+                            ));
+                            assert_eq!(
+                                reads.solid(outside.0, outside.1, outside.2),
+                                drawn,
+                                "level {level}, {a:?} reads {outside:?}, its neighbour {b:?} draws {inside:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 5000, "only {checked} border cells compared");
     }
 
     /// A block dug out right at a node's border opens a hole the neighbour
     /// must show its side of -- the edit is the only thing that says so.
+    /// **A face is shaded the same wherever a chunk border runs** (issue
+    /// #430), and the chunks an edit dirties are exactly the ones whose
+    /// mesh it can change: a block placed at a chunk's corner changes the
+    /// shade of a top face in the chunk diagonal to it, which must then be
+    /// among [`chunks_affected_by_edit`] -- and no chunk outside that list
+    /// changes at all.
+    #[test]
+    fn an_edit_at_a_corner_reshades_the_diagonal_chunk_and_only_the_chunks_it_names() {
+        let registry = test_registry();
+        let layer_of = |_: &str| 0;
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let mut world = World::new();
+        // A corner where the ground diagonal to it stands higher than the
+        // ground at it: the block that sits on the lower column, level with
+        // the higher one's top, is a corner occluder of that top face.
+        let (mut at, mut diagonal) = (None, [0; 3]);
+        'search: for cz in (-64..=64).step_by(16) {
+            for cx in (-64..=64).step_by(16) {
+                let hd = world.surface_height(cx - 1, cz - 1);
+                let pos = [cx, hd + 1, cz];
+                diagonal = [cx - 1, hd, cz - 1];
+                if world.is_solid_at(diagonal[0], diagonal[1], diagonal[2], blocks)
+                    && !world.is_solid_at(diagonal[0], hd + 1, diagonal[2], blocks)
+                    && !world.is_solid_at(pos[0], pos[1], pos[2], blocks)
+                {
+                    at = Some(pos);
+                    break 'search;
+                }
+            }
+        }
+        let pos = at.expect("a corner with higher ground diagonal to it, in this seed's terrain");
+        let affected = chunks_affected_by_edit(pos);
+        let mesh_of = |world: &World, c: ChunkCoord| {
+            mesh_node(
+                world,
+                &registry,
+                &layer_of,
+                NodeKey::containing(c, 0),
+                blocks,
+            )
+            .map(|g| (g.mesh.vertices, g.mesh.indices))
+        };
+        let own = ChunkCoord::from_block(pos[0], pos[1], pos[2]);
+        let around: Vec<ChunkCoord> = (-1..=1)
+            .flat_map(|dz| {
+                (-1..=1).flat_map(move |dy| {
+                    (-1..=1).map(move |dx| ChunkCoord::new(own.x + dx, own.y + dy, own.z + dz))
+                })
+            })
+            .collect();
+        let before: Vec<_> = around.iter().map(|&c| mesh_of(&world, c)).collect();
+        world.set_block(pos[0], pos[1], pos[2], cubara_voxel::BlockId(1));
+        let mut changed = Vec::new();
+        for (&c, was) in around.iter().zip(&before) {
+            if *was != mesh_of(&world, c) {
+                changed.push(c);
+            }
+        }
+        for c in &changed {
+            assert!(
+                affected.contains(c),
+                "{c:?} changed with an edit at {pos:?} and is not in {affected:?}"
+            );
+        }
+        let across = ChunkCoord::from_block(diagonal[0], diagonal[1], diagonal[2]);
+        // The shade itself, not just the mesh: a corner could also change a
+        // chunk's skirts, which says nothing about its ambient occlusion.
+        let shades = |m: &Option<(Vec<cubara_voxel::Vertex>, Vec<u32>)>| -> HashMap<_, _> {
+            m.iter()
+                .flat_map(|(vertices, _)| vertices)
+                .map(|v| ((v.x(), v.y(), v.z(), format!("{:?}", v.face())), v.ao()))
+                .collect()
+        };
+        let (was, now) = (
+            shades(&before[around.iter().position(|c| *c == across).expect("around")]),
+            shades(&mesh_of(&world, across)),
+        );
+        assert!(
+            was.iter().any(|(k, ao)| now.get(k).is_some_and(|n| n != ao)),
+            "the top face at {diagonal:?} kept its shade in chunk {across:?}, with a block set at {pos:?} on its corner"
+        );
+        assert_ne!(across, own);
+        assert!(
+            across.x != own.x && across.z != own.z,
+            "the chunk is diagonal to the edit's"
+        );
+    }
+
     #[test]
     fn digging_at_a_border_shows_the_neighbours_side() {
         let registry = test_registry();

@@ -609,15 +609,19 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
   riser area per direction and layer -- wherever no cave touches the
   surface. (Since §9.9 it counts the columns' tops, so a pit's walls and
   the risers of its floor are in it, stone under the soil: what a far wall
-  beside a sunk quad is mixed from.) The openness is within 0.08 on tops and 0.14 on a direction's
-  risers, and the test shows where the rest goes: **the mesher bakes a
-  chunk's AO without looking into the next chunk**, so faces at a chunk's
-  edge come out more open than the height field says (up to 0.06 of
-  openness on steep ground, about 2/255 on a grass top). Asked with that
-  blindness put in, the same corner rule gives the mesher's number to the
-  last bit. `ground_faces` reports the true neighbours; the chunk-edge
-  blindness is a level-0 mesher property, recorded here and not fixed by
-  this block.
+  beside a sunk quad is mixed from.) **The openness is exact** (to the
+  rounding of a mean, 1e-4, on tops and on every riser direction): since
+  #430 the mesher shades a face by the blocks across a chunk's border as it
+  does inside it (the border's neighbour is `cubara_world::mesh::
+  NeighbourBlocks`, the one place that says what lies beside a node), so
+  the height field's openness is the mesher's with no chunk-edge case. Before
+  #430 the mesher left the next chunk out -- a face at a chunk's edge, or
+  whose air side was in the chunk above, came out more open than the height
+  field says (up to 0.06 on tops, 0.11 on a direction's risers, about 2/255
+  on a grass top) -- and the test had to model that blindness to hold the two
+  together. An edit now dirties the chunks diagonal to its block as well
+  (`chunks_affected_by_edit`: up to eight at a corner), since a corner
+  reads the blocks around it.
 
 **The far-terrain interface** (#422 calls these; nothing else decides a far
 quad's height or a far face's colour):
@@ -953,13 +957,35 @@ Riser *area* is 0.96 to 1.00 of level 0's at level 1, 0.86 to 0.93 at level
 (§9.2): bumps inside a cell have no riser. It is reported and not bounded
 (§9.1 item 3).
 
-**#423 decision 3's 2/255 holds at levels 1 and 2, in every direction of
-every single footprint, and not at level 3.** Worst footprint and direction
-measured, tops then sides: level 1 1.50 and 1.51; level 2 1.66 and 1.62;
-level 3 **2.88** (nine of forty footprints are over 2.0) and **3.18** (two
-of 63 ranked directions: 3.18 and 2.21). The harness asserts 2.0 and 2.0,
-2.0 and 2.0, 3.0 and 3.25 (`T3_ALLOWED`; level 3's are chosen, just over
-the measured worst). The stone share of the sides is within 1.15 points of
+**#423 decision 3's 2/255 holds at levels 1 and 2 in every direction of
+every single footprint, bar one (below), and not at level 3.** After #430
+-- worst footprint and direction measured, tops then sides: level 1 0.99
+and 1.21; level 2 **2.0076** and 1.20; level 3 2.60 and 3.22. The harness
+asserts 1.25 and 1.5, 2.01 and 1.5, 2.75 and 3.25 (`T3_ALLOWED`, every one
+chosen, not derived, just over the measured worst; the bounds #423 asserted
+were 2.0 and 2.0, 2.0 and 2.0, 3.0 and 3.25, measured then at 1.48 / 1.51,
+1.93 / 1.63 and 2.98 / 3.12). **Level 2's tops are 0.01 over #423's 2.0,
+in one footprint**: `Gentle` at (-4096, -2048), whose coarse tops are
+lighter than level 0's by 0.026 of their light; item 1 below is what is
+missing there.
+
+**#430 moved the floor up before it moved it down.** The coarse AO of #423
+had been chosen against a level 0 that was blind at chunk edges (lighter
+than its own blocks there), and a coarse node is 16 cells wide at every
+level, so it was equally blind at *its* edges. With level 0 shading across
+its borders (§9.3) and the coarse rule unchanged, the worst footprint went
+to 1.96 / 1.81, 3.71 / 2.27 and 5.39 / 3.41. Two things brought it back:
+a coarse node reads what its same-level neighbour draws across its border
+(`NeighbourBlocks`; `a_node_reads_the_cells_its_neighbour_draws` pins that
+the read is the neighbour's own drawn cell, over 5000 border cells), which
+alone gave 0.99 / 1.70, 2.75 / 2.26, 3.45 / 3.41; and two rule changes,
+both chosen from the measurement: **every occluder darkens a coarse top's
+corner**, not only those at least half as tall as the riser that sets the
+band (tops 2.01 and 2.60 at levels 2 and 3), and **the wall band's shade is
+two occluders**, not one (sides 1.21, 1.20, 3.22). Six other variants made
+other footprints worse (band rounding up, down or geometric; the diagonal in
+the band; a riser of one given a band; an inner corner given one more).
+The stone share of the sides is within 1.15 points of
 level 0's in every footprint (asserted at 1.25), the soil share within 3.7,
 0.7 and 5.6 points per kind (asserted at 4.5, 2 and 6.5). What is left at
 level 3, in order (`top_shade_by_riser_report` takes the first apart):
@@ -975,12 +1001,11 @@ level 3, in order (`top_shade_by_riser_report` takes the first apart):
    top is the surface block over as many of them as are drawn, where level
    0 shows one row of it and soil under it: that is the soil level 3 is
    short of, and a direction with a few dozen faces is a sample of level
-   0's mix (the 3.18 is one cliff's +X, 2.45 of it the materials alone).
+   0's mix (the 3.22 is one cliff's +X, 2.40 of it the materials alone).
    **The lever:** let the cut-off row wear the surface block and the rest
    of its cell what the hash picks. Not built.
-3. **Level 0's own chunk-edge AO blindness** (§9.3, #430), which is about
-   2/255 on steep tops by itself and is in the reference every level is
-   held to.
+3. (Level 0's own chunk-edge AO blindness was item 3 here: fixed by #430,
+   §9.3.)
 
 (Pits were item 3 of this list: up to 267 columns of a footprint at level
 3. There are none left on the surface term at any level, and
