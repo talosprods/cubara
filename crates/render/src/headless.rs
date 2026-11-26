@@ -287,6 +287,32 @@ pub fn render_with_far(
     )
 }
 
+/// [`render_with_far`] with the trees on the far terrain (issue #433 item
+/// 1): `trees` are the trees its patches carry, `density` how densely
+/// trees stand per trunk height where every column may grow one
+/// (`cubara_world::far_trees::density`), what its tops' tint shows of the
+/// trees no longer drawn one by one. Empty slices: no trees, bare ground --
+/// [`render_with_far`].
+pub fn render_with_far_trees(
+    meshed: impl IntoIterator<Item = MeshedNode>,
+    far: &[crate::far::FarPatch<'_>],
+    far_params: Option<crate::far::FarParams>,
+    (trees, density): (&[crate::far_trees::FarTreePlacement], &[f32]),
+    shot: Shot,
+) -> Option<Frame> {
+    let nodes: Vec<MeshedNode> = meshed.into_iter().collect();
+    let tree_data: Vec<NodeTrees> = nodes.iter().map(NodeTrees::of).collect();
+    render_arena(
+        shot,
+        (far, far_params, crate::far::FarCulling::default()),
+        (trees, density),
+        tree_data,
+        |device, queue, multi_draw, anchor, _ctx| {
+            ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
+        },
+    )
+}
+
 /// [`render_with_far`] with the far terrain culled as `culling` says, not as
 /// the game culls it -- for a test that every level of culling draws the
 /// same pixels (`golden.rs`).
@@ -307,6 +333,7 @@ pub fn render_with_far_culled(
     render_arena(
         shot,
         (far, far_params, culling),
+        (&[], &[]),
         tree_data,
         |device, queue, multi_draw, anchor, _ctx| {
             ChunkArena::from_meshed(device, queue, multi_draw, anchor, nodes)
@@ -324,6 +351,7 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
     render_arena(
         shot,
         (&[], None, crate::far::FarCulling::default()),
+        (&[], &[]),
         Vec::new(),
         |device, queue, multi_draw, anchor, ctx| {
             let mut arena = ChunkArena::new(device, multi_draw, anchor);
@@ -393,6 +421,7 @@ fn render_arena(
         Option<crate::far::FarParams>,
         crate::far::FarCulling,
     ),
+    (far_trees, far_tree_density): (&[crate::far_trees::FarTreePlacement], &[f32]),
     tree_data: Vec<NodeTrees>,
     build_arena: impl FnOnce(&wgpu::Device, &wgpu::Queue, bool, Anchor, &MeshContext) -> ChunkArena,
 ) -> Option<Frame> {
@@ -506,6 +535,26 @@ fn render_arena(
         terrain.prepare(&queue, &frustum, eye_rel);
         terrain
     });
+    // The trees on the far terrain (issue #433 item 1), as the window draws
+    // them: one patch of them is as good as many here.
+    let mut far_tree_set = None;
+    if !far_trees.is_empty() || !far_tree_density.is_empty() {
+        let mut set = crate::render::load_far_trees(&device, &queue, &mesh_assets, anchor);
+        set.insert(0, far_trees.to_vec());
+        set.set_hole(far_params.and_then(|p| p.hole));
+        set.prepare(&device, &queue, &frustum, eye_rel, anchor, height);
+        far_tree_set = Some(set);
+    }
+    let mut far_terrain = far_terrain;
+    if let (Some(terrain), Some(set)) = (far_terrain.as_mut(), far_tree_set.as_ref()) {
+        let tint = (!far_tree_density.is_empty())
+            .then(|| crate::far_trees::FarTreeTint::new(far_tree_density, set.stand_ins()));
+        terrain.set_tree_tint(
+            &queue,
+            tint.as_ref(),
+            crate::far_trees::px_per_block(height),
+        );
+    }
 
     let mut scene = SceneRenderer::new(
         &device,
@@ -576,6 +625,7 @@ fn render_arena(
             cracking,
             players: &players,
             far: far_terrain.as_ref(),
+            far_trees: far_tree_set.as_ref(),
             trees: Some(TreeDraw {
                 oak: trees.oak_instances(),
                 silhouette: trees.silhouette_instances(),

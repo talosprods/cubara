@@ -18,6 +18,7 @@ mod arena;
 pub mod crack;
 pub mod culling;
 pub mod far;
+pub mod far_trees;
 pub mod figure;
 mod gpu_timer;
 pub mod haze;
@@ -39,6 +40,7 @@ pub use far::{
     FarCulling, FarDir, FarFace, FarParams, FarPatch, FarSlot, FarTerrain, FarVertex, FAR_MAX_RISE,
     FAR_QUADS, FAR_TOP_RANGE,
 };
+pub use far_trees::{FarTreePlacement, FarTreeTint, FarTrees, StandIn};
 pub use figure::{figure_vertices, FigureVertex, PlayerView};
 pub use gpu_timer::{
     classify_sample, timestamp_indices, timing_proven, GpuSample, GpuTimer, TimestampRing,
@@ -50,8 +52,9 @@ pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
     camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose, CameraUniform,
-    FrameUniform, Lighting, MorphParams, Presented, RebaseReport, Renderer,
+    load_far_trees, load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose,
+    CameraUniform,
+    FrameUniform, Lighting, MorphParams, Presented, RebaseReport, Renderer, FOV_Y_DEGREES,
 };
 pub use scene::HealthView;
 pub use scene::{
@@ -60,6 +63,6 @@ pub use scene::{
 };
 pub use text::TextRenderer;
 pub use trees::{
-    build_oak_mesh, build_silhouette_mesh, tree_model_meshes, TreeArena, TreeInstance, TreeModel,
-    TreeModelMesh, TreePlacement, TreeShapes, TreeVertex,
+    build_oak_mesh, build_silhouette_mesh, oak_shades, tree_model_meshes, TreeArena, TreeInstance,
+    TreeModel, TreeModelMesh, TreePlacement, TreeShapes, TreeVertex,
 };

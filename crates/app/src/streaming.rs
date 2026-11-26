@@ -753,6 +753,12 @@ impl NodeStreaming {
         }
     }
 
+    /// Which ids the terrain is made of, the oak included: what the far
+    /// terrain's trees are placed with (issue #433 item 1).
+    pub fn blocks(&self) -> TerrainBlocks {
+        self.blocks
+    }
+
     /// The box the far terrain may leave to the voxel nodes this frame, for
     /// an eye at `eye` -- the owner's holes while flying (2026-11-09: "laag
     /// detail niveau, dan is het weg, heel kort daarna laadt het op een hoger

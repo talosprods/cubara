@@ -123,7 +123,13 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 quality,
                 v.far_quad_scale,
             ) {
-                far = cubara_world::far::build(&cubara_world::WorldGen::new(world.seed()), &view);
+                // With the trees on it (issue #433 item 1), as the game
+                // draws them.
+                far = cubara_world::far::build_with(
+                    &cubara_world::WorldGen::new(world.seed()),
+                    &view,
+                    crate::far_trees::with_trees(blocks, &view, v.size.1),
+                );
             }
             far_params = Some(crate::far_streaming::to_far_params(
                 hole,
@@ -151,7 +157,15 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
         .zip(&faces)
         .map(|(p, f)| crate::far_streaming::to_far_patch(p, f))
         .collect();
-    let Some(frame) = headless::render_with_far(meshed, &patches, far_params, shot) else {
+    let trees: Vec<_> = far.iter().flat_map(crate::far_trees::to_far_trees).collect();
+    let density = if far.is_empty() {
+        Vec::new()
+    } else {
+        cubara_world::far_trees::density(blocks)
+    };
+    let Some(frame) =
+        headless::render_with_far_trees(meshed, &patches, far_params, (&trees, &density), shot)
+    else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
     };

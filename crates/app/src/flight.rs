@@ -1327,7 +1327,7 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         &crate::game::load_ore_registry(),
         move |name: &str| layers.layer_of(name),
     );
-    let mut far = FarStreaming::new(game.world().seed(), FarQuality::High);
+    let mut far = FarStreaming::new(game.world().seed(), FarQuality::High).with_trees(nodes.blocks());
     let budget = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut frame = |game: &mut Game, dt: f32, renderer: &mut Renderer| {
         for cc in game.advance(dt) {
@@ -1436,8 +1436,9 @@ impl Streamed {
             move |name: &str| layers.layer_of(name),
         );
         let world = Arc::new(World::new());
-        let far =
-            FarStreaming::new(world.seed(), flight.quality).with_quad_scale(flight.far_quad_scale);
+        let far = FarStreaming::new(world.seed(), flight.quality)
+            .with_quad_scale(flight.far_quad_scale)
+            .with_trees(nodes.blocks());
         Some(Self {
             world,
             nodes,

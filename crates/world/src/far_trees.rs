@@ -68,6 +68,23 @@ pub fn patch_trees(
     out
 }
 
+/// **How densely trees stand where every column may grow one**, per trunk
+/// height (the oak's, lowest first): trees per square block. The placement's
+/// own numbers ([`WorldGen::tree_site`]): one chunk column in `oak.density`
+/// carries a tree, its trunk height drawn evenly from the oak's range by the
+/// same hash. Times a quad's wooded share ([`crate::far::QuadGround::trees`])
+/// it is how densely the quad is wooded -- what the far terrain's tint
+/// stands for (issue #433 item 1). Empty for a world without trees.
+pub fn density(blocks: TerrainBlocks) -> Vec<f32> {
+    let Some(oak) = blocks.oak else {
+        return Vec::new();
+    };
+    let (lo, hi) = oak.height;
+    let heights = (hi - lo + 1).max(1);
+    let column = (cubara_voxel::Chunk::SIZE * cubara_voxel::Chunk::SIZE) as f32;
+    vec![1.0 / (oak.density as f32 * column * heights as f32); heights as usize]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +282,43 @@ mod tests {
             }
         }
         assert!(pits > 0, "no quad of the {quads} has a pit: this pins little");
+    }
+
+    /// **The density is what the world grows**: over the trees of a wide
+    /// stretch of land (patches of quads of 64, 16,384 chunk columns each),
+    /// the trees counted per trunk height against the density times the
+    /// ground a tree may grow on -- each quad's wooded share times its area.
+    /// Within 3% per height (**chosen, not derived**: the count's own
+    /// spread is about 1.5% at a few thousand trees a height).
+    #[test]
+    fn the_density_is_what_the_world_grows() {
+        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let blocks = oak_blocks();
+        let per_height = density(blocks);
+        assert_eq!(per_height.len(), 3);
+        let mut counted = [0f64; 3];
+        let mut expected = [0f64; 3];
+        for key in some_keys(6) {
+            let patch = generate_with(&gen, key, with_trees(6));
+            for t in &patch.trees {
+                counted[(t.height - 4) as usize] += 1.0;
+            }
+            let area = (key.quad() * key.quad()) as f64;
+            let grows: f64 = patch.ground.iter().map(|g| g.trees as f64 / 255.0 * area).sum();
+            for (e, d) in expected.iter_mut().zip(&per_height) {
+                *e += grows * *d as f64;
+            }
+        }
+        for h in 0..3 {
+            let off = (counted[h] - expected[h]).abs() / expected[h];
+            assert!(
+                off < 0.03,
+                "trunk height {}: {} trees where the density says {:.0}",
+                h + 4,
+                counted[h],
+                expected[h]
+            );
+        }
+        assert!(density(TerrainBlocks { oak: None, ..blocks }).is_empty());
     }
 }

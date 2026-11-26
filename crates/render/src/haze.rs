@@ -21,11 +21,21 @@ pub(crate) const MESH_WGSL: &str = concat!(
     include_str!("shaders/morph.wgsl"),
     include_str!("shaders/mesh.wgsl")
 );
-/// `haze.wgsl` and `face.wgsl` prepended to `far.wgsl`.
+/// `haze.wgsl`, `face.wgsl` and the far trees' fade by screen size
+/// (`fade.wgsl`, the tint's, issue #433 item 1) prepended to `far.wgsl`.
 pub(crate) const FAR_WGSL: &str = concat!(
     include_str!("shaders/haze.wgsl"),
     include_str!("shaders/face.wgsl"),
+    include_str!("shaders/fade.wgsl"),
     include_str!("shaders/far.wgsl")
+);
+/// `haze.wgsl`, `face.wgsl` and the fade by screen size (`fade.wgsl`)
+/// prepended to `far_trees.wgsl` (issue #433 item 1).
+pub(crate) const FAR_TREES_WGSL: &str = concat!(
+    include_str!("shaders/haze.wgsl"),
+    include_str!("shaders/face.wgsl"),
+    include_str!("shaders/fade.wgsl"),
+    include_str!("shaders/far_trees.wgsl")
 );
 /// `haze.wgsl` prepended to `figure.wgsl`.
 pub(crate) const FIGURE_WGSL: &str = concat!(

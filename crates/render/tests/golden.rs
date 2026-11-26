@@ -3004,6 +3004,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
             FarDir::PosX | FarDir::NegX => FarFace {
                 dir,
@@ -3016,6 +3017,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
             FarDir::PosZ | FarDir::NegZ => FarFace {
                 dir,
@@ -3028,6 +3030,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
         };
         let patch = FarPatch {
@@ -3111,6 +3114,7 @@ fn a_far_runs_padding_draws_nothing() {
         border: false,
         mix: [255, 0],
         open: 255,
+        trees: 0,
     };
     // One face in a corner; and fifteen that cover the middle, a hundred
     // kilometres away.
@@ -3200,6 +3204,7 @@ fn far_faces_are_hazed_by_distance() {
         border: false,
         mix: [0, 0],
         open: 255,
+        trees: 0,
     };
     let patch = FarPatch {
         origin: [0, 0],

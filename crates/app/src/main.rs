@@ -25,6 +25,7 @@ mod far_census_horizon;
 #[cfg(test)]
 mod far_trees_census;
 mod far_streaming;
+mod far_trees;
 mod flight;
 mod game;
 #[cfg(test)]
@@ -624,9 +625,11 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
+        let blocks = self.streaming.as_ref().map(NodeStreaming::blocks);
         self.far = Some(
             far_streaming::FarStreaming::new(self.game.world().seed(), self.settings.far)
-                .with_quad_scale(self.far_quad_scale),
+                .with_quad_scale(self.far_quad_scale)
+                .with_trees(blocks.expect("the node streaming was just made")),
         );
         let mut renderer = renderer;
         renderer.set_icons(self.game.item_icons());

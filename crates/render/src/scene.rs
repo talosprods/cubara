@@ -18,7 +18,8 @@ use crate::arena::ChunkArena;
 use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
-    build_far_pipeline, build_figure_pipeline, build_mesh_pipeline_from_module,
+    build_far_pipeline, build_far_tree_pipeline, build_figure_pipeline,
+    build_mesh_pipeline_from_module,
     build_outline_pipeline, build_pipeline, build_tree_pipeline, camera_bind_group_layout,
     create_depth_view, far_bind_group_layout, mesh_pipeline_constants, origins_bind_group_layout,
     outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
@@ -75,6 +76,10 @@ pub struct SceneFrame<'a> {
     /// already [`prepare`](crate::far::FarTerrain::prepare)d for this frame's
     /// camera, or `None` for none.
     pub far: Option<&'a crate::far::FarTerrain>,
+    /// The trees on the far terrain (issue #433 item 1), already
+    /// [`prepare`](crate::far_trees::FarTrees::prepare)d for this frame's
+    /// camera, or `None` for none.
+    pub far_trees: Option<&'a crate::far_trees::FarTrees>,
     /// Trees beyond the first ring (`docs/PROPOSAL_LOD_TRANSITIONS.md` §3
     /// R2, issue #332): the instance buffers to draw with the two static
     /// models, or `None` to draw none (a headless shot with no trees at
@@ -286,6 +291,8 @@ pub struct SceneRenderer {
     figure_pipeline: wgpu::RenderPipeline,
     /// The far terrain's (`far.wgsl`), drawn after the voxels.
     far_pipeline: wgpu::RenderPipeline,
+    /// The trees on the far terrain (`far_trees.wgsl`, issue #433 item 1).
+    far_tree_pipeline: wgpu::RenderPipeline,
     /// Trees beyond the first ring (`trees.wgsl`, issue #332 R2): one
     /// instanced pipeline, shared by both static models.
     tree_pipeline: wgpu::RenderPipeline,
@@ -354,6 +361,12 @@ impl SceneRenderer {
         let figure_pipeline = build_figure_pipeline(device, format, &camera_bgl);
         let far_pipeline =
             build_far_pipeline(device, format, &camera_bgl, &far_bind_group_layout(device));
+        let far_tree_pipeline = build_far_tree_pipeline(
+            device,
+            format,
+            &camera_bgl,
+            &crate::render::far_trees_bind_group_layout(device),
+        );
         // The mesh pipeline's three bind group layouts, in the same order:
         // the trees pipeline reads the same block texture array (decision
         // 4: "from the same uniforms") and, since issue #379 made its
@@ -419,6 +432,7 @@ impl SceneRenderer {
             texture_bind_group,
             figure_pipeline,
             far_pipeline,
+            far_tree_pipeline,
             tree_pipeline,
             tree_models,
             figure_vertex_buffer,
@@ -636,6 +650,7 @@ impl SceneRenderer {
             cracking,
             players,
             far,
+            far_trees,
             trees,
             overlay,
             hotbar,
@@ -824,6 +839,20 @@ impl SceneRenderer {
                         pass.draw_indexed(0..model.index_count, 0, 0..range.len() as u32);
                     }
                 }
+            }
+
+            // The trees on the far terrain (issue #433 item 1), before the
+            // far terrain they stand on: a tree's pixels are then the far
+            // terrain's that need not be shaded.
+            if let Some(far_trees) = far_trees.filter(|t| t.drawn() > 0) {
+                debug_assert_eq!(
+                    far_trees.anchor(),
+                    anchor,
+                    "the far trees were made relative to another anchor than the frame draws with"
+                );
+                pass.set_pipeline(&self.far_tree_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                far_trees.encode(&mut pass);
             }
 
             // The far terrain, after the voxels: where both could draw, the

@@ -111,6 +111,11 @@ pub struct FarFace {
     /// How open the face is to the sky, in 255ths: what ambient occlusion
     /// leaves of its light ([`face_open`]).
     pub open: u8,
+    /// A top: the share of its ground a tree may grow on, in 255ths
+    /// (`cubara_world::far::QuadGround::trees`) -- how densely the trees it
+    /// is tinted by stand where they are not drawn one by one
+    /// (`crate::far_trees`, issue #433 item 1). Zero for a wall.
+    pub trees: u8,
 }
 
 /// One corner of a [`FarFace`]: what `far.wgsl` is handed per vertex.
@@ -184,7 +189,7 @@ impl FarFace {
 
     /// The three words `far.wgsl` unpacks: `i0:6 j0:6 i1:6 j1:6 dir:3
     /// border:1`, then `top + 131072 : 18, rise : 14`, then `surface:8
-    /// soil:8 open:8`. A height or a step beyond what fits is clamped -- the
+    /// soil:8 open:8 trees:8`. A height or a step beyond what fits is clamped -- the
     /// terrain's own range is a small part of either (the app asserts it,
     /// `far_streaming`).
     pub fn pack(&self) -> [u32; 3] {
@@ -198,7 +203,10 @@ impl FarFace {
                 | (self.dir as u32) << 24
                 | (self.border as u32) << 27,
             (top - FAR_TOP_RANGE.start()) as u32 | rise << 18,
-            self.mix[0] as u32 | (self.mix[1] as u32) << 8 | (self.open as u32) << 16,
+            self.mix[0] as u32
+                | (self.mix[1] as u32) << 8
+                | (self.open as u32) << 16
+                | (self.trees as u32) << 24,
         ]
     }
 
@@ -216,6 +224,7 @@ impl FarFace {
             rise: w1 >> 18,
             mix: [(w2 & 0xFF) as u8, ((w2 >> 8) & 0xFF) as u8],
             open: ((w2 >> 16) & 0xFF) as u8,
+            trees: (w2 >> 24) as u8,
         }
     }
 
@@ -345,6 +354,14 @@ pub struct FarPatch<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FarSlot(u32);
 
+impl FarSlot {
+    /// The slot as a key: what the patch's trees are filed under
+    /// (`crate::far_trees::FarTrees`, issue #433 item 1).
+    pub fn id(self) -> u64 {
+        self.0 as u64
+    }
+}
+
 /// What `far.wgsl` reads besides the vertices.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FarParams {
@@ -404,12 +421,14 @@ struct ParamsGpu {
     side_color: [f32; 4],
     soil_color: [f32; 4],
     stone_color: [f32; 4],
+    /// The far trees' tint of the tops (`crate::far_trees::TintGpu`).
+    tint: crate::far_trees::TintGpu,
 }
 
 impl ParamsGpu {
     /// `p` with its hole made relative to `anchor` -- the space `far.wgsl`'s
-    /// vertices are in.
-    fn new(p: FarParams, anchor: Anchor, raised: bool) -> Self {
+    /// vertices are in -- and the trees' tint.
+    fn new(p: FarParams, tint: &crate::far_trees::TintGpu, anchor: Anchor, raised: bool) -> Self {
         // No hole: an empty box, min above max, which nothing is inside.
         let (min, max) = match p.hole {
             Some((min, max)) => (anchor::offset(min, anchor), anchor::offset(max, anchor)),
@@ -429,6 +448,7 @@ impl ParamsGpu {
             side_color: m.side.extend(m.soil_depth).to_array(),
             soil_color: m.soil.extend(1.0).to_array(),
             stone_color: m.stone.extend(1.0).to_array(),
+            tint: *tint,
         }
     }
 }
@@ -949,6 +969,9 @@ pub struct FarTerrain {
     /// under it ([`hidden_height`]): what `params` tells `far.wgsl`. Under
     /// it until [`prepare`](Self::prepare) says otherwise.
     raised: bool,
+    /// What the tops show of the trees not drawn one by one
+    /// ([`set_tree_tint`](Self::set_tree_tint)); none until then.
+    tint: crate::far_trees::TintGpu,
 }
 
 /// A patch as it was inserted, minus its faces (which the anchor does not
@@ -1070,7 +1093,12 @@ impl FarTerrain {
         queue.write_buffer(
             &params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(params_world, anchor, false)),
+            bytemuck::bytes_of(&ParamsGpu::new(
+                params_world,
+                &crate::far_trees::TintGpu::NONE,
+                anchor,
+                false,
+            )),
         );
 
         let quads = quad_indices();
@@ -1133,6 +1161,7 @@ impl FarTerrain {
             shown: true,
             raised: false,
             hole: None,
+            tint: crate::far_trees::TintGpu::NONE,
         }
     }
 
@@ -1212,7 +1241,12 @@ impl FarTerrain {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(self.params_world, anchor, self.raised)),
+            bytemuck::bytes_of(&ParamsGpu::new(
+                self.params_world,
+                &self.tint,
+                anchor,
+                self.raised,
+            )),
         );
     }
 
@@ -1272,7 +1306,30 @@ impl FarTerrain {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(params, self.anchor, self.raised)),
+            bytemuck::bytes_of(&ParamsGpu::new(params, &self.tint, self.anchor, self.raised)),
+        );
+    }
+
+    /// What the tops show of the trees no longer drawn one by one
+    /// (`crate::far_trees`, issue #433 item 1), for a screen whose blocks
+    /// stand `px_per_block` pixels tall at a distance of one block; `None`:
+    /// bare ground, the far terrain of a world without trees.
+    pub fn set_tree_tint(
+        &mut self,
+        queue: &wgpu::Queue,
+        tint: Option<&crate::far_trees::FarTreeTint>,
+        px_per_block: f32,
+    ) {
+        self.tint = crate::far_trees::TintGpu::of(tint, px_per_block);
+        queue.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&ParamsGpu::new(
+                self.params_world,
+                &self.tint,
+                self.anchor,
+                self.raised,
+            )),
         );
     }
 
@@ -1296,7 +1353,12 @@ impl FarTerrain {
                 queue.write_buffer(
                     &self.params,
                     0,
-                    bytemuck::bytes_of(&ParamsGpu::new(self.params_world, self.anchor, raised)),
+                    bytemuck::bytes_of(&ParamsGpu::new(
+                        self.params_world,
+                        &self.tint,
+                        self.anchor,
+                        raised,
+                    )),
                 );
             }
         }
@@ -1748,6 +1810,7 @@ mod tests {
             border: wall && next(4) == 0,
             mix,
             open: next(256) as u8,
+            trees: if wall { 0 } else { next(256) as u8 },
         }
     }
 
@@ -1779,6 +1842,7 @@ mod tests {
             border: true,
             mix: [0, 0],
             open: 255,
+            trees: 0,
         };
         assert_eq!(FarFace::unpack(edge.pack()), edge);
         let low = FarFace {
@@ -1997,6 +2061,7 @@ mod tests {
             border: false,
             mix: [255, 0],
             open: 255,
+            trees: 0,
         }
     }
 
@@ -2016,6 +2081,7 @@ mod tests {
                 border: true,
                 mix: [0, 0],
                 open: 255,
+                trees: 0,
             },
         ];
         let b = patch_box(&FarPatch {
@@ -2452,6 +2518,7 @@ mod tests {
                             border: false,
                             mix: [0, 0],
                             open: 255,
+                            trees: 0,
                         };
                         let corners = face.corners();
                         let raw = corners.map(|v| place(&v, (origin, quad, 40.0), None, 0.0));
@@ -2500,6 +2567,7 @@ mod tests {
             border: false,
             mix: [0, 0],
             open: 255,
+            trees: 0,
         };
         let p = face
             .corners()

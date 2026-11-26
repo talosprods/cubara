@@ -15,9 +15,9 @@ use cubara_render::aggregate::Materials;
 use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
-use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
+use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey, WithTrees};
 use cubara_world::node;
-use cubara_world::WorldGen;
+use cubara_world::{TerrainBlocks, WorldGen};
 
 /// How far the far terrain reaches, in blocks: the owner's "262 km first"
 /// (2026-09-26, `PROPOSAL_FAR_VIEW.md`).
@@ -288,6 +288,7 @@ pub fn to_far_faces(p: &PatchHeights) -> Vec<FarFace> {
             border: f.border,
             mix: f.mix,
             open: f.open,
+            trees: f.trees,
         })
         .collect()
 }
@@ -410,8 +411,9 @@ enum Urgency {
 }
 
 /// One patch to generate, and the generation (of [`FarStreaming`]) it was
-/// asked for in.
-type Job = (u64, WorldGen, PatchKey);
+/// asked for in -- with the world's trees, if it draws them (issue #433
+/// item 1).
+type Job = (u64, (WorldGen, Option<WithTrees>), PatchKey);
 
 /// The pool's two queues: a worker takes from `now` while it has anything,
 /// so a patch the eye wants never waits behind the prefetch.
@@ -476,8 +478,9 @@ impl Pool {
                 std::thread::Builder::new()
                     .name("cubara-far".into())
                     .spawn(move || {
-                        while let Some((generation, gen, key)) = next_job(&queues) {
-                            if done.send((generation, far::generate(&gen, key))).is_err() {
+                        while let Some((generation, (gen, trees), key)) = next_job(&queues) {
+                            let patch = far::generate_with(&gen, key, trees);
+                            if done.send((generation, patch)).is_err() {
                                 break;
                             }
                         }
@@ -819,6 +822,10 @@ pub struct FarStreaming {
     materials: Materials,
     /// Said once when the renderer runs out of slots, not every frame.
     warned_full: bool,
+    /// The world's trees (issue #433 item 1), and whether the renderer has
+    /// been told how densely they stand.
+    trees: Option<TerrainBlocks>,
+    density_told: bool,
 }
 
 impl FarStreaming {
@@ -832,7 +839,17 @@ impl FarStreaming {
             slots: HashMap::new(),
             materials: far_materials(),
             warned_full: false,
+            trees: None,
+            density_told: false,
         }
+    }
+
+    /// Draw `blocks`' trees on the far terrain (issue #433 item 1): every
+    /// patch near enough to hold one carries its trees, and the tops show the
+    /// ones no longer drawn one by one. Before the first frame.
+    pub fn with_trees(mut self, blocks: TerrainBlocks) -> Self {
+        self.trees = Some(blocks);
+        self
     }
 
     /// Draw with the quality's quads, error bound and floor `scale` times as
@@ -899,6 +916,16 @@ impl FarStreaming {
             self.plan.take(patch);
         }
         renderer.set_far_params(to_far_params(hole, self.materials));
+        if !self.density_told {
+            let density = self.trees.map(cubara_world::far_trees::density);
+            renderer.set_far_tree_density(&density.unwrap_or_default());
+            self.density_told = true;
+        }
+        let trees = self.trees.and_then(|blocks| {
+            let h = renderer.size().1;
+            let view = far_view_scaled([0.0; 3], h, None, self.plan.quality, self.plan.quad_scale)?;
+            crate::far_trees::with_trees(blocks, &view, h)
+        });
         let eye64 = eye.map(|v| v as f64);
         let slots = &self.slots;
         let step = self.plan.step(eye64, renderer.size().1, hole, || {
@@ -910,11 +937,11 @@ impl FarStreaming {
         }
         for key in step.request {
             self.pool
-                .ask((self.generation, self.gen, key), Urgency::Now);
+                .ask((self.generation, (self.gen, trees), key), Urgency::Now);
         }
         for key in step.prefetch {
             self.pool
-                .ask((self.generation, self.gen, key), Urgency::Ahead);
+                .ask((self.generation, (self.gen, trees), key), Urgency::Ahead);
         }
         for key in step.leave {
             if let Some(slot) = self.slots.remove(&key) {
@@ -927,6 +954,9 @@ impl FarStreaming {
             };
             match renderer.far_insert(to_far_patch(patch, &to_far_faces(patch))) {
                 Some(slot) => {
+                    if !patch.trees.is_empty() {
+                        renderer.far_trees_insert(slot, crate::far_trees::to_far_trees(patch));
+                    }
                     self.slots.insert(key, slot);
                 }
                 None if !self.warned_full => {
@@ -1885,7 +1915,7 @@ mod tests {
     #[test]
     fn the_pool_takes_the_urgent_queue_first() {
         let gen = WorldGen::new(1);
-        let job = |x: i32| (0u64, gen, PatchKey::new(4, x, 0));
+        let job = |x: i32| (0u64, (gen, None), PatchKey::new(4, x, 0));
         let mut q = Queues::default();
         q.push(job(1), Urgency::Ahead);
         q.push(job(2), Urgency::Ahead);

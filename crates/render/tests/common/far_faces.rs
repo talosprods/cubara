@@ -32,6 +32,7 @@ pub fn far_faces(faces: &[Face]) -> Vec<FarFace> {
             border: f.border,
             mix: f.mix,
             open: f.open,
+            trees: f.trees,
         })
         .collect()
 }
