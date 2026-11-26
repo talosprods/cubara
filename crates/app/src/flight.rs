@@ -2898,6 +2898,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         assert_eq!(
             r.flicker_frames(),
