@@ -680,9 +680,11 @@ impl FarTreeSet {
             if distance_to(eye, &b) > farthest || !frustum.intersects_aabb(&b) {
                 continue;
             }
+            // A patch wholly in view has every square in view.
+            let inside = frustum.contains_aabb(&b);
             for tile in &patch.tiles {
                 let b = relative_box(tile.min, tile.max, anchor);
-                if distance_to(eye, &b) > farthest || !frustum.intersects_aabb(&b) {
+                if distance_to(eye, &b) > farthest || !(inside || frustum.intersects_aabb(&b)) {
                     continue;
                 }
                 for t in &patch.trees[tile.trees.clone()] {
