@@ -1598,7 +1598,7 @@ mod tests {
         let keys = standin_keys(voxels).expect("the boxes differ across the ground only");
         let column: Vec<PatchKey> = (-4..=4).map(|z| PatchKey::new(3, 4, z)).collect();
         assert_eq!(keys, column);
-        assert_eq!(far::FINEST_LEVEL, 3, "level 3's cells are quads of 8");
+        const _: () = assert!(far::FINEST_LEVEL == 3, "level 3's cells are quads of 8");
         let settled = VoxelBox::settled(voxels.wanted);
         assert_eq!(standin_keys(settled), Some(Vec::new()), "nothing waits");
     }

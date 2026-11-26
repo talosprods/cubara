@@ -662,8 +662,10 @@ fn the_games_far_streaming_draws_the_strip_by_the_rule() {
     let expected = rule.frame(camera);
     let differ = shown
         .pixels
-        .chunks_exact(4)
-        .zip(expected.pixels.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.pixels.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(
