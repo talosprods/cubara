@@ -51,9 +51,8 @@ pub use materials::{load_icon, swatch_color, MeshAssets};
 pub use panel::{InventoryPanel, PanelSlot, PanelSlotKind};
 pub use profiling::Profiler;
 pub use render::{
-    camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor,
-    load_far_trees, load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose,
-    CameraUniform,
+    camera_bind_group_layout, create_depth_view, gpu_driven_features, grab_cursor, load_far_trees,
+    load_mesh_assets, load_registry, load_structures, load_tree_models, CameraPose, CameraUniform,
     FrameUniform, Lighting, MorphParams, Presented, RebaseReport, Renderer, FOV_Y_DEGREES,
 };
 pub use scene::HealthView;

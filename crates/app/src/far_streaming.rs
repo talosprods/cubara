@@ -844,6 +844,17 @@ impl FarStreaming {
         }
     }
 
+    /// The trees of the patches the renderer was handed and still draws:
+    /// what it must hold (`far_trees`'s test of the wiring).
+    #[cfg(test)]
+    pub fn trees_of_drawn_patches(&self) -> usize {
+        self.slots
+            .keys()
+            .filter_map(|k| self.plan.patch(*k))
+            .map(|p| p.trees.len())
+            .sum()
+    }
+
     /// Draw `blocks`' trees on the far terrain (issue #433 item 1): every
     /// patch near enough to hold one carries its trees, and the tops show the
     /// ones no longer drawn one by one. Before the first frame.

@@ -1306,7 +1306,12 @@ impl FarTerrain {
         queue.write_buffer(
             &self.params,
             0,
-            bytemuck::bytes_of(&ParamsGpu::new(params, &self.tint, self.anchor, self.raised)),
+            bytemuck::bytes_of(&ParamsGpu::new(
+                params,
+                &self.tint,
+                self.anchor,
+                self.raised,
+            )),
         );
     }
 

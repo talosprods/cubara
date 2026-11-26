@@ -181,8 +181,14 @@ mod tests {
                         (t.x as i64 - ox).div_euclid(key.quad()) as i32,
                         (t.z as i64 - oz).div_euclid(key.quad()) as i32,
                     );
-                    assert!((0..PATCH_QUADS as i32).contains(&i), "{t:?} outside {key:?}");
-                    assert!((0..PATCH_QUADS as i32).contains(&j), "{t:?} outside {key:?}");
+                    assert!(
+                        (0..PATCH_QUADS as i32).contains(&i),
+                        "{t:?} outside {key:?}"
+                    );
+                    assert!(
+                        (0..PATCH_QUADS as i32).contains(&j),
+                        "{t:?} outside {key:?}"
+                    );
                     assert_eq!(t.base, quad_top(&gen, key, i, j), "{t:?} in {key:?}");
                     let site = gen
                         .tree_site(t.x.div_euclid(16), t.z.div_euclid(16), blocks)
@@ -227,7 +233,10 @@ mod tests {
         assert!(!generate_with(&gen, key, with_trees(5)).trees.is_empty());
         let coarse = generate_with(&gen, key, with_trees(4));
         assert!(coarse.trees.is_empty());
-        assert!(coarse.ground.iter().any(|g| g.trees > 0), "the share is every level's");
+        assert!(
+            coarse.ground.iter().any(|g| g.trees > 0),
+            "the share is every level's"
+        );
         let bare = generate_with(&gen, key, None);
         assert!(bare.trees.is_empty());
         assert!(bare.ground.iter().all(|g| g.trees == 0));
@@ -258,7 +267,11 @@ mod tests {
         let (mut pits, mut quads) = (0, 0);
         // A mountain's flank, where caves open pits (the seed's nearest
         // range is within 600 blocks of the origin), and flat land.
-        for key in [PatchKey::new(3, 1, 1), PatchKey::new(3, -2, 0), PatchKey::new(3, 0, -2)] {
+        for key in [
+            PatchKey::new(3, 1, 1),
+            PatchKey::new(3, -2, 0),
+            PatchKey::new(3, 0, -2),
+        ] {
             let patch = generate_with(&gen, key, with_trees(3));
             let [ox, oz] = key.origin();
             for j in 0..PATCH_QUADS {
@@ -275,13 +288,20 @@ mod tests {
                         }
                     }
                     let want = (grows as f32 / 64.0 * 255.0).round() as u8;
-                    assert_eq!(patch.ground[j * PATCH_QUADS + i].trees, want, "{key:?} ({i}, {j})");
+                    assert_eq!(
+                        patch.ground[j * PATCH_QUADS + i].trees,
+                        want,
+                        "{key:?} ({i}, {j})"
+                    );
                     pits += usize::from(grows < 64);
                     quads += 1;
                 }
             }
         }
-        assert!(pits > 0, "no quad of the {quads} has a pit: this pins little");
+        assert!(
+            pits > 0,
+            "no quad of the {quads} has a pit: this pins little"
+        );
     }
 
     /// **The density is what the world grows**: over the trees of a wide
@@ -304,7 +324,11 @@ mod tests {
                 counted[(t.height - 4) as usize] += 1.0;
             }
             let area = (key.quad() * key.quad()) as f64;
-            let grows: f64 = patch.ground.iter().map(|g| g.trees as f64 / 255.0 * area).sum();
+            let grows: f64 = patch
+                .ground
+                .iter()
+                .map(|g| g.trees as f64 / 255.0 * area)
+                .sum();
             for (e, d) in expected.iter_mut().zip(&per_height) {
                 *e += grows * *d as f64;
             }
@@ -319,6 +343,10 @@ mod tests {
                 expected[h]
             );
         }
-        assert!(density(TerrainBlocks { oak: None, ..blocks }).is_empty());
+        assert!(density(TerrainBlocks {
+            oak: None,
+            ..blocks
+        })
+        .is_empty());
     }
 }

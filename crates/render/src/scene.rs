@@ -19,10 +19,10 @@ use crate::materials;
 use crate::panel::{InventoryPanel, PanelSlotKind};
 use crate::render::{
     build_far_pipeline, build_far_tree_pipeline, build_figure_pipeline,
-    build_mesh_pipeline_from_module,
-    build_outline_pipeline, build_pipeline, build_tree_pipeline, camera_bind_group_layout,
-    create_depth_view, far_bind_group_layout, mesh_pipeline_constants, origins_bind_group_layout,
-    outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform, OUTLINE_CUBE_EDGES,
+    build_mesh_pipeline_from_module, build_outline_pipeline, build_pipeline, build_tree_pipeline,
+    camera_bind_group_layout, create_depth_view, far_bind_group_layout, mesh_pipeline_constants,
+    origins_bind_group_layout, outline_bind_group_layout, FrameUniform, Lighting, OutlineUniform,
+    OUTLINE_CUBE_EDGES,
 };
 use crate::text::font;
 use crate::text::TextRenderer;

@@ -295,6 +295,11 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     }
     let to_eye = frame.eye.xyz - p;
     let dist = length(to_eye);
+    // The shortest trees fade first (`TintGpu`'s heights are in order): while
+    // they are whole, every tree here is.
+    if tree_scale(params.tree_height[0].y, dist, params.tree_fade) >= 1.0 {
+        return vec4<f32>(0.0);
+    }
     // The line of sight, or straight up for the share the canopies cover
     // seen from above (a measurement's, `TintView::FromAbove`).
     let v = select(to_eye / max(dist, 1e-3), vec3<f32>(0.0, 1.0, 0.0), params.tree_view.x > 0.5);

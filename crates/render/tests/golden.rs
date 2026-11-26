@@ -4140,7 +4140,10 @@ fn far_edge_shot(world: &World) -> Shot {
 /// of a wood a kilometre or more away.
 fn middle_of(frame: &Frame) -> Frame {
     let (w, h) = (640usize, 360usize);
-    let (x0, y0) = ((frame.width as usize - w) / 2, (frame.height as usize - h) / 2);
+    let (x0, y0) = (
+        (frame.width as usize - w) / 2,
+        (frame.height as usize - h) / 2,
+    );
     let mut pixels = Vec::with_capacity(w * h * 4);
     for y in y0..y0 + h {
         let at = (y * frame.width as usize + x0) * 4;
@@ -4276,12 +4279,9 @@ fn a_wood_swaps_nothing_where_the_voxels_end() {
         far_edge_shot(&world),
     )
     .expect("a GPU");
-    let far_without = render_far_with_trees(
-        &far,
-        headless::FarTreesShot::NONE,
-        far_edge_shot(&world),
-    )
-    .expect("a GPU");
+    let far_without =
+        render_far_with_trees(&far, headless::FarTreesShot::NONE, far_edge_shot(&world))
+            .expect("a GPU");
     let a = tree_pixels(&l3_with, &l3_without);
     let b = tree_pixels(&far_with, &far_without);
     let trees = a.iter().filter(|&&m| m).count();
@@ -4431,13 +4431,28 @@ fn a_fading_wood_keeps_its_colour() {
         let game = render(shot_of(Fade::GAME, TintView::LineOfSight, true));
         if let Some(dir) = std::env::var_os("CUBARA_FADING_DUMP") {
             let dir = std::path::PathBuf::from(dir);
-            for (what, f) in [("whole", &whole), ("sight", &sight), ("above", &above), ("bare", &bare), ("game", &game)] {
-                save_png(&dir.join(format!("fading_{name}_{what}.png")), f.width, f.height, &f.pixels);
+            for (what, f) in [
+                ("whole", &whole),
+                ("sight", &sight),
+                ("above", &above),
+                ("bare", &bare),
+                ("game", &game),
+            ] {
+                save_png(
+                    &dir.join(format!("fading_{name}_{what}.png")),
+                    f.width,
+                    f.height,
+                    &f.pixels,
+                );
             }
         }
         let (means, land) = middle_means(&[&whole, &sight, &above, &bare, &game]);
         let (rw, rh) = FADING_RECT;
-        assert_eq!(land, rw * rh, "{name}: the middle of the screen is not all land");
+        assert_eq!(
+            land,
+            rw * rh,
+            "{name}: the middle of the screen is not all land"
+        );
         let [whole_m, sight_m, above_m, bare_m, game_m] = [0, 1, 2, 3, 4].map(|k| means[k]);
         let d_sight = largest_channel_delta(whole_m, sight_m);
         let d_above = largest_channel_delta(whole_m, above_m);

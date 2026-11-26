@@ -48,10 +48,10 @@ pub const FULL_PX: f32 = 3.5;
 /// of its trunk, its ground's colour then wholly the tint's (which keeps a
 /// wood's colour, `golden.rs`'s `a_fading_wood_keeps_its_colour`).
 /// **Chosen, not derived**: the issue asks for "about 1 to 2 pixels"; at 2
-/// the gate's hill eye draws about 1,590 far trees a frame (25,400
-/// triangles with the crossed canopy), at 2.5 about 880 (14,100) -- the
-/// count the 5 to 7% the hill eye has left over 1,000 FPS can take
-/// (`far_trees_census`, §9.12). Gone at 1.9 to 2.6 km.
+/// the gate's hill eye draws 1,587 far trees a frame (25,386 triangles with
+/// the crossed canopy), at 2.5 892 (14,264) -- the count the 5 to 7% the
+/// hill eye has left over 1,000 FPS can take (`far_trees_census`'s
+/// `far_trees_drawn`, §9.12). Gone at 1.9 to 2.6 km.
 pub const GONE_PX: f32 = 2.5;
 
 /// How many pixels tall one block stands at a distance of one block, on a
@@ -223,8 +223,14 @@ impl StandIn {
                         open: face.open,
                     });
                 }
-                out.indices
-                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                out.indices.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                ]);
             }
         }
         out
@@ -275,7 +281,7 @@ impl StandIn {
 /// set to its plane.
 fn face_corners(min: [f32; 3], max: [f32; 3], d: usize) -> [[f32; 3]; 2] {
     let axis = d / 2;
-    let plane = if d % 2 == 0 { max[axis] } else { min[axis] };
+    let plane = if d.is_multiple_of(2) { max[axis] } else { min[axis] };
     let (mut p, mut q) = (min, max);
     p[axis] = plane;
     q[axis] = plane;
@@ -524,13 +530,20 @@ fn bounds_of(
         let [x, y, z] = t.base.map(i64::from);
         let top = y + tall(t.height).ceil() as i64;
         min = [min[0].min(x - r), min[1].min(y), min[2].min(z - r)];
-        max = [max[0].max(x + r + 1), max[1].max(top), max[2].max(z + r + 1)];
+        max = [
+            max[0].max(x + r + 1),
+            max[1].max(top),
+            max[2].max(z + r + 1),
+        ];
     }
     (min, max)
 }
 
 fn relative_box(min: [i64; 3], max: [i64; 3], anchor: Anchor) -> Aabb {
-    Aabb::new(anchor::offset_i64(min, anchor), anchor::offset_i64(max, anchor))
+    Aabb::new(
+        anchor::offset_i64(min, anchor),
+        anchor::offset_i64(max, anchor),
+    )
 }
 
 /// How far `eye` is from the nearest point of `b`.
@@ -1023,7 +1036,11 @@ mod tests {
         assert_eq!(tree_scale(tall, 1.0, k, Fade::GONE), 0.0);
     }
 
-    fn the_oak() -> (BlockRegistry, StructureRegistry, crate::materials::TextureLayers) {
+    fn the_oak() -> (
+        BlockRegistry,
+        StructureRegistry,
+        crate::materials::TextureLayers,
+    ) {
         let registry = crate::render::load_registry();
         let layers = crate::materials::TextureLayers::from_registry(&registry);
         (registry, crate::render::load_structures(), layers)
@@ -1047,13 +1064,28 @@ mod tests {
         let all = the_stand_ins();
         let shapes = TreeShapes::of(&structures);
         assert_eq!(all.len(), shapes.count());
-        let (oaks, silhouettes) = crate::trees::tree_model_meshes(&registry, &structures, &layer_of);
-        for ((h, s), (oak, silhouette)) in shapes.heights.clone().zip(&all).zip(oaks.iter().zip(&silhouettes)) {
+        let (oaks, silhouettes) =
+            crate::trees::tree_model_meshes(&registry, &structures, &layer_of);
+        for ((h, s), (oak, silhouette)) in shapes
+            .heights
+            .clone()
+            .zip(&all)
+            .zip(oaks.iter().zip(&silhouettes))
+        {
             let (min, max) = cubara_voxel::tree_bounds(h, shapes.canopy_radius);
             assert_eq!(s.tall, max[1] as f32 + 1.0, "height {h}");
             assert_eq!(
                 s.slots(),
-                vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 2)]
+                vec![
+                    (0, 0),
+                    (0, 1),
+                    (0, 2),
+                    (1, 0),
+                    (1, 1),
+                    (1, 2),
+                    (2, 0),
+                    (2, 2)
+                ]
             );
             let [along_x, along_z, trunk] = [s.boxes[0], s.boxes[1], s.boxes[2]];
             let bottom = (h - 1 - shapes.canopy_radius) as f32;
@@ -1078,7 +1110,10 @@ mod tests {
                             && v.color == face.colour
                             && (v.open - face.open).abs() < 1e-6
                     });
-                    assert!(found, "height {h}: face {d} {face:?} is no silhouette face's");
+                    assert!(
+                        found,
+                        "height {h}: face {d} {face:?} is no silhouette face's"
+                    );
                     assert!(shades.values().any(|&o| (o - face.open).abs() < 1e-6));
                 }
             }
@@ -1115,7 +1150,12 @@ mod tests {
         let (mut set, trees) = a_row(eye);
         let k = px_per_block(1080);
         let mut out = Vec::new();
-        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
         let tall = 6.0;
         let near = trees
             .iter()
@@ -1141,25 +1181,54 @@ mod tests {
         assert_eq!(moved.len(), out.len());
         assert_eq!(moved[0].foot, [64.5 - 4096.0, 40.0, 0.5]);
         // Looking away: none.
-        set.visible(&looking(eye, -Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        set.visible(
+            &looking(eye, -Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
         assert!(out.is_empty());
         // Every one, with the fade that takes none.
-        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::WHOLE), &mut out);
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::WHOLE),
+            &mut out,
+        );
         assert_eq!(out.len(), trees.len());
         // The voxels' box over the first 1,000 blocks: those are theirs. A
         // tree whose ground block is in the box is the voxels', one standing
         // on the box's top is not.
         set.set_hole(Some(([-16, 0, -16], [1000, 40, 16])));
-        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
-        assert_eq!(out.len(), near, "a tree standing on the box's top is the far terrain's");
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
+        assert_eq!(
+            out.len(),
+            near,
+            "a tree standing on the box's top is the far terrain's"
+        );
         set.set_hole(Some(([-16, 0, -16], [1000, 41, 16])));
-        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::GAME), &mut out);
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
         let in_box = trees.iter().filter(|t| t.base[0] < 1000).count();
         assert_eq!(out.len(), near - in_box);
         assert!(out.iter().all(|t| t.foot[0] > 1000.0));
         // Removed: nothing.
         set.remove(7);
-        set.visible(&looking(eye, Vec3::X), (eye, [0; 3]), (k, Fade::WHOLE), &mut out);
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::WHOLE),
+            &mut out,
+        );
         assert!(out.is_empty() && set.is_empty());
     }
 
@@ -1192,4 +1261,3 @@ mod tests {
         assert_eq!(TintGpu::of(None, 935.0), TintGpu::NONE);
     }
 }
-

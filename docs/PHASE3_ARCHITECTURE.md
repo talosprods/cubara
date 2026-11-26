@@ -2543,7 +2543,20 @@ tint. The bound is 0.6.
 the bench's camera path (`far_trees_census`'s `far_trees_drawn`, 1920 x
 1080, the gate's eyes):
 
-COST_TABLE
+| gate eye, quality | far trees held | drawn a frame (most) | triangles | vertices | draws |
+|---|--:|--:|--:|--:|--:|
+| ground, Medium | 29,359 | 874 (936) | 13,982 | 27,964 | 1 |
+| hill, Medium | 29,359 | 892 (956) | 14,264 | 28,529 | 1 |
+| flight, Medium | 20,362 | 0 | 0 | 0 | 0 |
+| hill, High | 80,411 | 893 (957) | 14,292 | 28,585 | 1 |
+
+At the hill eye -- the gate's lowest, with 5 to 7% left over 1,000 FPS on
+the M3 -- that is 9.7% more triangles than the far terrain's 146,586, all
+of them facing the eye. The flight eye sees no tree large enough. The fade
+is what decides the count: gone at 2 pixels the hill eye drew 1,587 trees,
+25,386 triangles; at 3, about 490. One box for the canopy would be 10
+triangles a tree (8,920 here) for the third of each tree's pixels changing
+at the ring edge measured above.
 
 The far trees' tiles are culled on the CPU each frame (squares of 128
 blocks, `TILE_BLOCKS`) and the trees in reach uploaded when they change. The

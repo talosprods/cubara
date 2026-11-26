@@ -65,7 +65,10 @@ fn in_hole(hole: &far::Hole, t: &FarTree) -> bool {
 const BUCKETS: [f64; 9] = [8.0, 5.0, 4.0, 3.0, 2.5, 2.0, 1.5, 1.0, 0.0];
 
 fn bucket(px: f64) -> usize {
-    BUCKETS.iter().position(|&b| px >= b).unwrap_or(BUCKETS.len() - 1)
+    BUCKETS
+        .iter()
+        .position(|&b| px >= b)
+        .unwrap_or(BUCKETS.len() - 1)
 }
 
 #[test]
@@ -75,7 +78,10 @@ fn far_trees_census() {
     let blocks = blocks();
     let k = px_per_block_at_one();
     let aspect = SIZE.0 as f32 / SIZE.1 as f32;
-    println!("{}x{}, 60 deg; {YAWS} directions along the bench's path; Medium at x{FAR_QUAD_SCALE}", SIZE.0, SIZE.1);
+    println!(
+        "{}x{}, 60 deg; {YAWS} directions along the bench's path; Medium at x{FAR_QUAD_SCALE}",
+        SIZE.0, SIZE.1
+    );
     for quality in [FarQuality::Medium, FarQuality::High] {
         for eye in GATE_EYES.iter() {
             let (hole, patches) = select(&gen, eye, quality);
@@ -99,16 +105,25 @@ fn far_trees_census() {
                 let frame = 200.0 + (s as f32 + 0.5) * 2000.0 / YAWS as f32;
                 let yaw = frame / 240.0 * 0.3;
                 let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
-                let frustum = Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, eye_v, dir));
+                let frustum =
+                    Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, eye_v, dir));
                 for t in &trees {
                     let b = Aabb {
                         min: Vec3::new(t.x as f32 - 2.0, t.base as f32, t.z as f32 - 2.0),
-                        max: Vec3::new(t.x as f32 + 3.0, (t.base + t.height + 1) as f32, t.z as f32 + 3.0),
+                        max: Vec3::new(
+                            t.x as f32 + 3.0,
+                            (t.base + t.height + 1) as f32,
+                            t.z as f32 + 3.0,
+                        ),
                     };
                     if !frustum.intersects_aabb(&b) {
                         continue;
                     }
-                    let mid = Vec3::new(t.x as f32 + 0.5, t.base as f32 + (t.height + 1) as f32 / 2.0, t.z as f32 + 0.5);
+                    let mid = Vec3::new(
+                        t.x as f32 + 0.5,
+                        t.base as f32 + (t.height + 1) as f32 / 2.0,
+                        t.z as f32 + 0.5,
+                    );
                     let d = mid.distance(eye_v) as f64;
                     let px = (t.height + 1) as f64 * k / d;
                     seen[bucket(px)] += 1.0;
@@ -118,7 +133,10 @@ fn far_trees_census() {
             println!("{} at {:?}, {}: {} patches; trees in patches of level <= 8 outside the hole: {} ({gen_ms:.0} ms to place)", eye.name, eye.eye, quality.name(), patches.len(), trees.len());
             for (l, (n, t)) in &by_level {
                 if *l <= 8 {
-                    println!("  level {l}: {n} patches, {t} trees ({:.0} a patch)", *t as f64 / (*n).max(1) as f64);
+                    println!(
+                        "  level {l}: {n} patches, {t} trees ({:.0} a patch)",
+                        *t as f64 / (*n).max(1) as f64
+                    );
                 } else {
                     println!("  level {l}: {n} patches");
                 }
@@ -128,7 +146,11 @@ fn far_trees_census() {
             for (i, n) in seen.iter().enumerate() {
                 cum += n / YAWS as f64;
                 let lo = BUCKETS[i];
-                let hi = if i == 0 { f64::INFINITY } else { BUCKETS[i - 1] };
+                let hi = if i == 0 {
+                    f64::INFINITY
+                } else {
+                    BUCKETS[i - 1]
+                };
                 println!("  | {lo}..{hi} | {:.0} | {cum:.0} |", n / YAWS as f64);
             }
         }
@@ -216,4 +238,3 @@ fn far_trees_drawn() {
         }
     }
 }
-

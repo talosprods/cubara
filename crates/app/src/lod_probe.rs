@@ -2999,6 +2999,7 @@ mod r6 {
             size: (1, 1),
             quality: FarQuality::Off,
             far_quad_scale: crate::far_streaming::FAR_QUAD_SCALE,
+            far_trees: true,
             morph: true,
         };
         let steps = (seconds * 60.0).round().max(0.0) as u32;

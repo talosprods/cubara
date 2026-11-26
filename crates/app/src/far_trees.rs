@@ -80,8 +80,14 @@ mod tests {
         assert_eq!(level(FarQuality::Medium), Some(6));
         assert_eq!(level(FarQuality::High), Some(6));
         assert_eq!(level(FarQuality::Low), Some(7));
-        let bare = TerrainBlocks { oak: None, ..blocks };
-        assert_eq!(with_trees(bare, &view(FarQuality::Medium, 1080), 1080), None);
+        let bare = TerrainBlocks {
+            oak: None,
+            ..blocks
+        };
+        assert_eq!(
+            with_trees(bare, &view(FarQuality::Medium, 1080), 1080),
+            None
+        );
     }
 
     #[test]
@@ -96,5 +102,46 @@ mod tests {
                 assert_eq!(at(h), at(1080), "{quality:?} at {h} rows");
             }
         }
+    }
+
+    /// **A far patch's trees are drawn while it is, and go with it**: the
+    /// window's wiring (`FarStreaming::update` hands the renderer each
+    /// patch's trees with the patch, `Renderer::far_remove` drops them with
+    /// it). Streamed round the gate's hill eye until settled, the renderer
+    /// holds exactly the trees of the patches it draws, and some; a new
+    /// world holds none.
+    #[test]
+    fn a_patchs_trees_come_and_go_with_it() {
+        use crate::far_streaming::{voxel_hole, FarStreaming};
+        let eye = [8.0, 300.0, 8.0];
+        let camera = cubara_render::CameraPose {
+            eye: glam::DVec3::from_array(eye.map(f64::from)),
+            look_dir: glam::Vec3::new(1.0, -0.25, 0.0),
+        };
+        let Some((mut renderer, _assets)) = cubara_render::Renderer::offscreen(320, 180, camera)
+        else {
+            cubara_render::headless::skip_or_require_gpu("a_patchs_trees_come_and_go_with_it");
+            return;
+        };
+        let seed = cubara_world::World::new().seed();
+        let mut far = FarStreaming::new(seed, FarQuality::Medium).with_trees(blocks());
+        let hole = voxel_hole(eye);
+        for _ in 0..4_000 {
+            far.update(&mut renderer, eye, hole);
+            if far.settled() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(far.settled(), "the far terrain did not settle");
+        let held = renderer.far_trees_drawn().1;
+        assert_eq!(held, far.trees_of_drawn_patches());
+        assert!(held > 10_000, "only {held} far trees held");
+        far.reset(seed, &mut renderer);
+        assert_eq!(
+            renderer.far_trees_drawn().1,
+            0,
+            "a new world kept the old one's trees"
+        );
     }
 }

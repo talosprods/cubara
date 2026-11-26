@@ -97,6 +97,9 @@ pub struct View {
     /// ([`FAR_QUAD_SCALE`](crate::far_streaming::FAR_QUAD_SCALE)) unless
     /// `--far-quad-scale` asks for another.
     pub far_quad_scale: f64,
+    /// Whether the far terrain draws the world's trees (issue #433 item 1):
+    /// yes, unless `--far-trees off` asks for the same commit's bare ground.
+    pub far_trees: bool,
 }
 
 /// `--gpu-timing off|auto|on`. Found necessary on Metal: attaching
@@ -409,7 +412,9 @@ pub fn run(
         }
         _ => (None, None),
     };
-    // The trees on it (issue #433 item 1), as the game draws them.
+    // The trees on it (issue #433 item 1), as the game draws them -- or none,
+    // for `--far-trees off`.
+    let far_trees_on = view.far_trees;
     let mut far_trees = None;
     let mut far_terrain = match (hole, far_view) {
         (Some(hole), Some(view)) => {
@@ -419,10 +424,12 @@ pub fn run(
                     &crate::game::load_structure_registry(),
                     &mesh_assets.registry,
                 );
+            let with_trees =
+                crate::far_trees::with_trees(tree_blocks, &view, height).filter(|_| far_trees_on);
             let patches = cubara_world::far::build_with(
                 &cubara_world::WorldGen::new(world.seed()),
                 &view,
-                crate::far_trees::with_trees(tree_blocks, &view, height),
+                with_trees,
             );
             log::info!(
                 "far terrain: {} patches, built in {:.2} s (single thread)",
@@ -450,19 +457,20 @@ pub fn run(
             let params =
                 crate::far_streaming::to_far_params(hole, crate::far_streaming::far_materials());
             terrain.set_params(&queue, params);
-            let mut on_it =
-                cubara_render::load_far_trees(&device, &queue, &mesh_assets, anchor);
+            let mut on_it = cubara_render::load_far_trees(&device, &queue, &mesh_assets, anchor);
             for (id, p) in patches.iter().enumerate() {
                 on_it.insert(id as u64, crate::far_trees::to_far_trees(p));
             }
             on_it.set_hole(params.hole);
-            let tint = cubara_render::FarTreeTint::new(
-                &cubara_world::far_trees::density(tree_blocks),
-                on_it.stand_ins(),
-            );
+            let tint = far_trees_on.then(|| {
+                cubara_render::FarTreeTint::new(
+                    &cubara_world::far_trees::density(tree_blocks),
+                    on_it.stand_ins(),
+                )
+            });
             terrain.set_tree_tint(
                 &queue,
-                Some(&tint),
+                tint.as_ref(),
                 cubara_render::far_trees::px_per_block(height),
             );
             log::info!("far trees: {} on the far terrain", on_it.len());
@@ -885,7 +893,7 @@ pub fn try_qualities(
     overlay: bool,
     gpu_timing: GpuTimingMode,
     fog: bool,
-    far_quad_scale: f64,
+    (far_quad_scale, far_trees): (f64, bool),
 ) -> Vec<(crate::far_streaming::FarQuality, Vec<(GateEye, Outcome)>)> {
     let view_radius = crate::streaming::render_radius_chunks();
     let mut tries = Vec::new();
@@ -904,6 +912,7 @@ pub fn try_qualities(
                     squash: Some(crate::streaming::VERTICAL_LOD_SQUASH),
                     far: Some(quality),
                     far_quad_scale,
+                    far_trees,
                 };
                 (
                     *gate_eye,

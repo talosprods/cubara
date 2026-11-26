@@ -34,6 +34,9 @@ pub struct View {
     /// (`far_streaming::FAR_QUAD_SCALE`) unless `--far-quad-scale` asked
     /// for another, to compare what it would look like (issue #422).
     pub far_quad_scale: f64,
+    /// Whether the far terrain draws the world's trees (issue #433 item 1):
+    /// yes, unless `--far-trees off` asks for bare far ground.
+    pub far_trees: bool,
 }
 
 /// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_chunks()` (chunks; times 16 for blocks)
@@ -70,6 +73,7 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
     // voxel region from outside and gets none, as the bench's orbit does.
     let mut far = Vec::new();
     let mut far_params = None;
+    let mut far_trees = false;
     let (shot, built) = match view {
         None => {
             let shot = Shot::default();
@@ -128,8 +132,9 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
                 far = cubara_world::far::build_with(
                     &cubara_world::WorldGen::new(world.seed()),
                     &view,
-                    crate::far_trees::with_trees(blocks, &view, v.size.1),
+                    crate::far_trees::with_trees(blocks, &view, v.size.1).filter(|_| v.far_trees),
                 );
+                far_trees = v.far_trees;
             }
             far_params = Some(crate::far_streaming::to_far_params(
                 hole,
@@ -157,21 +162,22 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
         .zip(&faces)
         .map(|(p, f)| crate::far_streaming::to_far_patch(p, f))
         .collect();
-    let trees: Vec<_> = far.iter().flat_map(crate::far_trees::to_far_trees).collect();
-    let density = if far.is_empty() {
+    let trees: Vec<_> = far
+        .iter()
+        .flat_map(crate::far_trees::to_far_trees)
+        .collect();
+    let density = if far.is_empty() || !far_trees {
         Vec::new()
     } else {
         cubara_world::far_trees::density(blocks)
     };
-    let Some(frame) =
-        headless::render_with_far_trees(
-            meshed,
-            &patches,
-            far_params,
-            headless::FarTreesShot::game(&trees, &density),
-            shot,
-        )
-    else {
+    let Some(frame) = headless::render_with_far_trees(
+        meshed,
+        &patches,
+        far_params,
+        headless::FarTreesShot::game(&trees, &density),
+        shot,
+    ) else {
         log::error!("no suitable GPU adapter — cannot render a screenshot");
         return;
     };

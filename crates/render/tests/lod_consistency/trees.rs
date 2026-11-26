@@ -347,7 +347,9 @@ pub enum Rep {
         morphed: bool,
     },
     /// The far tree on the far patch of `level` (issue #433 item 1).
-    Far { level: u32 },
+    Far {
+        level: u32,
+    },
 }
 
 /// `site` drawn as `rep` draws it.
