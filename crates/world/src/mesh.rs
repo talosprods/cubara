@@ -1272,11 +1272,8 @@ mod tests {
                             } else {
                                 ((t, gy, dims[2]), (t as usize, gy as usize, 0))
                             };
-                            let drawn = registry.is_solid(beside.drawn(
-                                inside.0 as usize,
-                                inside.1,
-                                inside.2,
-                            ));
+                            let drawn =
+                                registry.is_solid(beside.drawn(inside.0, inside.1, inside.2));
                             assert_eq!(
                                 reads.solid(outside.0, outside.1, outside.2),
                                 drawn,
