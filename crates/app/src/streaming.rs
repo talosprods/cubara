@@ -225,7 +225,7 @@ fn node_box(node: NodeKey) -> ([i32; 3], [i32; 3]) {
 /// to all of `want` only once `drawn(kept)` says the voxels draw what lies
 /// outside `kept` -- or at once when nothing of `prev` is kept (a first frame,
 /// a jump). See [`NodeStreaming::far_hole`].
-fn next_far_hole(
+pub(crate) fn next_far_hole(
     prev: ([i32; 3], [i32; 3]),
     want: ([i32; 3], [i32; 3]),
     drawn: impl FnOnce(([i32; 3], [i32; 3])) -> bool,

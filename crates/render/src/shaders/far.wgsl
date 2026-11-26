@@ -87,7 +87,7 @@ const QUADS: i32 = 32;
 const RUN_STANDIN: u32 = 1u;
 // How much further along its line of sight a stand-in's corner is drawn,
 // as a factor on its distance (`far.rs`'s `STANDIN_BEHIND`).
-const STANDIN_BEHIND: f32 = 1.00006103515625;
+const STANDIN_BEHIND: f32 = 1.000244140625;
 
 // `far.rs`'s `FarDir`, in its order.
 const DIR_TOP: u32 = 0u;

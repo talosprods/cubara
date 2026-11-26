@@ -20,8 +20,8 @@ use cubara_world::node::{covered_box_3d, desired_nodes_3d, NodeKey, DEFAULT_RING
 use cubara_world::{TerrainBlocks, World, WorldGen};
 
 use crate::far_streaming::{
-    far_materials, far_view_scaled, hole_in_blocks, to_far_faces, to_far_params, to_far_patch,
-    FarQuality, FAR_VIEW_RADIUS,
+    far_materials, far_view_scaled, hole_in_blocks, standin_faces, standin_keys, to_far_faces,
+    to_far_params, to_far_patch, FarQuality, VoxelBox, FAR_VIEW_RADIUS,
 };
 use crate::flight::{confirm_holes, screen_box, split_stale, stale_pixels, HoleTracker};
 use crate::streaming::{
@@ -188,6 +188,9 @@ struct Scene<'a> {
     nodes: &'a [NodeKey],
     hole: ([i32; 3], [i32; 3]),
     far: Vec<PatchKey>,
+    /// The stand-in's patches, cut for this box.
+    standin: Vec<PatchKey>,
+    voxels: Option<VoxelBox>,
 }
 
 fn draw(renderer: &mut Renderer, eye: [f32; 3]) {
@@ -233,6 +236,15 @@ fn render_scene(
         slots.push(
             renderer
                 .far_insert(to_far_patch(p, &faces))
+                .expect("room for the patch"),
+        );
+    }
+    for k in &scene.standin {
+        let p = &cache[k];
+        let faces = standin_faces(p, scene.voxels.expect("a box to cut for"));
+        slots.push(
+            renderer
+                .far_insert_as(to_far_patch(p, &faces), cubara_render::FarRole::StandIn)
                 .expect("room for the patch"),
         );
     }
@@ -344,12 +356,54 @@ fn strip_sliver_sequence() {
     let mut finished_crops = Vec::new();
     let mut flicker_frames = HashSet::new();
     let started = std::time::Instant::now();
+    let today = std::env::var("PROBE_LIVE").is_ok_and(|v| v == "today");
+    let voxels = VoxelBox {
+        wanted: hole_in_blocks(want),
+        drawn: hole_in_blocks(kept),
+    };
+    let standin_all = standin_keys(voxels).expect("a strip across the ground");
+    let standin: Vec<PatchKey> = standin_all.iter().copied().filter(|k| reach_patch(*k)).collect();
+    println!(
+        "stand-in: {} patches over the strip, {} reach the region: {standin:?}",
+        standin_all.len(),
+        standin.len()
+    );
+    for k in &standin {
+        cache.entry(*k).or_insert_with(|| far::generate(&gen, *k));
+    }
+    // `PROBE_STRIP_NODES=all|half|none`: which of the strip's nodes the live
+    // frame draws already.
+    let strip_nodes = std::env::var("PROBE_STRIP_NODES").unwrap_or_else(|_| "none".into());
+    let mut strip_all: Vec<NodeKey> = all.iter().copied().filter(|n| !in_kept(n)).collect();
+    strip_all.sort();
+    let live_nodes: Vec<NodeKey> = match strip_nodes.as_str() {
+        "none" => strip_less.clone(),
+        "all" => all.clone(),
+        "half" => strip_less
+            .iter()
+            .copied()
+            .chain(strip_all.iter().copied().step_by(2))
+            .collect(),
+        other => panic!("PROBE_STRIP_NODES {other}"),
+    };
+    let mut mask_diffs = 0usize;
     for (k, (&t, &eye)) in ts.iter().zip(&eyes).enumerate() {
-        let live_far = build_cached(&gen, &view(eye, kept), &mut cache, &reach_patch);
-        let live = Scene {
-            nodes: &strip_less,
-            hole: kept,
-            far: live_far,
+        let live = if today {
+            Scene {
+                nodes: &live_nodes,
+                hole: kept,
+                far: build_cached(&gen, &view(eye, kept), &mut cache, &reach_patch),
+                standin: Vec::new(),
+                voxels: None,
+            }
+        } else {
+            Scene {
+                nodes: &live_nodes,
+                hole: want,
+                far: build_cached(&gen, &view(eye, want), &mut cache, &reach_patch),
+                standin: standin.clone(),
+                voxels: Some(voxels),
+            }
         };
         let shown = crop(
             &render_scene(&mut renderer, &built, &cache, &live, eye, &mut slots),
@@ -360,6 +414,8 @@ fn strip_sliver_sequence() {
             nodes: &all,
             hole: want,
             far: fin_far,
+            standin: Vec::new(),
+            voxels: None,
         };
         let fin = crop(
             &render_scene(&mut renderer, &built, &cache, &finished, eye, &mut slots),
@@ -374,6 +430,46 @@ fn strip_sliver_sequence() {
                 .map(|p| shows_nothing(p)),
         );
         let dam = tracker.drawn_and_missing();
+        let differ: Vec<(u32, u32)> = shown
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(fin.pixels.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (a, b))| shows_nothing(&a[..]) != shows_nothing(&b[..]))
+            .map(|(i, _)| (r.x0 + i as u32 % cw, r.y0 + i as u32 / cw))
+            .collect();
+        let colour_at: Vec<((u32, u32), [u8; 4], [u8; 4])> = shown
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(fin.pixels.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, b))| ((r.x0 + i as u32 % cw, r.y0 + i as u32 / cw), *a, *b))
+            .collect();
+        let colour_differ = colour_at.len();
+        if colour_differ > 0 && colour_differ < 8 {
+            println!("    colour differs at {colour_at:?}");
+        }
+        if colour_differ > 0 {
+            let mean: f64 = colour_at
+                .iter()
+                .map(|(_, a, b)| (0..3).map(|c| (a[c] as f64 - b[c] as f64).abs()).sum::<f64>() / 3.0)
+                .sum::<f64>()
+                / colour_differ as f64;
+            println!("    mean |difference| over those: {mean:.1} of 255");
+        }
+        mask_diffs += differ.len();
+        if !differ.is_empty() || colour_differ > 0 {
+            println!(
+                "    frame {k}: land/nothing differs at {} px {:?}; {colour_differ} px differ in colour",
+                differ.len(),
+                &differ[..differ.len().min(10)]
+            );
+        }
         let stale = stale_pixels(&shown, &fin);
         let split = split_stale(&stale, &dam);
         let at = |i: u32| (r.x0 + i % cw, r.y0 + i / cw);
@@ -410,7 +506,8 @@ fn strip_sliver_sequence() {
     let mut ff: Vec<usize> = flicker_frames.into_iter().collect();
     ff.sort();
     println!(
-        "scale {scale}: {} of {} frames flicker: {:?} ({:.1?}, {} patches generated)",
+        "scale {scale} live {}: {} of {} frames flicker: {:?}; land/nothing differs from the finished frame at {mask_diffs} px in all ({:.1?}, {} patches generated)",
+        if today { "today" } else { "standin" },
         ff.len(),
         ts.len(),
         ff,

@@ -631,17 +631,34 @@ fn finer_gap(gen: &WorldGen, heights: &[f32], ox: i64, oz: i64, q: i64) -> (f32,
 /// On one thread. A live game streams instead, spreading the same loop over
 /// frames and workers; a one-shot caller has one frame to be right in.
 pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
-    let mut have: std::collections::HashMap<PatchKey, PatchHeights> =
-        std::collections::HashMap::new();
+    let mut have = std::collections::HashMap::new();
+    build_where(gen, view, &mut have, |_| true)
+        .iter()
+        .filter_map(|k| have.remove(k))
+        .collect()
+}
+
+/// [`build`]'s loop for the patches `wanted` lets through, generating into
+/// (and from) `have`: the keys of those it selects, in [`select`]'s order.
+/// A split reads only the patch's own error and its ancestors' -- which
+/// hold its ground, so `wanted` passes them too when it passes by ground
+/// -- so every patch it selects is one [`build`] selects. For a test that
+/// draws a part of the view (`cubara-app`'s `strip_standin`).
+pub fn build_where(
+    gen: &WorldGen,
+    view: &FarView,
+    have: &mut std::collections::HashMap<PatchKey, PatchHeights>,
+    wanted: impl Fn(PatchKey) -> bool,
+) -> Vec<PatchKey> {
     loop {
         let keys = select(view, |k| have.get(&k).map(|p| p.error));
         let new: Vec<PatchKey> = keys
             .iter()
             .copied()
-            .filter(|k| !have.contains_key(k))
+            .filter(|&k| wanted(k) && !have.contains_key(&k))
             .collect();
         if new.is_empty() {
-            return keys.iter().filter_map(|k| have.remove(k)).collect();
+            return keys.into_iter().filter(|&k| wanted(k)).collect();
         }
         for k in new {
             have.insert(k, generate(gen, k));

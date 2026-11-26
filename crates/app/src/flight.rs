@@ -45,7 +45,7 @@ fn shows_nothing(p: &[u8]) -> bool {
 }
 
 /// Per pixel of `frame`, whether it shows land: anything but [`NOTHING`].
-fn land_of(frame: &Frame) -> Vec<bool> {
+pub(crate) fn land_of(frame: &Frame) -> Vec<bool> {
     frame
         .pixels
         .as_chunks::<4>()
@@ -64,7 +64,7 @@ fn land_of(frame: &Frame) -> Vec<bool> {
 /// its edge go land, sky, land with nothing missing. A hole candidate is
 /// judged by it on the frame before ([`HoleTracker`]), and a hole and a
 /// stale pixel on the finished frame ([`confirm_holes`], [`stale_pixels`]).
-fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
+pub(crate) fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
     let w = width.max(1);
     let (x, y) = (i % w, i / w);
     let rows = land.len() / w;
@@ -1508,7 +1508,7 @@ impl Streamed {
     }
 }
 
-fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
+pub(crate) fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
     CameraPose {
         eye: glam::Vec3::from(eye).as_dvec3(),
         look_dir: glam::Vec3::from(flight.look).normalize_or_zero(),

@@ -365,14 +365,20 @@ pub enum FarRole {
 /// How much further from the eye a [`FarRole::StandIn`] face is drawn than
 /// it stands: every corner moved along its own line of sight, to this many
 /// times its distance -- the same pixels, a little deeper. A stand-in is
-/// the very surface the voxel nodes it stands in for draw (`far.wgsl`), and
-/// where one of them is drawn already the two would fight over every pixel;
-/// pushed back, the node wins them all. **Chosen, not derived**: 2^-14 is
-/// about 6 cm at a kilometre, where the stand-ins stand -- a thousand times
-/// the depth buffer's rounding there (`Depth32Float`, reversed Z) and less
-/// than the crack seal moves a corner, so nothing else that meets a
-/// stand-in can come out from behind it.
-pub const STANDIN_BEHIND: f32 = 1.0 + 1.0 / 16_384.0;
+/// the very surface the voxel nodes it stands in for draw, and where one of
+/// them is drawn already the two would fight over every pixel; pushed back,
+/// the node wins them all.
+///
+/// **Chosen, not derived**: 2^-12, about 24 cm at a kilometre, where the
+/// stand-ins stand (the voxels' box is 900 blocks or more from the eye).
+/// Measured on the low flight's strip with every node of it drawn over the
+/// stand-in, the region of the sliver over 26 frames (`strip_standin` in
+/// `cubara-app`): without the push 250 to 300 pixels a frame showed the
+/// stand-in instead of the node, at 2^-14 one pixel in one frame (where a
+/// crack-sealed corner, moved 6 cm out of its face, stood in front), at
+/// 2^-12 none. Nothing that should be hidden by a stand-in lies that close
+/// behind it: the ground it joins at the box's sides only touches it.
+pub const STANDIN_BEHIND: f32 = 1.0 + 1.0 / 4_096.0;
 
 /// What `far.wgsl` reads besides the vertices.
 #[derive(Clone, Copy, Debug, PartialEq)]

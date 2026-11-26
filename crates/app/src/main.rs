@@ -35,6 +35,8 @@ mod settings;
 mod streaming;
 #[cfg(test)]
 mod strip_probe;
+#[cfg(test)]
+mod strip_standin;
 mod tick_cost;
 #[cfg(test)]
 mod transition_study;

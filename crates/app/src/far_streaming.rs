@@ -420,6 +420,22 @@ pub fn standin_keys(voxels: VoxelBox) -> Option<Vec<PatchKey>> {
     standin_possible(voxels).then(|| finest_patches_between(voxels.wanted, voxels.drawn))
 }
 
+/// **What the far terrain draws for the voxels' box `voxels`**, with the
+/// patches `generated` says are: the box it is selected and holed at, and
+/// the stand-in's patches. Once every patch of the stand-in is generated,
+/// the finished frame's far terrain -- holed at the box the voxels want --
+/// and level 3 over the strip ([`standin_keys`]); until then the far
+/// terrain holed at the box they draw, standing in for the strip itself at
+/// its own quads, as it always did. The one rule for it: [`FarPlan::step`]
+/// draws by it, and the GPU test of the strip (`strip_standin`) draws what
+/// it says.
+pub fn far_stand(voxels: VoxelBox, generated: impl Fn(PatchKey) -> bool) -> (Hole, Vec<PatchKey>) {
+    match standin_keys(voxels) {
+        Some(keys) if keys.iter().all(|&k| generated(k)) => (voxels.wanted, keys),
+        _ => (voxels.drawn, Vec::new()),
+    }
+}
+
 /// The finest far level's patches round `wanted`, one coarsest voxel node
 /// deep: the ground the voxels' box gains when it moves on
 /// (`node::covered_box_3d` moves it a node at a time), whichever way --
@@ -844,23 +860,16 @@ impl FarPlan {
         self.hole
     }
 
-    /// The stand-in for the strip `voxels` has, once every patch of it is
-    /// generated: `Some` and empty while nothing waits, `None` while it
-    /// cannot stand in ([`standin_keys`]) or a patch of it is still to
-    /// come -- asked for at once, since the strip is in sight now. (The ring
-    /// has them generated before the box moves; a box that moves twice
-    /// before its first strip is drawn can outrun it.)
-    fn standin_for(&mut self, voxels: VoxelBox, step: &mut Step) -> Option<Vec<PatchKey>> {
-        let Some(keys) = standin_keys(voxels) else {
-            self.strip.clear();
-            return None;
-        };
-        let mut ready = true;
-        for &k in &keys {
+    /// Ask at once for every patch of the stand-in for the strip `voxels`
+    /// has ([`standin_keys`]) that is not generated: the strip is in sight
+    /// now. (The ring has them generated before the box moves; a box that
+    /// moves twice before its first strip is drawn can outrun it.)
+    fn ask_for_standin(&mut self, voxels: VoxelBox, step: &mut Step) {
+        self.strip = standin_keys(voxels).unwrap_or_default();
+        for &k in &self.strip {
             if self.heights.contains_key(&k) {
                 continue;
             }
-            ready = false;
             match self.in_flight.get(&k) {
                 None => step.request.push(k),
                 Some(Urgency::Ahead) => step.promote.push(k),
@@ -868,8 +877,6 @@ impl FarPlan {
             }
             self.in_flight.insert(k, Urgency::Now);
         }
-        self.strip.clone_from(&keys);
-        ready.then_some(keys)
     }
 
     /// Draw `now` as the stand-in from this frame on, if it is not what is
@@ -897,7 +904,7 @@ impl FarPlan {
         }
         self.ring_for = Some(wanted);
         self.ring = standin_ring(wanted).into_iter().collect();
-        let mut ask: Vec<PatchKey> = self
+        let ask: Vec<PatchKey> = self
             .ring
             .iter()
             .copied()
@@ -933,20 +940,13 @@ impl FarPlan {
     ) -> Step {
         let mut step = Step::default();
         let on = self.quality.detail().is_some();
-        let standin = on
-            .then(|| self.standin_for(voxels, &mut step))
-            .flatten();
-        let hole = if standin.is_some() {
-            voxels.wanted
+        let (hole, standin) = if on {
+            self.ask_for_standin(voxels, &mut step);
+            far_stand(voxels, |k| self.heights.contains_key(&k))
         } else {
-            voxels.drawn
+            (voxels.drawn, Vec::new())
         };
-        self.show_standin(
-            standin
-                .filter(|keys| !keys.is_empty())
-                .map(|keys| (voxels, keys)),
-            &mut step,
-        );
+        self.show_standin((!standin.is_empty()).then_some((voxels, standin)), &mut step);
         let mut step = self.select(eye, screen_height, hole, drawn, step);
         // Last, so nothing the eye wants now is asked for behind it.
         if on {
