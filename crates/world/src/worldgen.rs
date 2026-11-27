@@ -1354,9 +1354,9 @@ impl WorldGen {
     ///   side is the node's edge the cell one level coarser (rings are one
     ///   level apart; past the coarsest voxel level the far terrain's quads at
     ///   the join are that level's cells, §9.3);
-    /// - **the finer cells inside it**, in each of its block rows and the row
-    ///   over them -- the levels that may be drawn here as the player comes
-    ///   nearer, whose tops do not nest;
+    /// - **the finer cells inside it**, in the row over its highest (which
+    ///   covers its rows: see below) -- the levels that may be drawn here as
+    ///   the player comes nearer, whose tops do not nest;
     /// - **the cells over it**, in the row over its highest: the cell itself
     ///   (so the row that holds the cell's top is never cave: the cell's top
     ///   is where the ground is) and, where that row is the next node's, the
@@ -1411,9 +1411,6 @@ impl WorldGen {
         };
         let (i, j) = (x0.div_euclid(w).rem_euclid(cells), z0.div_euclid(w).rem_euclid(cells));
         for r in y..=highest {
-            if inside(r) {
-                return false;
-            }
             for [dx, dz] in GROUND_DIRECTIONS {
                 // The columns just across this side, and whether it is the
                 // node's.
@@ -1441,6 +1438,11 @@ impl WorldGen {
                 }
             }
         }
+        // The finer cells inside it are asked in the row over its highest
+        // alone: one that unroofs a row of the cave unroofs that row too. A
+        // column of this cell that reaches a cave row is cave there, and a
+        // column's top is never cave, so it stands over the row -- over
+        // every cave row above it in turn, and over the highest.
         let over = highest + 1;
         if inside(over) || unroofs(x0, z0, w, over) {
             return false;

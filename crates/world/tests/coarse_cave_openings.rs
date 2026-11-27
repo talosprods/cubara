@@ -91,7 +91,6 @@ impl Ground {
 }
 
 /// A cave row a level draws open through ground that level 0 draws there.
-#[derive(Debug)]
 struct Opening {
     level: u32,
     cell: [i32; 2],
@@ -100,6 +99,22 @@ struct Opening {
     toward: &'static str,
     /// The level whose cell leaves it open.
     by: u32,
+}
+
+impl std::fmt::Debug for Opening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            level,
+            cell: [x, z],
+            row,
+            toward,
+            by,
+        } = self;
+        write!(
+            f,
+            "level {level}, cell ({x}, {z}), row {row}, toward {toward}, left open by level {by}"
+        )
+    }
 }
 
 /// Every opening through level 0's ground of the cave rows `caves` of the
@@ -282,9 +297,13 @@ fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
 /// **No level opens a cave through level 0's ground, over a few square
 /// kilometres** around the owner's spot and the spawn: every cave row each
 /// level draws (`cell_draws_solid`), every side and the row over it, at
-/// levels 1 to 3. Main drew such openings by the hundred at every level
-/// (the count is printed); the levels must still draw caves, and many of
-/// them open where level 0 is open too, or the rule would be "no caves".
+/// levels 1 to 3. Main drew 69,342, 23,711 and 2,598 such openings here (the
+/// counts are printed). And **caves still nest**: every cave row of a coarse
+/// cell is open in each finer cell inside it, cave or over its top -- what a
+/// rule asking only its own level's cells breaks (a finer cell inside or
+/// beside a cave can stand lower than the coarser one). The levels must
+/// still draw caves, some of them open where level 0 is open too, or the
+/// rule would be "no caves".
 #[test]
 fn no_level_opens_a_cave_through_level_0s_ground() {
     let gen = WorldGen::new(World::new().seed());
@@ -297,7 +316,8 @@ fn no_level_opens_a_cave_through_level_0s_ground() {
     let mut total = 0;
     for level in 1..=COARSEST {
         let (w, v) = (1i32 << level, if level < 3 { 1 } else { 4 });
-        let (mut caves, mut open, mut through) = (0usize, 0usize, Vec::new());
+        let (mut caves, mut open, mut through, mut nest_breaks) =
+            (0usize, 0usize, Vec::new(), 0usize);
         for &([cx, cz], half) in &squares {
             let (xs, zs) = ((cx - half).div_euclid(w) * w, (cz - half).div_euclid(w) * w);
             for b in 0..2 * half / w {
@@ -310,6 +330,19 @@ fn no_level_opens_a_cave_through_level_0s_ground() {
                         .filter(|&y| !gen.cell_draws_solid(&cell, y, v))
                         .collect();
                     caves += rows.len();
+                    // Caves nest: each finer cell inside draws every one of
+                    // these rows open too -- cave, or over its top.
+                    if level > 1 {
+                        let (fw, fv) = (w / 2, if level - 1 < 3 { 1 } else { 4 });
+                        for q in 0..4 {
+                            let (fx, fz) = (x0 + q % 2 * fw, z0 + q / 2 * fw);
+                            let finer = gen.cell_ground(fx, fz, fw);
+                            nest_breaks += rows
+                                .iter()
+                                .filter(|&&r| r <= finer.top && gen.cell_draws_solid(&finer, r, fv))
+                                .count();
+                        }
+                    }
                     // How many are open to the sky at all, at this level.
                     open += rows
                         .iter()
@@ -325,15 +358,18 @@ fn no_level_opens_a_cave_through_level_0s_ground() {
             }
         }
         report.push(format!(
-            "level {level}: {caves} cave rows, {open} open to the sky, {} through level 0's ground",
+            "level {level}: {caves} cave rows, {open} open to the sky, {} through level 0's ground, {nest_breaks} where a finer cell draws ground",
             through.len()
         ));
-        total += through.len();
+        total += through.len() + nest_breaks;
         if let Some(first) = through.first() {
             report.push(format!("  the first: {first:?}"));
         }
+        // Chosen, not derived: half of what is measured at level 3 (20 rows
+        // open, 2,728 cave rows), so that a rule that drew no caves at all
+        // could not pass for one that keeps them shut.
         assert!(
-            caves >= 100 && open >= 20,
+            caves >= 1_000 && open >= 10,
             "level {level}: {caves} cave rows, {open} of them open -- too few for the sweep to mean anything"
         );
     }

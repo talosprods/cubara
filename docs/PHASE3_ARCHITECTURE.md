@@ -2640,7 +2640,7 @@ What the table says:
 **Measured** (`no_level_opens_a_cave_through_level_0s_ground`, two squares
 of 1,536 blocks: the owner's slopes, the spawn's hills and the mountain
 north of them; block rows, levels 1 / 2 / 3): openings through level 0's
-ground TBD on main, **0** now; rows drawn as cave 671,391 / 108,097 / 5,624
+ground 69,342 / 23,711 / 2,598 on main, **0** now; rows drawn as cave 671,391 / 108,097 / 5,624
 on main, 612,568 / 84,423 / 2,728 now; rows open to the sky 108,278 / 26,778
 / 2,350 on main (the count that test prints is of the same-level cells), 51,874
 / 5,036 / 20 now.
@@ -2656,7 +2656,10 @@ holds the generated nodes to the rule row by row, worked out from the
 columns' and the cells' tops; `coarse_caves_nest` is unchanged and green.
 GPU: `crates/render/tests/sky_through_ground.rs` renders the game's nodes at
 the owner's spot at 2,560 x 1,664 and 2,940 x 1,846: no sky through level
-0's ground wider than a sliver around the block (TBD).
+0's ground wider than a sliver around the block. Main drew 108 such
+pixels in one cluster 23 wide at 2,560 x 1,664 -- the tour's gap, pixel
+for pixel -- and 122, 25 wide, at 2,940 x 1,846; now 22 and 3, no cluster
+wider than one pixel.
 
 **What is left.**
 
