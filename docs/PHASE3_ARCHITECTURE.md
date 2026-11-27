@@ -2671,6 +2671,7 @@ tint. The bound is 0.6.
 | on screen at the ring edge, 15% of the trees' pixels at most, colour within 1.0 | `a_wood_swaps_nothing_where_the_voxels_end`, goldens `forest_far_edge_level_3`, `forest_far_edge_far` |
 | the fade keeps a wood's colour within 0.6, nearer the trees than the share from above | `a_fading_wood_keeps_its_colour`, golden `forest_fading` |
 | a frame draws the trees in view, in reach and not in the voxels' box | `a_frame_draws_the_trees_in_view_and_in_reach` |
+| while a strip loads, its stand-in carries exactly the trees on its tops, drawn inside the voxels' box a hair behind, handed to the renderer with it and taken back with it | `the_stand_in_draws_the_trees_on_its_tops`, `a_stand_in_draws_its_trees_inside_the_box_behind`, `the_stand_in_hands_its_trees_over_and_takes_them_back` |
 
 **What it costs.** Counted with the renderer's own culling and fade along
 the bench's camera path (`far_trees_census`'s `far_trees_drawn`, 1920 x
@@ -2703,10 +2704,21 @@ off` does.
 
 **What is left, and why.**
 
-- *A strip handed over.* While the voxels' box grows and the far terrain's
-  hole has not (§9.10's `far_hole`: a few frames of both drawing the strip),
-  the strip's trees are drawn by both, the far stand-in and level 3's
-  silhouette at almost one place; the ground is drawn twice there too.
+- *A strip handed over* (§9.11). While the strip the voxels' box gained
+  loads, the far terrain is holed at the box the voxels want, so none of its
+  own trees stand in the strip; the stand-in that draws the strip's ground
+  carries the strip's trees instead (`far_streaming::standin_trees`: those
+  on the quads the stand-in draws tops over, by the faces' own rule,
+  `in_strip`), at quads of 8 where level 3 will stand them, drawn inside
+  the box and a hair behind where they stand (`far_trees::STANDIN_TREE`,
+  the stand-in's own `STANDIN_BEHIND`). A node of the strip drawn
+  meanwhile draws its silhouettes in front of them; where a stand-in's
+  crossed boxes reach past a silhouette (the 12.6% above) they show until
+  the strip's last node is drawn and the stand-in leaves. Without them the
+  strip's wood blinked out for the frames it loads
+  (`the_stand_in_draws_the_trees_on_its_tops`,
+  `a_stand_in_draws_its_trees_inside_the_box_behind`,
+  `the_stand_in_hands_its_trees_over_and_takes_them_back`).
 - *Trees over walls.* The tint is the tops'; a tree standing behind a wall
   and showing over it is not a wall's colour, so the far terrain's walls
   are never tinted. Measured above as what is left at the low eye.

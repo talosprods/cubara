@@ -1120,6 +1120,18 @@ impl Renderer {
         self.far_trees.insert(slot.id(), trees);
     }
 
+    /// [`far_trees_insert`](Self::far_trees_insert) for a patch drawn as
+    /// `role`: the trees of a stand-in for voxel nodes not drawn yet are the
+    /// strip's own, drawn inside the voxels' box behind anything there.
+    pub fn far_trees_insert_as(
+        &mut self,
+        slot: crate::far::FarSlot,
+        trees: Vec<crate::far_trees::FarTreePlacement>,
+        role: crate::far::FarRole,
+    ) {
+        self.far_trees.insert_as(slot.id(), trees, role);
+    }
+
     /// How densely trees stand, per trunk height (in the order of the oak's
     /// heights), in trees a square block where every column may grow one
     /// (`cubara_world::far_trees::density`): what the far terrain's tops

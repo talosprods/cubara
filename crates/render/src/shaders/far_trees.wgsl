@@ -32,6 +32,12 @@ struct Frame {
 @group(0) @binding(0) var<uniform> frame: Frame;
 
 const MAX_BOXES: u32 = 3u;
+// `FarTreeInstance::height`'s flag for a tree of the strip's stand-in
+// (`far_trees.rs`'s `STANDIN_TREE`), and how much further along its line of
+// sight such a tree is drawn, as a factor on its distance (`far.rs`'s
+// `STANDIN_BEHIND`, which `far.wgsl` pushes the stand-in's ground back by).
+const STANDIN_TREE: u32 = 0x80000000u;
+const STANDIN_BEHIND: f32 = 1.000244140625;
 
 // One box of a stand-in, in blocks from the trunk's base block, and per face
 // (+X -X +Y -Y +Z -Z) its colour and openness; `.w` below zero: a face it
@@ -93,13 +99,15 @@ fn vs_main(in: VsIn) -> VsOut {
     }
     let b = params.slots[slot].x;
     let axis = params.slots[slot].y;
-    let tall = params.tall[in.height].x;
+    let height = in.height & 0xFFu;
+    let standin = (in.height & STANDIN_TREE) != 0u;
+    let tall = params.tall[height].x;
     let middle = in.foot + vec3<f32>(0.0, 0.5 * tall, 0.0);
     let s = tree_scale(tall, distance(middle, frame.eye.xyz), params.fade);
     if s <= 0.0 {
         return out;
     }
-    let bx = params.boxes[in.height * MAX_BOXES + b];
+    let bx = params.boxes[height * MAX_BOXES + b];
     // The box, shrunk about the trunk's foot: (0.5, 0, 0.5) in its frame.
     let pivot = vec3<f32>(0.5, 0.0, 0.5);
     let lo = in.foot + (bx.min.xyz - pivot) * s;
@@ -125,7 +133,11 @@ fn vs_main(in: VsIn) -> VsOut {
     p[axis] = select(lo[axis], hi[axis], positive);
     p[u] = select(lo[u], hi[u], e == 1u);
     p[v] = select(lo[v], hi[v], f == 1u);
-    out.clip_pos = frame.view_proj * vec4<f32>(p, 1.0);
+    // A stand-in's tree a hair further along its line of sight: the same
+    // pixels, a little deeper, so a level-3 node's silhouette of it drawn
+    // already keeps them all.
+    let behind = frame.eye.xyz + (p - frame.eye.xyz) * STANDIN_BEHIND;
+    out.clip_pos = frame.view_proj * vec4<f32>(select(p, behind, standin), 1.0);
 
     let n = FACE_NORMALS[d];
     let brightness = face_brightness(

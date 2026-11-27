@@ -34,6 +34,7 @@ use glam::Vec3;
 
 use crate::anchor::{self, Anchor};
 use crate::culling::{Aabb, Frustum};
+use crate::far::FarRole;
 use crate::trees::{oak_shades, TreeModelMesh, TreeShapes, TreeVertex};
 
 /// **A far tree is drawn whole while it stands this many pixels tall or
@@ -487,13 +488,21 @@ impl TintGpu {
 /// One far tree drawn this frame: where its trunk's foot stands, relative
 /// to the render anchor -- the middle of its base block's floor, `(x + 0.5,
 /// base, z + 0.5)`, exact in `f32` -- and which trunk height's stand-in it
-/// is drawn with.
+/// is drawn with, [`STANDIN_TREE`] set for a tree of the strip's stand-in.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FarTreeInstance {
     pub foot: [f32; 3],
     pub height: u32,
 }
+
+/// [`FarTreeInstance::height`]'s flag for a tree of a stand-in for voxel
+/// nodes not drawn yet ([`FarRole::StandIn`]): drawn a hair further along
+/// its line of sight than it stands, as the stand-in's ground is
+/// ([`crate::far::STANDIN_BEHIND`]), so a level-3 node drawn meanwhile --
+/// the same tree, as its silhouette -- is what the depth test keeps.
+/// `far_trees.wgsl`'s `STANDIN_TREE`.
+pub const STANDIN_TREE: u32 = 1 << 31;
 
 /// The side of the squares, in blocks, a patch's trees are culled by
 /// frame by frame -- against the frustum and against how far the tallest
@@ -511,14 +520,15 @@ struct Tile {
     trees: std::ops::Range<usize>,
 }
 
-/// One patch's trees, by square ([`TILE_BLOCKS`]), and the box round all of
-/// them.
+/// One patch's trees, by square ([`TILE_BLOCKS`]), the box round all of
+/// them, and what they are drawn as.
 #[derive(Clone, Debug)]
 struct PatchTrees {
     trees: Vec<FarTreePlacement>,
     tiles: Vec<Tile>,
     min: [i64; 3],
     max: [i64; 3],
+    role: FarRole,
 }
 
 /// `(min, max)`, in world blocks, of `trees` standing as `tall` says, their
@@ -598,7 +608,16 @@ impl FarTreeSet {
     /// Record (or replace) the trees of the patch `id` -- the caller's key
     /// for it, the far terrain's slot in the game. An empty list removes
     /// it.
-    pub fn insert(&mut self, id: u64, mut trees: Vec<FarTreePlacement>) {
+    pub fn insert(&mut self, id: u64, trees: Vec<FarTreePlacement>) {
+        self.insert_as(id, trees, FarRole::Terrain);
+    }
+
+    /// [`insert`](Self::insert), the trees drawn as `role`: those of a
+    /// stand-in for voxel nodes not drawn yet ([`FarRole::StandIn`]) are
+    /// the strip's own -- the caller has already kept those standing on
+    /// its ground (`cubara-app`'s `standin_trees`) -- and are drawn inside
+    /// the voxels' box, a hair behind where they stand ([`STANDIN_TREE`]).
+    pub fn insert_as(&mut self, id: u64, mut trees: Vec<FarTreePlacement>, role: FarRole) {
         if trees.is_empty() || self.talls.is_empty() {
             self.by_patch.remove(&id);
             return;
@@ -633,6 +652,7 @@ impl FarTreeSet {
                 tiles,
                 min,
                 max,
+                role,
             },
         );
     }
@@ -677,8 +697,9 @@ impl FarTreeSet {
     /// patch, square and tree order: every tree the frustum can see whose
     /// size on screen is over `fade`'s gone size -- by its own height, from
     /// `eye` (anchor-relative), at `px_per_block` -- and whose ground is not
-    /// the voxels'. Squares and patches out of the frustum or out of reach are
-    /// passed over whole.
+    /// the voxels', but for a stand-in's, which stands in for theirs.
+    /// Squares and patches out of the frustum or out of reach are passed
+    /// over whole.
     pub fn visible(
         &self,
         frustum: &Frustum,
@@ -699,6 +720,7 @@ impl FarTreeSet {
             }
             // A patch wholly in view has every square in view.
             let inside = frustum.contains_aabb(&b);
+            let standin = patch.role == FarRole::StandIn;
             for tile in &patch.tiles {
                 let b = relative_box(tile.min, tile.max, anchor);
                 if distance_to(eye, &b) > farthest || !(inside || frustum.intersects_aabb(&b)) {
@@ -710,13 +732,13 @@ impl FarTreeSet {
                     let foot = anchor::offset(t.base, anchor) + Vec3::new(0.5, 0.0, 0.5);
                     let middle = foot + Vec3::Y * (tall / 2.0);
                     if tree_scale(tall, middle.distance(eye), px_per_block, fade) <= 0.0
-                        || self.in_hole(t)
+                        || (!standin && self.in_hole(t))
                     {
                         continue;
                     }
                     out.push(FarTreeInstance {
                         foot: foot.to_array(),
-                        height: k as u32,
+                        height: k as u32 | if standin { STANDIN_TREE } else { 0 },
                     });
                 }
             }
@@ -899,6 +921,11 @@ impl FarTrees {
     /// it carried before.
     pub fn insert(&mut self, id: u64, trees: Vec<FarTreePlacement>) {
         self.set.insert(id, trees);
+    }
+
+    /// [`insert`](Self::insert), drawn as `role` ([`FarTreeSet::insert_as`]).
+    pub fn insert_as(&mut self, id: u64, trees: Vec<FarTreePlacement>, role: FarRole) {
+        self.set.insert_as(id, trees, role);
     }
 
     pub fn remove(&mut self, id: u64) {
@@ -1264,5 +1291,70 @@ mod tests {
         };
         assert_eq!(TintGpu::of(Some(&above), 935.0).view[0], 1.0);
         assert_eq!(TintGpu::of(None, 935.0), TintGpu::NONE);
+    }
+
+    /// **A stand-in's trees are the strip's** (issue #433 item 1 with
+    /// §9.11's stand-in): drawn inside the voxels' box -- which the far
+    /// terrain's own trees there are not -- and flagged, so the shader draws
+    /// them a hair behind where they stand, as the stand-in's ground is.
+    #[test]
+    fn a_stand_in_draws_its_trees_inside_the_box_behind() {
+        let eye = Vec3::new(0.0, 60.0, 0.0);
+        let (mut set, trees) = a_row(eye);
+        let k = px_per_block(1080);
+        // Every tree's ground in the box.
+        set.set_hole(Some(([-16, 0, -16], [100_000, 40, 16])));
+        let mut out = Vec::new();
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "the far terrain's trees in the box are the voxels'"
+        );
+        set.remove(7);
+        set.insert_as(9, trees, FarRole::StandIn);
+        set.visible(
+            &looking(eye, Vec3::X),
+            (eye, [0; 3]),
+            (k, Fade::GAME),
+            &mut out,
+        );
+        assert!(out.len() > 20, "only {} of the stand-in's trees", out.len());
+        assert!(out.iter().all(|t| t.height & STANDIN_TREE != 0));
+        assert!(out.iter().all(|t| t.height & !STANDIN_TREE == 1));
+    }
+
+    /// The shader reads the flag and the push as this module and the far
+    /// terrain's stand-in define them (`far.rs`'s `STANDIN_BEHIND`).
+    #[test]
+    fn the_shader_draws_a_stand_in_tree_as_the_stand_in() {
+        let wgsl = crate::haze::FAR_TREES_WGSL;
+        let constant = |name: &str| {
+            wgsl.lines()
+                .find_map(|l| l.strip_prefix(&format!("const {name}: ")))
+                .unwrap_or_else(|| panic!("far_trees.wgsl has {name}"))
+                .to_string()
+        };
+        let behind: f32 = constant("STANDIN_BEHIND")
+            .strip_prefix("f32 = ")
+            .and_then(|v| v.trim_end_matches(';').parse().ok())
+            .expect("a number");
+        assert_eq!(behind, crate::far::STANDIN_BEHIND);
+        let flag = constant("STANDIN_TREE");
+        assert_eq!(
+            flag.trim_end_matches(';'),
+            format!("u32 = {STANDIN_TREE:#010x}u")
+        );
+        for line in [
+            "let behind = frame.eye.xyz + (p - frame.eye.xyz) * STANDIN_BEHIND;",
+            "out.clip_pos = frame.view_proj * vec4<f32>(select(p, behind, standin), 1.0);",
+            "let height = in.height & 0xFFu;",
+        ] {
+            assert!(wgsl.contains(line), "far_trees.wgsl no longer has: {line}");
+        }
     }
 }
