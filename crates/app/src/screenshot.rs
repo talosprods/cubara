@@ -8,14 +8,18 @@
 //!
 //! Run with: `cargo run --release -- --screenshot out.png`, or from a place:
 //! `--screenshot out.png --eye X,Y,Z --look DX,DY,DZ [--radius N] [--size WxH]
-//! [--far-quad-scale F]`.
+//! [--far-quad-scale F]`, or from where a player standing on block column
+//! `X,Z` has their eye ([`standing_eye`]), at the game's own render distance
+//! unless `--radius` says otherwise: `--screenshot out.png --stand X,Z
+//! [--look DX,DY,DZ] [--radius N] [--size WxH]`.
 
 use cubara_render::materials::TextureLayers;
 use cubara_render::{headless, load_registry, Lighting, Shot};
-use cubara_voxel::ChunkCoord;
+use cubara_sim::physics::EYE_HEIGHT;
+use cubara_voxel::{ChunkCoord, Fixed};
 use cubara_world::mesh::{mesh_nodes, mesh_region};
 use cubara_world::node::{desired_nodes_3d, schedule_for_radius};
-use cubara_world::World;
+use cubara_world::{World, WorldGen};
 
 use crate::streaming::{to_meshed_node, VERTICAL_LOD_SQUASH};
 
@@ -34,6 +38,27 @@ pub struct View {
     /// (`far_streaming::FAR_QUAD_SCALE`) unless `--far-quad-scale` asked
     /// for another, to compare what it would look like (issue #422).
     pub far_quad_scale: f64,
+}
+
+/// The eye of a player standing on block column `(x, z)` (`--stand X,Z`):
+/// over the middle of the column, [`EYE_HEIGHT`] above the top they stand
+/// on -- the highest block of ground the sky sees there,
+/// [`WorldGen::column_top`] (the surface block, or the floor of a pit), so
+/// the feet are on that block's top face. Before trees and edits, like the
+/// top itself: a column a trunk stands on puts the eye inside the trunk.
+///
+/// A pure function of the seed, so a stand names the same eye on every
+/// machine -- the one the simulation settles a player at there
+/// (`a_stand_is_where_the_simulation_stands_a_player`).
+pub fn standing_eye(gen: &WorldGen, x: i32, z: i32) -> [f32; 3] {
+    let feet = Fixed::from_blocks(gen.column_top(x, z) + 1);
+    [x as f32 + 0.5, (feet + EYE_HEIGHT).to_f32(), z as f32 + 0.5]
+}
+
+/// `--stand X,Z`: a block column, as two whole numbers.
+pub fn parse_column(text: &str) -> Option<(i32, i32)> {
+    let (x, z) = text.split_once(',')?;
+    Some((x.trim().parse().ok()?, z.trim().parse().ok()?))
 }
 
 /// Fog for `shot`'s own `region_radius` -- not `streaming::render_radius_chunks()` (chunks; times 16 for blocks)
@@ -174,6 +199,77 @@ pub fn run(path: &str, view: Option<View>, menu: Option<String>, paths: &crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cubara_voxel::FixedVec3;
+
+    /// `--stand X,Z` shows what a player standing there sees only if its eye
+    /// is the one the simulation gives them, so this asks the simulation: a
+    /// real `Server`'s player, dropped onto the column from a block above
+    /// the eye, lands with its eye exactly at `standing_eye` -- feet on the
+    /// top face, `EYE_HEIGHT` over them, over the column's middle.
+    ///
+    /// Two columns, each pinning what the other cannot: the spawn, where the
+    /// server itself puts a player on a column (so its `x`/`z` are the
+    /// server's, not a re-derivation), and a pit, whose top is its floor and
+    /// not the surface the cave carved away -- a stand on the surface height
+    /// would hang in the air over it. Both are open to the sky, checked
+    /// first, so a tree in the way fails as that and not as a wrong eye.
+    #[test]
+    fn a_stand_is_where_the_simulation_stands_a_player() {
+        let mut server = cubara_server::Server::new();
+        server.open(std::path::Path::new("cubara-nonexistent-stand-fixture"));
+        let terrain = server.terrain.expect("assets are loaded");
+        let gen = WorldGen::new(server.world.seed());
+        let who = server.local.expect("a local player");
+        let spawn = server.world_spawn().expect("a spawn");
+        let [sx, _, sz] = spawn.floor_block();
+        let open = |x: i32, z: i32, from: i32, to: i32| {
+            (from..=to).all(|y| !server.world.is_solid_at(x, y, z, terrain))
+        };
+        let pit = (0..64 * 64)
+            .map(|k| (k % 64 - 32, k / 64 - 32))
+            .find(|&(x, z)| {
+                let c = gen.column(x, z);
+                c.top < c.surface && open(x, z, c.top + 1, c.surface + 4)
+            })
+            .expect("a pit open to the sky within 32 blocks of the origin");
+
+        let eye = standing_eye(&gen, sx, sz);
+        assert_eq!(
+            [eye[0], eye[2]],
+            [spawn.x.to_f32(), spawn.z.to_f32()],
+            "a stand on the spawn column is not where the server stands a player on it"
+        );
+        let columns = [(sx, sz), pit];
+        for (x, z) in columns {
+            let top = gen.column_top(x, z);
+            assert!(open(x, z, top + 1, top + 5), "({x}, {z}): not open above");
+        }
+        for (x, z) in columns {
+            let eye = standing_eye(&gen, x, z);
+            let p = server.sim.player_mut(who);
+            p.pos = FixedVec3::from_f32([eye[0], eye[1] + 1.0, eye[2]]);
+            p.velocity = FixedVec3::ZERO;
+            for _ in 0..120 {
+                server.tick_sim(&cubara_sim::InputFrame::default());
+            }
+            let p = server.sim.get(who).expect("the player");
+            assert!(p.on_ground, "({x}, {z}): never landed");
+            assert_eq!(
+                p.pos.to_f32(),
+                eye,
+                "({x}, {z}): the simulation stands a player with its eye elsewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_is_two_whole_numbers() {
+        assert_eq!(parse_column("5376,3408"), Some((5376, 3408)));
+        assert_eq!(parse_column(" -120 , 48 "), Some((-120, 48)));
+        for bad in ["", "12", "1,2,3", "1.5,2", "x,2", "1,"] {
+            assert_eq!(parse_column(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn shot_with_fog_stays_inside_its_own_region_regardless_of_radius() {

@@ -55,6 +55,9 @@ cargo run --release --features profile -- --bench
 # Render a single frame to a PNG (headless, no window)
 cargo run --release -- --screenshot world.png
 
+# ...seen by a player standing on block column X,Z, at the game's render distance
+cargo run --release -- --screenshot stand.png --stand 120,-40 --look 1,-0.1,0 --size 2560x1440
+
 # Print GPU adapter capabilities (feature support for GPU-driven rendering)
 cargo run --release -- --caps
 

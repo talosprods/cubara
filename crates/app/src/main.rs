@@ -1498,19 +1498,51 @@ fn main() {
                 .and_then(|i| args.get(i + 1))
                 .map(String::as_str)
         };
-        let view = value("--eye")
-            .and_then(bench::parse_eye)
-            .map(|eye| screenshot::View {
-                eye,
-                look: value("--look")
-                    .and_then(bench::parse_eye)
-                    .unwrap_or([1.0, -0.2, 0.0]),
-                radius: value("--radius").and_then(|r| r.parse().ok()).unwrap_or(32),
-                size: value("--size")
-                    .and_then(bench::parse_size)
-                    .unwrap_or((1920, 1080)),
-                far_quad_scale,
-            });
+        // `--stand X,Z`: the eye a player standing on that block column has
+        // (`screenshot::standing_eye`), in place of `--eye`'s free one, and
+        // the game's own render distance unless `--radius` says otherwise --
+        // so the shot shows what the window shows from there. Refused rather
+        // than defaulted, like `--size`: a typo must not silently become the
+        // orbit shot.
+        let stand = args.iter().any(|a| a == "--stand").then(|| {
+            value("--stand")
+                .and_then(screenshot::parse_column)
+                .unwrap_or_else(|| {
+                    eprintln!("--stand needs X,Z in whole blocks, e.g. --stand 120,-40");
+                    std::process::exit(2);
+                })
+        });
+        if stand.is_some() && args.iter().any(|a| a == "--eye") {
+            eprintln!("--stand and --eye both place the eye: give one of them");
+            std::process::exit(2);
+        }
+        let eye = match stand {
+            Some((x, z)) => {
+                let gen = cubara_world::WorldGen::new(cubara_world::World::new().seed());
+                let eye = screenshot::standing_eye(&gen, x, z);
+                log::info!("--stand {x},{z}: the eye at {eye:?}");
+                Some(eye)
+            }
+            None => value("--eye").and_then(bench::parse_eye),
+        };
+        let radius = if stand.is_some() {
+            streaming::render_radius_chunks()
+        } else {
+            32
+        };
+        let view = eye.map(|eye| screenshot::View {
+            eye,
+            look: value("--look")
+                .and_then(bench::parse_eye)
+                .unwrap_or([1.0, -0.2, 0.0]),
+            radius: value("--radius")
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(radius),
+            size: value("--size")
+                .and_then(bench::parse_size)
+                .unwrap_or((1920, 1080)),
+            far_quad_scale,
+        });
         // Static overlay text -- the pause menu or console, for a review
         // screenshot of `Hud::menu` with no window (`--screenshot menu.png
         // --menu "line one\nline two"`, `\n` unescaped since a shell arg
