@@ -428,7 +428,18 @@ pub(crate) struct Covered {
 
 /// The ground under a coarse node, cell by cell: what
 /// [`WorldGen::generate_aniso`] makes the node of.
-pub(crate) struct NodeGround {
+pub(crate) struct NodeGround<'a> {
+    /// The node's corner column, `(x, z)`, and its cells' width in blocks.
+    corner: [i32; 2],
+    step: i32,
+    /// Any level-0 column, by its offset from the corner: the node's own and
+    /// the ring around it asked once, anything further worked out when asked
+    /// -- what the cave rule asks of the ground around a cell
+    /// ([`WorldGen::cave_opens_only_where_level_0_does`]).
+    column: Box<dyn Fn(i32, i32) -> GroundColumn + 'a>,
+    /// The tops of cells other than the node's own, by corner and width, as
+    /// they are worked out: an accelerator only (§3).
+    other_tops: std::cell::RefCell<std::collections::HashMap<(i32, i32, i32), i32>>,
     /// Columns per cell: the cell's width squared.
     per_cell: usize,
     /// Every cell's level-0 columns, **sorted by top, ascending**, cell
@@ -465,14 +476,20 @@ struct CellColumns<'a> {
     foot: i32,
 }
 
-impl NodeGround {
-    /// The ground of a node of 16 x 16 cells, each `step` blocks wide, over
-    /// the columns `column(i, j)`, asked in blocks from the node's corner:
-    /// anywhere from one cell's width outside the node to one cell's width
-    /// past its far side (a column's neighbours, and the cells around a
-    /// cell that might hold a summit). The world's own columns for a real
-    /// node ([`WorldGen::node_ground`]); a test hands in ones made by hand.
-    pub(crate) fn over(step: i32, column: impl Fn(i32, i32) -> GroundColumn) -> Self {
+impl<'a> NodeGround<'a> {
+    /// The ground of a node of 16 x 16 cells, each `step` blocks wide, whose
+    /// corner column is `corner`, over the columns `column(i, j)`, asked in
+    /// blocks from that corner: from one cell's width outside the node to
+    /// one cell's width past its far side to work the cells out (a column's
+    /// neighbours, and the cells around a cell that might hold a summit),
+    /// and further for the cave rule's cells around a cave. The world's own
+    /// columns for a real node ([`WorldGen::node_ground`]); a test hands in
+    /// ones made by hand.
+    pub(crate) fn over(
+        corner: [i32; 2],
+        step: i32,
+        column: impl Fn(i32, i32) -> GroundColumn + 'a,
+    ) -> Self {
         let height = |i: i32, j: i32| column(i, j).top;
         let surface = |i: i32, j: i32| column(i, j).surface;
         let cells = Chunk::SIZE as i32;
@@ -554,12 +571,43 @@ impl NodeGround {
             })
             .collect();
         Self {
+            corner,
+            step,
+            column: Box::new(column),
+            other_tops: Default::default(),
             per_cell,
             columns,
             tops,
             lows,
             feet,
         }
+    }
+
+    /// The top ([`WorldGen::column_top`]) of the level-0 column `(x, z)`, in
+    /// world blocks.
+    fn column_top(&self, x: i32, z: i32) -> i32 {
+        (self.column)(x - self.corner[0], z - self.corner[1]).top
+    }
+
+    /// The top ([`WorldGen::cell_top`]) of the cell `w` blocks wide at
+    /// corner `(x0, z0)`, in world blocks, over this ground: one of the
+    /// node's own cells as it was worked out, any other by the one rule
+    /// ([`WorldGen::top_over`]).
+    fn cell_top(&self, x0: i32, z0: i32, w: i32) -> i32 {
+        let (i, j) = (x0 - self.corner[0], z0 - self.corner[1]);
+        let cells = Chunk::SIZE as i32;
+        if w == self.step
+            && (0..cells).contains(&i.div_euclid(w))
+            && (0..cells).contains(&j.div_euclid(w))
+        {
+            return self.tops[(j / w * cells + i / w) as usize];
+        }
+        if let Some(&top) = self.other_tops.borrow().get(&(x0, z0, w)) {
+            return top;
+        }
+        let top = WorldGen::top_over(&|x, z| self.column_top(x, z), x0, z0, w, w);
+        self.other_tops.borrow_mut().insert((x0, z0, w), top);
+        top
     }
 
     fn cell(&self, at: usize) -> CellColumns<'_> {
@@ -827,16 +875,23 @@ impl WorldGen {
     /// deriving every level from level 0's own columns costs, and
     /// `generation_cost_report` (`crates/render/tests/lod_consistency`)
     /// measures it.
-    fn node_ground(&self, x0: i32, z0: i32, step: i32) -> NodeGround {
+    fn node_ground(&self, x0: i32, z0: i32, step: i32) -> NodeGround<'static> {
         // The node's columns and a cell's width around them, each worked
-        // out when it is first asked for.
+        // out when it is first asked for; the few the cave rule asks
+        // further out (`cave_opens_only_where_level_0_does`), whenever they
+        // are asked.
         let side = (Chunk::SIZE as i32 + 2) * step;
         let unasked = GroundColumn::whole(i32::MIN);
         let grid = vec![std::cell::Cell::new(unasked); (side * side) as usize];
-        NodeGround::over(step, |i, j| {
-            let slot = &grid[((j + step) * side + i + step) as usize];
+        let gen = *self;
+        NodeGround::over([x0, z0], step, move |i, j| {
+            let (a, b) = (i + step, j + step);
+            if !(0..side).contains(&a) || !(0..side).contains(&b) {
+                return gen.column(x0 + i, z0 + j);
+            }
+            let slot = &grid[(b * side + a) as usize];
             if slot.get() == unasked {
-                slot.set(self.column(x0 + i, z0 + j));
+                slot.set(gen.column(x0 + i, z0 + j));
             }
             slot.get()
         })
@@ -921,10 +976,9 @@ impl WorldGen {
     /// most of a node -- are spared the count.
     fn coarse_block(
         &self,
-        x: i32,
-        y: i32,
-        z: i32,
-        cell: CellColumns,
+        [x, y, z]: [i32; 3],
+        ground: &NodeGround,
+        at: usize,
         blocks: TerrainBlocks,
         v: i32,
     ) -> Option<BlockId> {
@@ -933,7 +987,7 @@ impl WorldGen {
             top,
             low,
             foot,
-        } = cell;
+        } = ground.cell(at);
         if y > top {
             return None;
         }
@@ -946,7 +1000,15 @@ impl WorldGen {
         let reaching_blocks = reaching
             .iter()
             .map(|c| (x + c.at[0] as i32, z + c.at[1] as i32, c.top));
-        if self.row_is_cave(reaching_blocks, peak, top, y, v) {
+        if self.row_is_cave(reaching_blocks, peak, top, y, v)
+            && self.cave_opens_only_where_level_0_does(
+                &|x, z| ground.column_top(x, z),
+                &|x0, z0, w| ground.cell_top(x0, z0, w),
+                [x, z, ground.step],
+                top,
+                (y, v),
+            )
+        {
             return None;
         }
         // The cell that holds the top.
@@ -1256,6 +1318,152 @@ impl WorldGen {
         ground
     }
 
+    /// Whether the cave [`row_is_cave`](Self::row_is_cave) has found in the
+    /// block rows `rows` (`y` to `y + v - 1`) of the coarse cell `w` blocks
+    /// wide at `(x0, z0)` (`cell`), its top at `top`, is drawn: **only where
+    /// no level opens it through ground that level 0 draws**
+    /// (`docs/PHASE3_ARCHITECTURE.md` §9.12). `column_top` is a level-0
+    /// column's top ([`column_top`](Self::column_top)) and `cell_top` a
+    /// cell's ([`cell_top`](Self::cell_top)), over the same ground.
+    ///
+    /// **Why.** At level 0 a cave under the ground is hidden by the ground
+    /// around it. A coarse level draws that ground lower wherever a cell's
+    /// mean stands under some of its columns -- by design (§9.3) -- and where
+    /// that ground is what hid a cave, the cave is open: the owner's
+    /// floating block, a level-2 cell at (5460, 3068) whose rows 135 and 136
+    /// are cave, seen past the cell in front of it standing at its mean,
+    /// 134, where level 0's columns stand at 136 to 138 and close the cave.
+    /// The sky showed through it from 346 blocks away, and it closed at 288.
+    /// The cave itself was right -- every block of it is cave at level 0 --
+    /// and what opened it was a top. So every block row of the cave is asked,
+    /// on each side and over its highest row:
+    ///
+    /// - **Beside it**: level 0 is open -- no block of ground -- across the
+    ///   whole cell beside it in that row, so what a level opens there level
+    ///   0 opens too; or every cell that may be drawn against that side
+    ///   stands at or over the row: of every level from 1 to this one, the
+    ///   cells that touch the side, and where the side is the node's edge
+    ///   the cell one level coarser that touches it (rings are one level
+    ///   apart; past the coarsest voxel level the far terrain's quads at the
+    ///   join are that level's cells, §9.3).
+    /// - **Over it**: level 0 is open across the cell's own columns in the
+    ///   row over the cave, or every cell that may be drawn there stands at
+    ///   or over that row: the cell itself, every finer cell in it, and
+    ///   where that row is the next node's, the cell one level coarser.
+    ///
+    /// Otherwise the row stays rock, as a cave too narrow for the cell does:
+    /// it shows when a level that keeps it closed where level 0 does is
+    /// drawn.
+    ///
+    /// **It nests, so caves still do** (`coarse_caves_nest`): a finer cell in
+    /// this one passes the same test in the same row. Its own ground is part
+    /// of this cell's; a cell beside it is inside this one (open: all of
+    /// this cell's ground in the row is cave) or inside the cell beside this
+    /// one (open if that is, and among the cells that stand over the row if
+    /// not); and the cells that stand over this one's rows stand over its.
+    /// Asking only what the cell's own level draws beside it would not nest:
+    /// tops do not nest, and a finer cell beside a cave can stand lower than
+    /// the coarser one that hid it.
+    ///
+    /// Asked only of a row [`row_is_cave`](Self::row_is_cave) has found
+    /// cave, which few rows are: level 0's blocks across a cell beside it
+    /// first, which the first block of ground ends, and the cells' tops only
+    /// where that is not open.
+    fn cave_opens_only_where_level_0_does(
+        &self,
+        column_top: &dyn Fn(i32, i32) -> i32,
+        cell_top: &dyn Fn(i32, i32, i32) -> i32,
+        cell: [i32; 3],
+        top: i32,
+        rows: (i32, i32),
+    ) -> bool {
+        let [x0, z0, w] = cell;
+        let (y, v) = rows;
+        let level = w.trailing_zeros();
+        // A node is 16 cells wide and deep, and 16 cells' widths tall.
+        let (cells, node) = (Chunk::SIZE as i32, Chunk::SIZE as i32 * w);
+        // Where a cell one level coarser may be drawn beside or over this
+        // one; past the coarsest voxel level it is the far terrain, whose
+        // quads at the join are this level's cells.
+        let coarser = level < crate::far::FINEST_LEVEL;
+        let highest = (y + v - 1).min(top);
+        // Level 0 has no block of ground in row `r` of the cell `cw` wide at
+        // `(cx, cz)`.
+        let open = |cx: i32, cz: i32, cw: i32, r: i32| {
+            (0..cw * cw).all(|k| {
+                let (x, z) = (cx + k % cw, cz + k / cw);
+                r > column_top(x, z) || self.cave_at(x, r, z)
+            })
+        };
+        // The lowest top of the cells of widths 2 to `2^last` that hold any
+        // of the columns `(at(t), t)`.
+        let lowest = |at: &dyn Fn(i32) -> (i32, i32), count: i32, last: u32| -> i32 {
+            (1..=last)
+                .flat_map(|k| {
+                    let cw = 1 << k;
+                    (0..count).step_by(cw.min(count) as usize).map(move |t| {
+                        let (x, z) = at(t);
+                        (x.div_euclid(cw) * cw, z.div_euclid(cw) * cw, cw)
+                    })
+                })
+                .map(|(cx, cz, cw)| cell_top(cx, cz, cw))
+                .min()
+                .expect("a level at least")
+        };
+        let (i, j) = (x0.div_euclid(w).rem_euclid(cells), z0.div_euclid(w).rem_euclid(cells));
+        for [dx, dz] in GROUND_DIRECTIONS {
+            // The columns just across this side, and whether it is the node's.
+            let across = |t: i32| match (dx, dz) {
+                (1, _) => (x0 + w, z0 + t),
+                (-1, _) => (x0 - 1, z0 + t),
+                (_, 1) => (x0 + t, z0 + w),
+                _ => (x0 + t, z0 - 1),
+            };
+            let edge = match (dx, dz) {
+                (1, _) => i == cells - 1,
+                (-1, _) => i == 0,
+                (_, 1) => j == cells - 1,
+                _ => j == 0,
+            };
+            let last = if edge && coarser { level + 1 } else { level };
+            let mut stands = None;
+            for r in y..=highest {
+                if open(x0 + dx * w, z0 + dz * w, w, r) {
+                    continue;
+                }
+                if *stands.get_or_insert_with(|| lowest(&across, w, last)) < r {
+                    return false;
+                }
+            }
+        }
+        let over = highest + 1;
+        if !open(x0, z0, w, over) {
+            let last = if over.rem_euclid(node) == 0 && coarser {
+                level + 1
+            } else {
+                level
+            };
+            // The cells over it: the cell itself, the finer cells in it, and
+            // the coarser one that holds it.
+            let low = (1..=last)
+                .flat_map(|k| {
+                    let cw = 1i32 << k;
+                    let per = (w / cw).max(1);
+                    (0..per * per).map(move |q| {
+                        let (x, z) = (x0 + q % per * cw, z0 + q / per * cw);
+                        (x.div_euclid(cw) * cw, z.div_euclid(cw) * cw, cw)
+                    })
+                })
+                .map(|(cx, cz, cw)| cell_top(cx, cz, cw))
+                .min()
+                .expect("a level at least");
+            if low < over {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The level-0 columns the cell `w` blocks wide at corner `(x0, z0)`
     /// covers, and its top ([`CellGround`]): `w * w` surface heights, and
     /// for a cell that might hold a summit a look at the cells around it.
@@ -1308,7 +1516,25 @@ impl WorldGen {
             .iter()
             .enumerate()
             .map(|(k, &top)| (cell.x0 + k as i32 % w, cell.z0 + k as i32 / w, top));
-        !self.row_is_cave(columns, cell.peak, cell.top, row, v)
+        if !self.row_is_cave(columns, cell.peak, cell.top, row, v) {
+            return true;
+        }
+        // The cell's own columns are at hand; any other is worked out.
+        let column_top = |x: i32, z: i32| {
+            let (i, j) = (x - cell.x0, z - cell.z0);
+            if (0..w).contains(&i) && (0..w).contains(&j) {
+                cell.tops[(j * w + i) as usize]
+            } else {
+                self.column_top(x, z)
+            }
+        };
+        !self.cave_opens_only_where_level_0_does(
+            &column_top,
+            &|x0, z0, cw| Self::top_over(&column_top, x0, z0, cw, cw),
+            [cell.x0, cell.z0, w],
+            cell.top,
+            (row, v),
+        )
     }
 
     /// What a column is made of `depth` blocks below its own surface
@@ -2048,7 +2274,7 @@ impl WorldGen {
                 let x = origin[0] + lx as i32 * step;
                 let y = origin[1] + ly as i32 * step;
                 let z = origin[2] + lz as i32 * step;
-                self.coarse_block(x, y, z, ground.cell(lz * Chunk::SIZE + lx), blocks, step)
+                self.coarse_block([x, y, z], &ground, lz * Chunk::SIZE + lx, blocks, step)
                     .unwrap_or(BlockId::AIR)
             });
         }
@@ -2122,7 +2348,7 @@ impl WorldGen {
             let x = origin[0] + lx as i32 * step_h;
             let y = origin[1] + ly as i32 * v;
             let z = origin[2] + lz as i32 * step_h;
-            self.coarse_block(x, y, z, ground.cell(lz * Chunk::SIZE + lx), blocks, v)
+            self.coarse_block([x, y, z], ground, lz * Chunk::SIZE + lx, blocks, v)
                 .unwrap_or(BlockId::AIR)
         });
         if v == 1 {
@@ -3700,19 +3926,47 @@ mod tests {
     /// - Deeper than that it is rock, whatever its blocks are.
     /// - Above its top it is air.
     ///
+    /// - And where all of it is cave, the row stays rock only where a level
+    ///   that may be drawn beside it or over it would open it through ground
+    ///   level 0 draws (`docs/PHASE3_ARCHITECTURE.md` §9.12,
+    ///   [`cave_opens_only_where_level_0_does`]): a side or the row over it
+    ///   where level 0 has a block of ground across the cell there, and a
+    ///   cell of some level that may be drawn there -- 1 to this one, and
+    ///   one coarser at the node's edge or top -- stands under the row.
+    ///   Worked out here from the blocks and the cells' tops, not by the
+    ///   rule's own body.
+    ///
     /// The rule this replaces was a vote (a cell was cave where the noise at
     /// its corner was, or where most of eight samples in it were): a cell
     /// could open a pit over ground no finer level opened, and close it
     /// again as the player came nearer. This one can only ever show less
     /// cave than the level under it. Both outcomes must turn up here, and
     /// cells that the old vote would have carved, or the test could not
-    /// tell the rules apart.
+    /// tell the rules apart -- and rows kept whole for what is beside them.
+    ///
+    /// [`cave_opens_only_where_level_0_does`]: WorldGen::cave_opens_only_where_level_0_does
     #[test]
     fn a_coarse_cell_is_cave_only_where_all_its_ground_is() {
         let gen = WorldGen::new(0xCAFE);
         let blocks = test_blocks();
-        for (step, v) in [(2, 1), (4, 1), (8, 4)] {
+        let mut kept_for_what_is_beside = 0u32;
+        for (step, v) in [(2i32, 1i32), (4, 1), (8, 4)] {
             let size = 16 * step;
+            let level = step.trailing_zeros();
+            // No block of ground in row `r` of the cell `step` wide at `(x, z)`.
+            let open = |x: i32, z: i32, r: i32| {
+                (0..step * step).all(|k| !gen.is_solid(x + k % step, r, z + k / step))
+            };
+            // Whether some cell of widths 2 to `2^last` holding one of the
+            // columns `at` stands under `r`.
+            let under = |at: &[(i32, i32)], last: u32, r: i32| {
+                (1..=last).any(|k| {
+                    let cw = 1 << k;
+                    at.iter().any(|&(x, z)| {
+                        gen.cell_top(x.div_euclid(cw) * cw, z.div_euclid(cw) * cw, cw) < r
+                    })
+                })
+            };
             let (mut carved, mut whole_with_cave, mut deep) = (0u32, 0u32, 0u32);
             // (Twelve node columns: a pit is no longer a carved row but a
             // sunk top, §9.9, so carved rows are the caves under a top and
@@ -3765,11 +4019,39 @@ mod tests {
                                     deep += (cave == ground) as u32;
                                     continue;
                                 }
+                                // Whether some level would open it through
+                                // level 0's ground: beside it, or over it.
+                                let highest = (y + v - 1).min(top);
+                                let (i, j) = (
+                                    x0.div_euclid(step).rem_euclid(16),
+                                    z0.div_euclid(step).rem_euclid(16),
+                                );
+                                let line = |f: &dyn Fn(i32) -> (i32, i32)| -> Vec<(i32, i32)> {
+                                    (0..step).map(f).collect()
+                                };
+                                let sides = [
+                                    ((x0 + step, z0), i == 15, line(&|t| (x0 + step, z0 + t))),
+                                    ((x0 - step, z0), i == 0, line(&|t| (x0 - 1, z0 + t))),
+                                    ((x0, z0 + step), j == 15, line(&|t| (x0 + t, z0 + step))),
+                                    ((x0, z0 - step), j == 0, line(&|t| (x0 + t, z0 - 1))),
+                                ];
+                                let beside = (y..=highest).any(|r| {
+                                    sides.iter().any(|((nx, nz), edge, across)| {
+                                        let last = level + (*edge && level < 3) as u32;
+                                        !open(*nx, *nz, r) && under(across, last, r)
+                                    })
+                                });
+                                let over = highest + 1;
+                                let inside: Vec<(i32, i32)> = columns.iter().map(|c| (c.0, c.1)).collect();
+                                let last = level + (over.rem_euclid(size) == 0 && level < 3) as u32;
+                                let above = !open(x0, z0, over) && under(&inside, last, over);
+                                let opens = beside || above;
                                 assert_eq!(
                                     air,
-                                    cave == ground,
-                                    "{at}: {cave} of its {ground} blocks of ground are cave"
+                                    cave == ground && !opens,
+                                    "{at}: {cave} of its {ground} blocks of ground are cave; a level would open it through level 0's ground: {opens}"
                                 );
+                                kept_for_what_is_beside += (cave == ground && opens) as u32;
                                 carved += air as u32;
                                 // What a vote would have opened: most of it cave.
                                 whole_with_cave += (!air && 2 * cave >= ground) as u32;
@@ -3786,6 +4068,11 @@ mod tests {
                 "step {step}: {carved} carved, {whole_with_cave} kept whole: not enough to tell the rules apart"
             );
         }
+        println!("{kept_for_what_is_beside} rows all cave, kept whole for what is beside them");
+        assert!(
+            kept_for_what_is_beside >= 10,
+            "only {kept_for_what_is_beside} rows kept whole for what is beside them: not enough to tell the rules apart"
+        );
     }
 
     #[test]
