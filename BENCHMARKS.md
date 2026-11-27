@@ -262,6 +262,12 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-26 | **Gate eye: ground** at #445 (level-0 AO across chunk borders, coarse AO retuned to it) on top of #444, C of the A/B/C in footnote 101 (B = #444, the main it lands on), 2 runs (`GATE: MET at Medium` each; High missed: 990 / 992), same conditions¹⁰² | -- | -- | 1,108 / 1,105 (−2.5%) | 0.437 / 0.436 ms | 1.010 / 1.011 ms | `64db509` |
 | 2026-11-26 | Gate eye: hill at #445 on #444, 2 runs, same conditions¹⁰² | -- | -- | 1,070 / 1,055 (−2.5%) | 0.454 / 0.465 ms | 1.194 / 1.293 ms | `64db509` |
 | 2026-11-26 | Gate eye: flight at #445 on #444, 2 runs, same conditions; 0 draws¹⁰² | 0 | far only | 4,197 / 4,060 (−2.2%) | 0.103 / 0.107 ms | 0.238 / 0.215 ms | `64db509` |
+| 2026-11-27 | **Gate eye: ground** at main (#445 merged), A of the A/B/C for #446 (the chunk arena sized from the selection) and #447 (the strip stand-in), 2 runs (`GATE: MET at Medium` each), alternating A, B, C; AC power, battery 100% and charged, no thermal or performance warning recorded, no input for over three hours, no agents running here or in the other sessions on this Mac (they held still), 5 quiet minutes before the first run¹⁰³ | -- | -- | 1,108 / 1,107 | 0.437 / 0.437 ms | 1.001 / 0.996 ms | `13b2138` |
+| 2026-11-27 | **Gate eye: ground** at #446, B, 2 runs (`GATE: MET at Medium` each), same conditions¹⁰³ | -- | -- | 1,099 / 1,109 (−0.3%) | 0.440 / 0.437 ms | 1.047 / 0.989 ms | `49dad53` |
+| 2026-11-27 | Gate eye: hill at main (A), 2 runs, same conditions¹⁰³ | -- | -- | 1,067 / 1,054 | 0.456 / 0.459 ms | 1.102 / 1.077 ms | `13b2138` |
+| 2026-11-27 | Gate eye: hill at #446, 2 runs, same conditions¹⁰³ | -- | -- | 1,063 / 1,072 (+0.7%) | 0.460 / 0.455 ms | 1.170 / 1.098 ms | `49dad53` |
+| 2026-11-27 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws¹⁰³ | 0 | far only | 4,282 / 4,283 | 0.128 / 0.107 ms | 0.454 / 0.267 ms | `13b2138` |
+| 2026-11-27 | Gate eye: flight at #446, 2 runs, same conditions; 0 draws¹⁰³ | 0 | far only | 4,249 / 4,273 (−0.5%) | 0.105 / 0.106 ms | 0.241 / 0.245 ms | `49dad53` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3437,3 +3443,5 @@ The tiles give the hill eye 6.7% (1,094 against 1,024 / 1,026 FPS) at the same q
 | toward a mountain, #445 on #444 | 0 of 1,782; 0 of 1,769 | 0; 0 | 0; 0 | 273; 268 | 1,680 / 19,498 / 24,778; 1,815 / 25,875 / 50,439 | 2.0; 2.1 |
 
 The true level-0 shade costs 2.4% at the ground eye and 2.5% at the hill eye: the AO now differs along chunk and node borders, so the greedy mesher merges fewer quads (3.1% more triangles, 6.8% at level 3, PR #445's census). The low flight's one flicker frame a run is the strip hand-over sliver of footnote 101 (the follow-up branch `feat/strip-standin` closes it), not a new class; FIRST LOAD and work p99 move within the runs' spread.
+
+¹⁰³ **#446's quiet A/B, from the A/B/C with #447** (main `13b2138`, #446 `49dad53`, #447 `5aa559c`, built in release on 2026-11-26 at 22:5x and checked distinct; a first attempt at 23:07 overlapped another session's CPU job and was thrown away; this one ran 01:10-01:40 with every session on the Mac holding still). The arena sized from the selection costs nothing measurable (ground and hill within the runs' spread) and holds 13 MB more at the default setting; `ARENA OVERFLOWS: 0` on both flights in both runs. Low flight: main FLICKER 0 and 1 (the strip sliver of footnote 101), #446 0 and 0; toward a mountain 0 everywhere.

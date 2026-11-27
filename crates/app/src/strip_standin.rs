@@ -168,7 +168,7 @@ struct View {
 
 impl View {
     fn new(flight: &Flight, eye: [f32; 3]) -> Option<(Self, cubara_render::MeshAssets)> {
-        let (mut renderer, assets) = Renderer::offscreen(SIZE.0, SIZE.1, pose(flight, eye))?;
+        let (mut renderer, assets) = Renderer::offscreen(SIZE.0, SIZE.1, pose(flight, eye), crate::arena_capacity::game_capacity())?;
         renderer.set_clear_color(wgpu::Color {
             r: 1.0,
             g: 0.0,

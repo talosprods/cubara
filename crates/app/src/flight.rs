@@ -920,6 +920,41 @@ pub struct FlightReport {
     /// How often the world was copied while this ran, and what one copy
     /// weighs (issue #387).
     pub world_clones: WorldClones,
+    /// What the chunk arena refused for want of room (issue #434): holes
+    /// from a full arena, told apart from the holes of loading above.
+    pub arena_overflows: ArenaOverflows,
+}
+
+/// What a run's chunk arena refused for want of room, and what room it had
+/// (issue #434). Every one is a hole that is not a late mesh: the capacity
+/// did not hold the selection. Zero on every standard flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArenaOverflows {
+    /// Inserts refused, counting each retry of the same node.
+    pub refused_inserts: u64,
+    /// Different nodes refused.
+    pub refused_nodes: u32,
+    pub vertices_capacity: u32,
+    pub indices_capacity: u32,
+}
+
+impl ArenaOverflows {
+    pub fn of(usage: cubara_render::ArenaUsage) -> Self {
+        Self {
+            refused_inserts: usage.refused_inserts,
+            refused_nodes: usage.refused_nodes,
+            vertices_capacity: usage.vertices_capacity,
+            indices_capacity: usage.indices_capacity,
+        }
+    }
+
+    /// The `ARENA OVERFLOWS` term of a bench line.
+    pub fn term(&self) -> String {
+        format!(
+            "ARENA OVERFLOWS: {} refused inserts for {} nodes (arena {} vertices, {} indices)",
+            self.refused_inserts, self.refused_nodes, self.vertices_capacity, self.indices_capacity,
+        )
+    }
 }
 
 /// `World` clones over a run: the count, what one clone copies, and the run's
@@ -1042,7 +1077,7 @@ impl FlightReport {
              FIRST LOAD: {first_frames} kept frames show land not drawn yet as nothing, \
              worst {:.3}% | \
              SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
-             ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {}",
+             ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {} | {}",
             self.mean() * 100.0,
             worst.loading * 100.0,
             worst.t,
@@ -1079,6 +1114,7 @@ impl FlightReport {
             s.p99_blocks,
             s.max_blocks,
             self.world_clones.term(),
+            self.arena_overflows.term(),
         )
     }
 
@@ -1314,7 +1350,12 @@ impl WalkScript {
 pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkReport> {
     use crate::game::{load_item_registry, load_recipe_book, Game};
     let mut game = Game::new();
-    let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
+    let (mut renderer, assets) = Renderer::offscreen(
+        size.0,
+        size.1,
+        game.camera_pose(),
+        crate::arena_capacity::game_capacity(),
+    )?;
     renderer.set_morph(crate::streaming::morph_params());
     let layers = assets.layers;
     let registry = Arc::new(assets.registry);
@@ -1420,7 +1461,12 @@ impl Streamed {
     /// [`NOTHING`] (the hole count, which a sky-cleared run cannot make).
     fn new(flight: &Flight, sky: bool) -> Option<Self> {
         let camera = pose(flight, flight.start);
-        let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
+        let (mut renderer, assets) = Renderer::offscreen(
+            flight.size.0,
+            flight.size.1,
+            camera,
+            crate::arena_capacity::game_capacity(),
+        )?;
         if !sky {
             renderer.set_clear_color(NOTHING);
         }
@@ -1846,6 +1892,7 @@ pub fn fly(
         bytes_each: live.world.clone_bytes(),
         seconds: start.elapsed().as_secs_f32(),
     };
+    let arena_overflows = ArenaOverflows::of(live.renderer.arena_usage());
     drop(live);
     let (candidates, counts) = holes.map_or((Vec::new(), Vec::new()), |h| {
         let counts = h.counts();
@@ -2089,6 +2136,7 @@ pub fn fly(
         pops,
         swap_lags,
         world_clones,
+        arena_overflows,
     })
 }
 
@@ -2397,6 +2445,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
@@ -2849,6 +2898,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         assert_eq!(
             r.flicker_frames(),
@@ -3251,6 +3301,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         // 10 stale pixels per mille in all: 2 late, 5 loading, 3 neither.
         let r = report(vec![sample(0.004, 0.002, 0.002), sample(0.006, 0.0, 0.003)]);
@@ -3361,8 +3412,18 @@ mod tests {
                 bytes_each: 140,
                 seconds: 10.0,
             },
+            arena_overflows: ArenaOverflows {
+                refused_inserts: 7,
+                refused_nodes: 3,
+                vertices_capacity: 5_000_000,
+                indices_capacity: 7_500_000,
+            },
         };
         let line = r.line();
+        assert!(
+            line.contains("ARENA OVERFLOWS: 7 refused inserts for 3 nodes (arena 5000000 vertices, 7500000 indices)"),
+            "{line}"
+        );
         assert!(
             line.contains("HOLES: 1 of 4 frames show a hole, worst 0.400%, of which under a late swap 25% (2 candidate frames, 2 checked against the finished frame)"),
             "{line}"

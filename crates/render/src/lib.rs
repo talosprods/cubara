@@ -33,7 +33,7 @@ mod trees;
 mod uploads;
 
 pub use anchor::Anchor;
-pub use arena::{faces_facing, ArenaUsage, ChunkArena, MeshedNode, NodeId};
+pub use arena::{faces_facing, ArenaCapacity, ArenaUsage, ChunkArena, MeshedNode, NodeId};
 pub use culling::{Aabb, Frustum};
 pub use far::{
     FarCulling, FarDir, FarFace, FarParams, FarPatch, FarRole, FarSlot, FarTerrain, FarVertex,
