@@ -1409,7 +1409,10 @@ impl WorldGen {
                 (0..per * per).any(|q| unroofs(x0 + q % per * cw, z0 + q / per * cw, cw, r))
             })
         };
-        let (i, j) = (x0.div_euclid(w).rem_euclid(cells), z0.div_euclid(w).rem_euclid(cells));
+        let (i, j) = (
+            x0.div_euclid(w).rem_euclid(cells),
+            z0.div_euclid(w).rem_euclid(cells),
+        );
         for r in y..=highest {
             for [dx, dz] in GROUND_DIRECTIONS {
                 // The columns just across this side, and whether it is the
@@ -4042,7 +4045,9 @@ mod tests {
                                         || sides.iter().any(|(edge, across)| {
                                             let last = level + (*edge && level < 3) as u32;
                                             (1..=last).any(|k| {
-                                                across.iter().any(|&(x, z)| holding(x, z, 1 << k, r))
+                                                across
+                                                    .iter()
+                                                    .any(|&(x, z)| holding(x, z, 1 << k, r))
                                             })
                                         })
                                 });

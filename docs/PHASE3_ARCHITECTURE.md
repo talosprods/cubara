@@ -2590,10 +2590,13 @@ cave (§9.4, unchanged) is drawn as cave only where no cell that may be
 drawn around it **unroofs** it: stands under one of its rows while one of
 its columns stands at or over that row. Asked of the cells beside it (of
 every level from 1 to this one, the cells that touch each side, and at the
-node's edge the cell one level coarser), of the finer cells inside it (in
-its rows and the row over them), and of the cells over it in the row over
-its highest (the cell itself, and at the node's top the cell one level
-coarser). So the row that holds a cell's top is never cave: the cell's top
+node's edge the cell one level coarser), of the finer cells inside it, and
+of the cells over it, these two in the row over its highest (the cell
+itself, and at the node's top the cell one level coarser). The row over is
+enough for the finer cells: a column of the cell that reaches a cave row is
+cave there, and a column's top is never cave, so it stands over the row --
+and a finer cell that unroofs one of the cave's rows unroofs the row over
+its highest too. So the row that holds a cell's top is never cave: the cell's top
 is where the ground is. Otherwise the row stays rock, as a cave too narrow
 for its cell always has (§9.4): it shows when a level that keeps it shut
 where level 0 does is drawn. Past level 3 is the far terrain, whose quads

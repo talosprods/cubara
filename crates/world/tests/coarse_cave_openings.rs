@@ -274,8 +274,16 @@ fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
         ((5460 - origin[0]) / 4) as usize,
         ((3068 - origin[2]) / 4) as usize,
     );
-    assert_eq!(g.top(5460, 3068, 4), 140, "the cell holds the hill's summit");
-    assert_eq!(g.top(5460, 3072, 4), 134, "the cell in front stands at its mean");
+    assert_eq!(
+        g.top(5460, 3068, 4),
+        140,
+        "the cell holds the hill's summit"
+    );
+    assert_eq!(
+        g.top(5460, 3072, 4),
+        134,
+        "the cell in front stands at its mean"
+    );
     for y in [135, 136] {
         // Every block of its ground in the row is cave at level 0 ...
         let cave = (0..16).all(|k| {
@@ -285,7 +293,10 @@ fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
         assert!(cave, "row {y}: the cave is no longer there to be closed");
         // ... and the cell in front leaves the row open where level 0 has
         // ground at or over it: its columns stand to 139.
-        assert!(g.unroofs(5460, 3072, 4, y), "row {y}: level 0 is open in front too");
+        assert!(
+            g.unroofs(5460, 3072, 4, y),
+            "row {y}: level 0 is open in front too"
+        );
         assert_ne!(
             chunk.drawn(lx, (y - origin[1]) as usize, lz),
             BlockId::AIR,

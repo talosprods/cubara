@@ -1132,7 +1132,8 @@ mod tests {
             for level in 1..=3u32 {
                 let node = NodeKey::new(level, [0, 0, 0]);
                 let (w, v) = (node.extent_chunks(), node.cell_height_blocks());
-                let flat = NodeGround::over([0, 0], w, |_, _| crate::worldgen::GroundColumn::whole(t));
+                let flat =
+                    NodeGround::over([0, 0], w, |_, _| crate::worldgen::GroundColumn::whole(t));
                 // The node that holds the surface.
                 let oy = t.div_euclid(16 * w) * 16 * w;
                 let chunk = gen.generate_aniso_over([0, oy, 0], w, v, blocks, &flat);
