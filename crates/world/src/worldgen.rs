@@ -1510,14 +1510,20 @@ impl WorldGen {
         if !self.row_is_cave(columns, cell.peak, cell.top, row, v) {
             return true;
         }
-        // The cell's own columns are at hand; any other is worked out.
+        // The cell's own columns are at hand; any other is worked out once
+        // (the cells around it share columns).
+        let others = std::cell::RefCell::new(std::collections::HashMap::new());
         let column_top = |x: i32, z: i32| {
             let (i, j) = (x - cell.x0, z - cell.z0);
             if (0..w).contains(&i) && (0..w).contains(&j) {
-                cell.tops[(j * w + i) as usize]
-            } else {
-                self.column_top(x, z)
+                return cell.tops[(j * w + i) as usize];
             }
+            if let Some(&top) = others.borrow().get(&(x, z)) {
+                return top;
+            }
+            let top = self.column_top(x, z);
+            others.borrow_mut().insert((x, z), top);
+            top
         };
         !Self::cave_opens_only_where_level_0_does(
             &column_top,
