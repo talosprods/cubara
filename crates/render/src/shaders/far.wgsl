@@ -187,21 +187,21 @@ fn vs_main(
         // what the ground shows under the floor is still drawn.
         let inward = select(0.5, -0.5, (corner & 1u) != 0u) * tile.quad;
         let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);
-        // The step between the corner quad and the next quad along the z
-        // side, where the corner quad is the higher (`far::corner_wall`):
-        // a wall facing along x, one quad in from the nearest x side, facing
-        // away from it, with an end on a z side.
-        let lo_x = (world.x - params.hole_min.x) / tile.quad;
-        let hi_x = (params.hole_max.x - world.x) / tile.quad;
-        let step_x = i32(round(select(-lo_x, hi_x, hi_x < lo_x)));
-        let away = (dir == DIR_POS_X && step_x == -1) || (dir == DIR_NEG_X && step_x == 1);
-        let run = f32(dj) * tile.quad;
-        let run_lo = select(world.z, world.z - run, e == 1u);
-        let on_lo = run_lo == params.hole_min.z;
-        let on_hi = run_lo + run == params.hole_max.z;
-        let corner_wall = faces_x && away && (on_lo || on_hi);
         if all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)
             && top > params.hole_min.y && top < params.hole_max.y {
+            // The step between the corner quad and the next quad along the
+            // z side, where the corner quad is the higher (`far::corner_wall`):
+            // a wall facing along x, one quad in from the nearest x side,
+            // facing away from it, with an end on a z side.
+            let lo_x = (world.x - params.hole_min.x) / tile.quad;
+            let hi_x = (params.hole_max.x - world.x) / tile.quad;
+            let step_x = i32(round(select(-lo_x, hi_x, hi_x < lo_x)));
+            let away = (dir == DIR_POS_X && step_x == -1) || (dir == DIR_NEG_X && step_x == 1);
+            let run = f32(dj) * tile.quad;
+            let run_lo = select(world.z, world.z - run, e == 1u);
+            let on_lo = run_lo == params.hole_min.z;
+            let on_hi = run_lo + run == params.hole_max.z;
+            let corner_wall = faces_x && away && (on_lo || on_hi);
             if corner_wall {
                 // Folded onto the z side over the corner quad's part of it:
                 // its far end to the box's corner, at its own height.
@@ -221,9 +221,10 @@ fn vs_main(
                 seal = 0.0;
             }
         }
-    } else {
-        // A top's corner (`far::join` and `far::corner` are these rules,
-        // and their tests say why).
+    } else if all(world.xz >= params.hole_min.xz) && all(world.xz <= params.hole_max.xz) {
+        // A top's corner in the box or on its sides (`far::join` and
+        // `far::corner` are these rules, and their tests say why); every
+        // other corner is drawn where it stands, without a step of this.
         // How many quads to the nearest side of the box along each axis, as
         // a step in the grid: negative towards the low side.
         let lo = (world.xz - params.hole_min.xz) / tile.quad;

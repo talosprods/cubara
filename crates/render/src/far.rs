@@ -1584,6 +1584,10 @@ pub fn place(
         }
         return world;
     }
+    // A corner beside the box, not on it or in it, stands where it is.
+    if x < min.x || x > max.x || z < min.z || z > max.z {
+        return world;
+    }
     let lo = [(x - min.x) / quad, (z - min.z) / quad];
     let hi = [(max.x - x) / quad, (max.z - z) / quad];
     // From this corner into its face, along x and z.
@@ -3459,6 +3463,8 @@ mod tests {
             "y - tile.skirt,",
             // `hidden_height`, worked out on the CPU (`FarTerrain::prepare`).
             "world.y = params.hole_min.w;",
+            // Only a top's corner in the box or on its sides is joined.
+            "} else if all(world.xz >= params.hole_min.xz) && all(world.xz <= params.hole_max.xz) {",
             // `corner`: a top of the box at a corner of the box.
             "let into = vec2<i32>(select(1, -1, e == 1u), select(1, -1, u == 1u));",
             "let middle = world.xz + 0.5 * tile.quad * vec2<f32>(into);",
