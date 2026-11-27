@@ -13,15 +13,16 @@
 //!
 //! **The class, as these tests measure it.** For every block row a coarse
 //! level draws as cave -- air at or under its cell's top -- and for every
-//! row beside it or over it that a level which may be drawn there leaves
-//! open to the sky -- a cell beside it whose top is under the row, of the
-//! cell's own level or, at its node's edge, of the level finer or coarser
-//! (rings are one level apart); the row over the cell's top; at a node's
-//! top, the row over it as the next node's level draws it -- level 0 has no
-//! block of ground in that row across the cell the level opens there.
-//! Where level 0 has, it hides the cave from that side, and a level that
-//! shows it there shows a hole through the ground: the sky, where the cave
-//! runs through. Level 0 never breaks it: it draws its own blocks.
+//! cell that may be drawn beside it or over it and leaves that row open to
+//! the sky -- a cell beside it whose top is under the row, of the cell's own
+//! level or, at its node's edge, of the level finer or coarser (rings are
+//! one level apart); the cell itself over its own top; at a node's top, the
+//! cell over it as the next node's level draws it -- the sky sees that row
+//! across that cell at level 0 too: none of its columns stands at or over
+//! the row. Where one does, level 0 has ground there -- the block itself, or
+//! a roof over a cave -- and a level that leaves it open shows the cave
+//! through it: the sky, where the cave runs through. Level 0 never breaks
+//! it: it draws its own blocks.
 //!
 //! What a level draws is the game's own: the generated nodes in the first
 //! test, `WorldGen::cell_draws_solid` in the sweep (held to the generated
@@ -46,6 +47,7 @@ const NODE_CELLS: i32 = 16;
 struct Ground {
     gen: WorldGen,
     tops: HashMap<(i32, i32, i32), i32>,
+    peaks: HashMap<(i32, i32, i32), i32>,
 }
 
 impl Ground {
@@ -53,6 +55,7 @@ impl Ground {
         Self {
             gen,
             tops: HashMap::new(),
+            peaks: HashMap::new(),
         }
     }
 
@@ -66,10 +69,24 @@ impl Ground {
             .or_insert_with(|| gen.cell_top(x0, z0, w))
     }
 
-    /// Whether level 0 has a block of ground in row `y` of the cell `w`
-    /// wide at `(x0, z0)`.
-    fn ground_in(&self, x0: i32, z0: i32, w: i32, y: i32) -> bool {
-        (0..w * w).any(|k| self.gen.is_solid(x0 + k % w, y, z0 + k / w))
+    /// The highest column top of the cell `w` blocks wide that holds the
+    /// column `(x, z)`: at level 0 the sky sees every row over it there,
+    /// and no row at or under it.
+    fn peak(&mut self, x: i32, z: i32, w: i32) -> i32 {
+        let (x0, z0) = (x.div_euclid(w) * w, z.div_euclid(w) * w);
+        let gen = self.gen;
+        *self.peaks.entry((x0, z0, w)).or_insert_with(|| {
+            (0..w * w)
+                .map(|k| gen.column_top(x0 + k % w, z0 + k / w))
+                .max()
+                .expect("a cell covers a column")
+        })
+    }
+
+    /// The cell `w` wide holding `(x, z)` leaves row `r` open to the sky
+    /// where level 0 has ground at or over it.
+    fn unroofs(&mut self, x: i32, z: i32, w: i32, r: i32) -> bool {
+        self.top(x, z, w) < r && self.peak(x, z, w) >= r
     }
 }
 
@@ -116,22 +133,20 @@ fn openings(g: &mut Ground, level: u32, [x0, z0]: [i32; 2], caves: &[i32]) -> Ve
                 (_, 1) => (x0 + t, z0 + w),
                 _ => (x0 + t, z0 - 1),
             };
-            let open_by = levels.into_iter().find(|&k| {
+            let through = levels.into_iter().find(|&k| {
                 (0..w).any(|t| {
                     let (x, z) = across(t);
-                    g.top(x, z, 1 << k) < r
+                    g.unroofs(x, z, 1 << k, r)
                 })
             });
-            if let Some(by) = open_by {
-                if g.ground_in(x0 + dx * w, z0 + dz * w, w, r) {
-                    found.push(Opening {
-                        level,
-                        cell: [x0, z0],
-                        row: r,
-                        toward,
-                        by,
-                    });
-                }
+            if let Some(by) = through {
+                found.push(Opening {
+                    level,
+                    cell: [x0, z0],
+                    row: r,
+                    toward,
+                    by,
+                });
             }
         }
         // Over it: the cell itself inside its node; at the node's top, the
@@ -149,19 +164,17 @@ fn openings(g: &mut Ground, level: u32, [x0, z0]: [i32; 2], caves: &[i32]) -> Ve
             }
             l
         };
-        let open_by = levels
+        let through = levels
             .into_iter()
-            .find(|&k| (0..w * w).any(|t| g.top(x0 + t % w, z0 + t / w, 1 << k) < over));
-        if let Some(by) = open_by {
-            if g.ground_in(x0, z0, w, over) {
-                found.push(Opening {
-                    level,
-                    cell: [x0, z0],
-                    row: r,
-                    toward: "above",
-                    by,
-                });
-            }
+            .find(|&k| (0..w * w).any(|t| g.unroofs(x0 + t % w, z0 + t / w, 1 << k, over)));
+        if let Some(by) = through {
+            found.push(Opening {
+                level,
+                cell: [x0, z0],
+                row: r,
+                toward: "above",
+                by,
+            });
         }
     }
     found
@@ -186,8 +199,8 @@ fn test_blocks() -> TerrainBlocks {
 ///
 /// Those two rows are cave in every block of their ground at level 0 --
 /// asserted here, so that what keeps them closed is seen to be the cell in
-/// front of them and nothing else: it stands at 134, and level 0's ground
-/// beside the cave stands in both rows.
+/// front of them and nothing else: it stands at 134, under its own columns,
+/// which stand over both rows at level 0.
 #[test]
 fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
     let world = World::new();
@@ -255,9 +268,9 @@ fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
             y > gen.column_top(x, z) || !gen.is_solid(x, y, z)
         });
         assert!(cave, "row {y}: the cave is no longer there to be closed");
-        // ... and level 0 has ground beside it, where the cell in front is
-        // open in that row.
-        assert!(g.ground_in(5460, 3072, 4, y), "row {y}: level 0 is open in front");
+        // ... and the cell in front leaves the row open where level 0 has
+        // ground at or over it: its columns stand to 139.
+        assert!(g.unroofs(5460, 3072, 4, y), "row {y}: level 0 is open in front too");
         assert_ne!(
             chunk.drawn(lx, (y - origin[1]) as usize, lz),
             BlockId::AIR,

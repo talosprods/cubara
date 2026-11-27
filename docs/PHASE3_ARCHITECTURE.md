@@ -2563,94 +2563,100 @@ by the columns of the cell in front, (5460, 3072), which stand at 136 to
 a third to a half of a slope's columns stand above the coarser cell that
 covers them, by design). So the line of sight passes over the cell in front
 at 135, into the cave, and out through the far side of the hill to the sky.
-The cave was right and the top was right; together they opened what level
-0 keeps shut. §9.4's nesting is about the cave's own blocks, and holds: what
+At the forest edge it is a roof: the cave runs under the high columns of the
+cell beside it, which level 2 draws at their mean, roof and all gone.
+The cave was right and the tops were right; together they opened what level
+0 keeps shut. §9.4's nesting is about a cave's own blocks, and holds: what
 a level carves, every finer level leaves open. Whether the sky *sees* a
-cave depends on the ground around it, which does not nest.
+cave depends on the ground around it and over it, which does not nest.
 
 **The class.** *A coarse level never opens a cave through ground that level
 0 draws.* For every block row a level draws as cave (air at or under its
-cell's top) and every row beside it or over it that a level which may be
-drawn there leaves open to the sky -- a cell beside it whose top is under
-the row, of the cell's own level or, at its node's edge, of the level finer
-or coarser (rings are one level apart); the row over the cell's own top; at
-a node's top, the row over it as the next node's level draws it -- level 0
-has no block of ground in that row across the cell the level opens there.
-Where it has one, level 0 hides the cave from that side, and a level that
-shows it there shows a hole through the ground: the sky, where the cave
-runs through, as at the owner's spot. Level 0 never breaks it: it draws its
-own blocks. (One ground, §9.3: what the sky sees of the ground at any level
-is what it sees at level 0, in its share -- a cave included.)
+cell's top), every cell that may be drawn beside it or over it and leaves
+that row open to the sky -- a cell beside it whose top is under the row, of
+the cell's own level or, at its node's edge, of the level finer or coarser
+(rings are one level apart); the cell itself, over its own top; at a node's
+top, the cell over it as the next node's level draws it -- leaves it open
+where the sky sees it at level 0 too: none of that cell's columns stands at
+or over the row. Where one does, level 0 has ground there -- the block
+itself, or a roof over a cave -- and a level that leaves the row open shows
+the cave through it, and the sky where the cave runs through. Level 0 never
+breaks it: it draws its own blocks. (One ground, §9.3 and §9.9: what the sky
+sees at any level is what it sees at level 0.)
 
 **The rule** (`WorldGen::cave_opens_only_where_level_0_does`, asked by
 `coarse_block` and `cell_draws_solid` alike). A cell-row whose ground is all
-cave (§9.4, unchanged) is drawn as cave only where nothing a level may draw
-beside it or over it opens it through level 0's ground. For each of its
-block rows and each side: level 0 is open (no block of ground) across the
-whole cell beside it in that row -- so what a level opens there, level 0
-opens too -- or every cell that may be drawn against that side stands at or
-over the row: of every level from 1 to this one, the cells that touch the
-side, and at the node's edge the cell one level coarser. Over its highest
-row: level 0 is open across the cell's own columns in the row above, or
-every cell that may be drawn there stands at or over it -- the cell itself,
-every finer cell in it, and at the node's top the cell one level coarser.
-Otherwise the row stays rock, as a cave too narrow for its cell does (§9.4):
-it shows when a level that keeps it shut where level 0 does is drawn. Past
-level 3 is the far terrain, whose quads at the join are level 3's cells
-(§9.3): no coarser level stands beside it.
+cave (§9.4, unchanged) is drawn as cave only where no cell that may be
+drawn around it **unroofs** it: stands under one of its rows while one of
+its columns stands at or over that row. Asked of the cells beside it (of
+every level from 1 to this one, the cells that touch each side, and at the
+node's edge the cell one level coarser), of the finer cells inside it (in
+its rows and the row over them), and of the cells over it in the row over
+its highest (the cell itself, and at the node's top the cell one level
+coarser). So the row that holds a cell's top is never cave: the cell's top
+is where the ground is. Otherwise the row stays rock, as a cave too narrow
+for its cell always has (§9.4): it shows when a level that keeps it shut
+where level 0 does is drawn. Past level 3 is the far terrain, whose quads
+at the join are level 3's cells (§9.3): no coarser level stands beside it.
+The rule asks only tops -- the columns' and the cells' -- so it costs no
+noise sample beyond §9.4's.
 
-**Why every finer level, and the seams.** Asking only what the cell's own
-level draws beside it closes the owner's gap and every opening of the same
-level, but it does not nest -- tops do not, and a finer cell beside a cave
-can stand under the row where the coarser cell that hid it did not -- and
-it does not cover a ring's edge, where the cell beside is a level finer or
-coarser. The rule above nests: a finer cell inside this one passes the same
-test in the same row (its own ground is part of this cell's; a cell beside
-it is inside this one, which is open in the row, or inside the cell beside
-this one, which is open if that is and among the cells that stand over the
-row if not; and the cells over this one's rows stand over its). So
-`coarse_caves_nest` holds as it did. The study that chose it
-(`crates/world`, throwaway, from the world's own columns; 512 x 512 blocks
-around the owner's spot, block rows, levels 1 / 2 / 3):
+**Why every finer level, the cells inside, and the seams.** Asking only
+what the cell's own level draws beside it closes every opening of that
+level, but it does not nest -- tops do not, and a finer cell beside or inside
+a cave can stand lower than the coarser one that hid it -- and it does not
+cover a ring's edge, where the cell beside is a level finer or coarser. The
+rule above nests: a finer cell inside this one passes the same test in the
+same row (its own ground is part of this cell's, and the cells beside it,
+inside it and over it are among those this cell asked about, or are this
+cell itself, which stands at or over every row it carves). So
+`coarse_caves_nest` holds as it did. The study that chose it (a throwaway
+`crates/world` example, from the world's own columns; the block rows of
+512 x 512 blocks around the owner's spot, and 1,024 x 1,024 north of the
+spawn in brackets; levels 1 / 2 / 3):
 
-| rule | rows drawn as cave | openings beside, of which through level 0's ground | openings over, through | a finer cell draws ground under a coarser cave (512 / 1,024 around the spawn) | openings through level 0's ground at a ring's edge (same) |
+| rule | rows drawn as cave | rows open to the sky | openings through level 0's ground | at a ring's edge | a finer cell draws ground under a coarser cave |
 |---|---|---|---|---|---|
-| §9.4 alone (main) | 47,734 / 7,787 / 380 | 7,585 / 1,783 / 143, through **199 / 161 / 41** | 380 / 104 / 11, through **22 / 9 / 2** | 0 / 0 / 0 | (not asked) |
-| the cell's own level only | 47,519 / 7,627 / 337 | 7,231 / 1,545 / 63, through 0 | 341 / 84 / 3, through 0 | 0 / 14 / 0 (0 / 26 / 2) | 10 / 3 / 0 (36 / 2 / 0) |
-| open, or every column beside it reaches the row | 46,725 / 6,996 / 271 | 6,545 / 1,079 / 29, through 0 | 286 / 44 / 1, through 0 | (not measured) | (not measured) |
-| **open, or every level that may be drawn there stands over it (built)** | **47,509 / 7,411 / 299** | **7,226 / 1,352 / 37, through 0** | **341 / 62 / 1, through 0** | **0** | **0** |
+| §9.4 alone (main) | 47,734 / 7,787 / 380 (150,489 / 24,790 / 1,332) | 5,750 / 1,367 / 99 (20,653 / 4,818 / 454) | **3,349 / 1,139 / 126** (12,028 / 3,907 / 488) | 421 / 88 / 0 (1,644 / 563 / 18) | 0 |
+| the cell's own level only | 44,882 / 6,857 / 276 (140,109 / 21,686 / 884) | 2,898 / 437 / 0 (10,273 / 1,714 / 56) | 0 | 253 / 24 / 0 (873 / 213 / 0) | 0 / 349 / 17 (0 / 1,350 / 133) |
+| **built** | **44,630 / 6,574 / 256** (139,236 / 20,560 / 736) | **2,757 / 247 / 0** (9,830 / 967 / 8) | **0** | **0** | **0** |
 
 What the table says:
 
-- **The class was real at every level**: 199, 161 and 41 openings beside a
-  cave through level 0's ground, and 22, 9 and 2 over one, in a quarter of
-  a square kilometre -- one in ten of level 2's openings and three in ten
-  of level 3's. Level 1's are the most, and the smallest on screen.
-- **Most of what a coarse level opens, level 0 opens too** (the walls of
-  pits, §9.9, and cave mouths in steep ground): a rule that drew no coarse
-  caves, or only caves walled in at every level, would drop those as well.
-  The built rule keeps 98, 83 and 36% of them at levels 1 to 3. What it
-  drops at level 3 are caves in cells beside ground that stands under them
-  at some finer level: a cave mouth a cell wide that appears at 512 blocks
-  instead of 1,024 -- detail arriving on the way in, which is what is
-  allowed to change.
-- **The rows it keeps whole are 0.5, 4.8 and 21% of the cave rows**, all
-  of them under ground or behind it -- triangles below.
+- **The class was everywhere**: on main, 3,349, 1,139 and 126 openings
+  through level 0's ground beside 5,750, 1,367 and 99 cave rows open to the
+  sky at all -- most of them the mean's few blocks of lowering beside a
+  cave mouth, the owner's floating block and the forest edge's window the
+  worst of them.
+- **What is left open is what level 0 opens**: about half of level 1's
+  open cave rows (2,757 of 5,750), a fifth of level 2's (247 of 1,367), and
+  next to none of level 3's (0 of 99; 8 of 454 north of the spawn). A cell
+  of 8 blocks beside a cave nearly always has a column at or over the
+  cave's row; it is drawn whole, and the cave mouth arrives at 512 blocks,
+  or 288 -- detail on the way in, which is what may change.
+- **The cave rows it keeps whole are 7, 16 and 33%** (owner) of main's, nearly
+  all of them under ground or behind it: triangles below.
+
+**Measured** (`no_level_opens_a_cave_through_level_0s_ground`, two squares
+of 1,536 blocks: the owner's slopes, the spawn's hills and the mountain
+north of them; block rows, levels 1 / 2 / 3): openings through level 0's
+ground TBD on main, **0** now; rows drawn as cave 671,391 / 108,097 / 5,624
+on main, 612,568 / 84,423 / 2,728 now; rows open to the sky 108,278 / 26,778
+/ 2,350 on main (the count that test prints is of the same-level cells), 51,874
+/ 5,036 / 20 now.
 
 **Tests.** `crates/world/tests/coarse_cave_openings.rs`:
 `the_owners_floating_block_is_rock_where_level_0_hides_it` (the nodes the
 game generates at levels 1 to 3 around the block and beside them: no
 opening through level 0's ground, and rows 135 and 136 of the cell at
 (5460, 3068) are ground, though every block of them is cave at level 0)
-and `no_level_opens_a_cave_through_level_0s_ground` (two squares of 1,536
-blocks, the owner's slopes and the spawn's hills and mountain: TBD openings
-at levels 1 / 2 / 3 on main, 0 now; and the levels still draw caves, many
-of them open). `a_coarse_cell_is_cave_only_where_all_its_ground_is` holds
-the generated nodes to the rule row by row, worked out from the blocks and
-the cells' tops; `coarse_caves_nest` is unchanged and green. GPU:
-`crates/render/tests/sky_through_ground.rs` renders the game's nodes at the
-owner's spot at 2,560 x 1,664 and 2,940 x 1,846: no sky through level 0's
-ground wider than a sliver around the block (TBD).
+and `no_level_opens_a_cave_through_level_0s_ground` (above; and the levels
+still draw caves, some of them open). `a_coarse_cell_is_cave_only_where_all_its_ground_is`
+holds the generated nodes to the rule row by row, worked out from the
+columns' and the cells' tops; `coarse_caves_nest` is unchanged and green.
+GPU: `crates/render/tests/sky_through_ground.rs` renders the game's nodes at
+the owner's spot at 2,560 x 1,664 and 2,940 x 1,846: no sky through level
+0's ground wider than a sliver around the block (TBD).
 
 **What is left.**
 
@@ -2661,6 +2667,9 @@ ground wider than a sliver around the block (TBD).
   the lean, one pixel wide: the mean's outline (§9.4's 95th percentile is
   the size of a cell), not a cave. The GPU test lets two pixels through and
   no more.
+- **Fewer cave mouths from afar.** Level 3 draws next to none open, level 2
+  a fifth of what it did. They arrive on the way in, at the ring that can
+  hold them shut where level 0 does.
 - **A gap at a vertical seam** between nodes of different levels -- a
   coarser node under a finer one whose cell stands under the finer node's
   floor -- would be the same picture without a cave. Not found by the tour
