@@ -1715,9 +1715,10 @@ pub fn wall_on_side(v: &FarVertex, world: Vec3, quad: f32, (min, max): (Vec3, Ve
     plane == side && along > span.0 && along < span.1 && top > min.y && top < max.y
 }
 
-/// Where `far.wgsl` puts a vertex that lies strictly inside the voxels' box
-/// -- the join of `docs/PROPOSAL_FAR_VIEW.md` §3.4, as a function so it can be
-/// tested. `far.wgsl`'s `vs_main` is this, line for line.
+/// Where `far.wgsl` puts a top's corner in the voxels' box -- strictly inside
+/// it ([`join`]), or at one of its corners ([`corner`]) -- the join of
+/// `docs/PROPOSAL_FAR_VIEW.md` §3.4, as a function so it can be tested.
+/// `far.wgsl`'s `vs_main` is this, line for line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Join {
     /// The first ring inside: straight under the grid vertex `[i, j]` on the
@@ -2749,7 +2750,11 @@ mod tests {
                             // (`wall_on_side`), its top where it was.
                             on_side += 1;
                             for c in 0..4 {
-                                let drop = if corners[c].corner & 2 == 0 { 40.0 } else { 0.0 };
+                                let drop = if corners[c].corner & 2 == 0 {
+                                    40.0
+                                } else {
+                                    0.0
+                                };
                                 assert_eq!(p[c], raw[c] - Vec3::Y * drop, "{face:?} at {origin:?}");
                             }
                         } else {
@@ -3220,12 +3225,24 @@ mod tests {
         // On the z side, one quad in from the x side: the corner quad's
         // corner folds along x, the next quad's slides to the corner.
         let on_z = ([1.0, 0.0], [255.0, 256.0]);
-        assert_eq!(corner([9, 4], on_z.0, on_z.1, [-1, 1]), Some(Join::Skirt([8, 4])));
-        assert_eq!(corner([9, 4], on_z.0, on_z.1, [1, 1]), Some(Join::Slide([8, 4])));
+        assert_eq!(
+            corner([9, 4], on_z.0, on_z.1, [-1, 1]),
+            Some(Join::Skirt([8, 4]))
+        );
+        assert_eq!(
+            corner([9, 4], on_z.0, on_z.1, [1, 1]),
+            Some(Join::Slide([8, 4]))
+        );
         // The high sides step the other way.
         let high = ([255.0, 255.0], [1.0, 0.0]);
-        assert_eq!(corner([9, 5], high.0, high.1, [1, -1]), Some(Join::Skirt([10, 5])));
-        assert_eq!(corner([9, 5], high.0, high.1, [-1, -1]), Some(Join::Slide([10, 5])));
+        assert_eq!(
+            corner([9, 5], high.0, high.1, [1, -1]),
+            Some(Join::Skirt([10, 5]))
+        );
+        assert_eq!(
+            corner([9, 5], high.0, high.1, [-1, -1]),
+            Some(Join::Slide([10, 5]))
+        );
         // Away from a corner, `join` decides: on the x side, two quads in
         // from the z side, or one from x and two from z.
         assert_eq!(corner([8, 5], [0.0, 1.0], [256.0, 255.0], [1, -1]), None);
@@ -3247,7 +3264,10 @@ mod tests {
         let (origin, quad, skirt) = ([0.0f32, 0.0f32], 8.0f32, 40.0f32);
         let height = |i: i32, j: i32| 60 + 9 * ((i * 3 + j * 5) % 7);
         // The box's corner at grid (4, 4); its other sides far away.
-        let hole = (Vec3::new(32.0, -100.0, 32.0), Vec3::new(5000.0, 900.0, 5000.0));
+        let hole = (
+            Vec3::new(32.0, -100.0, 32.0),
+            Vec3::new(5000.0, 900.0, 5000.0),
+        );
         let hidden = hidden_height(hole.0, hole.1, Vec3::new(500.0, 100.0, 500.0), 20.0);
         let faces: Vec<FarFace> = (0..12u8)
             .flat_map(|j| (0..12u8).map(move |i| (i, j)))
@@ -3263,7 +3283,9 @@ mod tests {
             // A quad outside the box is drawn where it stands, corners on
             // the box's sides included.
             if f.i0 < 4 || f.j0 < 4 {
-                let own = f.corners().map(|v| place(&v, (origin, quad, skirt), None, hidden));
+                let own = f
+                    .corners()
+                    .map(|v| place(&v, (origin, quad, skirt), None, hidden));
                 assert_eq!(c, own, "{f:?} lies outside the box and was moved");
             }
             for t in QUAD_INDICES.chunks(3) {
@@ -3339,7 +3361,10 @@ mod tests {
     #[test]
     fn a_wall_on_the_boxs_side_facing_in_hangs_a_skirt() {
         let (origin, quad, skirt) = ([0.0f32, 0.0f32], 8.0f32, 40.0f32);
-        let hole = (Vec3::new(32.0, -100.0, 32.0), Vec3::new(5000.0, 900.0, 5000.0));
+        let hole = (
+            Vec3::new(32.0, -100.0, 32.0),
+            Vec3::new(5000.0, 900.0, 5000.0),
+        );
         let wall = |dir, i0: u8, j0: u8, i1: u8, j1: u8, border| FarFace {
             dir,
             i0,
@@ -3381,7 +3406,10 @@ mod tests {
     #[test]
     fn the_step_beside_the_corner_quad_folds_onto_the_z_side() {
         let (origin, quad, skirt) = ([0.0f32, 0.0f32], 8.0f32, 40.0f32);
-        let hole = (Vec3::new(32.0, -100.0, 32.0), Vec3::new(5000.0, 900.0, 5000.0));
+        let hole = (
+            Vec3::new(32.0, -100.0, 32.0),
+            Vec3::new(5000.0, 900.0, 5000.0),
+        );
         let wall = |dir, i: u8, j0: u8, j1: u8| FarFace {
             dir,
             i0: i,
@@ -3394,8 +3422,10 @@ mod tests {
             mix: [255, 0],
             open: 255,
         };
-        let placed =
-            |f: FarFace| f.corners().map(|v| place(&v, (origin, quad, skirt), Some(hole), 0.0));
+        let placed = |f: FarFace| {
+            f.corners()
+                .map(|v| place(&v, (origin, quad, skirt), Some(hole), 0.0))
+        };
         // The corner quad (4, 4) higher than (5, 4): a +x wall on line 5.
         let p = placed(wall(FarDir::PosX, 5, 4, 5));
         for v in &p {
@@ -3403,7 +3433,10 @@ mod tests {
             assert!(v.y == 78.0 || v.y == 90.0, "{p:?}: not the step");
         }
         let xs: Vec<f32> = p.iter().map(|v| v.x).collect();
-        assert!(xs.contains(&32.0) && xs.contains(&40.0), "{p:?}: not over the corner quad");
+        assert!(
+            xs.contains(&32.0) && xs.contains(&40.0),
+            "{p:?}: not over the corner quad"
+        );
         for t in QUAD_INDICES.chunks(3) {
             let [a, b, c] = [p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]];
             assert!((b - a).cross(c - a).z > 0.0, "{p:?}: faces out of the box");
@@ -3416,7 +3449,10 @@ mod tests {
             wall(FarDir::PosX, 6, 4, 5),
             wall(FarDir::PosX, 5, 5, 6),
         ] {
-            assert!(placed(f).iter().all(|v| v.y <= -100.0), "{f:?} still stands");
+            assert!(
+                placed(f).iter().all(|v| v.y <= -100.0),
+                "{f:?} still stands"
+            );
         }
     }
 
