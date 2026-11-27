@@ -1725,7 +1725,7 @@ mod tests {
         set.insert_as(2, strip, FarRole::StandIn);
         set.set_hole(Some(([-1024, -64, -1024], [1024, 400, 1024])));
         let worked_out_at = Vec3::new(30.0, 120.0, -20.0);
-        let mut rng = Xorshift(0x5eed_0f_7ee5);
+        let mut rng = Xorshift(0x5eed_f7ee);
         let (mut shown, mut trials) = (0usize, 0usize);
         for height in [1080, 1664] {
             let k = px_per_block(height);

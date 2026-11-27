@@ -2671,36 +2671,71 @@ tint. The bound is 0.6.
 | on screen at the ring edge, 15% of the trees' pixels at most, colour within 1.0 | `a_wood_swaps_nothing_where_the_voxels_end`, goldens `forest_far_edge_level_3`, `forest_far_edge_far` |
 | the fade keeps a wood's colour within 0.6, nearer the trees than the share from above | `a_fading_wood_keeps_its_colour`, golden `forest_fading` |
 | a frame draws the trees in view, in reach and not in the voxels' box | `a_frame_draws_the_trees_in_view_and_in_reach` |
+| the trees handed to the GPU hold every tree a frame from an eye within the margin shows, over random eyes and views at 1080 and 1664 rows | `the_trees_in_reach_hold_every_tree_a_frame_within_the_margin_shows` |
+| they are worked out again only when they can change: never for a standing eye or a patch beyond reach | `the_trees_in_reach_are_worked_out_again_only_when_they_can_change`, `the_far_trees_are_worked_out_again_only_when_they_can_change` |
+| the shader drops only trees off screen: never one whose box the frustum can see, at either aspect | `the_shader_drops_only_trees_off_screen` |
 | while a strip loads, its stand-in carries exactly the trees on its tops, drawn inside the voxels' box a hair behind, handed to the renderer with it and taken back with it | `the_stand_in_draws_the_trees_on_its_tops`, `a_stand_in_draws_its_trees_inside_the_box_behind`, `the_stand_in_hands_its_trees_over_and_takes_them_back` |
 
-**What it costs.** Counted with the renderer's own culling and fade along
-the bench's camera path (`far_trees_census`'s `far_trees_drawn`, 1920 x
-1080, the gate's eyes):
+**What it costs.** The first build culled the trees on the CPU every frame
+(squares of 128 blocks, then each tree) and uploaded the ones in view
+whenever they changed -- every frame the camera turned. The lead's quiet
+bench of it (M3, Medium, 1920 x 1080, 2026-11-27): the gate's ground and
+hill eyes at 992 and 935 FPS against 1,106 and 1,064 with `--far-trees
+off`, CPU/frame +0.052 and +0.069 ms; at 2560 x 1664, 17 and 19% fewer
+FPS; the flight eye, which draws no far tree, 9% fewer -- the tint. The gate
+fell to Low. Three changes since:
 
-| gate eye, quality | far trees held | drawn a frame (most) | triangles | vertices | draws |
-|---|--:|--:|--:|--:|--:|
-| ground, Medium | 29,359 | 874 (936) | 13,982 | 27,964 | 1 |
-| hill, Medium | 29,359 | 892 (956) | 14,264 | 28,529 | 1 |
-| flight, Medium | 20,362 | 0 | 0 | 0 | 0 |
-| hill, High | 80,411 | 893 (957) | 14,292 | 28,585 | 1 |
+- **Nothing a frame does on the CPU scales with the trees.** The trees
+  within their reach plus `REACH_MARGIN` (64 blocks, chosen, not derived)
+  of where the eye stood are worked out (`FarTreeSet::in_reach`) and
+  uploaded only when `ReachCache` says they can have changed: the eye moved
+  past the margin, the anchor, the screen's height or the fade changed, the
+  voxels' box moved, or a patch came or went within reach of where they
+  were worked out. A standing eye -- every gate eye, however the camera
+  turns -- works them out once; a flight, every 64 blocks it flies.
+  `far_trees.wgsl` drops, in its first lines, a tree faded out or off
+  screen: a sphere about its middle that holds it at every size it fades
+  through (`StandIn::radius`) behind the eye or past a side plane, by a
+  bound on the plane's normal read from the view-projection.
+  `FarTreeSet::visible`, the per-tree definition of what a frame shows, is
+  now what the drawing is held to and what a census counts; no frame works
+  it out.
+- **The tint reads three faces, not five, with no local array**: a
+  stand-in's top and, along each horizontal axis, its side towards the eye
+  (the other faces away: a projected area of nothing), and the distance
+  within which every tree is whole is worked out once (`TintGpu`'s
+  `view.y`), not per vertex. The same arithmetic: `forest_fading.png` and
+  the fade's numbers are unchanged.
+- **The far trees' shader compiles on DX12**: the first wrote a corner's
+  coordinates through a varying index (`p[axis] = ...`), which DX12's shader
+  compiler cannot address; the corner is now a mask.
 
-At the hill eye -- the gate's lowest, with 5 to 7% left over 1,000 FPS on
-the M3 -- that is 9.7% more triangles than the far terrain's 146,586, all
-of them facing the eye. The flight eye sees no tree large enough. The fade
-is what decides the count: gone at 2 pixels the hill eye drew 1,587 trees,
-25,386 triangles; at 3, about 490. One box for the canopy would be 10
-triangles a tree (8,920 here) for the third of each tree's pixels changing
-at the ring edge measured above.
+Counted along the bench's camera path (`far_trees_census`'s
+`far_trees_drawn`, Medium; High hands over and shows the same):
 
-The far trees' tiles are culled on the CPU each frame (squares of 128
-blocks, `TILE_BLOCKS`) and the trees in reach uploaded when they change. The
-tint adds a loop of the trunk heights to every far top vertex beyond where
-every tree is whole. No FPS here: the gate and flight rows are the lead's,
-on a quiet machine (`--bench gate`, `--bench flight`); the counts above are
-what they will show, and `--bench` logs the far trees drawn. `--far-trees
-off` draws the same commit's bare far ground -- the window, the benches, a
-flight and `--screenshot` -- for an A/B without a second build, as `--fog
-off` does.
+| screen, gate eye | far trees held | handed to the GPU (vertex shader runs) | shown a frame (most) | triangles shown |
+|---|--:|--:|--:|--:|
+| 1920 x 1080, ground | 29,359 | 3,776 (120,832) | 838 (887) | 13,412 |
+| 1920 x 1080, hill | 29,359 | 3,712 (118,784) | 854 (910) | 13,672 |
+| 1920 x 1080, flight | 20,362 | 0 | 0 | 0 |
+| 2560 x 1664, ground | 80,411 | 10,681 (341,792) | 2,251 (2,293) | 36,009 |
+| 2560 x 1664, hill | 80,411 | 10,626 (340,032) | 2,288 (2,338) | 36,610 |
+| 2560 x 1664, flight | 76,534 | 3,829 (122,528) | 0 | 0 |
+
+A tree handed over but not shown costs its 32 vertex shader runs up to the
+drop (the fade, one matrix product and four comparisons); one shown, the
+whole shader, as before. A taller screen draws trees whole further out, so
+2.7 times as many at 1664 rows as at 1080. The fade is what decides the
+count: gone at 2 pixels the 1080-row hill eye drew 1,587 trees in the first
+build's count, at 3 about 490 (`GONE_PX`, one constant). One box for the
+canopy would be 10 triangles a tree for the third of each tree's pixels
+changing at the ring edge measured above.
+
+No FPS here: the gate and flight rows are the lead's, on a quiet machine
+(`--bench gate`, `--bench flight`). `--bench` logs the trees handed to the
+GPU and their vertex shader runs. `--far-trees off` draws the same commit's
+bare far ground -- the window, the benches, a flight and `--screenshot` --
+for an A/B without a second build, as `--fog off` does.
 
 **What is left, and why.**
 
