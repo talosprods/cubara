@@ -158,12 +158,13 @@ fn far_trees_census() {
 }
 
 /// **What the game draws of the far trees** at the gate's eyes, along the
-/// bench's path: the renderer's own culling and fade
-/// (`cubara_render::far_trees::FarTreeSet::visible`), its stand-ins and face
-/// slots, the trees the game's patches carry (`far::build_with` and
-/// `far_trees::with_trees`, as `--bench` builds them) -- per frame, the
-/// trees, triangles, vertices and draws, and the far tops the tint reaches
-/// (those of patches in view beyond where every tree is whole).
+/// bench's path, with its stand-ins and face slots and the trees the game's
+/// patches carry (`far::build_with` and `far_trees::with_trees`, as `--bench`
+/// builds them): the trees handed to the GPU -- every one in reach
+/// (`FarTreeSet::in_reach`), worked out once at a standing eye -- and the
+/// vertex shader runs they cost; and per frame the trees shown
+/// (`FarTreeSet::visible`, the definition the drawing is held to) with
+/// their triangles and vertices.
 ///
 /// ```bash
 /// cargo test -p cubara --bin cubara far_trees_drawn -- --ignored --nocapture
@@ -181,8 +182,11 @@ fn far_trees_drawn() {
     let stand_ins = stand_ins(&registry, &structures, &layer_of);
     let slots = stand_ins[0].slots().len() as f64;
     let shapes = cubara_render::TreeShapes::of(&structures);
-    let aspect = SIZE.0 as f32 / SIZE.1 as f32;
-    let px = px_per_block(SIZE.1);
+    // The bench's screen, and the owner's other screen height (#449's
+    // quiet bench measured both).
+    for (width, height) in [SIZE, (2560, 1664)] {
+    let aspect = width as f32 / height as f32;
+    let px = px_per_block(height);
     for quality in [FarQuality::Medium, FarQuality::High] {
         for eye in GATE_EYES.iter() {
             let schedule = node::schedule_for_radius(crate::streaming::render_radius_chunks());
@@ -193,13 +197,13 @@ fn far_trees_drawn() {
             };
             let view = far_view_scaled(
                 eye.eye.map(f64::from),
-                SIZE.1,
+                height,
                 Some(hole),
                 quality,
                 FAR_QUAD_SCALE,
             )
             .expect("drawn");
-            let with = crate::far_trees::with_trees(blocks, &view, SIZE.1);
+            let with = crate::far_trees::with_trees(blocks, &view, height);
             let patches = far::build_with(&gen, &view, with);
             let mut set = FarTreeSet::new(&shapes, &stand_ins);
             for (id, p) in patches.iter().enumerate() {
@@ -208,33 +212,38 @@ fn far_trees_drawn() {
             set.set_hole(Some((min.map(|c| c * 16), max.map(|c| c * 16))));
             let eye_v = Vec3::from(eye.eye);
             let mut out: Vec<FarTreeInstance> = Vec::new();
+            set.in_reach(
+                (eye_v, [0; 3]),
+                (px, Fade::GAME),
+                cubara_render::far_trees::REACH_MARGIN,
+                &mut out,
+            );
+            let handed = out.len();
             let (mut trees, mut most) = (0f64, 0usize);
-            let mut cull_ms = 0.0;
             for s in 0..YAWS {
                 let frame = 200.0 + (s as f32 + 0.5) * 2000.0 / YAWS as f32;
                 let yaw = frame / 240.0 * 0.3;
                 let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
                 let frustum =
                     Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, eye_v, dir));
-                let started = std::time::Instant::now();
                 set.visible(&frustum, (eye_v, [0; 3]), (px, Fade::GAME), &mut out);
-                cull_ms += started.elapsed().as_secs_f64() * 1000.0;
                 trees += out.len() as f64;
                 most = most.max(out.len());
             }
             let per = trees / YAWS as f64;
             println!(
-                "{} {}: {} far trees held (patches to level {:?}); a frame draws {per:.0} \
-                 (most {most}): {:.0} triangles, {:.0} vertices, 1 draw; culling {:.3} ms a frame \
-                 (debug build, busy machine)",
+                "{width}x{height} {} {}: {} far trees held (patches to level {:?}); {handed} \
+                 handed to the GPU ({:.0} vertex shader runs, 1 draw); a frame shows {per:.0} \
+                 (most {most}): {:.0} triangles, {:.0} vertices",
                 eye.name,
                 quality.name(),
                 set.len(),
                 with.map(|w| w.up_to_level),
+                handed as f64 * slots * 4.0,
                 per * slots * 2.0,
                 per * slots * 4.0,
-                cull_ms / YAWS as f64,
             );
         }
+    }
     }
 }

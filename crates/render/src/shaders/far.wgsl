@@ -59,7 +59,8 @@ struct Params {
     // +Z -Z) the stand-in's area times colour (`.w` the area) and area times
     // colour times openness.
     tree_fade: vec4<f32>,
-    // `.x` 1: measured from straight above (`far_trees.rs`'s `TintView`).
+    // `.x` 1: measured from straight above (`far_trees.rs`'s `TintView`);
+    // `.y` the distance within which every trunk height is drawn whole.
     tree_view: vec4<f32>,
     tree_height: array<vec4<f32>, 8>,
     tree_colour: array<array<vec4<f32>, 5>, 8>,
@@ -275,16 +276,6 @@ fn vs_main(
     return out;
 }
 
-// The five directions a top can see a tree's faces from: `far_trees.rs`'s
-// `TINT_DIRECTIONS`.
-const TINT_NORMALS = array<vec3<f32>, 5>(
-    vec3<f32>(1.0, 0.0, 0.0),
-    vec3<f32>(-1.0, 0.0, 0.0),
-    vec3<f32>(0.0, 1.0, 0.0),
-    vec3<f32>(0.0, 0.0, 1.0),
-    vec3<f32>(0.0, 0.0, -1.0),
-);
-
 // **What a top shows of its trees that are not drawn one by one** (issue
 // #433 item 1): `.a` the share of the top's ground they hide from the eye,
 // `.rgb` the lit colour they show there -- for a top at `p` whose share of
@@ -305,6 +296,12 @@ const TINT_NORMALS = array<vec3<f32>, 5>(
 // each fading by its own height. Seen straight down it is the share the
 // canopies cover from above; seen low over a wide top, more, as a wood is.
 // Zero where every tree is drawn whole, and for a top without trees.
+//
+// Of a stand-in's faces the eye sees its top and, along each horizontal
+// axis, the side towards it: three directions, whose areas and colours are
+// `params.tree_colour[k]`'s slots (+X 0, -X 1, +Y 2, +Z 3, -Z 4,
+// `far_trees.rs`'s `TINT_DIRECTIONS`). No local array, and nothing written
+// through a varying index: DX12's compiler cannot address one.
 fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     let heights = u32(params.tree_fade.x);
     if heights == 0u || wooded <= 0.0 {
@@ -312,16 +309,9 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     }
     let to_eye = frame.eye.xyz - p;
     let dist = length(to_eye);
-    // What each trunk height no longer draws of its trees here; nothing to
-    // tint while every one is whole (all the far terrain the trees cover).
-    var missing: array<f32, 8>;
-    var any_missing = false;
-    for (var k = 0u; k < heights; k++) {
-        let s = tree_scale(params.tree_height[k].y, dist, params.tree_fade);
-        missing[k] = 1.0 - s * s;
-        any_missing = any_missing || missing[k] > 0.0;
-    }
-    if !any_missing {
+    // Nearer than this every trunk height is drawn whole (`TintGpu`'s
+    // `view.y`): nothing to tint -- all the far terrain the trees cover.
+    if dist <= params.tree_view.y {
         return vec4<f32>(0.0);
     }
     // The line of sight, or straight up for the share the canopies cover
@@ -331,52 +321,66 @@ fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
     if v.y <= 1e-4 {
         return vec4<f32>(0.0);
     }
-    // How each direction of a stand-in face is lit (`trees.wgsl`'s light),
-    // and how much of it faces the eye.
-    var lit: array<vec3<f32>, 5>;
-    var facing: array<f32, 5>;
-    for (var d = 0u; d < 5u; d++) {
-        let n = TINT_NORMALS[d];
-        lit[d] = frame.sun_color.rgb * face_brightness(
-            n,
-            frame.sun_dir.xyz,
-            frame.ambient.x,
-            frame.ambient.y,
-            frame.sun_color.w,
-        );
-        // How much of a face this way the line of sight sees: its
-        // projected area, not a light (that is `face_brightness`'s, above).
-        facing[d] = max(dot(v, n), 0.0);
-    }
-    // How far behind it a tree's side hides the ground, per block of its
-    // height: the line of sight's run over its rise.
+    let east = v.x > 0.0;
+    let south = v.z > 0.0;
+    let sx = select(1u, 0u, east);
+    let sz = select(4u, 3u, south);
+    // How each seen face is lit (`trees.wgsl`'s light).
+    let lit_top = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(0.0, 1.0, 0.0),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    let lit_x = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(select(-1.0, 1.0, east), 0.0, 0.0),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    let lit_z = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(0.0, 0.0, select(-1.0, 1.0, south)),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    // How much of a face each way the line of sight sees, per block of
+    // ground, over `v.y`: the top's is 1, a side's its projected area (not
+    // a light; that is `face_brightness`'s, above) times its shadow's share
+    // on the top, below. And how far behind it a tree's side hides the
+    // ground, per block of its height: the line of sight's run over its rise.
+    let fx = abs(v.x) / v.y;
+    let fz = abs(v.z) / v.y;
     let run = length(v.xz) / v.y;
     var hidden = 0.0;
     var colour = vec3<f32>(0.0);
     for (var k = 0u; k < heights; k++) {
         let h = params.tree_height[k];
-        if missing[k] <= 0.0 {
+        let s = tree_scale(h.y, dist, params.tree_fade);
+        let missing = 1.0 - s * s;
+        if missing <= 0.0 {
             continue;
         }
         // The share of the sides' shadows that falls on the top, `quad`
         // deep, its trees standing anywhere on it.
         let shadow = h.y * run;
         let on_top = select(quad / (2.0 * shadow), 1.0 - shadow / (2.0 * quad), shadow < quad);
-        var area = 0.0;
-        var seen = vec3<f32>(0.0);
-        for (var d = 0u; d < 5u; d++) {
-            let c = params.tree_colour[k][d];
-            // `mix(ao_floor, 1, open)` is linear in `open`: over the faces
-            // of a direction, `ao_floor * sum(area * colour) + (1 - ao_floor)
-            // * sum(area * colour * open)`.
-            let shaded = mix(params.tree_open[k][d].rgb, c.rgb, frame.ambient.z);
-            // The top (`d` 2) hides the ground under it; a side, its
-            // shadow's share on the top.
-            let w = facing[d] / v.y * select(on_top, 1.0, d == 2u);
-            area += c.w * w;
-            seen += w * lit[d] * shaded;
-        }
-        let n = h.x * wooded * missing[k];
+        let wx = fx * on_top;
+        let wz = fz * on_top;
+        let ct = params.tree_colour[k][2u];
+        let cx = params.tree_colour[k][sx];
+        let cz = params.tree_colour[k][sz];
+        // `mix(ao_floor, 1, open)` is linear in `open`: over the faces of a
+        // direction, `ao_floor * sum(area * colour) + (1 - ao_floor) *
+        // sum(area * colour * open)`.
+        let area = ct.w + wx * cx.w + wz * cz.w;
+        let seen = lit_top * mix(params.tree_open[k][2u].rgb, ct.rgb, frame.ambient.z)
+            + wx * lit_x * mix(params.tree_open[k][sx].rgb, cx.rgb, frame.ambient.z)
+            + wz * lit_z * mix(params.tree_open[k][sz].rgb, cz.rgb, frame.ambient.z);
+        let n = h.x * wooded * missing;
         hidden += n * area;
         colour += n * seen;
     }

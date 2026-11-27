@@ -1944,14 +1944,14 @@ mod tests {
         let (standin, terrain) = (far.trees_of_standin(), far.trees_of_drawn_patches());
         assert!(standin > 20, "only {standin} trees on the strip");
         assert_eq!(
-            renderer.far_trees_drawn().1,
+            renderer.far_trees_counts().1,
             terrain + standin,
             "the renderer holds the far terrain's trees and the strip's"
         );
         far.update(&mut renderer, moved, VoxelBox::settled(voxels.wanted));
         assert_eq!(far.trees_of_standin(), 0, "the strip's nodes are drawn");
         assert_eq!(
-            renderer.far_trees_drawn().1,
+            renderer.far_trees_counts().1,
             far.trees_of_drawn_patches(),
             "the stand-in's trees left with it"
         );

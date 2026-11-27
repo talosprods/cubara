@@ -1150,9 +1150,10 @@ impl Renderer {
         self.far.set_tree_tint(&self.queue, tint.as_ref(), px);
     }
 
-    /// Far trees drawn in the last frame, and held.
-    pub fn far_trees_drawn(&self) -> (usize, usize) {
-        (self.far_trees.drawn(), self.far_trees.len())
+    /// Far trees handed to the GPU in the last frame (every one in reach,
+    /// [`crate::far_trees::FarTrees::handed`]), and held.
+    pub fn far_trees_counts(&self) -> (usize, usize) {
+        (self.far_trees.handed(), self.far_trees.len())
     }
 
     /// The far terrain's hole and colour; a tree whose ground is in the hole
@@ -1467,7 +1468,6 @@ impl Renderer {
         self.far_trees.prepare(
             &self.device,
             &self.queue,
-            &self.frustum,
             camera.relative_eye(self.anchor),
             self.anchor,
             screen_height,
@@ -2677,6 +2677,68 @@ mod tests {
     /// must go with the slot -- or the next node to take it draws them at
     /// its own origin until the retry lands. GPU-backed because `ArenaSink`
     /// is the real sink over the real arena; without an adapter it skips.
+    /// **A frame touches the far trees only when the trees in reach can
+    /// change** (issue #433 item 1, `FarTrees::prepare` with the game's own
+    /// stand-ins): worked out once for a standing eye however the camera
+    /// turns, and again when a patch comes or goes within reach, the voxels'
+    /// box moves or the eye moves past the margin -- not for a patch beyond
+    /// reach or a box set to what it was. What is handed over is every tree
+    /// in reach, whichever way the camera looks.
+    #[test]
+    fn the_far_trees_are_worked_out_again_only_when_they_can_change() {
+        use crate::far_trees::{FarTreePlacement, REACH_MARGIN};
+        let pose = CameraPose {
+            eye: glam::DVec3::new(8.0, 300.0, 8.0),
+            look_dir: glam::Vec3::X,
+        };
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose, ArenaCapacity::FLOOR) else {
+            crate::headless::skip_or_require_gpu(
+                "the_far_trees_are_worked_out_again_only_when_they_can_change",
+            );
+            return;
+        };
+        // A row of trees from 1.1 to 1.9 km east, and one 40 km out.
+        let row = |z: i32| -> Vec<FarTreePlacement> {
+            (0..20)
+                .map(|k| FarTreePlacement {
+                    base: [1100 + 40 * k, 40, z],
+                    height: 5,
+                })
+                .collect()
+        };
+        let far_away = vec![FarTreePlacement {
+            base: [40_000, 40, 0],
+            height: 5,
+        }];
+        let (device, queue) = (r.device.clone(), r.queue.clone());
+        let trees = &mut r.far_trees;
+        let eye = glam::Vec3::new(8.0, 300.0, 8.0);
+        let frame = |trees: &mut crate::far_trees::FarTrees, eye: glam::Vec3| {
+            trees.prepare(&device, &queue, eye, [0; 3], 1080);
+            (trees.workings_out(), trees.handed())
+        };
+        trees.insert(1, row(0));
+        assert_eq!(frame(trees, eye), (1, 20), "the first frame");
+        assert_eq!(frame(trees, eye), (1, 20), "standing: nothing");
+        assert_eq!(
+            frame(trees, eye + glam::Vec3::new(30.0, -20.0, 10.0)),
+            (1, 20),
+            "moved within the margin"
+        );
+        trees.insert(2, far_away);
+        assert_eq!(frame(trees, eye), (1, 20), "a patch beyond reach");
+        trees.insert(3, row(64));
+        assert_eq!(frame(trees, eye), (2, 40), "a patch within reach");
+        trees.remove(1);
+        assert_eq!(frame(trees, eye), (3, 20), "a patch within reach left");
+        trees.set_hole(None);
+        assert_eq!(frame(trees, eye), (3, 20), "the box as it was");
+        trees.set_hole(Some(([-1024, -64, -1024], [1300, 400, 1024])));
+        assert_eq!(frame(trees, eye), (4, 15), "the box moved over five of them");
+        let moved = eye + glam::Vec3::new(REACH_MARGIN + 1.0, 0.0, 0.0);
+        assert_eq!(frame(trees, moved).0, 5, "moved past the margin");
+    }
+
     #[test]
     fn a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot() {
         let pose = CameraPose {

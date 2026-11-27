@@ -183,6 +183,28 @@ pub const MAX_SLOTS: usize = 3 * MAX_BOXES;
 pub const MAX_HEIGHTS: usize = 8;
 
 impl StandIn {
+    /// The radius of a sphere about the tree's middle -- `tall / 2` above
+    /// its foot -- that holds every box of it at every size it fades
+    /// through: the farthest corner at full size, or the foot, whichever is
+    /// further (a box shrinks about the foot, so each corner moves along the
+    /// line to it). What `far_trees.wgsl` drops a tree off screen by.
+    pub fn radius(&self) -> f32 {
+        let middle = Vec3::new(0.5, self.tall / 2.0, 0.5);
+        self.boxes
+            .iter()
+            .flat_map(|b| {
+                (0..8).map(move |i| {
+                    Vec3::new(
+                        if i & 1 == 0 { b.min[0] } else { b.max[0] },
+                        if i & 2 == 0 { b.min[1] } else { b.max[1] },
+                        if i & 4 == 0 { b.min[2] } else { b.max[2] },
+                    )
+                })
+            })
+            .map(|corner| corner.distance(middle))
+            .fold(self.tall / 2.0, f32::max)
+    }
+
     /// Every face the stand-in can show, as a tree model (local, standing
     /// on its trunk's base block): what `tests/lod_consistency` measures.
     /// The GPU draws, of each box, the faces that face the eye; the faces
@@ -440,7 +462,8 @@ pub struct TintGpu {
     /// `.x` the heights in use; `.y` and `.z` the fade's pixel sizes
     /// ([`Fade`]), `.w` pixels a block is tall at a distance of one block.
     pub fade: [f32; 4],
-    /// `.x` 1 to measure from straight above ([`TintView::FromAbove`]).
+    /// `.x` 1 to measure from straight above ([`TintView::FromAbove`]);
+    /// `.y` the distance within which every trunk height is drawn whole.
     pub view: [f32; 4],
     pub height: [[f32; 4]; MAX_HEIGHTS],
     pub colour: [[[f32; 4]; 5]; MAX_HEIGHTS],
@@ -472,6 +495,14 @@ impl TintGpu {
             px_per_block,
         ];
         out.view[0] = f32::from(u8::from(tint.view == TintView::FromAbove));
+        // Nearer than this every trunk height is drawn whole and there is
+        // nothing to tint: where the shortest stand-in is `full_px` tall
+        // (everywhere, for a fade that never takes a tree).
+        out.view[1] = tint
+            .heights
+            .iter()
+            .map(|(_, stand_in)| stand_in.tall * px_per_block / tint.fade.full_px)
+            .fold(f32::INFINITY, f32::min);
         for (k, (density, stand_in)) in tint.heights.iter().enumerate() {
             out.height[k] = [*density, stand_in.tall, 0.0, 0.0];
             let dirs = stand_in.by_direction();
@@ -693,47 +724,49 @@ impl FarTreeSet {
         })
     }
 
-    /// **The trees a frame draws**, as instances relative to `anchor`, in
-    /// patch, square and tree order: every tree the frustum can see whose
-    /// size on screen is over `fade`'s gone size -- by its own height, from
-    /// `eye` (anchor-relative), at `px_per_block` -- and whose ground is not
-    /// the voxels', but for a stand-in's, which stands in for theirs.
-    /// Squares and patches out of the frustum or out of reach are passed
-    /// over whole.
-    pub fn visible(
+    /// The box round a held patch's trees, in world blocks, if it is held.
+    pub fn patch_box(&self, id: u64) -> Option<([i64; 3], [i64; 3])> {
+        self.by_patch.get(&id).map(|p| (p.min, p.max))
+    }
+
+    /// The farthest any tree is drawn at all ([`reach`] of the tallest).
+    pub fn farthest(&self, px_per_block: f32, fade: Fade) -> f32 {
+        self.talls
+            .iter()
+            .map(|&t| reach(t, px_per_block, fade))
+            .fold(0.0, f32::max)
+    }
+
+    /// Every held tree that `keep` keeps -- given its trunk height's index,
+    /// its foot and middle relative to `anchor`, and whether it is a
+    /// stand-in's -- of the patches and squares within `farthest` of `eye`
+    /// (anchor-relative), as instances, in patch, square and tree order.
+    /// A tree whose ground is the voxels' is never kept, but for a
+    /// stand-in's, which stands in for theirs.
+    fn instances(
         &self,
-        frustum: &Frustum,
         (eye, anchor): (Vec3, Anchor),
-        (px_per_block, fade): (f32, Fade),
+        farthest: f32,
+        keep: impl Fn(usize, Vec3, Vec3) -> bool,
         out: &mut Vec<FarTreeInstance>,
     ) {
         out.clear();
-        let farthest = self
-            .talls
-            .iter()
-            .map(|&t| reach(t, px_per_block, fade))
-            .fold(0.0, f32::max);
         for patch in self.by_patch.values() {
             let b = relative_box(patch.min, patch.max, anchor);
-            if distance_to(eye, &b) > farthest || !frustum.intersects_aabb(&b) {
+            if distance_to(eye, &b) > farthest {
                 continue;
             }
-            // A patch wholly in view has every square in view.
-            let inside = frustum.contains_aabb(&b);
             let standin = patch.role == FarRole::StandIn;
             for tile in &patch.tiles {
                 let b = relative_box(tile.min, tile.max, anchor);
-                if distance_to(eye, &b) > farthest || !(inside || frustum.intersects_aabb(&b)) {
+                if distance_to(eye, &b) > farthest {
                     continue;
                 }
                 for t in &patch.trees[tile.trees.clone()] {
                     let k = self.height_index(t.height);
-                    let tall = self.talls[k];
                     let foot = anchor::offset(t.base, anchor) + Vec3::new(0.5, 0.0, 0.5);
-                    let middle = foot + Vec3::Y * (tall / 2.0);
-                    if tree_scale(tall, middle.distance(eye), px_per_block, fade) <= 0.0
-                        || (!standin && self.in_hole(t))
-                    {
+                    let middle = foot + Vec3::Y * (self.talls[k] / 2.0);
+                    if !keep(k, foot, middle) || (!standin && self.in_hole(t)) {
                         continue;
                     }
                     out.push(FarTreeInstance {
@@ -743,6 +776,60 @@ impl FarTreeSet {
                 }
             }
         }
+    }
+
+    /// **The trees a frame may draw from an eye within `margin` of `eye`**
+    /// (anchor-relative): every tree whose middle is within its own
+    /// [`reach`] plus `margin` of `eye`, wherever the camera looks -- what
+    /// [`FarTrees`] hands the GPU, which drops a tree that is off screen or
+    /// faded out (`far_trees.wgsl`). It is worked out again only when the eye
+    /// has moved `margin` or the trees, the voxels' box or the screen
+    /// changed, so a frame touches no tree on the CPU.
+    pub fn in_reach(
+        &self,
+        (eye, anchor): (Vec3, Anchor),
+        (px_per_block, fade): (f32, Fade),
+        margin: f32,
+        out: &mut Vec<FarTreeInstance>,
+    ) {
+        let farthest = self.farthest(px_per_block, fade) + margin;
+        self.instances(
+            (eye, anchor),
+            farthest,
+            |k, _, middle| middle.distance(eye) <= reach(self.talls[k], px_per_block, fade) + margin,
+            out,
+        );
+    }
+
+    /// **The trees a frame shows**, as instances relative to `anchor`, in
+    /// patch, square and tree order: every tree whose box the frustum can
+    /// see and whose size on screen is over `fade`'s gone size -- by its own
+    /// height, from `eye` (anchor-relative), at `px_per_block` -- and whose
+    /// ground is not the voxels', but for a stand-in's, which stands in for
+    /// theirs. The definition the GPU's drawing is held to (a tree it draws
+    /// is one of [`in_reach`](Self::in_reach)'s that `far_trees.wgsl` does
+    /// not drop), and what a census counts as drawn; no frame works it out.
+    pub fn visible(
+        &self,
+        frustum: &Frustum,
+        (eye, anchor): (Vec3, Anchor),
+        (px_per_block, fade): (f32, Fade),
+        out: &mut Vec<FarTreeInstance>,
+    ) {
+        let r = self.canopy_radius as f32 + 0.5;
+        self.instances(
+            (eye, anchor),
+            self.farthest(px_per_block, fade),
+            |k, foot, middle| {
+                let tall = self.talls[k];
+                tree_scale(tall, middle.distance(eye), px_per_block, fade) > 0.0
+                    && frustum.intersects_aabb(&Aabb::new(
+                        foot - Vec3::new(r, 0.0, r),
+                        foot + Vec3::new(r, tall, r),
+                    ))
+            },
+            out,
+        );
     }
 }
 
@@ -766,7 +853,8 @@ struct ParamsGpu {
     fade: [f32; 4],
     /// The face slots ([`StandIn::slots`]): `.x` the box, `.y` the axis.
     slots: [[u32; 4]; MAX_SLOTS],
-    /// Per trunk height, the stand-in's height in blocks.
+    /// Per trunk height, the stand-in's height in blocks and the radius of
+    /// the sphere about its middle that holds it ([`StandIn::radius`]).
     tall: [[f32; 4]; MAX_HEIGHTS],
     boxes: [[BoxGpu; MAX_BOXES]; MAX_HEIGHTS],
 }
@@ -790,7 +878,7 @@ impl ParamsGpu {
             out.slots[k] = [b as u32, axis as u32, 0, 0];
         }
         for (k, s) in stand_ins.iter().take(MAX_HEIGHTS).enumerate() {
-            out.tall[k][0] = s.tall;
+            out.tall[k] = [s.tall, s.radius(), 0.0, 0.0];
             for (slot, b) in s.boxes.iter().take(MAX_BOXES).enumerate() {
                 out.boxes[k][slot] = BoxGpu {
                     min: [b.min[0], b.min[1], b.min[2], 0.0],
@@ -829,10 +917,100 @@ fn tree_indices() -> Vec<u16> {
         .collect()
 }
 
+/// **How far the eye may move before the trees handed to the GPU are worked
+/// out again** ([`FarTreeSet::in_reach`]'s margin, in blocks). **Chosen, not
+/// derived**: a frame at a standing eye -- every gate eye, the camera turning
+/// -- then touches no far tree on the CPU; a flight works them out again
+/// every 64 blocks it flies (a few hundred frames at the game's speed), and
+/// hands the GPU the trees within 64 blocks more than their reach, which its
+/// fade drops for nothing but a vertex shader's first lines.
+pub const REACH_MARGIN: f32 = 64.0;
+
+/// What the trees in reach were worked out for: where the eye was, in world
+/// blocks, and the anchor, screen and fade they were made for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReachKey {
+    eye: [f64; 3],
+    anchor: Anchor,
+    px_per_block: f32,
+    fade: Fade,
+}
+
+/// **When the far trees handed to the GPU are worked out again** -- the one
+/// decision a frame makes about them on the CPU ([`FarTrees::prepare`]),
+/// with no GPU so a test can drive it: when the eye has moved further than
+/// [`REACH_MARGIN`] from where they were worked out, the anchor, the
+/// screen's height or the fade changed, the voxels' box moved, or a patch
+/// came or went within reach of where they were.
+#[derive(Clone, Debug, Default)]
+pub struct ReachCache {
+    at: Option<ReachKey>,
+}
+
+/// How far `p` is from the nearest point of the box `(min, max)`, all in
+/// world blocks.
+fn distance_to_box(p: [f64; 3], (min, max): ([i64; 3], [i64; 3])) -> f64 {
+    (0..3)
+        .map(|a| {
+            let d = (min[a] as f64 - p[a]).max(p[a] - max[a] as f64).max(0.0);
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+impl ReachCache {
+    /// Whether the trees in reach must be worked out again for an eye at
+    /// `eye` (world blocks), made relative to `anchor`, on a screen of
+    /// `px_per_block`, faded as `fade` says.
+    pub fn stale(&self, eye: [f64; 3], anchor: Anchor, px_per_block: f32, fade: Fade) -> bool {
+        self.at.is_none_or(|k| {
+            k.anchor != anchor
+                || k.px_per_block != px_per_block
+                || k.fade != fade
+                || (0..3).map(|a| (k.eye[a] - eye[a]).powi(2)).sum::<f64>().sqrt()
+                    > f64::from(REACH_MARGIN)
+        })
+    }
+
+    /// They were worked out, for what [`stale`](Self::stale) was asked.
+    pub fn worked_out(&mut self, eye: [f64; 3], anchor: Anchor, px_per_block: f32, fade: Fade) {
+        self.at = Some(ReachKey {
+            eye,
+            anchor,
+            px_per_block,
+            fade,
+        });
+    }
+
+    /// A patch's trees came or went, within the box `(min, max)` (world
+    /// blocks); `farthest(px_per_block, fade)` is how far any tree is drawn.
+    /// The trees in reach change only if that box is within reach, plus the
+    /// margin, of where they were worked out.
+    pub fn patch_changed(
+        &mut self,
+        bounds: ([i64; 3], [i64; 3]),
+        farthest: impl Fn(f32, Fade) -> f32,
+    ) {
+        if let Some(k) = self.at {
+            let within = f64::from(farthest(k.px_per_block, k.fade) + REACH_MARGIN);
+            if distance_to_box(k.eye, bounds) <= within {
+                self.at = None;
+            }
+        }
+    }
+
+    /// Everything changed: the voxels' box, or every patch.
+    pub fn forget(&mut self) {
+        self.at = None;
+    }
+}
+
 /// **The far trees on the GPU**: [`FarTreeSet`], the stand-ins' parameters,
-/// and the instances a frame draws -- uploaded by [`prepare`](Self::prepare)
-/// whenever they differ from the last frame's, and drawn in one instanced
-/// draw.
+/// and the instances of every tree in reach ([`FarTreeSet::in_reach`]),
+/// uploaded when [`ReachCache`] says they changed -- not when the camera
+/// turns -- and drawn in one instanced draw, `far_trees.wgsl` dropping the
+/// ones off screen or faded out.
 pub struct FarTrees {
     set: FarTreeSet,
     stand_ins: Vec<StandIn>,
@@ -843,9 +1021,11 @@ pub struct FarTrees {
     index_count: u32,
     instances: Option<wgpu::Buffer>,
     capacity: usize,
-    /// This frame's instances, and how many of them were uploaded.
-    drawn: Vec<FarTreeInstance>,
-    uploaded: Vec<FarTreeInstance>,
+    /// The trees in reach, as uploaded.
+    handed: Vec<FarTreeInstance>,
+    reach: ReachCache,
+    /// How many times they were worked out and uploaded.
+    workings_out: u64,
     /// What the instances were made relative to, and for what screen.
     anchor: Anchor,
     px_per_block: f32,
@@ -900,8 +1080,9 @@ impl FarTrees {
             index_count: (slots * 6) as u32,
             instances: None,
             capacity: 0,
-            drawn: Vec::new(),
-            uploaded: Vec::new(),
+            handed: Vec::new(),
+            reach: ReachCache::default(),
+            workings_out: 0,
             anchor,
             px_per_block: 0.0,
             fade: Fade::GAME,
@@ -920,24 +1101,40 @@ impl FarTrees {
     /// The trees a far patch carries (the caller's key, `id`), replacing any
     /// it carried before.
     pub fn insert(&mut self, id: u64, trees: Vec<FarTreePlacement>) {
-        self.set.insert(id, trees);
+        self.insert_as(id, trees, FarRole::Terrain);
     }
 
     /// [`insert`](Self::insert), drawn as `role` ([`FarTreeSet::insert_as`]).
     pub fn insert_as(&mut self, id: u64, trees: Vec<FarTreePlacement>, role: FarRole) {
+        self.patch_changed(id);
         self.set.insert_as(id, trees, role);
+        self.patch_changed(id);
     }
 
     pub fn remove(&mut self, id: u64) {
+        self.patch_changed(id);
         self.set.remove(id);
+    }
+
+    /// Tell the cache that the patch `id`'s trees (as held now) change.
+    fn patch_changed(&mut self, id: u64) {
+        if let Some(bounds) = self.set.patch_box(id) {
+            let set = &self.set;
+            self.reach
+                .patch_changed(bounds, |px, fade| set.farthest(px, fade));
+        }
     }
 
     pub fn clear(&mut self) {
         self.set.clear();
+        self.reach.forget();
     }
 
     pub fn set_hole(&mut self, hole: Option<([i32; 3], [i32; 3])>) {
-        self.set.set_hole(hole);
+        if hole != self.set.hole {
+            self.set.set_hole(hole);
+            self.reach.forget();
+        }
     }
 
     /// Trees held, drawn or not.
@@ -954,18 +1151,41 @@ impl FarTrees {
         &self.stand_ins
     }
 
-    /// Trees drawn this frame, from the last [`prepare`](Self::prepare).
-    pub fn drawn(&self) -> usize {
-        self.drawn.len()
+    /// Trees handed to the GPU, from the last [`prepare`](Self::prepare):
+    /// every one in reach, of which it draws those on screen and not faded
+    /// out ([`shown`](Self::shown) counts those).
+    pub fn handed(&self) -> usize {
+        self.handed.len()
     }
 
-    /// What this frame's far trees cost: `(draws, triangles, vertices)` --
-    /// one instanced draw, and per tree two triangles and four vertices a
-    /// face slot ([`StandIn::slots`]).
-    pub fn drawn_cost(&self) -> (u32, u64, u64) {
-        let trees = self.drawn.len() as u64;
+    /// How many times the trees in reach were worked out and uploaded
+    /// ([`prepare`](Self::prepare)): once at a standing eye, however the
+    /// camera turns.
+    pub fn workings_out(&self) -> u64 {
+        self.workings_out
+    }
+
+    /// What drawing the trees handed over costs: `(draws, vertex shader
+    /// runs)` -- one instanced draw, and four corners a face slot
+    /// ([`StandIn::slots`]) a tree. The runs for a tree off screen or faded
+    /// out end in the shader's first lines.
+    pub fn handed_cost(&self) -> (u32, u64) {
+        let trees = self.handed.len() as u64;
         let faces = self.index_count as u64 / 6;
-        (u32::from(trees > 0), trees * faces * 2, trees * faces * 4)
+        (u32::from(trees > 0), trees * faces * 4)
+    }
+
+    /// How many trees a frame with this frustum shows ([`FarTreeSet::visible`],
+    /// the definition the drawing is held to): for a census, never a frame.
+    pub fn shown(&self, frustum: &Frustum, eye: Vec3, anchor: Anchor) -> usize {
+        let mut out = Vec::new();
+        self.set.visible(
+            frustum,
+            (eye, anchor),
+            (self.px_per_block, self.fade),
+            &mut out,
+        );
+        out.len()
     }
 
     /// The anchor the instances drawn were made relative to.
@@ -973,16 +1193,16 @@ impl FarTrees {
         self.anchor
     }
 
-    /// Work out which trees this frame draws ([`FarTreeSet::visible`]) and
-    /// upload them if they differ from the last frame's: `eye` relative to
-    /// `anchor`, which the instances are made relative to (so a rebase
-    /// needs nothing but the next frame), on a screen `screen_height` pixels
-    /// tall.
+    /// Bring the trees handed to the GPU up to date for an eye at `eye`
+    /// (relative to `anchor`, which the instances are made relative to) on a
+    /// screen `screen_height` pixels tall: nothing, unless [`ReachCache`]
+    /// says they changed -- then every tree in reach
+    /// ([`FarTreeSet::in_reach`]), uploaded. Where the camera looks changes
+    /// nothing here: `far_trees.wgsl` drops what is off screen.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        frustum: &Frustum,
         eye: Vec3,
         anchor: Anchor,
         screen_height: u32,
@@ -998,15 +1218,23 @@ impl FarTrees {
             );
         }
         self.anchor = anchor;
-        let mut drawn = std::mem::take(&mut self.drawn);
-        self.set
-            .visible(frustum, (eye, anchor), (px, self.fade), &mut drawn);
-        self.drawn = drawn;
-        if self.drawn == self.uploaded || self.drawn.is_empty() {
+        let world = [0, 1, 2].map(|a| f64::from(eye[a]) + f64::from(anchor[a]));
+        if !self.reach.stale(world, anchor, px, self.fade) {
             return;
         }
-        if self.instances.is_none() || self.drawn.len() > self.capacity {
-            self.capacity = self.drawn.len().next_power_of_two();
+        self.reach.worked_out(world, anchor, px, self.fade);
+        self.workings_out += 1;
+        self.set.in_reach(
+            (eye, anchor),
+            (px, self.fade),
+            REACH_MARGIN,
+            &mut self.handed,
+        );
+        if self.handed.is_empty() {
+            return;
+        }
+        if self.instances.is_none() || self.handed.len() > self.capacity {
+            self.capacity = self.handed.len().next_power_of_two();
             self.instances = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("far-tree-instances"),
                 size: (self.capacity * std::mem::size_of::<FarTreeInstance>()) as u64,
@@ -1017,24 +1245,23 @@ impl FarTrees {
         queue.write_buffer(
             self.instances.as_ref().expect("just ensured"),
             0,
-            bytemuck::cast_slice(&self.drawn),
+            bytemuck::cast_slice(&self.handed),
         );
-        self.uploaded.clone_from(&self.drawn);
     }
 
-    /// Draw this frame's trees. The pipeline and bind group 0 (the camera)
-    /// are the caller's to set.
+    /// Draw the trees handed over. The pipeline and bind group 0 (the
+    /// camera) are the caller's to set.
     pub(crate) fn encode(&self, pass: &mut wgpu::RenderPass<'_>) {
         let Some(instances) = self.instances.as_ref() else {
             return;
         };
-        if self.drawn.is_empty() || self.index_count == 0 {
+        if self.handed.is_empty() || self.index_count == 0 {
             return;
         }
         pass.set_bind_group(1, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, instances.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
-        pass.draw_indexed(0..self.index_count, 0, 0..self.drawn.len() as u32);
+        pass.draw_indexed(0..self.index_count, 0, 0..self.handed.len() as u32);
     }
 }
 
@@ -1353,6 +1580,242 @@ mod tests {
             "let behind = frame.eye.xyz + (p - frame.eye.xyz) * STANDIN_BEHIND;",
             "out.clip_pos = frame.view_proj * vec4<f32>(select(p, behind, standin), 1.0);",
             "let height = in.height & 0xFFu;",
+        ] {
+            assert!(wgsl.contains(line), "far_trees.wgsl no longer has: {line}");
+        }
+    }
+
+    /// A small deterministic generator for the tests below (no crate for it).
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn between(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * self.next()
+        }
+    }
+
+    /// **The trees handed to the GPU are worked out again only when they
+    /// can change** ([`ReachCache`]): never while the eye stands or moves
+    /// less than [`REACH_MARGIN`] -- however the camera turns -- and always
+    /// when it moves further, the anchor, the screen or the fade changes, a
+    /// patch comes or goes within reach of where they were worked out, or
+    /// the voxels' box moves; a patch beyond reach changes nothing.
+    #[test]
+    fn the_trees_in_reach_are_worked_out_again_only_when_they_can_change() {
+        let k = px_per_block(1080);
+        let farthest = |px: f32, fade: Fade| reach(8.0, px, fade);
+        let mut cache = ReachCache::default();
+        let eye = [100.0, 300.0, -50.0];
+        assert!(cache.stale(eye, [0; 3], k, Fade::GAME), "never worked out");
+        cache.worked_out(eye, [0; 3], k, Fade::GAME);
+        assert!(!cache.stale(eye, [0; 3], k, Fade::GAME), "standing");
+        let near = [eye[0] + 40.0, eye[1] - 40.0, eye[2] + 20.0];
+        assert!(!cache.stale(near, [0; 3], k, Fade::GAME), "within the margin");
+        let far = [eye[0] + f64::from(REACH_MARGIN) + 0.5, eye[1], eye[2]];
+        assert!(cache.stale(far, [0; 3], k, Fade::GAME), "moved past the margin");
+        assert!(cache.stale(eye, [4096, 0, 0], k, Fade::GAME), "rebased");
+        assert!(cache.stale(eye, [0; 3], px_per_block(1664), Fade::GAME), "a taller screen");
+        assert!(cache.stale(eye, [0; 3], k, Fade::WHOLE), "another fade");
+        // A patch beyond reach of where they were worked out changes nothing...
+        let reach_far = f64::from(farthest(k, Fade::GAME) + REACH_MARGIN);
+        let beyond = (eye[0] + reach_far + 2.0) as i64;
+        cache.patch_changed(([beyond, 0, -50], [beyond + 256, 400, 206]), farthest);
+        assert!(!cache.stale(eye, [0; 3], k, Fade::GAME), "a patch beyond reach");
+        // ...one within it does.
+        let within = (eye[0] + reach_far - 2.0) as i64;
+        cache.patch_changed(([within, 0, -50], [within + 256, 400, 206]), farthest);
+        assert!(cache.stale(eye, [0; 3], k, Fade::GAME), "a patch within reach");
+        cache.worked_out(eye, [0; 3], k, Fade::GAME);
+        cache.forget();
+        assert!(cache.stale(eye, [0; 3], k, Fade::GAME), "the voxels' box moved");
+    }
+
+    /// **The trees handed over hold every tree any frame shows from an eye
+    /// within [`REACH_MARGIN`] of where they were worked out**: over a
+    /// field of trees round a voxels' box, with a strip's stand-in in it,
+    /// for random eyes within the margin and random views at two screen
+    /// heights, every tree [`FarTreeSet::visible`] shows is one
+    /// [`FarTreeSet::in_reach`] handed over -- so a frame between two
+    /// workings-out never misses one.
+    #[test]
+    fn the_trees_in_reach_hold_every_tree_a_frame_within_the_margin_shows() {
+        let (_, structures, _) = the_oak();
+        let mut set = FarTreeSet::new(&TreeShapes::of(&structures), &the_stand_ins());
+        let mut trees = Vec::new();
+        for i in -60..60 {
+            for j in -60..60 {
+                trees.push(FarTreePlacement {
+                    base: [i * 48 + (j % 7) * 5, 40 + (i + j).rem_euclid(9), j * 48],
+                    height: 4 + (i * 7 + j).rem_euclid(3),
+                });
+            }
+        }
+        set.insert(1, trees);
+        // The strip's stand-in, inside the box along its +x side.
+        let strip: Vec<_> = (0..40)
+            .map(|j| FarTreePlacement {
+                base: [1000, 44, -1000 + j * 50],
+                height: 5,
+            })
+            .collect();
+        set.insert_as(2, strip, FarRole::StandIn);
+        set.set_hole(Some(([-1024, -64, -1024], [1024, 400, 1024])));
+        let worked_out_at = Vec3::new(30.0, 120.0, -20.0);
+        let mut rng = Xorshift(0x5eed_0f_7ee5);
+        let (mut shown, mut trials) = (0usize, 0usize);
+        for height in [1080, 1664] {
+            let k = px_per_block(height);
+            let mut handed = Vec::new();
+            set.in_reach(
+                (worked_out_at, [0; 3]),
+                (k, Fade::GAME),
+                REACH_MARGIN,
+                &mut handed,
+            );
+            let key = |t: &FarTreeInstance| (t.foot.map(f32::to_bits), t.height);
+            let handed: std::collections::HashSet<_> = handed.iter().map(key).collect();
+            for _ in 0..200 {
+                let offset = Vec3::new(
+                    rng.between(-1.0, 1.0),
+                    rng.between(-1.0, 1.0),
+                    rng.between(-1.0, 1.0),
+                )
+                .normalize_or_zero()
+                    * rng.between(0.0, REACH_MARGIN * 0.999);
+                let eye = worked_out_at + offset;
+                let yaw = rng.between(0.0, std::f32::consts::TAU);
+                let pitch = rng.between(-0.7, 0.3);
+                let dir = Vec3::new(yaw.cos(), pitch, yaw.sin());
+                let frustum = Frustum::from_view_proj(crate::CameraUniform::look_view_proj(
+                    16.0 / 9.0,
+                    eye,
+                    dir,
+                ));
+                let mut out = Vec::new();
+                set.visible(&frustum, (eye, [0; 3]), (k, Fade::GAME), &mut out);
+                for t in &out {
+                    assert!(
+                        handed.contains(&key(t)),
+                        "{height} rows, eye {eye}: the tree at {:?} is shown but was not handed over",
+                        t.foot
+                    );
+                }
+                shown += out.len();
+                trials += 1;
+            }
+        }
+        assert!(
+            shown > trials * 50,
+            "{shown} trees shown over {trials} frames: this pins little"
+        );
+    }
+
+    /// `far_trees.wgsl`'s test of a tree off screen, line for line: its
+    /// middle in clip space, against the side planes widened by the radius
+    /// times a bound on each plane's normal, and behind the eye.
+    fn off_screen(view_proj: glam::Mat4, middle: Vec3, radius: f32) -> bool {
+        let c = view_proj * middle.extend(1.0);
+        let row = |i: usize| {
+            Vec3::new(
+                view_proj.x_axis[i],
+                view_proj.y_axis[i],
+                view_proj.z_axis[i],
+            )
+        };
+        let kx = radius * (1.0 + row(0).length());
+        let ky = radius * (1.0 + row(1).length());
+        c.w < -radius || c.x.abs() > c.w + kx || c.y.abs() > c.w + ky
+    }
+
+    /// **The shader drops only trees off screen**: over random views at two
+    /// aspects and random trees, a tree whose box the frustum can see
+    /// (`Frustum::intersects_aabb`, the scene's own test, of the stand-in at
+    /// full size) is never dropped -- with the radius `ParamsGpu` hands the
+    /// shader, which holds every box of it at every size it fades through --
+    /// while most of those it cannot see are; and the shader says it as
+    /// [`off_screen`] does.
+    #[test]
+    fn the_shader_drops_only_trees_off_screen() {
+        let stand_ins = the_stand_ins();
+        let params = ParamsGpu::new(&stand_ins, px_per_block(1080), Fade::GAME);
+        for (k, s) in stand_ins.iter().enumerate() {
+            assert_eq!(params.tall[k][1], s.radius());
+            // Every corner, at every size it fades through, within it.
+            let middle = Vec3::new(0.5, s.tall / 2.0, 0.5);
+            let pivot = Vec3::new(0.5, 0.0, 0.5);
+            for b in &s.boxes {
+                for i in 0..8 {
+                    let corner = Vec3::new(
+                        if i & 1 == 0 { b.min[0] } else { b.max[0] },
+                        if i & 2 == 0 { b.min[1] } else { b.max[1] },
+                        if i & 4 == 0 { b.min[2] } else { b.max[2] },
+                    );
+                    for step in 0..=10 {
+                        let scale = step as f32 / 10.0;
+                        let p = pivot + (corner - pivot) * scale;
+                        assert!(p.distance(middle) <= s.radius() + 1e-4, "{k}: {p}");
+                    }
+                }
+            }
+        }
+        let mut rng = Xorshift(0xf00d_cafe);
+        let (mut outside, mut dropped) = (0usize, 0usize);
+        for aspect in [16.0 / 9.0, 2560.0 / 1664.0] {
+            for _ in 0..300 {
+                let eye = Vec3::new(
+                    rng.between(-500.0, 500.0),
+                    rng.between(20.0, 900.0),
+                    rng.between(-500.0, 500.0),
+                );
+                let yaw = rng.between(0.0, std::f32::consts::TAU);
+                let dir = Vec3::new(yaw.cos(), rng.between(-0.9, 0.4), yaw.sin());
+                let view_proj = crate::CameraUniform::look_view_proj(aspect, eye, dir);
+                let frustum = Frustum::from_view_proj(view_proj);
+                for _ in 0..60 {
+                    let k = (rng.next() * stand_ins.len() as f32) as usize % stand_ins.len();
+                    let s = &stand_ins[k];
+                    let foot = Vec3::new(
+                        rng.between(-3000.0, 3000.0).floor() + 0.5,
+                        rng.between(0.0, 200.0).floor(),
+                        rng.between(-3000.0, 3000.0).floor() + 0.5,
+                    );
+                    let middle = foot + Vec3::Y * (s.tall / 2.0);
+                    let corners = s.boxes.iter().fold(
+                        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                        |(lo, hi), b| {
+                            (
+                                lo.min(Vec3::from(b.min) - Vec3::new(0.5, 0.0, 0.5)),
+                                hi.max(Vec3::from(b.max) - Vec3::new(0.5, 0.0, 0.5)),
+                            )
+                        },
+                    );
+                    let seen = frustum.intersects_aabb(&Aabb::new(foot + corners.0, foot + corners.1));
+                    let drop = off_screen(view_proj, middle, s.radius());
+                    assert!(!(seen && drop), "a tree at {foot} the frustum can see was dropped");
+                    if !seen {
+                        outside += 1;
+                        dropped += usize::from(drop);
+                    }
+                }
+            }
+        }
+        assert!(
+            dropped * 10 > outside * 9,
+            "only {dropped} of {outside} trees off screen dropped"
+        );
+        let wgsl = crate::haze::FAR_TREES_WGSL;
+        for line in [
+            "let c = frame.view_proj * vec4<f32>(middle, 1.0);",
+            "let radius = params.tall[height].y;",
+            "let kx = radius * (1.0 + length(vec3<f32>(vp[0].x, vp[1].x, vp[2].x)));",
+            "let ky = radius * (1.0 + length(vec3<f32>(vp[0].y, vp[1].y, vp[2].y)));",
+            "if c.w < -radius || abs(c.x) > c.w + kx || abs(c.y) > c.w + ky {",
         ] {
             assert!(wgsl.contains(line), "far_trees.wgsl no longer has: {line}");
         }

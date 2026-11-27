@@ -844,7 +844,7 @@ impl SceneRenderer {
             // The trees on the far terrain (issue #433 item 1), before the
             // far terrain they stand on: a tree's pixels are then the far
             // terrain's that need not be shaded.
-            if let Some(far_trees) = far_trees.filter(|t| t.drawn() > 0) {
+            if let Some(far_trees) = far_trees.filter(|t| t.handed() > 0) {
                 debug_assert_eq!(
                     far_trees.anchor(),
                     anchor,

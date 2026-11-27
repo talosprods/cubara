@@ -576,7 +576,7 @@ fn render_arena(
         set.insert(0, far_trees.trees.to_vec());
         set.set_hole(far_params.and_then(|p| p.hole));
         set.set_fade(far_trees.fade);
-        set.prepare(&device, &queue, &frustum, eye_rel, anchor, height);
+        set.prepare(&device, &queue, eye_rel, anchor, height);
         far_tree_set = Some(set);
     }
     let mut far_terrain = far_terrain;

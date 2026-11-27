@@ -638,7 +638,7 @@ pub fn run(
             f.prepare(&queue, &frustum, eye);
         }
         if let Some(t) = far_trees.as_mut() {
-            t.prepare(&device, &queue, &frustum, eye, anchor, height);
+            t.prepare(&device, &queue, eye, anchor, height);
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bench-encoder"),
@@ -781,7 +781,7 @@ pub fn run(
     let mut far_patches_sum = 0u64;
     let mut far_triangles_sum = 0u64;
     let mut far_vertices_sum = 0u64;
-    let (mut far_trees_sum, mut far_tree_triangles_sum) = (0u64, 0u64);
+    let (mut far_trees_sum, mut far_tree_runs_sum) = (0u64, 0u64);
     let wall_start = Instant::now();
     for _ in 0..MEASURE_FRAMES {
         cubara_render::Profiler::new_frame();
@@ -805,8 +805,8 @@ pub fn run(
             far_vertices_sum += f.drawn_cost().1;
         }
         if let Some(t) = far_trees.as_ref() {
-            far_trees_sum += t.drawn() as u64;
-            far_tree_triangles_sum += t.drawn_cost().1;
+            far_trees_sum += t.handed() as u64;
+            far_tree_runs_sum += t.handed_cost().1;
         }
         let _ = device.poll(wgpu::PollType::Poll);
         // One slot per frame, round-robin, not all `GPU_TIMER_DEPTH` of them:
@@ -860,10 +860,14 @@ pub fn run(
             far_vertices_sum as f64 / MEASURE_FRAMES as f64,
             view.far_quad_scale
         );
+        // Every tree in reach is handed over, whichever way the camera
+        // looks; the shader drops those off screen or faded out in its
+        // first lines (`cubara_render::far_trees::FarTrees`). How many a
+        // frame shows is `far_trees_census`'s `far_trees_drawn`.
         log::info!(
-            "far trees drawn: avg {:.0} trees, {:.0} triangles (1 draw)",
+            "far trees handed to the GPU: avg {:.0} trees in reach, {:.0} vertex shader runs (1 draw)",
             far_trees_sum as f64 / MEASURE_FRAMES as f64,
-            far_tree_triangles_sum as f64 / MEASURE_FRAMES as f64,
+            far_tree_runs_sum as f64 / MEASURE_FRAMES as f64,
         );
     }
 

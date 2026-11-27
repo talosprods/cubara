@@ -54,7 +54,8 @@ struct Params {
     fade: vec4<f32>,
     // Per face slot, `.x` the box, `.y` the axis.
     slots: array<vec4<u32>, 9>,
-    // Per trunk height, `.x` the stand-in's height in blocks.
+    // Per trunk height, `.x` the stand-in's height in blocks, `.y` the radius
+    // of a sphere about its middle holding every box of it.
     tall: array<vec4<f32>, 8>,
     // Per trunk height, `MAX_BOXES` boxes.
     boxes: array<Box, 24>,
@@ -107,17 +108,35 @@ fn vs_main(in: VsIn) -> VsOut {
     if s <= 0.0 {
         return out;
     }
-    let bx = params.boxes[height * MAX_BOXES + b];
+    // A tree off screen costs this and no more (`FarTrees` hands over every
+    // tree in reach, wherever the camera looks): the sphere about its middle
+    // that holds it (`.y`) is behind the eye, or past a side plane of the
+    // frustum. A side plane is the clip-space row `w +- x` (or `y`), whose
+    // normal is at most `1 + |row x|` long, so a centre further outside than
+    // the radius times that is outside by more than the radius.
+    let c = frame.view_proj * vec4<f32>(middle, 1.0);
+    let radius = params.tall[height].y;
+    let vp = frame.view_proj;
+    let kx = radius * (1.0 + length(vec3<f32>(vp[0].x, vp[1].x, vp[2].x)));
+    let ky = radius * (1.0 + length(vec3<f32>(vp[0].y, vp[1].y, vp[2].y)));
+    if c.w < -radius || abs(c.x) > c.w + kx || abs(c.y) > c.w + ky {
+        return out;
+    }
+    // Read in place, not copied out: `boxes` is a uniform array.
+    let bi = height * MAX_BOXES + b;
     // The box, shrunk about the trunk's foot: (0.5, 0, 0.5) in its frame.
     let pivot = vec3<f32>(0.5, 0.0, 0.5);
-    let lo = in.foot + (bx.min.xyz - pivot) * s;
-    let hi = in.foot + (bx.max.xyz - pivot) * s;
+    let lo = in.foot + (params.boxes[bi].min.xyz - pivot) * s;
+    let hi = in.foot + (params.boxes[bi].max.xyz - pivot) * s;
     // Of the box's two faces along `axis`, the one on the eye's side of its
     // middle; when the eye is between that face's plane and the middle (a
     // top seen from under it), it winds away from the eye and is culled.
-    let positive = frame.eye[axis] > 0.5 * (lo[axis] + hi[axis]);
+    // `axis` picked out by a mask, as `high` below is.
+    let along = vec3<u32>(0u, 1u, 2u);
+    let on_axis = select(vec3<f32>(0.0), vec3<f32>(1.0), along == vec3<u32>(axis));
+    let positive = dot(frame.eye.xyz, on_axis) > 0.5 * dot(lo + hi, on_axis);
     let d = axis * 2u + select(1u, 0u, positive);
-    let face = bx.faces[d];
+    let face = params.boxes[bi].faces[d];
     if face.w < 0.0 {
         return out;
     }
@@ -129,10 +148,13 @@ fn vs_main(in: VsIn) -> VsOut {
     let v = (axis + 2u) % 3u;
     let e = (corner & 1u) ^ select(0u, 1u, positive);
     let f = corner >> 1u;
-    var p = lo;
-    p[axis] = select(lo[axis], hi[axis], positive);
-    p[u] = select(lo[u], hi[u], e == 1u);
-    p[v] = select(lo[v], hi[v], f == 1u);
+    // Which coordinates are the box's high end, as a mask rather than by
+    // writing `p[axis]`: a vector written through a varying index is what
+    // DX12's shader compiler cannot do ("not natively addressable").
+    let high = ((along == vec3<u32>(axis)) & vec3<bool>(positive))
+        | ((along == vec3<u32>(u)) & vec3<bool>(e == 1u))
+        | ((along == vec3<u32>(v)) & vec3<bool>(f == 1u));
+    let p = select(lo, hi, high);
     // A stand-in's tree a hair further along its line of sight: the same
     // pixels, a little deeper, so a level-3 node's silhouette of it drawn
     // already keeps them all.

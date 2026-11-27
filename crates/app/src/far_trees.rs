@@ -140,12 +140,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(far.settled(), "the far terrain did not settle in 300 s");
-        let held = renderer.far_trees_drawn().1;
+        let held = renderer.far_trees_counts().1;
         assert_eq!(held, far.trees_of_drawn_patches());
         assert!(held > 10_000, "only {held} far trees held");
         far.reset(seed, &mut renderer);
         assert_eq!(
-            renderer.far_trees_drawn().1,
+            renderer.far_trees_counts().1,
             0,
             "a new world kept the old one's trees"
         );
