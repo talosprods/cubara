@@ -2392,7 +2392,7 @@ move). Three changes:
   (`PREFETCH_MARGIN`, chosen, not derived: 60 blocks ahead at 1,024, where a
   patch takes 6 to 9 ms), reaching 1/16 further, with a hole one coarsest
   node smaller on every side -- the ground a moving voxels' box hands back,
-  which `NodeStreaming::far_hole` gives the far terrain at once. Every test
+  which `NodeStreaming::voxel_box` gives the far terrain at once. Every test
   to split in it is the eye's or looser and its hole is inside the eye's,
   so it keeps or splits every patch the eye's view does; it asks for every
   patch it walks, the ones it keeps and the ones it splits, because a
@@ -2412,13 +2412,13 @@ most; at 2.7 58 and 31, 0.0055 / 0.052 / 0.070 ms. #398 §6.2's budget is a
 sum within 3x and no step over 1 ms. The plan holds the heights of 304
 patches at x3 and 328 at 2.7, of which 206 and 227 are drawn.
 
-**Not closed: the strip's sliver.** While the voxels' box has moved and the
-nodes of the strip it gained are not all drawn, the far terrain stands in
-for the strip (`NodeStreaming::far_hole`), drawn as the far terrain draws
-there -- quads of 16 to 32 -- where the finished frame has level 3's cells.
-A sliver of sky between two of its ridges that slides over a pixel level 3
-covers is flicker (#443's frame 326; t 5.49 s at (211, 358) on both quiet
-x3 runs of #442). Two ways of closing it were measured and are not built:
+**The strip's sliver (closed by §9.11).** While the voxels' box has moved
+and the nodes of the strip it gained are not all drawn, the far terrain
+stood in for the strip, drawn as the far terrain draws there -- quads of 16
+to 32 -- where the finished frame has level 3's cells. A sliver of sky
+between two of its ridges that slides over a pixel level 3 covers is
+flicker (#443's frame 326; t 5.49 s at (211, 358) on both quiet x3 runs of
+#442). Two ways of closing it were measured and are not built:
 
 - *A far terrain of level 3 round the voxels' box*, one coarsest node wide,
   so that the strip is level 3's outline before the box moves (#443's
@@ -2434,11 +2434,109 @@ x3 runs of #442). Two ways of closing it were measured and are not built:
   edge. Where the finer outline is lower, land drawn goes missing: flicker
   over a band, to remove a sliver.
 
-What would close it: the strip's level-3 stand-in drawn by the far terrain
-*in addition* to a selection holed at the box the voxels want, clipped to
-the strip -- the far terrain the finished frame draws, plus level 3 where it
-draws nodes. A renderer change (a second box, kept where the hole is cut),
-left for its own issue.
+What closes it is the third: the far terrain the finished frame draws,
+plus level 3 cut to the strip where the finished frame draws nodes (§9.11).
+
+### 9.11 The strip's stand-in: level 3 while the voxels' box loads (#398)
+
+**What flickered.** When the eye crosses a chunk, the voxels' box moves a
+coarsest node on (`node::covered_box_3d`) and gains a strip 128 blocks
+wide about a kilometre ahead. Its nodes take frames to be searched for,
+meshed and drawn, and for those frames the part of the box the voxels draw
+(`NodeStreaming::voxel_box`'s `drawn`) is smaller than the box they want.
+Until this section the far terrain stood in for the strip as it draws it,
+selected and holed at `drawn`: quads of 16 to 32 where the finished frame
+draws level 3's cells. Its skyline is another: on the low flight's first
+move (t 5.27 s, the strip x 1,152 to 1,280) its ridges stood up to five
+pixels above level 3's, and a crack a fifth of a pixel wide between two of
+them slid over pixels level 3 covers -- land, sky, land: the owner's
+flicker. Reproduced on the GPU with the game's renderer
+(`strip_standin::the_strip_stands_in_as_the_finished_frame_draws_it`):
+over the low flight's 60 Hz frames from t 5.28 to 5.80 s, flicker at t
+5.63 s at (209, 357), and 1,438 pixels of the region round the sliver
+unlike the finished frame off its own skyline.
+
+**The rule** (`far_streaming::far_stand`, the one place it is decided).
+While a strip waits, the far terrain is what the finished frame draws --
+selected and holed at the box the voxels *want* -- and a **stand-in** draws
+the strip: the far terrain's finest level over it (`standin_keys`). A far
+quad of 8 is level 3's cell, top for top and wall for wall (§9.8), so the
+stand-in is the ground the strip's nodes will draw. Of each of its patches
+only the faces of a quad in the strip are drawn (`standin_faces`) -- a
+top's own quad, a wall's the higher of the two it stands between
+(`FarFace::owner`), as a voxel mesher gives a riser to the column it is the
+side of. So every face is drawn once: a wall on the strip's side towards
+the drawn voxels where the strip is the higher (theirs where they are), and
+one on its far side where the strip is the higher (the far terrain's
+beyond). Until every patch of it is generated, the far terrain stands in
+for the strip itself, as it did -- never a frame of neither.
+
+**Drawn as it stands, a hair behind.** The renderer takes a stand-in's
+patches as `FarRole::StandIn` (`Renderer::far_insert_as`): drawn inside the
+box, the box's join not applied (its faces are already cut), its tiles
+culled as they stand (`cull_runs`). Every corner is drawn `STANDIN_BEHIND`
+= 1 + 2^-12 times as far along its own line of sight -- the same pixels,
+about 24 cm deeper at a kilometre -- so a node of the strip drawn meanwhile
+keeps every pixel it covers. Measured with every node of the strip drawn
+over the stand-in, the region over 26 frames: without the push 250 to 300
+pixels a frame showed the stand-in instead of the node, at 2^-14 one pixel
+in one frame, at 2^-12 none (chosen, not derived).
+
+**Generated before the box moves.** Whenever the box changes, the ring of
+finest-level patches one coarsest node round it is asked for behind what
+the eye wants (`standin_ring`; 36 patches round the default box). Every
+strip one move can gain is in it, whichever way the eye crosses
+(`the_ring_holds_every_strip_a_move_can_gain`), so the stand-in stands from
+the frame the box moves (`a_box_move_finds_what_it_hands_back_generated`),
+and on every waiting frame of the low flight the far terrain is the
+finished frame's and the stand-in is the strip's
+(`the_live_selection_is_the_exact_one_on_every_frame`, at 2.7 and 3). A box
+that moves twice before its first strip is drawn can outrun the ring: what
+is missing is asked for at once and stood in for when it comes
+(`a_strip_the_ring_does_not_hold_is_asked_for_at_once`).
+
+**Where it does not stand in.** Both boxes must hold every height of
+ground any level draws (`far::ground_range`: a column's top plus one, pit
+floors included, `WorldGen::column_top_range`). An eye some 900 blocks
+above the ground or 770 under it has the box's floor or ceiling through the
+hills, and a move up or down hands over a slab of ground under all of the
+box; there the far terrain stands in as it did
+(`a_box_whose_floor_cuts_the_ground_has_no_stand_in`).
+
+**What it costs.** At a standing eye nothing waits, and the far terrain is
+the same selection with the same hole, triangle for triangle: **0 at the
+gate's eyes**. While a strip waits, the far terrain is the finished frame's
+plus the stand-in (`standin_cost_report`, the triangles
+`FarTerrain::prepare` sends, no GPU): on the low flight's first move at
+High, 244,007 far triangles a frame as it was and 257,967 now at 2.7
+(+13,960), 220,028 and 234,060 at 3 (+14,032) -- of which the stand-in
+12,842 (its nine patches, culled by tiles), and the rest the far terrain's
+own tiles inside the box the voxels want, which the finished frame sends
+too. Only for the frames the strip's nodes take to be drawn -- a few
+hundred milliseconds after each move on the quiet M3's low flights, a move
+every 5.3 s at flight speed. The ring is 36 patches of generation a box
+move on the far workers (6 to 9 ms each), held on the CPU, about 3 MB,
+uploaded only while a strip waits.
+
+**What it does not do.** It is ground. A tree of a strip node not drawn
+yet is land not drawn yet -- first load, as before -- and arrives with its
+node. A cave mouth level 3 opens (a cell-row all of whose ground is cave)
+shows as ground until its node is drawn: land, never sky.
+
+**Tests.** The GPU test above holds every frame of the low flight's strip
+against its finished frame -- no flicker by the flight's own measure, no
+pixel land or nothing unlike it off its skyline, and once the strip's nodes
+are drawn over the stand-in no pixel inside its land of another colour --
+drawing only the 71 nodes and 36 far patches that reach the region, which
+draw it pixel for pixel as the whole scene does
+(`the_cut_draws_the_region_as_the_whole_scene_does`, ignored: minutes).
+`the_games_far_streaming_draws_the_strip_by_the_rule` holds the game's
+`FarStreaming` to `far_stand`, frame for frame. The rules: `standin_keys`,
+`standin_faces`, `far_stand` and the ring in `far_streaming`'s tests; the
+cull and the shader in `cubara-render`'s
+(`a_stand_in_is_drawn_inside_the_hole_and_culled_as_it_stands`,
+`the_shader_draws_a_stand_in_as_this_module_does`); `ground_range` and
+`far::build_where` in `cubara-world`'s.
 
 ## §10 The chunk arena's capacity follows from the selection (block 3.0b, [#434](../../issues/434))
 
