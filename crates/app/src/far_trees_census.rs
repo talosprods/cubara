@@ -185,65 +185,66 @@ fn far_trees_drawn() {
     // The bench's screen, and the owner's other screen height (#449's
     // quiet bench measured both).
     for (width, height) in [SIZE, (2560, 1664)] {
-    let aspect = width as f32 / height as f32;
-    let px = px_per_block(height);
-    for quality in [FarQuality::Medium, FarQuality::High] {
-        for eye in GATE_EYES.iter() {
-            let schedule = node::schedule_for_radius(crate::streaming::render_radius_chunks());
-            let (min, max) = node::covered_box_3d(ChunkCoord::from_world_pos(eye.eye), &schedule);
-            let hole = far::Hole {
-                min: min.map(|c| (c * 16) as f64),
-                max: max.map(|c| (c * 16) as f64),
-            };
-            let view = far_view_scaled(
-                eye.eye.map(f64::from),
-                height,
-                Some(hole),
-                quality,
-                FAR_QUAD_SCALE,
-            )
-            .expect("drawn");
-            let with = crate::far_trees::with_trees(blocks, &view, height);
-            let patches = far::build_with(&gen, &view, with);
-            let mut set = FarTreeSet::new(&shapes, &stand_ins);
-            for (id, p) in patches.iter().enumerate() {
-                set.insert(id as u64, crate::far_trees::to_far_trees(p));
-            }
-            set.set_hole(Some((min.map(|c| c * 16), max.map(|c| c * 16))));
-            let eye_v = Vec3::from(eye.eye);
-            let mut out: Vec<FarTreeInstance> = Vec::new();
-            set.in_reach(
-                (eye_v, [0; 3]),
-                (px, Fade::GAME),
-                cubara_render::far_trees::REACH_MARGIN,
-                &mut out,
-            );
-            let handed = out.len();
-            let (mut trees, mut most) = (0f64, 0usize);
-            for s in 0..YAWS {
-                let frame = 200.0 + (s as f32 + 0.5) * 2000.0 / YAWS as f32;
-                let yaw = frame / 240.0 * 0.3;
-                let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
-                let frustum =
-                    Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, eye_v, dir));
-                set.visible(&frustum, (eye_v, [0; 3]), (px, Fade::GAME), &mut out);
-                trees += out.len() as f64;
-                most = most.max(out.len());
-            }
-            let per = trees / YAWS as f64;
-            println!(
-                "{width}x{height} {} {}: {} far trees held (patches to level {:?}); {handed} \
+        let aspect = width as f32 / height as f32;
+        let px = px_per_block(height);
+        for quality in [FarQuality::Medium, FarQuality::High] {
+            for eye in GATE_EYES.iter() {
+                let schedule = node::schedule_for_radius(crate::streaming::render_radius_chunks());
+                let (min, max) =
+                    node::covered_box_3d(ChunkCoord::from_world_pos(eye.eye), &schedule);
+                let hole = far::Hole {
+                    min: min.map(|c| (c * 16) as f64),
+                    max: max.map(|c| (c * 16) as f64),
+                };
+                let view = far_view_scaled(
+                    eye.eye.map(f64::from),
+                    height,
+                    Some(hole),
+                    quality,
+                    FAR_QUAD_SCALE,
+                )
+                .expect("drawn");
+                let with = crate::far_trees::with_trees(blocks, &view, height);
+                let patches = far::build_with(&gen, &view, with);
+                let mut set = FarTreeSet::new(&shapes, &stand_ins);
+                for (id, p) in patches.iter().enumerate() {
+                    set.insert(id as u64, crate::far_trees::to_far_trees(p));
+                }
+                set.set_hole(Some((min.map(|c| c * 16), max.map(|c| c * 16))));
+                let eye_v = Vec3::from(eye.eye);
+                let mut out: Vec<FarTreeInstance> = Vec::new();
+                set.in_reach(
+                    (eye_v, [0; 3]),
+                    (px, Fade::GAME),
+                    cubara_render::far_trees::REACH_MARGIN,
+                    &mut out,
+                );
+                let handed = out.len();
+                let (mut trees, mut most) = (0f64, 0usize);
+                for s in 0..YAWS {
+                    let frame = 200.0 + (s as f32 + 0.5) * 2000.0 / YAWS as f32;
+                    let yaw = frame / 240.0 * 0.3;
+                    let dir = glam::vec3(yaw.cos(), -0.25, yaw.sin());
+                    let frustum =
+                        Frustum::from_view_proj(CameraUniform::look_view_proj(aspect, eye_v, dir));
+                    set.visible(&frustum, (eye_v, [0; 3]), (px, Fade::GAME), &mut out);
+                    trees += out.len() as f64;
+                    most = most.max(out.len());
+                }
+                let per = trees / YAWS as f64;
+                println!(
+                    "{width}x{height} {} {}: {} far trees held (patches to level {:?}); {handed} \
                  handed to the GPU ({:.0} vertex shader runs, 1 draw); a frame shows {per:.0} \
                  (most {most}): {:.0} triangles, {:.0} vertices",
-                eye.name,
-                quality.name(),
-                set.len(),
-                with.map(|w| w.up_to_level),
-                handed as f64 * slots * 4.0,
-                per * slots * 2.0,
-                per * slots * 4.0,
-            );
+                    eye.name,
+                    quality.name(),
+                    set.len(),
+                    with.map(|w| w.up_to_level),
+                    handed as f64 * slots * 4.0,
+                    per * slots * 2.0,
+                    per * slots * 4.0,
+                );
+            }
         }
-    }
     }
 }

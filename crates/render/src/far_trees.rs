@@ -796,7 +796,9 @@ impl FarTreeSet {
         self.instances(
             (eye, anchor),
             farthest,
-            |k, _, middle| middle.distance(eye) <= reach(self.talls[k], px_per_block, fade) + margin,
+            |k, _, middle| {
+                middle.distance(eye) <= reach(self.talls[k], px_per_block, fade) + margin
+            },
             out,
         );
     }
@@ -968,7 +970,10 @@ impl ReachCache {
             k.anchor != anchor
                 || k.px_per_block != px_per_block
                 || k.fade != fade
-                || (0..3).map(|a| (k.eye[a] - eye[a]).powi(2)).sum::<f64>().sqrt()
+                || (0..3)
+                    .map(|a| (k.eye[a] - eye[a]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
                     > f64::from(REACH_MARGIN)
         })
     }
@@ -1518,6 +1523,41 @@ mod tests {
         };
         assert_eq!(TintGpu::of(Some(&above), 935.0).view[0], 1.0);
         assert_eq!(TintGpu::of(None, 935.0), TintGpu::NONE);
+        // Nearer than `view.y` every height is whole, and just beyond it the
+        // shortest is not: the tint starts where the first tree shrinks.
+        let whole = gpu.view[1];
+        for s in &all {
+            assert_eq!(tree_scale(s.tall, whole, 935.0, Fade::GAME), 1.0);
+        }
+        assert!(all
+            .iter()
+            .any(|s| tree_scale(s.tall, whole + 1.0, 935.0, Fade::GAME) < 1.0));
+        // A fade that never takes a tree never tints; one that takes them
+        // all tints from the eye on.
+        let never = FarTreeTint {
+            fade: Fade::WHOLE,
+            ..FarTreeTint::new(&density, &all)
+        };
+        assert_eq!(TintGpu::of(Some(&never), 935.0).view[1], f32::INFINITY);
+        let always = FarTreeTint {
+            fade: Fade::GONE,
+            ..FarTreeTint::new(&density, &all)
+        };
+        assert!(TintGpu::of(Some(&always), 935.0).view[1] < 1e-3);
+        // `far.wgsl` reads the seen faces in this layout: +X 0, -X 1, +Y 2,
+        // +Z 3, -Z 4 -- the side towards the eye along each axis.
+        assert_eq!(TINT_DIRECTIONS, [0, 1, 2, 4, 5]);
+        let wgsl = crate::haze::FAR_WGSL;
+        for line in [
+            "let east = v.x > 0.0;",
+            "let south = v.z > 0.0;",
+            "let sx = select(1u, 0u, east);",
+            "let sz = select(4u, 3u, south);",
+            "let ct = params.tree_colour[k][2u];",
+            "if dist <= params.tree_view.y {",
+        ] {
+            assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
+        }
     }
 
     /// **A stand-in's trees are the strip's** (issue #433 item 1 with
@@ -1616,24 +1656,42 @@ mod tests {
         cache.worked_out(eye, [0; 3], k, Fade::GAME);
         assert!(!cache.stale(eye, [0; 3], k, Fade::GAME), "standing");
         let near = [eye[0] + 40.0, eye[1] - 40.0, eye[2] + 20.0];
-        assert!(!cache.stale(near, [0; 3], k, Fade::GAME), "within the margin");
+        assert!(
+            !cache.stale(near, [0; 3], k, Fade::GAME),
+            "within the margin"
+        );
         let far = [eye[0] + f64::from(REACH_MARGIN) + 0.5, eye[1], eye[2]];
-        assert!(cache.stale(far, [0; 3], k, Fade::GAME), "moved past the margin");
+        assert!(
+            cache.stale(far, [0; 3], k, Fade::GAME),
+            "moved past the margin"
+        );
         assert!(cache.stale(eye, [4096, 0, 0], k, Fade::GAME), "rebased");
-        assert!(cache.stale(eye, [0; 3], px_per_block(1664), Fade::GAME), "a taller screen");
+        assert!(
+            cache.stale(eye, [0; 3], px_per_block(1664), Fade::GAME),
+            "a taller screen"
+        );
         assert!(cache.stale(eye, [0; 3], k, Fade::WHOLE), "another fade");
         // A patch beyond reach of where they were worked out changes nothing...
         let reach_far = f64::from(farthest(k, Fade::GAME) + REACH_MARGIN);
         let beyond = (eye[0] + reach_far + 2.0) as i64;
         cache.patch_changed(([beyond, 0, -50], [beyond + 256, 400, 206]), farthest);
-        assert!(!cache.stale(eye, [0; 3], k, Fade::GAME), "a patch beyond reach");
+        assert!(
+            !cache.stale(eye, [0; 3], k, Fade::GAME),
+            "a patch beyond reach"
+        );
         // ...one within it does.
         let within = (eye[0] + reach_far - 2.0) as i64;
         cache.patch_changed(([within, 0, -50], [within + 256, 400, 206]), farthest);
-        assert!(cache.stale(eye, [0; 3], k, Fade::GAME), "a patch within reach");
+        assert!(
+            cache.stale(eye, [0; 3], k, Fade::GAME),
+            "a patch within reach"
+        );
         cache.worked_out(eye, [0; 3], k, Fade::GAME);
         cache.forget();
-        assert!(cache.stale(eye, [0; 3], k, Fade::GAME), "the voxels' box moved");
+        assert!(
+            cache.stale(eye, [0; 3], k, Fade::GAME),
+            "the voxels' box moved"
+        );
     }
 
     /// **The trees handed over hold every tree any frame shows from an eye
@@ -1795,9 +1853,13 @@ mod tests {
                             )
                         },
                     );
-                    let seen = frustum.intersects_aabb(&Aabb::new(foot + corners.0, foot + corners.1));
+                    let seen =
+                        frustum.intersects_aabb(&Aabb::new(foot + corners.0, foot + corners.1));
                     let drop = off_screen(view_proj, middle, s.radius());
-                    assert!(!(seen && drop), "a tree at {foot} the frustum can see was dropped");
+                    assert!(
+                        !(seen && drop),
+                        "a tree at {foot} the frustum can see was dropped"
+                    );
                     if !seen {
                         outside += 1;
                         dropped += usize::from(drop);

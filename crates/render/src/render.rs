@@ -2734,7 +2734,11 @@ mod tests {
         trees.set_hole(None);
         assert_eq!(frame(trees, eye), (3, 20), "the box as it was");
         trees.set_hole(Some(([-1024, -64, -1024], [1300, 400, 1024])));
-        assert_eq!(frame(trees, eye), (4, 15), "the box moved over five of them");
+        assert_eq!(
+            frame(trees, eye),
+            (4, 15),
+            "the box moved over five of them"
+        );
         let moved = eye + glam::Vec3::new(REACH_MARGIN + 1.0, 0.0, 0.0);
         assert_eq!(frame(trees, moved).0, 5, "moved past the margin");
     }
