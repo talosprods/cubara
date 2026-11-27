@@ -189,16 +189,17 @@ fn vs_main(
         let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);
         // The step between the corner quad and the next quad along the z
         // side, where the corner quad is the higher (`far::corner_wall`):
-        // a wall facing along x, one quad wide, one quad in from the nearest
-        // x side, facing away from it, with an end on a z side.
+        // a wall facing along x, one quad in from the nearest x side, facing
+        // away from it, with an end on a z side.
         let lo_x = (world.x - params.hole_min.x) / tile.quad;
         let hi_x = (params.hole_max.x - world.x) / tile.quad;
         let step_x = i32(round(select(-lo_x, hi_x, hi_x < lo_x)));
         let away = (dir == DIR_POS_X && step_x == -1) || (dir == DIR_NEG_X && step_x == 1);
-        let run_lo = select(world.z, world.z - tile.quad, e == 1u);
+        let run = f32(dj) * tile.quad;
+        let run_lo = select(world.z, world.z - run, e == 1u);
         let on_lo = run_lo == params.hole_min.z;
-        let on_hi = run_lo + tile.quad == params.hole_max.z;
-        let corner_wall = faces_x && dj == 1u && away && (on_lo || on_hi);
+        let on_hi = run_lo + run == params.hole_max.z;
+        let corner_wall = faces_x && away && (on_lo || on_hi);
         if all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)
             && top > params.hole_min.y && top < params.hole_max.y {
             if corner_wall {
@@ -218,26 +219,6 @@ fn vs_main(
                 // underground (seen as three pixels in `golden.rs`'s curtain
                 // test).
                 seal = 0.0;
-            }
-        } else if !border && (corner & 2u) == 0u {
-            // A wall on one of the box's sides, facing into it (`far::
-            // wall_on_side`): the step down to its own first quad inside
-            // hangs a skirt's depth further, as a patch's edge does.
-            let plane = select(world.z, world.x, faces_x);
-            let along = select(middle.x, middle.y, faces_x);
-            let side = select(
-                select(params.hole_max.z, params.hole_min.z, dir == DIR_POS_Z),
-                select(params.hole_max.x, params.hole_min.x, dir == DIR_POS_X),
-                faces_x,
-            );
-            let span = select(
-                vec2<f32>(params.hole_min.x, params.hole_max.x),
-                vec2<f32>(params.hole_min.z, params.hole_max.z),
-                faces_x,
-            );
-            if plane == side && along > span.x && along < span.y
-                && top > params.hole_min.y && top < params.hole_max.y {
-                world.y = world.y - tile.skirt;
             }
         }
     } else {
