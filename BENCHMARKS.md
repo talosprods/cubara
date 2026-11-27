@@ -271,6 +271,10 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-27 | **Gate eye: ground** at #447 (a level-3 stand-in for a voxels' strip while its nodes load), C of footnote 103's A/B/C, 2 runs (`GATE: MET at Medium` each), same conditions¹⁰⁴ | -- | -- | 1,111 / 1,108 (+0.2%) | 0.436 / 0.437 ms | 0.981 / 0.989 ms | `5aa559c` |
 | 2026-11-27 | Gate eye: hill at #447, 2 runs, same conditions¹⁰⁴ | -- | -- | 1,067 / 1,069 (+0.7%) | 0.457 / 0.457 ms | 1.020 / 1.073 ms | `5aa559c` |
 | 2026-11-27 | Gate eye: flight at #447, 2 runs, same conditions; 0 draws¹⁰⁴ | 0 | far only | 4,126 / 4,257 (−2.1%) | 0.105 / 0.108 ms | 0.230 / 0.241 ms | `5aa559c` |
+| 2026-11-27 | **Gate eye: ground** at main `a2dc3b6` (#446's arena and #447's stand-in merged), 2 runs (`GATE: MET at Medium` each; High missed: 989 / 989), the delta against the previous main row (footnote 103's A, `13b2138`); AC power, battery 100% and charged, no thermal or performance warning recorded, no input for over five hours, no agents running (one paused at 03:36, quiet from 03:49), 5 quiet minutes before the first run¹⁰⁵ | -- | -- | 1,099 / 1,109 (−0.3%) | 0.446 / 0.436 ms | 1.140 / 0.983 ms | `a2dc3b6` |
+| 2026-11-27 | Gate eye: hill at main `a2dc3b6`, 2 runs, same conditions¹⁰⁵ | -- | -- | 1,069 / 1,067 (+0.7%) | 0.456 / 0.457 ms | 1.084 / 1.035 ms | `a2dc3b6` |
+| 2026-11-27 | Gate eye: flight at main `a2dc3b6`, 2 runs, same conditions; 0 draws¹⁰⁵ | 0 | far only | 4,395 / 4,196 (+0.3%) | 0.104 / 0.108 ms | 0.240 / 0.218 ms | `a2dc3b6` |
+| 2026-11-27 | #388's windowed walk (`--bench walk --window`, 60 s from process start) at main `a2dc3b6`: six rows, three suspects on and off, 3 runs each, with the verdicts (all three refuted); AC power, 100% and charged, no thermal level reported on Apple Silicon¹⁰⁶ | -- | -- | -- | -- | -- | `a2dc3b6` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -1396,6 +1400,8 @@ From ⁹⁸ on, a hole also needs the finished frame to show the pixel inside la
 | 2026-11-09 | the same⁸⁰ | toward a peak | 1,278 / 1,249 | 0 / 0 | 0.023% / 0.001% | 3 / 4, 0.022% / 0.000% | `main` |
 | 2026-11-09 | **Voxel quads sealed against T-junction cracks** (corners moved out 0.05 px)⁸¹ — `main` / sealed | down, 1 run each | 897 / **7** | 0 / 0 | 0.004% / **0.000%** | 3 / **0** | *(this PR)* |
 | 2026-11-09 | the same⁸¹ | low | 673 / **330** | 0 / 0 | 0.005% / 0.004% | 13 / 10, 0.015% | *(this PR)* |
+
+The M3's flights (gate item 0's low, high, toward-a-mountain and down flights, counted by the same rules) are not in this table: they sit in the footnotes of its own table, 101, 104 and 105.
 
 ## Detailed run logs
 
@@ -3450,3 +3456,42 @@ The true level-0 shade costs 2.4% at the ground eye and 2.5% at the hill eye: th
 ¹⁰³ **#446's quiet A/B, from the A/B/C with #447** (main `13b2138`, #446 `49dad53`, #447 `5aa559c`, built in release on 2026-11-26 at 22:5x and checked distinct; a first attempt at 23:07 overlapped another session's CPU job and was thrown away; this one ran 01:10-01:40 with every session on the Mac holding still). The arena sized from the selection costs nothing measurable (ground and hill within the runs' spread) and holds 13 MB more at the default setting; `ARENA OVERFLOWS: 0` on both flights in both runs. Low flight: main FLICKER 0 and 1 (the strip sliver of footnote 101), #446 0 and 0; toward a mountain 0 everywhere.
 
 ¹⁰⁴ **#447 from the A/B/C of footnote 103** (main `13b2138`). Nothing waits at the gate eyes, so the stand-in costs nothing there (ground and hill within the runs' spread). Low flight at the default x2.7: FLICKER **0 and 0** (main 0 and 1: the strip hand-over sliver the stand-in closes), FIRST LOAD 3 and 3, POPS p99 39,297 and 38,550; at `--far-quad-scale 3` FLICKER 1 and 0 (the run with the 1 also shows a hitch: POPS max 142,999, work p99 4.3 ms). Toward a mountain 0 everywhere.
+
+¹⁰⁵ **Main `a2dc3b6` at the gate's three eyes, its flights, and #397's seal check** (main = #446 and #447 merged; every run kept as it came out; 2026-11-27: gate, low and toward-a-mountain flights 03:49-04:20, two runs of each, in the A/B window for #449, whose rows are not recorded here (that PR is being reworked); down and low flights 04:46-04:48, runs 1 and 2; down flights 05:29-05:31, runs 3 and 4). AC power and 100% charged at the start and the end of every window; `pmset -g therm` reports no thermal or performance level on Apple Silicon, so none is recorded; the owner was idle for over five hours; no agents ran during the measurements (one was paused at 03:36, the Mac was quiet from 03:49 for the first window and from 05:23 for the last), and the scripts checked AC power and the owner's idle time before every run. The deltas in the table are against footnote 103's main row (`13b2138`); against footnote 104's #447 rows (`5aa559c`, the same stand-in) they are ground 1,104 against 1,110, hill 1,068 against 1,068, flight 4,296 against 4,192 (means of the two runs). Gate flights, in the order the runs were made (the low flight's runs 1 and 2 are the first window's, 3 and 4 the second's; the down flight's runs 3 and 4 are the third's):
+
+| Flight | HOLES (frames) | FLICKER (frames) | FIRST LOAD (kept frames) | work p99 / p99.9 / max ms | ARENA OVERFLOWS |
+|---|---|---|---|---|---|
+| low, 4 runs | 0 of 1,173; 0 of 1,171; 0 of 1,169; 0 of 1,173 | 0; 0; 0; 0 | 3; 3; 3; 3 | 3.6 / 5.8 / 13.0; 3.8 / 5.6 / 7.8; 3.7 / 5.6 / 10.5; 3.2 / 6.8 / 13.6 | 0; 0; 0; 0 |
+| toward a mountain, 2 runs | 0 of 1,769; 0 of 1,768 | 0; 0 | 0; 0 | 2.2 / 4.4 / 6.4; 2.1 / 4.3 / 5.6 | 0; 0 |
+| down, 4 runs | 0 of 892; 0 of 890; 0 of 884; 0 of 890 | 0; 0; 0; 0 | 0; 0; 0; 0 | 3.9 / 7.1 / 8.6; 3.6 / 5.3 / 5.6; 3.9 / 6.5 / 6.7; 3.9 / 5.9 / 14.3 | 0; 0; 0; 0 |
+| down, the seal set back to 5e-5, 4 runs | **1 of 889**; 0 of 888; 0 of 885; 0 of 889 | **1**; 0; 0; 0 | 0; 0; 0; 0 | 3.6 / 6.2 / 7.7; 3.6 / 5.5 / 5.9; 3.8 / 6.0 / 7.0; 3.7 / 5.8 / 6.4 | 0; 0; 0; 0 |
+
+The low flight shows what footnote 104 predicted: the strip stand-in holds, FLICKER 0 in all four runs (main before #447: 0 and 1), and the 3 FIRST LOAD kept frames are the same ones as there. The arena never overflows, and the work p99 sits at 3.2 to 3.9 ms on the low and down flights. **#397, the seal check:** the gate's down flight (`--eye 8,450,8 --look 0.4,-0.8,0.2 --seconds 15`) on main, where `face.wgsl`'s `CRACK_SEAL` is 0.00006 since #421, showed a hole in 0 of 4 runs. With the seal set back to 0.00005, the value before #421 and the only difference between the two binaries, 1 of 4 runs showed a hole: one frame in run 1 (one pixel, which is also that run's one FLICKER frame). So the old seal is caught rarely, not reliably: the gate's down flight is a check that can notice it, one run in four here, not a test that fails whenever the old value comes back.
+
+¹⁰⁶ **#388's rows for the M3: `--bench walk --window`, main `a2dc3b6`, 60 s from process start, three suspects on and off, 3 runs each** (2026-11-27, 04:49-05:04 for the first five configurations, round-robin with a fresh world per run, and 05:23-05:28 for the two Fifo ones; `--world` on a scratch directory every run, so no save or settings file was touched). Conditions as in footnote 105: AC power, 100% and charged; no thermal or performance level reported (Apple Silicon); the owner idle for over five hours; no agents running (quiet from 03:49 and from 05:23). Fullscreen came out at 2940x1846 (the display's scaled mode), windowed at 2560x1500; every run is a 60 Hz panel. The measuring window presents Immediate unless `--present fifo` is given (Metal offers Fifo and Immediate, no Mailbox), so (a)'s rows and both "Immediate" rows run Immediate, and the fullscreen default start (`fs`) equals `fs-immediate`. Suspect (b) is therefore Fifo against Immediate, not Mailbox against Fifo. `--rebuild-at` cannot be combined with fullscreen, so (c) is windowed only; its rebuild is a window resize two pixels shorter, at 30 s. The columns give each run in order; "over 33.3 ms" and "over 25.0 ms" are the whole run's counts, with the count after the first 10 s in brackets. `over 16.7 ms` is left out: under Fifo it counts every second frame (about 1,700 of 3,500) and says nothing.
+
+| Suspect | Configuration | Runs | Size and mode | max ms | p99.9 ms | over 33.3 ms (after 10 s) | over 25.0 ms (after 10 s) | Power / thermal |
+|---|---|---|---|---|---|---|---|---|
+| (a) tune child **on** | `fs`: default start | 3 | 2940x1846 fullscreen, Immediate | 69.1 / 66.0 / 116.3 | 3.0 / 13.4 / 3.4 | 3 / 4 / 2 (0 / 0 / 0) | 3 / 5 / 5 (0 / 0 / 0) | AC 100% / no level reported |
+| (a) tune child **off** | `fs-notune`: `--no-tune` | 3 | 2940x1846 fullscreen, Immediate | 92.2 / 40.4 / 47.3 | 3.7 / 14.2 / 4.5 | 4 / 2 / 1 (0 / 0 / 0) | 7 / 5 / 3 (0 / 0 / 0) | AC 100% / no level reported |
+| (b) **Fifo** | `fs-fifo`: `--present fifo` | 3 | 2940x1846 fullscreen, Fifo | 48.8 / 48.7 / 47.4 | 31.3 / 31.8 / 28.0 | 2 / 2 / 1 (0 / 0 / 0) | 6 / 8 / 5 (0 / 0 / 0) | AC 100% / no level reported |
+| (b) **Immediate** | `fs` and `fs-immediate`, both Immediate (the two are one configuration) | 6 | 2940x1846 fullscreen, Immediate | 69.1 / 66.0 / 116.3 / 88.9 / 51.3 / 99.5 | 3.0 / 13.4 / 3.4 / 3.6 / 4.1 / 3.8 | 3 / 4 / 2 / 1 / 2 / 1 (0 in all six) | 3 / 5 / 5 / 1 / 5 / 3 (0 in all six) | AC 100% / no level reported |
+| (c) rebuild **at 30 s** | `win-rebuild`: `--rebuild-at 30` | 3 | 2560x1500 windowed, 2560x1498 after the rebuild, Immediate | 464.0 / 72.4 / 99.6 | 13.8 / 6.6 / 15.7 | 3 / 3 / 2 (2 / 2 / 1) | 6 / 7 / 5 (4 / 4 / 2) | AC 100% / no level reported |
+| (c) **no** rebuild | `win` | 3 | 2560x1500 windowed, Immediate | 67.3 / 33.2 / 66.6 | 8.7 / 13.2 / 15.6 | 3 / 0 / 3 (1 / 0 / 1) | 5 / 3 / 5 (1 / 1 / 1) | AC 100% / no level reported |
+| extra: windowed Fifo | `win-fifo`: `--present fifo` | 3 | 2560x1500 windowed, Fifo | 50.1 / 29.4 / 33.5 | 18.9 / 18.8 / 18.5 | 3 / 0 / 2 (1 / 0 / 1) | 4 / 2 / 3 (2 / 0 / 1) | AC 100% / no level reported |
+
+**Verdicts**, by #388's rule on the whole-run `over 33.3 ms` count (spread = max − min within a configuration; confirmed if the medians differ by more than the larger spread):
+
+| Suspect | on / first configuration: runs, median, spread | off / second: runs, median, spread | difference of medians | larger spread | Verdict |
+|---|---|---|---|---|---|
+| (a) tune child | 3, 4, 2: median 3, spread 2 | 4, 2, 1: median 2, spread 3 | 1 | 3 | **refuted** |
+| (b) Fifo against Immediate (six Immediate runs) | 2, 2, 1: median 2, spread 1 | 3, 4, 2, 1, 2, 1: median 2, spread 3 | 0 | 3 | **refuted** |
+| (b) the same against `fs-immediate` alone | 2, 2, 1: median 2, spread 1 | 1, 2, 1: median 1, spread 1 | 1 | 1 | **refuted** (1 is not more than 1) |
+| (c) rebuild at 30 s | 3, 3, 2: median 3, spread 1 | 3, 0, 3: median 3, spread 3 | 0 | 3 | **refuted** |
+
+Three runs a configuration is a weak test, so these are pointers for follow-up issues, not proofs; the noise floor shows in the table itself: `fs` and `fs-immediate` are one configuration and their medians differ by 2 (3 against 1) with spreads of 2 and 1. A Fifo row also measures something else than an Immediate row (the display gates the loop, so a gap of two intervals is a missed refresh, where under Immediate it is the loop's own hitch). What the runs show, plainly:
+
+- Every run but two has 1 to 4 gaps over 33.3 ms inside its first 10 s, the worst of them up to 116.3 ms (`fs`, run 3); the two exceptions, `win` run 2 and `win-fifo` run 2, have none over 33.3 ms (their worst gaps are 33.2 and 29.4 ms) and 2 over 25.0 ms in the first 10 s. In the fullscreen runs the worst gaps cluster at 0.7 to 4.0 s, with the first present 0.7 to 2.9 s after the process starts.
+- Fullscreen after 10 s is clean: 0 gaps over 25.0 ms in all 12 fullscreen runs (all Fifo ones, so no missed refresh, with p99.9 at 17.0 to 17.6 ms, the refresh interval, and max 17.2 to 23.0 ms), and 0 over 33.3 ms in all the Immediate ones (max 4.7 to 20.2 ms).
+- Windowed after 10 s shows occasional gaps of 25 to 60 ms: 1 over 25.0 ms in each of the three `win` runs (47.1, 33.2 and 60.6 ms; 2 of 3 over 33.3), and 2, 0 and 1 in `win-fifo` (50.1 ms at most).
+- The rebuild frame itself costs 72.4, 464.0 and 99.6 ms in the three runs (the pipeline rebuild logged 15, 451 and 10 ms), so a resize is a confirmed cost of its own; by the rule it is not a cause of random stutter, since the whole-run count does not move.
