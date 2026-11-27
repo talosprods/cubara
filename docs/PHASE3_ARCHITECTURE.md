@@ -1625,6 +1625,24 @@ is the finest far patch level at any screen height and quality: on a 1664-row
 display the pixel floor let quads of 4 reach out to 1,589 blocks, a fine band
 between two coarse ones. `the_far_terrain_is_never_finer_than_the_join`.
 
+**The seam at the join is closed on every side of the box** (2026-11-27,
+`far_streaming::the_far_terrain_closes_the_seam_to_the_voxels_on_every_side`,
+GPU-free): wherever the far terrain just outside the voxels' box stands
+higher than the ground the voxels draw just inside it (level 3's cells, by
+`World::certainly_solid_at_v`), the far faces standing on that side and
+facing in -- the first ring folded into a skirt, the wall between the quads
+on either side -- cover every height between the two, at every block column
+of all four sides, for the game's box, view and quad scale at the
+player-view tour's stands, at 1,080 and 1,846 rows. It found the box's
+corners open (`PROPOSAL_FAR_VIEW.md` §3.4 has the change). The tour's static
+pinholes were not the join: every one of them is either another lane's (a
+level-3 or level-2 cave window, a crack the distance morph opens) or the
+drawn geometry's own outline -- a far or level-3 top a few blocks under
+level 0's, with a nearer edge closing the sky round it -- with no far face,
+tile, seal or skirt missing (a CPU ray cast of the voxels' and the far
+terrain's triangles, placed as the shaders place them, agreed with the GPU
+on 2,012 of 2,013 pixels round one of them).
+
 **What a top wears.** The voxels' rule for it (`top_block`, §9.6), read
 through `WorldGen::top_layer`: what level 0 shows from above one of the
 quad's columns, the column picked by the cell's hash (`top_pick`, the one

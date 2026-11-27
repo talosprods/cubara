@@ -394,6 +394,18 @@ blocks.
   next to it (`far::hidden_height`). And when the
   eye's visibility search finds no way out to the sky at all, the far terrain
   is not drawn (`cubara_world::visibility::Sight::open_to_sky`).
+  *Changed 2026-11-27 (the box's corners):* a vertex one quad in from two sides
+  snapped to the box's corner, so no quad there folded into a skirt and the
+  corner quad's stretch of both sides stood open between the voxels' ground and
+  the far terrain outside -- 111 of 87,040 columns of the sides at the
+  player-view tour's stands, all within 30 blocks of a corner, where the far
+  terrain stood 1 to 12 blocks above the voxels' ground. One quad cannot hang a
+  skirt on two sides (its triangles share a diagonal), so at a corner the first
+  ring folds onto the box's x side and the quad after the corner along the z
+  side stretches its skirt over the corner quad's part of that side
+  (`cubara_render::far::corner`). Held, every block column of all four sides
+  against the ground the voxels draw there, by
+  `the_far_terrain_closes_the_seam_to_the_voxels_on_every_side`.
 - At the join, a block is about 1 px wide at 1080p (§2B). At 4K it is about
   2 px, so the join is slightly visible there. The join distance can be made to
   follow the resolution.
