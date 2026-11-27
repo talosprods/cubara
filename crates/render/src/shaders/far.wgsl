@@ -70,17 +70,24 @@ struct Face {
     word2: u32,
 };
 
-// One run of faces: its patch's slot, its first face, and how many it is
-// (and a word of padding: a class's runs start on 256 bytes, `far.rs`'s
-// `RUN_ALIGN`).
+// One run of faces: its patch's slot, its first face, how many it is, and
+// what its patch is drawn as (`RUN_STANDIN`; sixteen bytes, so a class's
+// runs start on 256 bytes, `far.rs`'s `RUN_ALIGN`).
 struct Run {
     slot: u32,
     first: u32,
     count: u32,
-    pad: u32,
+    flags: u32,
 };
 
 const QUADS: i32 = 32;
+
+// `Run::flags`: the run is of a stand-in for voxel nodes not drawn yet
+// (`far.rs`'s `FarRole::StandIn` and `RUN_STANDIN`).
+const RUN_STANDIN: u32 = 1u;
+// How much further along its line of sight a stand-in's corner is drawn,
+// as a factor on its distance (`far.rs`'s `STANDIN_BEHIND`).
+const STANDIN_BEHIND: f32 = 1.000244140625;
 
 // `far.rs`'s `FarDir`, in its order.
 const DIR_TOP: u32 = 0u;
@@ -166,7 +173,13 @@ fn vs_main(
     // pipeline); it is all done by moving vertices.
     let faces_x = dir == DIR_POS_X || dir == DIR_NEG_X;
     var seal = CRACK_SEAL;
-    if wall {
+    // A stand-in's faces are already cut to the ground the voxel nodes it
+    // stands in for will draw, inside the box (`far.rs`'s `FarRole`):
+    // nothing of the join below is theirs.
+    let standin = (run.flags & RUN_STANDIN) != 0u;
+    if standin {
+        // Drawn where it stands.
+    } else if wall {
         // A wall is in the box or out of it as a whole (`far::wall_in_hole`):
         // by a point half a quad along it from this corner, which is the same
         // side of every line for all four corners, and by its top. In the box
@@ -234,9 +247,13 @@ fn vs_main(
         outward = select(vec3<f32>(su, sv, 0.0), vec3<f32>(0.0, sv, su), faces_x);
     }
     let sealed = world + outward * (seal * distance(world, frame.eye.xyz));
+    // A stand-in a hair further along the corner's line of sight: the same
+    // pixels, a little deeper, so a voxel node of the same ground drawn
+    // already keeps them all.
+    let behind = frame.eye.xyz + (sealed - frame.eye.xyz) * STANDIN_BEHIND;
 
     var out: VertexOut;
-    out.clip_pos = frame.view_proj * vec4<f32>(sealed, 1.0);
+    out.clip_pos = frame.view_proj * vec4<f32>(select(sealed, behind, standin), 1.0);
     out.color = shade(sealed, face_colour(dir, word2) * face_open(word2), FACE_NORMALS[dir]);
     return out;
 }

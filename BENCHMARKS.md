@@ -268,6 +268,9 @@ read CPU/frame high and FPS low by about the amounts in ⁷⁵.
 | 2026-11-27 | Gate eye: hill at #446, 2 runs, same conditions¹⁰³ | -- | -- | 1,063 / 1,072 (+0.7%) | 0.460 / 0.455 ms | 1.170 / 1.098 ms | `49dad53` |
 | 2026-11-27 | Gate eye: flight at main (A), 2 runs, same conditions; 0 draws¹⁰³ | 0 | far only | 4,282 / 4,283 | 0.128 / 0.107 ms | 0.454 / 0.267 ms | `13b2138` |
 | 2026-11-27 | Gate eye: flight at #446, 2 runs, same conditions; 0 draws¹⁰³ | 0 | far only | 4,249 / 4,273 (−0.5%) | 0.105 / 0.106 ms | 0.241 / 0.245 ms | `49dad53` |
+| 2026-11-27 | **Gate eye: ground** at #447 (a level-3 stand-in for a voxels' strip while its nodes load), C of footnote 103's A/B/C, 2 runs (`GATE: MET at Medium` each), same conditions¹⁰⁴ | -- | -- | 1,111 / 1,108 (+0.2%) | 0.436 / 0.437 ms | 0.981 / 0.989 ms | `5aa559c` |
+| 2026-11-27 | Gate eye: hill at #447, 2 runs, same conditions¹⁰⁴ | -- | -- | 1,067 / 1,069 (+0.7%) | 0.457 / 0.457 ms | 1.020 / 1.073 ms | `5aa559c` |
+| 2026-11-27 | Gate eye: flight at #447, 2 runs, same conditions; 0 draws¹⁰⁴ | 0 | far only | 4,126 / 4,257 (−2.1%) | 0.105 / 0.108 ms | 0.230 / 0.241 ms | `5aa559c` |
 
 ### Linux — Intel i7-8750H / NVIDIA GTX 1060 Max-Q Design (Vulkan)
 
@@ -3445,3 +3448,5 @@ The tiles give the hill eye 6.7% (1,094 against 1,024 / 1,026 FPS) at the same q
 The true level-0 shade costs 2.4% at the ground eye and 2.5% at the hill eye: the AO now differs along chunk and node borders, so the greedy mesher merges fewer quads (3.1% more triangles, 6.8% at level 3, PR #445's census). The low flight's one flicker frame a run is the strip hand-over sliver of footnote 101 (the follow-up branch `feat/strip-standin` closes it), not a new class; FIRST LOAD and work p99 move within the runs' spread.
 
 ¹⁰³ **#446's quiet A/B, from the A/B/C with #447** (main `13b2138`, #446 `49dad53`, #447 `5aa559c`, built in release on 2026-11-26 at 22:5x and checked distinct; a first attempt at 23:07 overlapped another session's CPU job and was thrown away; this one ran 01:10-01:40 with every session on the Mac holding still). The arena sized from the selection costs nothing measurable (ground and hill within the runs' spread) and holds 13 MB more at the default setting; `ARENA OVERFLOWS: 0` on both flights in both runs. Low flight: main FLICKER 0 and 1 (the strip sliver of footnote 101), #446 0 and 0; toward a mountain 0 everywhere.
+
+¹⁰⁴ **#447 from the A/B/C of footnote 103** (main `13b2138`). Nothing waits at the gate eyes, so the stand-in costs nothing there (ground and hill within the runs' spread). Low flight at the default x2.7: FLICKER **0 and 0** (main 0 and 1: the strip hand-over sliver the stand-in closes), FIRST LOAD 3 and 3, POPS p99 39,297 and 38,550; at `--far-quad-scale 3` FLICKER 1 and 0 (the run with the 1 also shows a hitch: POPS max 142,999, work p99 4.3 ms). Toward a mountain 0 everywhere.

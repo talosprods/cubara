@@ -369,6 +369,7 @@ impl Scene {
         in_view
             .iter()
             .map(|&i| CullPatch {
+                role: cubara_render::far::FarRole::Terrain,
                 aabb: self.boxes[i],
                 origin: self.placement[i].0,
                 quad: self.placement[i].1,

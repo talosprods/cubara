@@ -45,7 +45,7 @@ fn shows_nothing(p: &[u8]) -> bool {
 }
 
 /// Per pixel of `frame`, whether it shows land: anything but [`NOTHING`].
-fn land_of(frame: &Frame) -> Vec<bool> {
+pub(crate) fn land_of(frame: &Frame) -> Vec<bool> {
     frame
         .pixels
         .as_chunks::<4>()
@@ -64,7 +64,7 @@ fn land_of(frame: &Frame) -> Vec<bool> {
 /// its edge go land, sky, land with nothing missing. A hole candidate is
 /// judged by it on the frame before ([`HoleTracker`]), and a hole and a
 /// stale pixel on the finished frame ([`confirm_holes`], [`stale_pixels`]).
-fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
+pub(crate) fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
     let w = width.max(1);
     let (x, y) = (i % w, i / w);
     let rows = land.len() / w;
@@ -235,7 +235,7 @@ pub fn split_stale(stale: &[u32], drawn_and_missing: &[u32]) -> StaleSplit {
 /// `POPS:` measures), not a hole -- the rule the stale pixels were already
 /// judged by (`BENCHMARKS.md` ⁸⁰). Found on the low flight (frame 326 of a
 /// run of PR #441): while the far terrain stands in for a strip of ground
-/// the voxels are taking over (`NodeStreaming::far_hole`), a frame shows
+/// the voxels are taking over (`NodeStreaming::voxel_box`), a frame shows
 /// that strip's skyline as the far terrain draws it, and a sliver of sky a
 /// fifth of a pixel wide between two ridges there slid across a pixel the
 /// voxels' skyline covers in the finished frame -- with sky directly above
@@ -1377,8 +1377,8 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         let camera = game.camera_pose();
         let eye = camera.eye.as_vec3().to_array();
         nodes.update(renderer, game.world(), eye);
-        let hole = nodes.far_hole(renderer, eye);
-        far.update(renderer, eye, hole);
+        let voxels = nodes.voxel_box(renderer, eye);
+        far.update(renderer, eye, voxels);
         renderer.set_far_shown(nodes.far_in_sight(eye));
         renderer.render(
             camera,
@@ -1500,8 +1500,8 @@ impl Streamed {
     fn frame_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
         self.nodes
             .update(&mut self.renderer, &self.world, stream_eye);
-        let hole = self.nodes.far_hole(&self.renderer, stream_eye);
-        self.far.update(&mut self.renderer, stream_eye, hole);
+        let voxels = self.nodes.voxel_box(&self.renderer, stream_eye);
+        self.far.update(&mut self.renderer, stream_eye, voxels);
         self.renderer
             .set_far_shown(self.nodes.far_in_sight(stream_eye));
         self.renderer.render(
@@ -1554,7 +1554,7 @@ impl Streamed {
     }
 }
 
-fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
+pub(crate) fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
     CameraPose {
         eye: glam::Vec3::from(eye).as_dvec3(),
         look_dir: glam::Vec3::from(flight.look).normalize_or_zero(),

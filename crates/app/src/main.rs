@@ -34,6 +34,8 @@ mod present;
 mod screenshot;
 mod settings;
 mod streaming;
+#[cfg(test)]
+mod strip_standin;
 mod tick_cost;
 #[cfg(test)]
 mod transition_study;
@@ -959,8 +961,8 @@ impl ApplicationHandler for App {
                             w.settle();
                         }
                     }
-                    let hole = streaming.far_hole(renderer, eye);
-                    far.update(renderer, eye, hole);
+                    let voxels = streaming.voxel_box(renderer, eye);
+                    far.update(renderer, eye, voxels);
                     // Shut in underground, none of it can be seen (#424).
                     renderer.set_far_shown(streaming.far_in_sight(eye));
                 }
