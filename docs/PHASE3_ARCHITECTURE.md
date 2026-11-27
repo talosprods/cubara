@@ -2648,6 +2648,19 @@ on main, 612,568 / 84,423 / 2,728 now; rows open to the sky 108,278 / 26,778
 / 2,350 on main (the count that test prints is of the same-level cells), 51,874
 / 5,036 / 20 now.
 
+**Triangles** (`geometry_census`, every node of the game's selection,
+radius 64, squash 2; main -> now): the ground eye 1,758,152 -> 1,768,696
+(+0.6%; level 1 +2.2%, level 2 +1.4%, level 3 -0.6%), the hill eye
+1,055,690 -> 1,060,558 (+0.5%), the owner's spot 2,733,262 -> 2,751,144
+(+0.7%). The gain is underground (the census's own split: level 1's
+underground share at the ground eye 31.9 -> 33.1%): a row kept whole
+inside a cave that stays open around it has faces of its own. Meshing a
+whole selection on one thread (shared machine, the ratio only) took 6, 11
+and 10% longer at the three: the border and morph paths ask the rule
+through `cell_draws_solid`, which works a neighbour's columns out per call.
+**The lever, not built:** keep each border cell's tops and peaks for the
+meshing job, as `BorderGround` already keeps its `CellGround`.
+
 **Tests.** `crates/world/tests/coarse_cave_openings.rs`:
 `the_owners_floating_block_is_rock_where_level_0_hides_it` (the nodes the
 game generates at levels 1 to 3 around the block and beside them: no
