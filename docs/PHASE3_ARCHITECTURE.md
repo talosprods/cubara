@@ -791,6 +791,9 @@ What changed, all of it behind the functions of §9.3:
   the caves under a top). The depth limit nests as well: a row is carved
   only if its lowest block is within `DISTANT_CAVE_DEPTH` of the cell's
   highest column. It replaces a vote (§9.1 item 7; PHASE1 §8.6 is amended).
+  (Since §9.12 a row all of whose ground is cave is drawn as cave only where
+  no level opens it through ground level 0 draws: the tops around it do not
+  nest, and the cave they bared was the owner's floating block.)
   The first block of rock ends the count, so a cell still costs one noise
   sample nearly always.
 - **Material.** `coarse_block` replaces `block_at_on_surface_v`, `top_cell`
@@ -2095,7 +2098,8 @@ added; what follows from it:
   top is cave where every block of ground in it is, a column's ground being
   what is at or under its own top. The air of a pit is no longer a cave the
   rule has to find; it is where the top is. Caves still nest
-  (`coarse_caves_nest`); tops never did.
+  (`coarse_caves_nest`); tops never did -- which is how a cave under a top
+  could still open through ground level 0 draws, until §9.12.
 - **A riser is level 0's faces**, as before: a column shows a side at every
   row above a neighbour's top and at or under its own, so the wall of a pit
   is among the faces a coarse cell picks from, by its depth below its

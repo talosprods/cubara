@@ -237,8 +237,9 @@ fn the_owners_floating_block_is_rock_where_level_0_hides_it() {
     );
     assert!(caves_seen > 0, "no cave rows in these nodes to check");
 
-    // The gap itself: level 2's cell at (5460, 3068), rows 135 and 136.
-    let node = NodeKey::containing(ChunkCoord::from_world_pos(block), 2);
+    // The gap itself: level 2's cell at (5460, 3068), rows 135 and 136 (in
+    // the node beside the block's, which starts at z = 3072).
+    let node = NodeKey::containing(ChunkCoord::from_world_pos([5460.0, 135.0, 3068.0]), 2);
     let chunk = world.node_at(node, blocks).expect("the hill top's node");
     let origin = node.world_origin();
     let (lx, lz) = (
@@ -278,7 +279,7 @@ fn no_level_opens_a_cave_through_level_0s_ground() {
     // Two squares of 1,536 blocks: the owner's slopes and the spawn's hills
     // and the mountain north of them. Chosen, not derived: a few square
     // kilometres, and seconds to sweep.
-    let squares = [([5376, 3408], 768), ([0, -512], 768)];
+    let squares: [([i32; 2], i32); 2] = [([5376, 3408], 768), ([0, -512], 768)];
     let mut report = Vec::new();
     let mut total = 0;
     for level in 1..=COARSEST {

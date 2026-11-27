@@ -904,7 +904,9 @@ impl WorldGen {
     /// row is solid while its lowest block is at or under the top, and the
     /// row that holds the top is cut off at it when the node is drawn
     /// ([`generate_aniso`](Self::generate_aniso)). **Air where a cave has
-    /// carved all of it** ([`row_is_cave`](Self::row_is_cave)).
+    /// carved all of it** ([`row_is_cave`](Self::row_is_cave)) and no level
+    /// would open it through ground level 0 draws
+    /// ([`cave_opens_only_where_level_0_does`](Self::cave_opens_only_where_level_0_does)).
     ///
     /// **Made of what level 0's faces show there** (issue #423 decision 2:
     /// "a coarse riser face takes the mix of materials that level 0's faces
@@ -1292,6 +1294,10 @@ impl WorldGen {
     /// The first block of rock ends the count, and nearly every cell has
     /// one at the first block asked: one noise sample a cell, as a cave
     /// sample has always cost.
+    ///
+    /// **Necessary, not enough**: a row this finds cave is drawn as cave only
+    /// where no level opens it through ground level 0 draws
+    /// ([`cave_opens_only_where_level_0_does`](Self::cave_opens_only_where_level_0_does)).
     fn row_is_cave(
         &self,
         columns: impl Iterator<Item = (i32, i32, i32)>,
@@ -1497,8 +1503,9 @@ impl WorldGen {
 
     /// Whether a coarse node whose rows are `v` blocks tall draws the block
     /// at row `y` of `cell` solid: at or under the cell's top, in a row no
-    /// cave has carved away ([`row_is_cave`](Self::row_is_cave), the rule
-    /// [`generate_aniso`](Self::generate_aniso) builds the node by). For
+    /// cave has carved away ([`row_is_cave`](Self::row_is_cave) and
+    /// [`cave_opens_only_where_level_0_does`](Self::cave_opens_only_where_level_0_does),
+    /// the rule [`generate_aniso`](Self::generate_aniso) builds the node by). For
     /// judging what a neighbouring node of another level of detail draws,
     /// without generating it.
     ///
