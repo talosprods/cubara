@@ -217,6 +217,61 @@ fn bare(node: NodeKey, resident: &HashSet<NodeKey>) -> bool {
         && !node.children().iter().any(|c| resident.contains(c))
 }
 
+/// The order to ask the mesh pool for `to_load` in: **what a swap waits for
+/// first** -- each node that replaces one drawn now (a child of a resident
+/// node, or the parent of resident children: not [`bare`]), and each bare
+/// node beside a node that is `held` until it arrives ([`can_unload`]) --
+/// then the rest, each part nearest first. The pool takes jobs in the order
+/// asked, and a search's answer asks for the swaps' replacements together
+/// with ground it only now sees and the air and rock it must open to see
+/// further, much of it nearer than the ring edges where the swaps are: by
+/// distance alone a swap waited behind all of it, and a swap that lands late
+/// is a moment the old detail stays on screen (#451's bench: the swap lag's
+/// p99 rose by half with the near field's added nodes, and a late swap is
+/// where a hole of a pixel or two can flicker).
+fn request_order(
+    to_load: Vec<NodeKey>,
+    resident: &HashSet<NodeKey>,
+    held: &HashSet<NodeKey>,
+    center: ChunkCoord,
+) -> Vec<NodeKey> {
+    let waited_for = beside_any(held);
+    let (mut urgent, mut rest): (Vec<NodeKey>, Vec<NodeKey>) = to_load
+        .into_iter()
+        .partition(|&n| !bare(n, resident) || waited_for.contains(&n));
+    node::sort_nearest_first(&mut urgent, center);
+    node::sort_nearest_first(&mut rest, center);
+    urgent.extend(rest);
+    urgent
+}
+
+/// Every node [`beside`] one of `nodes` that a selection can hold: the same
+/// level across each face, or a level coarser or finer (neighbours differ by
+/// at most one level, `cubara_world::node::desired_nodes_3d`). Found from each
+/// node's own neighbourhood rather than by testing every pair, so a burst of
+/// swaps costs the main thread nothing like `held` times `to_load`.
+fn beside_any(nodes: &HashSet<NodeKey>) -> HashSet<NodeKey> {
+    let mut found = HashSet::new();
+    for &n in nodes {
+        for axis in 0..3 {
+            for step in [-1, 1] {
+                let mut pos = n.pos;
+                pos[axis] += step;
+                let across = NodeKey::new(n.level, pos);
+                for candidate in std::iter::once(across)
+                    .chain(std::iter::once(across.parent()))
+                    .chain(across.children())
+                {
+                    if beside(n, candidate) {
+                        found.insert(candidate);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// A box in blocks, `(min, max)` with `max` exclusive: what the streamer
 /// reports a node's, or the far hole's, extent as to a measurement.
 pub type BlockBox = ([f32; 3], [f32; 3]);
@@ -748,11 +803,11 @@ impl NodeStreaming {
         let to_unload: Vec<NodeId> = unload_now.into_iter().map(to_node_id).collect();
         renderer.apply_node_updates(to_unload, std::iter::empty());
 
-        let mut to_load: Vec<NodeKey> = loading
+        let to_load: Vec<NodeKey> = loading
             .into_iter()
             .filter(|n| !self.mesh_pool.is_in_flight(*n))
             .collect();
-        node::sort_nearest_first(&mut to_load, done.center);
+        let to_load = request_order(to_load, &self.resident, &self.held, done.center);
         // One snapshot for the whole batch (issue #387 decision 2): every job
         // this search starts meshes the same world, and shares the one copy.
         let snapshot = Arc::new(world.snapshot());
@@ -1093,6 +1148,208 @@ mod tests {
             &cubara_server::assets::load_ore_registry(),
             |_: &str| 0,
         )
+    }
+
+    /// **What the node streaming asks of the mesh pool, and how long a swap
+    /// waits for it, along the bench's flights** (#451's quiet bench: the
+    /// swap lag rose with the near field's added nodes). GPU-free: the
+    /// flight's eye at 60 frames a second; the game's selection and
+    /// visibility search as [`NodeStreaming`] runs them (a search when the
+    /// eye crosses a chunk, and ten frames after new links arrived); every
+    /// node a search asks for built on this thread by the pool's own job
+    /// (`build_node_shared`, one snapshot and parent cache per batch) and
+    /// timed. Each job is classed by what it turned out to be: sky (above all
+    /// the generator places, free), air (generated, nothing solid), rock
+    /// (solid, nothing to draw) or ground (a mesh). Each batch is then run
+    /// through a modelled pool of `MODEL_WORKERS` workers at the measured
+    /// costs, in the order the game asks ([`request_order`]) and in nearest-
+    /// first order alone, and the time until the last job a swap waits for is
+    /// done is added to the search's own: a model of the swap lag without
+    /// the frames in between. The spawn is loaded first, as the bench does,
+    /// and not counted. Prints per flight; asserts nothing.
+    #[test]
+    #[ignore = "builds every node three flights ask for: cargo test -p cubara --release streaming_work_report -- --ignored --nocapture"]
+    fn streaming_work_report() {
+        use crate::flight::{eye_at, toward_peak, Flight, FLY_SPEED};
+        use cubara_world::mesh::{build_node_shared, ParentCache};
+        use std::time::Instant;
+
+        /// The pool the model runs: the M3's eight cores less the main
+        /// thread's (`MeshPool::new`).
+        const MODEL_WORKERS: usize = 7;
+        const CLASSES: [&str; 4] = ["sky", "air", "rock", "ground"];
+
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&cubara_server::assets::load_structure_registry(), &registry)
+            .with_ores(&cubara_server::assets::load_ore_registry(), &registry);
+        let layer_of = |_: &str| 0u32;
+        let world = World::new();
+        let sky_from = cubara_world::WorldGen::highest_generated_y(blocks);
+        let (peak_start, peak_look) = toward_peak(&cubara_world::WorldGen::new(world.seed()));
+        let flights = [
+            ("low", [8.0, 120.0, 8.0], [1.0, -0.15, 0.3], 20.0f32),
+            ("toward the peak", peak_start, peak_look, 30.0),
+            ("down", [8.0, 450.0, 8.0], [0.4, -0.8, 0.2], 15.0),
+        ];
+        // When the last of `urgent` is done if `order` goes through the
+        // modelled pool, each job taking `cost` -- in milliseconds.
+        let swap_done = |order: &[NodeKey],
+                         cost: &HashMap<NodeKey, f64>,
+                         urgent: &HashSet<NodeKey>|
+         -> f64 {
+            let mut free = [0.0f64; MODEL_WORKERS];
+            let mut done = 0.0f64;
+            for n in order {
+                let w = (0..MODEL_WORKERS)
+                    .min_by(|&a, &b| free[a].total_cmp(&free[b]))
+                    .unwrap_or(0);
+                free[w] += cost[n];
+                if urgent.contains(n) {
+                    done = done.max(free[w]);
+                }
+            }
+            done
+        };
+        let quantiles = |mut v: Vec<f64>| -> String {
+            v.sort_by(f64::total_cmp);
+            let q = |p: f64| v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0);
+            format!("p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms", q(0.5), q(0.9), q(0.99), q(1.0))
+        };
+        for (name, start, look, seconds) in flights {
+            let flight = Flight {
+                start,
+                look,
+                speed: FLY_SPEED,
+                seconds,
+                fps: 60,
+                every: 1.0,
+                size: (1, 1),
+                quality: crate::far_streaming::FarQuality::Off,
+                far_quad_scale: crate::far_streaming::FAR_QUAD_SCALE,
+                morph: true,
+            };
+            let mut links: HashMap<NodeKey, visibility::NodeLinks> = HashMap::new();
+            let mut resident: HashSet<NodeKey> = HashSet::new();
+            let mut jobs = [0u64; 4];
+            let mut time = [0.0f64; 4];
+            let mut levels = [[0u64; 4]; 4];
+            let (mut searches, mut search_ms, mut select_ms) = (0u64, Vec::new(), Vec::new());
+            let (mut swaps_asked, mut swaps_nearest) = (Vec::new(), Vec::new());
+            // One search and the batch it asks for, as `follow_visibility`
+            // does it; `count` false for the spawn's.
+            let mut round = |center: ChunkCoord, count: bool| -> usize {
+                let began = Instant::now();
+                let desired: HashSet<NodeKey> =
+                    node::desired_nodes_3d(center, VERTICAL_LOD_SQUASH, node::DEFAULT_RING_SCHEDULE)
+                        .into_iter()
+                        .collect();
+                let selected = began.elapsed().as_secs_f64() * 1000.0;
+                let sight = visibility::search(center, &desired, |n| links.get(&n).copied());
+                let searched = began.elapsed().as_secs_f64() * 1000.0;
+                links.retain(|&n, _| worth_remembering(n, &desired));
+                let visible = sight.nodes;
+                // Drawn nodes no longer visible: held while something
+                // replaces them, gone at once otherwise.
+                let stale: Vec<NodeKey> =
+                    resident.iter().copied().filter(|n| !visible.contains(n)).collect();
+                let held: HashSet<NodeKey> = stale
+                    .iter()
+                    .copied()
+                    .filter(|&n| replacements_of(n, &visible).iter().any(|r| !resident.contains(r)))
+                    .collect();
+                resident.retain(|n| visible.contains(n) || held.contains(n));
+                let to_load: Vec<NodeKey> =
+                    visible.iter().copied().filter(|n| !resident.contains(n)).collect();
+                let asked = request_order(to_load.clone(), &resident, &held, center);
+                let waited_for = beside_any(&held);
+                let urgent: HashSet<NodeKey> = to_load
+                    .iter()
+                    .copied()
+                    .filter(|&n| !bare(n, &resident) || waited_for.contains(&n))
+                    .collect();
+                let mut nearest = to_load;
+                node::sort_nearest_first(&mut nearest, center);
+                let snapshot = Arc::new(world.snapshot());
+                let cache = ParentCache::default();
+                let mut cost = HashMap::new();
+                for &node in &asked {
+                    let began = Instant::now();
+                    let built =
+                        build_node_shared(&snapshot, &registry, &layer_of, node, blocks, &cache);
+                    let took = began.elapsed().as_secs_f64() * 1000.0;
+                    cost.insert(node, took);
+                    let class = if built.geometry.is_some() {
+                        3
+                    } else if built.links != visibility::OPEN {
+                        2
+                    } else if node.world_origin()[1] > sky_from {
+                        0
+                    } else {
+                        1
+                    };
+                    if count {
+                        jobs[class] += 1;
+                        time[class] += took;
+                        levels[class][node.level as usize] += 1;
+                    }
+                    links.insert(node, built.links);
+                }
+                if count {
+                    searches += 1;
+                    search_ms.push(searched);
+                    select_ms.push(selected);
+                    if !urgent.is_empty() {
+                        swaps_asked.push(searched + swap_done(&asked, &cost, &urgent));
+                        swaps_nearest.push(searched + swap_done(&nearest, &cost, &urgent));
+                    }
+                }
+                // Everything asked for has arrived; what it replaces leaves.
+                resident.retain(|n| visible.contains(n));
+                resident.extend(asked.iter().copied());
+                asked.len()
+            };
+            let at = ChunkCoord::from_world_pos(eye_at(&flight, 0.0));
+            while round(at, false) > 0 {}
+            let (mut center, mut since, mut fresh) = (at, 0u32, false);
+            for f in 1..=(seconds * 60.0) as u32 {
+                let here = ChunkCoord::from_world_pos(eye_at(&flight, f as f32 / 60.0));
+                since += 1;
+                if here != center || (fresh && since >= VISIBILITY_EVERY_FRAMES) {
+                    center = here;
+                    since = 0;
+                    fresh = round(here, true) > 0;
+                }
+            }
+            let total: f64 = time.iter().sum();
+            println!(
+                "FLIGHT {name} ({seconds} s): jobs {} = {}; job time {:.0} ms = {} ({:.0} ms per second of flight)",
+                jobs.iter().sum::<u64>(),
+                (0..4).map(|k| format!("{} {}", CLASSES[k], jobs[k])).collect::<Vec<_>>().join(", "),
+                total,
+                (0..4).map(|k| format!("{} {:.0}", CLASSES[k], time[k])).collect::<Vec<_>>().join(", "),
+                total / seconds as f64,
+            );
+            for k in 0..4 {
+                println!(
+                    "  {name} {}: jobs by level {:?}, {:.3} ms a job",
+                    CLASSES[k],
+                    levels[k],
+                    time[k] / jobs[k].max(1) as f64
+                );
+            }
+            println!(
+                "  {name} searches: {searches}, {} (of which the selection {})",
+                quantiles(search_ms),
+                quantiles(select_ms)
+            );
+            println!(
+                "  {name} modelled swap wait, {} batches with a swap: asked as the game asks {}; nearest first {}",
+                swaps_asked.len(),
+                quantiles(swaps_asked),
+                quantiles(swaps_nearest)
+            );
+        }
     }
 
     /// **A node's trees reach the renderer with their own height, foot and
@@ -1730,6 +1987,90 @@ mod tests {
     /// renderer does not draw yet is loading -- whether it is in flight or
     /// still waiting to be requested -- and a node that is drawn, or one the
     /// search cannot see, is not.
+    /// **What a swap waits for is asked for first** (#451): the children
+    /// replacing a resident parent, the parent replacing resident children,
+    /// and a bare node beside a node held until it arrives go ahead of
+    /// ground and air only now seen -- even nearer ones -- each part nearest
+    /// first; nothing is dropped or asked for twice. Goes red with the
+    /// nearest-first order alone (the near frontier first), or with the held
+    /// node's bare neighbour left among the rest.
+    #[test]
+    fn what_a_swap_waits_for_is_asked_for_first() {
+        let center = ChunkCoord::new(0, 0, 0);
+        // A level-1 node splitting: its children replace it.
+        let split = NodeKey::new(1, [5, 0, 0]);
+        // Children of a level-1 node merging into it: it replaces them.
+        let merged = NodeKey::new(1, [-6, 0, 0]);
+        let merging_child = merged.children()[0];
+        // A level-0 node held until the bare node beside it arrives.
+        let held_node = NodeKey::new(0, [0, 0, 8]);
+        let beside_held = NodeKey::new(0, [0, 0, 9]);
+        // Ground and air only now seen, nearer than all of the above.
+        let frontier = [NodeKey::new(0, [1, 1, 0]), NodeKey::new(0, [0, -2, 1])];
+        let resident: HashSet<NodeKey> = [split, merging_child, held_node].into_iter().collect();
+        let held: HashSet<NodeKey> = [held_node].into_iter().collect();
+        let children = split.children();
+        let mut to_load: Vec<NodeKey> = children.clone();
+        to_load.extend([merged, beside_held]);
+        to_load.extend(frontier);
+        let order = request_order(to_load.clone(), &resident, &held, center);
+        assert_eq!(order.len(), to_load.len());
+        let set: HashSet<NodeKey> = order.iter().copied().collect();
+        assert_eq!(set.len(), order.len(), "a node asked for twice");
+        let urgent = children.len() + 2;
+        let (first, rest) = order.split_at(urgent);
+        for n in children.iter().chain([&merged, &beside_held]) {
+            assert!(first.contains(n), "{n:?} waits behind the frontier: {order:?}");
+        }
+        assert!(frontier.iter().all(|n| rest.contains(n)), "{order:?}");
+        // Nearest first within each part.
+        let mut nearest = first.to_vec();
+        node::sort_nearest_first(&mut nearest, center);
+        assert_eq!(first, &nearest[..]);
+        let mut nearest = rest.to_vec();
+        node::sort_nearest_first(&mut nearest, center);
+        assert_eq!(rest, &nearest[..]);
+    }
+
+    /// [`beside_any`] finds exactly the nodes one level apart or less that
+    /// share a face with one of its nodes: against every such node in a
+    /// neighbourhood, tested pair by pair with [`beside`].
+    #[test]
+    fn beside_any_is_every_node_beside_one_of_them() {
+        for n in [
+            NodeKey::new(0, [3, -2, 5]),
+            NodeKey::new(1, [-1, 0, 2]),
+            NodeKey::new(2, [0, 1, -1]),
+        ] {
+            let found = beside_any(&[n].into_iter().collect());
+            let mut expected = HashSet::new();
+            for level in n.level.saturating_sub(1)..=n.level + 1 {
+                let scale = |p: i32| {
+                    if level > n.level {
+                        p.div_euclid(2)
+                    } else if level < n.level {
+                        p * 2
+                    } else {
+                        p
+                    }
+                };
+                let c = n.pos.map(scale);
+                for dx in -3..=4 {
+                    for dy in -3..=4 {
+                        for dz in -3..=4 {
+                            let m = NodeKey::new(level, [c[0] + dx, c[1] + dy, c[2] + dz]);
+                            if beside(n, m) {
+                                expected.insert(m);
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(!expected.is_empty());
+            assert_eq!(found, expected, "{n:?}");
+        }
+    }
+
     #[test]
     fn a_loading_node_is_visible_and_not_resident() {
         let (drawn, meshing, waiting, unseen) = (

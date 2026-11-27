@@ -201,6 +201,18 @@ pub fn node_columns(
     node: NodeKey,
     blocks: TerrainBlocks,
 ) -> Option<MorphColumns> {
+    columns_for(world, node, blocks, true)
+}
+
+/// [`node_columns`], and with `spare_untouched` false the columns of a node
+/// the ground does not reach into as well -- what the test of that rule
+/// checks it against.
+fn columns_for(
+    world: &WorldSnapshot,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+    spare_untouched: bool,
+) -> Option<MorphColumns> {
     if !MORPH_LEVELS.contains(&node.level) {
         return None;
     }
@@ -227,6 +239,65 @@ pub fn node_columns(
         let pw = 2 * w;
         top_of(x.div_euclid(pw) * pw, z.div_euclid(pw) * pw, pw)
     };
+    // The lowest top a column may show the node as built: inside the node
+    // its own; a neighbour outside the node may be drawn a level coarser
+    // (its parent's top) or, above level 0, a level finer -- the two finer
+    // cells of it that touch the node.
+    let floor_of = |cx: i32, cz: i32, top: i32, parent: i32| {
+        if (0..n).contains(&cx) && (0..n).contains(&cz) {
+            return top;
+        }
+        let mut floor = top.min(parent);
+        if level > 0 {
+            let half = w / 2;
+            let (x, z) = corner(cx, cz);
+            let finer: [(i32, i32); 2] = if cx < 0 {
+                [(x + half, z), (x + half, z + half)]
+            } else if cx >= n {
+                [(x, z), (x, z + half)]
+            } else if cz < 0 {
+                [(x, z + half), (x + half, z + half)]
+            } else {
+                [(x, z), (x + half, z)]
+            };
+            for (fx, fz) in finer {
+                floor = floor.min(top_of(fx, fz, half));
+            }
+        }
+        floor
+    };
+    let row = |y_top_block: i32| y_top_block + 1 - oy;
+    let mut parents = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
+    let mut floors = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
+    for cz in -1..=n {
+        for cx in -1..=n {
+            let (top, parent) = (tops[at(cx, cz)], parent_top(cx, cz));
+            parents.push(parent);
+            floors.push(floor_of(cx, cz, top, parent));
+        }
+    }
+
+    // **A node the ground does not reach into has nothing to morph**: every
+    // face the morph moves is a top on its column's top row or a riser
+    // between a top and the floor of the column beside it, and a riser only
+    // the morph opens is laid on one of those rows too. With every top under
+    // the node's rows -- it is air over the ground -- or every top and floor
+    // over them -- it is rock under it -- none of those rows is the node's,
+    // so the mesher would key no face of it and the morph would leave its
+    // mesh exactly as it is without one: say so, and spare the job the
+    // purity below and its parent's generation and mesh (the colour morph's
+    // `ParentFaces`), which a streamed flight paid for every such node it
+    // reached (#451's bench: three times the job's own generation and mesh).
+    let height = n * w;
+    let highest = (-1..=n)
+        .flat_map(|cz| (-1..=n).map(move |cx| (cx, cz)))
+        .map(|(cx, cz)| row(tops[at(cx, cz)]))
+        .max()
+        .unwrap_or(i32::MIN);
+    let lowest = floors.iter().map(|&f| row(f)).min().unwrap_or(i32::MAX);
+    if spare_untouched && (highest <= 0 || lowest > height) {
+        return None;
+    }
 
     // Purity, two rings out: solid from the lowest neighbour's top to its own.
     let ring = PAD - 1;
@@ -254,7 +325,6 @@ pub fn node_columns(
     let morphs =
         |cx: i32, cz: i32| (-1..=1).all(|dz| (-1..=1).all(|dx| pure[at(cx + dx, cz + dz)]));
 
-    let row = |y_top_block: i32| y_top_block + 1 - oy;
     // No column morphs across a floor or ceiling of its parent level's
     // nodes (multiples of their height, `32 * w` blocks): its target is its
     // parent's top clamped into the rows of the parent-level node that holds
@@ -286,8 +356,8 @@ pub fn node_columns(
     let mut morphing = Vec::with_capacity(((n + 2) * (n + 2)) as usize);
     for cz in -1..=n {
         for cx in -1..=n {
-            let top = tops[at(cx, cz)];
-            let parent = parent_top(cx, cz);
+            let k = ((cz + 1) * (n + 2) + (cx + 1)) as usize;
+            let (top, parent, floor) = (tops[at(cx, cz)], parents[k], floors[k]);
             morphing.push(morphs(cx, cz));
             let target = if morphs(cx, cz) {
                 morph_target(top, parent)
@@ -295,31 +365,7 @@ pub fn node_columns(
                 top
             };
             let inside = (0..n).contains(&cx) && (0..n).contains(&cz);
-            let (floor, target_floor) = if inside {
-                (top, target)
-            } else {
-                // A neighbour outside the node may be drawn a level coarser
-                // (its parent's top) or, above level 0, a level finer: the
-                // two finer cells of it that touch the node.
-                let mut floor = top.min(parent);
-                if level > 0 {
-                    let half = w / 2;
-                    let (x, z) = corner(cx, cz);
-                    let finer: [(i32, i32); 2] = if cx < 0 {
-                        [(x + half, z), (x + half, z + half)]
-                    } else if cx >= n {
-                        [(x, z), (x, z + half)]
-                    } else if cz < 0 {
-                        [(x, z + half), (x + half, z + half)]
-                    } else {
-                        [(x, z), (x + half, z)]
-                    };
-                    for (fx, fz) in finer {
-                        floor = floor.min(top_of(fx, fz, half));
-                    }
-                }
-                (floor, target.min(parent))
-            };
+            let target_floor = if inside { target } else { target.min(parent) };
             columns.push([row(top), row(target), row(floor), row(target_floor)]);
         }
     }
@@ -1161,6 +1207,82 @@ mod tests {
             near > 10_000 && steep > 1_000,
             "{near} vertices with a target in the near field, {steep} of them steeply above \
              or below: the test saw too little"
+        );
+    }
+
+    /// **A node the ground does not reach into has nothing to morph**, and
+    /// `node_columns` spares it -- the purity checks and the parent's
+    /// generation and mesh (the colour morph) a streamed flight paid for
+    /// every such node it reached (#451's bench: air over the ground and rock
+    /// under it, the job three times its own generation and mesh). For the
+    /// game's selection around the tour's peak and the foot of its face,
+    /// every node of levels 0-2 over a 128-block square around the eye, at
+    /// every height: where `node_columns` spares a node, its full columns
+    /// key nothing in it -- no column inside it has its top on one of its
+    /// rows, and no riser toward any of its four neighbours (`riser_map`,
+    /// the mesher's own rule, latent risers included) has a row in it. Seen
+    /// spared over the ground and under it, and kept where the ground
+    /// crosses. Goes red when the rule leaves out a neighbour's floor, or
+    /// takes a top on the node's ceiling for one above it.
+    #[test]
+    fn a_node_the_ground_does_not_reach_into_has_nothing_to_morph() {
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let blocks = blocks();
+        let (mut over, mut under, mut kept) = (0, 0, 0);
+        for eye in [[-960.5f32, 243.62, -3335.5], [-886.5, 70.62, -3137.5]] {
+            let at = ChunkCoord::from_world_pos(eye);
+            for node in desired_nodes_3d(at, SQUASH, DEFAULT_RING_SCHEDULE) {
+                let o = node.world_origin();
+                let size = (16 * node.extent_chunks()) as f32;
+                let near = |k: usize| (o[k] as f32 - eye[k]).max(eye[k] - o[k] as f32 - size);
+                if !MORPH_LEVELS.contains(&node.level) || near(0) > 64.0 || near(2) > 64.0 {
+                    continue;
+                }
+                let full = columns_for(&snapshot, node, blocks, false).expect("a morphing level");
+                if node_columns(&snapshot, node, blocks).is_some() {
+                    kept += 1;
+                    continue;
+                }
+                let height = 16 * node.extent_chunks();
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let own = full.at(x, z);
+                        assert!(
+                            !(1..=height).contains(&own[0]),
+                            "{node:?} spared, but column ({x},{z}) has its top on row {}",
+                            own[0]
+                        );
+                        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            if let Some([s_bot, s_top, _, _]) = riser_map(own, full.at(x + dx, z + dz))
+                            {
+                                // The mesher keys rows `s_bot..s_top`, lays a
+                                // growing riser's foot on `s_bot` and a riser
+                                // with no rows on row `s_top`: none of them
+                                // the node's.
+                                assert!(
+                                    s_top <= 0 || s_bot > height || (s_bot == height && s_top > height),
+                                    "{node:?} spared, but the riser of ({x},{z}) toward \
+                                     ({},{}) has rows {s_bot}..{s_top} of its {height}",
+                                    x + dx,
+                                    z + dz
+                                );
+                            }
+                        }
+                    }
+                }
+                if full.at(0, 0)[0] <= 0 {
+                    over += 1;
+                } else {
+                    under += 1;
+                }
+            }
+        }
+        // Chosen, not derived: measured 1,793 spared over the ground, 1,036
+        // under it and 409 kept.
+        assert!(
+            over > 500 && under > 500 && kept > 100,
+            "spared {over} over the ground and {under} under it, kept {kept}: too few to tell"
         );
     }
 
