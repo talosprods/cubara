@@ -550,7 +550,7 @@ pub fn sort_nearest_first(nodes: &mut [NodeKey], center: ChunkCoord) {
 /// half-chunk offset stays exact without floats); comparing a node's real
 /// center against `center`'s own *corner* instead would make the two chunks
 /// straddling that corner tie in distance and sort arbitrarily.
-fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
+pub fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
     let extent = node.extent_chunks() as i64;
     let origin = node.chunk_origin();
     let node_center_x = origin.x as i64 * 2 + extent;

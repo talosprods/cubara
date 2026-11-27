@@ -218,41 +218,68 @@ fn bare(node: NodeKey, resident: &HashSet<NodeKey>) -> bool {
 }
 
 /// The order to ask the mesh pool for `to_load` in: **what a swap waits for
-/// first** -- each node that replaces one drawn now (a child of a resident
-/// node, or the parent of resident children: not [`bare`]), and each bare
-/// node beside a node that is `held` until it arrives ([`can_unload`]) --
-/// then the rest, each part nearest first. The pool takes jobs in the order
-/// asked, and a search's answer asks for the swaps' replacements together
-/// with ground it only now sees and the air and rock it must open to see
-/// further, much of it nearer than the ring edges where the swaps are: by
-/// distance alone a swap waited behind all of it, and a swap that lands late
-/// is a moment the old detail stays on screen (#451's bench: the swap lag's
-/// p99 rose by half with the near field's added nodes, and a late swap is
-/// where a hole of a pixel or two can flicker).
+/// first, one swap after another** -- each node that replaces one drawn now
+/// (a child of a resident node, or the parent of resident children: not
+/// [`bare`]) and each bare node beside a node `held` until it arrives
+/// ([`can_unload`]), grouped by the swap it finishes, the nearest swap first
+/// -- then the rest, nearest first. The pool takes jobs in the order asked,
+/// and a search's answer asks for the swaps' replacements together with
+/// ground it only now sees and the air and rock it must open to see further,
+/// much of it nearer than the ring edges where the swaps are: by distance
+/// alone a swap waited behind all of it, and its eight children were spread
+/// over the batch, so it ended with the batch. A swap that lands late is a
+/// moment the old detail stays on screen, and where a hole of a pixel or two
+/// can flicker (#451's bench: the swap lag's p99 rose by half with the near
+/// field's added nodes).
 fn request_order(
     to_load: Vec<NodeKey>,
     resident: &HashSet<NodeKey>,
     held: &HashSet<NodeKey>,
     center: ChunkCoord,
 ) -> Vec<NodeKey> {
-    let waited_for = beside_any(held);
-    let (mut urgent, mut rest): (Vec<NodeKey>, Vec<NodeKey>) = to_load
-        .into_iter()
-        .partition(|&n| !bare(n, resident) || waited_for.contains(&n));
-    node::sort_nearest_first(&mut urgent, center);
+    let waited_for = beside_held(held, center);
+    // The drawn node a swap replaces: the parent its children replace, the
+    // children's parent itself, or the held node a bare one is beside.
+    let swap_of = |n: NodeKey| {
+        if resident.contains(&n.parent()) {
+            Some(n.parent())
+        } else if n.children().iter().any(|c| resident.contains(c)) {
+            Some(n)
+        } else {
+            waited_for.get(&n).copied()
+        }
+    };
+    let (mut urgent, mut rest) = (Vec::new(), Vec::new());
+    for n in to_load {
+        match swap_of(n) {
+            Some(swap) => urgent.push((n, swap)),
+            None => rest.push(n),
+        }
+    }
+    urgent.sort_by_key(|&(n, swap)| {
+        (
+            node::node_dist_sq(swap, center),
+            swap,
+            node::node_dist_sq(n, center),
+            n,
+        )
+    });
     node::sort_nearest_first(&mut rest, center);
-    urgent.extend(rest);
-    urgent
+    urgent.into_iter().map(|(n, _)| n).chain(rest).collect()
 }
 
-/// Every node [`beside`] one of `nodes` that a selection can hold: the same
-/// level across each face, or a level coarser or finer (neighbours differ by
-/// at most one level, `cubara_world::node::desired_nodes_3d`). Found from each
-/// node's own neighbourhood rather than by testing every pair, so a burst of
-/// swaps costs the main thread nothing like `held` times `to_load`.
-fn beside_any(nodes: &HashSet<NodeKey>) -> HashSet<NodeKey> {
-    let mut found = HashSet::new();
-    for &n in nodes {
+/// Every node [`beside`] one of the `held` nodes that a selection can hold
+/// -- the same level across each face, or a level coarser or finer
+/// (neighbours differ by at most one level, `cubara_world::node::desired_nodes_3d`)
+/// -- each with the held node it is beside, the nearest one if several. Found
+/// from each node's own neighbourhood rather than by testing every pair, so
+/// a burst of swaps costs the main thread nothing like `held` times
+/// `to_load`.
+fn beside_held(held: &HashSet<NodeKey>, center: ChunkCoord) -> HashMap<NodeKey, NodeKey> {
+    let mut nearest_first: Vec<NodeKey> = held.iter().copied().collect();
+    node::sort_nearest_first(&mut nearest_first, center);
+    let mut found = HashMap::new();
+    for n in nearest_first {
         for axis in 0..3 {
             for step in [-1, 1] {
                 let mut pos = n.pos;
@@ -263,7 +290,7 @@ fn beside_any(nodes: &HashSet<NodeKey>) -> HashSet<NodeKey> {
                     .chain(across.children())
                 {
                     if beside(n, candidate) {
-                        found.insert(candidate);
+                        found.entry(candidate).or_insert(n);
                     }
                 }
             }
@@ -1163,9 +1190,10 @@ mod tests {
     /// (solid, nothing to draw) or ground (a mesh). Each batch is then run
     /// through a modelled pool of `MODEL_WORKERS` workers at the measured
     /// costs, in the order the game asks ([`request_order`]) and in nearest-
-    /// first order alone, and the time until the last job a swap waits for is
-    /// done is added to the search's own: a model of the swap lag without
-    /// the frames in between. The spawn is loaded first, as the bench does,
+    /// first order alone, and for every node held for a swap the time until
+    /// the last job it waits for is done ([`can_unload`]) is added to the
+    /// search's own: a model of the swap lag without the frames between a
+    /// search and its answer, or between a mesh and its upload. The spawn is loaded first, as the bench does,
     /// and not counted. Prints per flight; asserts nothing.
     #[test]
     #[ignore = "builds every node three flights ask for: cargo test -p cubara --release streaming_work_report -- --ignored --nocapture"]
@@ -1192,22 +1220,17 @@ mod tests {
             ("toward the peak", peak_start, peak_look, 30.0),
             ("down", [8.0, 450.0, 8.0], [0.4, -0.8, 0.2], 15.0),
         ];
-        // When the last of `urgent` is done if `order` goes through the
-        // modelled pool, each job taking `cost` -- in milliseconds.
-        let swap_done = |order: &[NodeKey],
-                         cost: &HashMap<NodeKey, f64>,
-                         urgent: &HashSet<NodeKey>|
-         -> f64 {
+        // When each job of `order` is done if it goes through the modelled
+        // pool, each taking `cost` -- in milliseconds from the batch's start.
+        let finish = |order: &[NodeKey], cost: &HashMap<NodeKey, f64>| -> HashMap<NodeKey, f64> {
             let mut free = [0.0f64; MODEL_WORKERS];
-            let mut done = 0.0f64;
+            let mut done = HashMap::new();
             for n in order {
                 let w = (0..MODEL_WORKERS)
                     .min_by(|&a, &b| free[a].total_cmp(&free[b]))
                     .unwrap_or(0);
                 free[w] += cost[n];
-                if urgent.contains(n) {
-                    done = done.max(free[w]);
-                }
+                done.insert(*n, free[w]);
             }
             done
         };
@@ -1262,11 +1285,22 @@ mod tests {
                 let to_load: Vec<NodeKey> =
                     visible.iter().copied().filter(|n| !resident.contains(n)).collect();
                 let asked = request_order(to_load.clone(), &resident, &held, center);
-                let waited_for = beside_any(&held);
-                let urgent: HashSet<NodeKey> = to_load
+                // What each held node waits for: what replaces it, and the
+                // bare nodes beside it (`can_unload`).
+                let swaps: Vec<Vec<NodeKey>> = held
                     .iter()
-                    .copied()
-                    .filter(|&n| !bare(n, &resident) || waited_for.contains(&n))
+                    .map(|&h| {
+                        to_load
+                            .iter()
+                            .copied()
+                            .filter(|&n| {
+                                n.parent() == h
+                                    || h.parent() == n
+                                    || (bare(n, &resident) && beside(h, n))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|waits| !waits.is_empty())
                     .collect();
                 let mut nearest = to_load;
                 node::sort_nearest_first(&mut nearest, center);
@@ -1299,9 +1333,12 @@ mod tests {
                     searches += 1;
                     search_ms.push(searched);
                     select_ms.push(selected);
-                    if !urgent.is_empty() {
-                        swaps_asked.push(searched + swap_done(&asked, &cost, &urgent));
-                        swaps_nearest.push(searched + swap_done(&nearest, &cost, &urgent));
+                    for (order, lags) in [(&asked, &mut swaps_asked), (&nearest, &mut swaps_nearest)] {
+                        let done = finish(order, &cost);
+                        for waits in &swaps {
+                            let last = waits.iter().map(|n| done[n]).fold(0.0, f64::max);
+                            lags.push(searched + last);
+                        }
                     }
                 }
                 // Everything asked for has arrived; what it replaces leaves.
@@ -1344,7 +1381,7 @@ mod tests {
                 quantiles(select_ms)
             );
             println!(
-                "  {name} modelled swap wait, {} batches with a swap: asked as the game asks {}; nearest first {}",
+                "  {name} modelled swap lag, {} swaps that wait for a job: asked as the game asks {}; nearest first {}",
                 swaps_asked.len(),
                 quantiles(swaps_asked),
                 quantiles(swaps_nearest)
@@ -1987,13 +2024,15 @@ mod tests {
     /// renderer does not draw yet is loading -- whether it is in flight or
     /// still waiting to be requested -- and a node that is drawn, or one the
     /// search cannot see, is not.
-    /// **What a swap waits for is asked for first** (#451): the children
-    /// replacing a resident parent, the parent replacing resident children,
-    /// and a bare node beside a node held until it arrives go ahead of
-    /// ground and air only now seen -- even nearer ones -- each part nearest
-    /// first; nothing is dropped or asked for twice. Goes red with the
-    /// nearest-first order alone (the near frontier first), or with the held
-    /// node's bare neighbour left among the rest.
+    /// **What a swap waits for is asked for first, one swap after another**
+    /// (#451): the children replacing a resident parent, the parent
+    /// replacing resident children, and a bare node beside a node held until
+    /// it arrives go ahead of ground and air only now seen -- even nearer
+    /// ones -- the nodes of one swap together, the nearest swap first; the
+    /// rest nearest first; nothing dropped or asked for twice. Goes red with
+    /// the nearest-first order alone (the near frontier first), with the held
+    /// node's bare neighbour left among the rest, or with a swap's nodes
+    /// interleaved with another's.
     #[test]
     fn what_a_swap_waits_for_is_asked_for_first() {
         let center = ChunkCoord::new(0, 0, 0);
@@ -2023,26 +2062,32 @@ mod tests {
             assert!(first.contains(n), "{n:?} waits behind the frontier: {order:?}");
         }
         assert!(frontier.iter().all(|n| rest.contains(n)), "{order:?}");
-        // Nearest first within each part.
-        let mut nearest = first.to_vec();
-        node::sort_nearest_first(&mut nearest, center);
-        assert_eq!(first, &nearest[..]);
+        // One swap after another, the nearest swap first: the held node's
+        // neighbour (8 chunks out), then the split parent's eight children
+        // together, then the merge (11-12 chunks out).
+        assert_eq!(first[0], beside_held);
+        assert!(first[1..=children.len()].iter().all(|n| children.contains(n)), "{first:?}");
+        assert_eq!(first[children.len() + 1], merged);
+        // The rest nearest first.
         let mut nearest = rest.to_vec();
         node::sort_nearest_first(&mut nearest, center);
         assert_eq!(rest, &nearest[..]);
     }
 
-    /// [`beside_any`] finds exactly the nodes one level apart or less that
+    /// [`beside_held`] finds exactly the nodes one level apart or less that
     /// share a face with one of its nodes: against every such node in a
     /// neighbourhood, tested pair by pair with [`beside`].
     #[test]
-    fn beside_any_is_every_node_beside_one_of_them() {
+    fn beside_held_is_every_node_beside_one_of_them() {
         for n in [
             NodeKey::new(0, [3, -2, 5]),
             NodeKey::new(1, [-1, 0, 2]),
             NodeKey::new(2, [0, 1, -1]),
         ] {
-            let found = beside_any(&[n].into_iter().collect());
+            let found: HashSet<NodeKey> =
+                beside_held(&[n].into_iter().collect(), ChunkCoord::new(0, 0, 0))
+                    .into_keys()
+                    .collect();
             let mut expected = HashSet::new();
             for level in n.level.saturating_sub(1)..=n.level + 1 {
                 let scale = |p: i32| {

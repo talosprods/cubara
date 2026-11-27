@@ -195,31 +195,69 @@ impl<'a> Index<'a> {
     /// sibling, or the same-level or one-coarser sub-block beyond the face --
     /// or, when [`finer`](Self::finer) steps are allowed and neither exists,
     /// the finer sub-blocks touching it.
-    fn neighbours(&self, n: u32, sub: usize, face: Face) -> Vec<(u32, usize)> {
+    ///
+    /// Kept in place, not on the heap: the search asks this once for every
+    /// step it takes, a million times over a full render distance, and
+    /// allocating each answer was a fifth of what a search cost (#451).
+    fn neighbours(&self, n: u32, sub: usize, face: Face) -> Neighbours {
+        let mut found = Neighbours::default();
         let node = self.nodes[n as usize];
         let c = [sub % GRAIN, sub / GRAIN % GRAIN, sub / GRAIN / GRAIN];
         let d = step_of(face);
         let inside = (0..3).all(|k| (0..GRAIN as i32).contains(&(c[k] as i32 + d[k])));
         if inside {
             let m = [0, 1, 2].map(|k| (c[k] as i32 + d[k]) as usize);
-            return vec![(n, (m[2] * GRAIN + m[1]) * GRAIN + m[0])];
+            found.push((n, (m[2] * GRAIN + m[1]) * GRAIN + m[0]));
+            return found;
         }
         let beyond = |along: [i32; 2]| self.beyond(node, c, d, along);
-        if let Some(found) = self.locate(beyond([2, 2]), &[node.level, node.level + 1]) {
-            return vec![found];
+        if let Some(v) = self.locate(beyond([2, 2]), &[node.level, node.level + 1]) {
+            found.push(v);
+            return found;
         }
         if !self.finer || node.level == 0 {
-            return Vec::new();
+            return found;
         }
-        let mut found = Vec::with_capacity(4);
         for along in [[1, 1], [3, 1], [1, 3], [3, 3]] {
             if let Some(v) = self.locate(beyond(along), &[node.level - 1]) {
-                if !found.contains(&v) {
+                if !found.contains(v) {
                     found.push(v);
                 }
             }
         }
         found
+    }
+}
+
+/// [`Index::neighbours`]' answer: at most the four finer sub-blocks touching
+/// a face.
+#[derive(Clone, Copy, Default)]
+struct Neighbours {
+    found: [(u32, usize); 4],
+    len: usize,
+}
+
+impl Neighbours {
+    fn push(&mut self, v: (u32, usize)) {
+        self.found[self.len] = v;
+        self.len += 1;
+    }
+
+    fn contains(&self, v: (u32, usize)) -> bool {
+        self.found[..self.len].contains(&v)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl IntoIterator for Neighbours {
+    type Item = (u32, usize);
+    type IntoIter = std::iter::Take<std::array::IntoIter<(u32, usize), 4>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.found.into_iter().take(self.len)
     }
 }
 
