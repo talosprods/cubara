@@ -3048,7 +3048,9 @@ mod tests {
             for p in &fps {
                 let placement = ([p.origin[0] as f32, p.origin[1] as f32], p.quad, p.skirt);
                 for f in p.faces {
-                    let c = f.corners().map(|v| place(&v, placement, Some((min, max)), hidden));
+                    let c = f
+                        .corners()
+                        .map(|v| place(&v, placement, Some((min, max)), hidden));
                     for t in QUAD_INDICES.chunks(3) {
                         let t = [c[t[0] as usize], c[t[1] as usize], c[t[2] as usize]];
                         let n = (t[1] - t[0]).cross(t[2] - t[0]);
@@ -3154,12 +3156,19 @@ mod tests {
             }
         }
         println!("{columns} columns, {needed} with the far terrain higher, {skirted} closed by the skirt");
-        for o in open.iter().take(400) {
+        for o in open.iter().take(20) {
             println!("OPEN {o}");
         }
-        assert!(open.is_empty(), "{} columns of the seam are open", open.len());
+        assert!(
+            open.is_empty(),
+            "{} columns of the seam are open",
+            open.len()
+        );
         // Not vacuous: the join had work to do, and the skirt did some of it.
-        assert!(needed > 1_000, "only {needed} columns needed the seam closed");
+        assert!(
+            needed > 1_000,
+            "only {needed} columns needed the seam closed"
+        );
         assert!(skirted > 500, "only {skirted} columns needed the skirt");
     }
 }
