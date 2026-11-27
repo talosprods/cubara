@@ -39,7 +39,7 @@ use std::f32::consts::SQRT_2;
 
 use cubara_voxel::MorphColumns;
 
-use crate::node::{NodeKey, RingSchedule};
+use crate::node::{NodeKey, RingSchedule, NEAR_FIELD_CHUNKS};
 use crate::{TerrainBlocks, WorldSnapshot};
 
 /// Blocks per chunk, as a float.
@@ -59,17 +59,21 @@ pub const MORPH_LEVELS: std::ops::RangeInclusive<u32> = 0..=2;
 pub const MAX_BAND: f32 = 128.0;
 
 /// How far from the eye the finest level's terrain stands exactly on the
-/// block grid: level 0's band never starts nearer, in blocks of the metric.
+/// block grid: level 0's band never starts nearer, in blocks of the metric
+/// -- and, since the metric counts height once out to here
+/// ([`morph_metric`]), in blocks of true distance too, in every direction.
 /// **Chosen, not derived**: near the player a block is tens to hundreds of
 /// pixels tall, so any fraction of one shows -- a band that started at the
 /// eye (as #380's first one did, 0 to 128) moved a vertex at 20 blocks 16%
 /// of the way to its parent's height, and the owner's play test of
 /// 2026-11-25 saw thin slabs on the terraces and slivers at the foot of
 /// walls. The value is the measurement of that day (`docs/PHASE3_ARCHITECTURE.md`
-/// §9.5): the transition study at the 160 m edge, against today's band.
+/// §9.6.1): the transition study at the 160 m edge, against today's band.
+/// It is the selection's near field ([`NEAR_FIELD_CHUNKS`]), in blocks: one
+/// number, so the morph and the selection cannot disagree about it.
 /// [`morph_bands`] keeps it at most three quarters of the way to the band's
 /// end, so a short ring (a weak PC's) still has a band.
-pub const NEAR_EXACT: f32 = 96.0;
+pub const NEAR_EXACT: f32 = CHUNK * NEAR_FIELD_CHUNKS as f32;
 
 /// A level's morph band, in blocks of [`morph_metric`]: its vertices start
 /// moving to their parent's height at `start` and have arrived at `end`.
@@ -128,12 +132,37 @@ pub fn morph_bands(schedule: &RingSchedule, squash: i32) -> [Option<MorphBand>; 
 
 /// The morph metric of a vertex at `rel` (its position minus the eye's, in
 /// blocks): the selection's own distance (`node::node_distance_components`),
-/// continuous -- horizontal distance, or `squash` times the vertical one,
-/// whichever is larger.
+/// continuous -- horizontal distance, or the vertical one as the selection
+/// counts it ([`squashed_height`]), whichever is larger.
+///
+/// **Never more than the true distance inside the near field**: height
+/// counts once out to [`NEAR_EXACT`], so a point fewer than [`NEAR_EXACT`]
+/// blocks from the eye in a straight line has a metric under it, whatever
+/// the direction -- and level 0's band starts there. With height counted
+/// `squash` times all the way to the eye, ground 75 blocks under a peak was
+/// at metric 150 and drawn at its parent's heights (§9.6.2).
 pub fn morph_metric(rel: [f32; 3], squash: i32) -> f32 {
     rel[0]
         .hypot(rel[2])
-        .max(squash.max(1) as f32 * rel[1].abs())
+        .max(squashed_height(rel[1].abs(), squash))
+}
+
+/// A vertical distance of `v` blocks (`>= 0`) as the morph metric counts it:
+/// [`crate::node::squashed_gap`] continued between chunks,
+/// `max(v, squash * (v - 16 * shift))` with [`crate::node::vertical_shift`]'s
+/// `shift` -- `v` itself out to [`NEAR_EXACT`] at the game's squash, twice
+/// as fast beyond. `morph.wgsl`'s `morph_factor` does exactly this, with the
+/// shift in blocks from `MorphParams::shift` ([`vertical_shift_blocks`]).
+pub fn squashed_height(v: f32, squash: i32) -> f32 {
+    let s = squash.max(1) as f32;
+    v.max(s * (v - vertical_shift_blocks(squash)))
+}
+
+/// [`crate::node::vertical_shift`] in blocks: how far every ring's vertical reach
+/// lies further from the eye than a plain squash would put it. What the
+/// renderer is handed with the squash (`MorphParams::shift`).
+pub fn vertical_shift_blocks(squash: i32) -> f32 {
+    CHUNK * crate::node::vertical_shift(squash) as f32
 }
 
 /// How far a vertex at metric `metric` has moved to its parent's height: 0
@@ -1056,6 +1085,85 @@ mod tests {
         );
     }
 
+    /// **Within [`NEAR_EXACT`] blocks in a straight line, the ground is level
+    /// 0 and does not move -- looking down from a peak and up a face too**
+    /// (the acceptance tour of 2026-11-27, §9.6.2). Real nodes of the game's
+    /// selection around two eyes the tour stood at: on the highest peak near
+    /// the origin, and at the foot of the steepest face beside it. Every node
+    /// that comes that near is level 0, and every vertex of it that has a
+    /// morph target and lies that near has factor 0. Guarded by how many of
+    /// those vertices are more than half of [`NEAR_EXACT`] above or below
+    /// the eye -- the ones the squash used to move. Goes red with height
+    /// squashed from the eye: in the selection (a level-1 node 81 blocks
+    /// under the peak) or in the metric (factor 1 at 75 blocks down).
+    #[test]
+    fn level_0_stands_exactly_on_the_grid_within_the_near_field_in_true_distance() {
+        // The acceptance pass asked for 96 blocks: the near field cannot be
+        // set back under it without this failing to build.
+        const _: () = assert!(NEAR_EXACT >= 96.0, "the near field is at least 96 blocks");
+        let registry = registry();
+        let blocks = TerrainBlocks::from_registry(&registry);
+        let world = crate::World::new();
+        let snapshot = world.snapshot();
+        let layer = |_: &str| 0u32;
+        let band = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH)[0].expect("level 0 morphs");
+        let (mut near, mut steep) = (0, 0);
+        for eye in [[-960.5f32, 243.62, -3335.5], [-886.5, 70.62, -3137.5]] {
+            let at = ChunkCoord::from_world_pos(eye);
+            for node in desired_nodes_3d(at, SQUASH, DEFAULT_RING_SCHEDULE) {
+                let o = node.world_origin();
+                let size = CHUNK * node.extent_chunks() as f32;
+                let gap = |k: usize| {
+                    (o[k] as f32 - eye[k])
+                        .max(eye[k] - o[k] as f32 - size)
+                        .max(0.0)
+                };
+                if (gap(0).powi(2) + gap(1).powi(2) + gap(2).powi(2)).sqrt() >= NEAR_EXACT {
+                    continue;
+                }
+                assert_eq!(
+                    node.level, 0,
+                    "{node:?} comes within {NEAR_EXACT} of {eye:?}"
+                );
+                let Some(geometry) =
+                    crate::mesh::mesh_node(&snapshot, &registry, &layer, node, blocks)
+                else {
+                    continue;
+                };
+                for v in &geometry.mesh.vertices {
+                    if v.morph_delta() == 0.0 {
+                        continue;
+                    }
+                    let rel = [
+                        (o[0] + v.x() as i32) as f32 - eye[0],
+                        (o[1] + v.y() as i32) as f32 - eye[1],
+                        (o[2] + v.z() as i32) as f32 - eye[2],
+                    ];
+                    let distance = (rel[0].powi(2) + rel[1].powi(2) + rel[2].powi(2)).sqrt();
+                    if distance >= NEAR_EXACT {
+                        continue;
+                    }
+                    near += 1;
+                    if 2.0 * rel[1].abs() > NEAR_EXACT {
+                        steep += 1;
+                    }
+                    let metric = morph_metric(rel, SQUASH);
+                    assert_eq!(
+                        morph_factor(metric, band),
+                        0.0,
+                        "{node:?} vertex {rel:?}, {distance} blocks from {eye:?}, has metric \
+                         {metric} and moves"
+                    );
+                }
+            }
+        }
+        assert!(
+            near > 10_000 && steep > 1_000,
+            "{near} vertices with a target in the near field, {steep} of them steeply above \
+             or below: the test saw too little"
+        );
+    }
+
     #[test]
     fn a_ring_too_narrow_for_its_nodes_has_no_band() {
         // Every radius halved: the level-1 ring is 4 chunks wide, but a
@@ -1087,11 +1195,83 @@ mod tests {
         assert_eq!(morph_factor(1e9, b), 1.0);
     }
 
+    /// **The morph's metric is the selection's, continued between chunks**:
+    /// at every chunk boundary its vertical part is the selection's
+    /// ([`crate::node::squashed_gap`], times 16), at every squash; inside
+    /// the near field height counts once, beyond it `squash` times as fast.
+    /// Goes red when either side changes its vertical distance alone -- the
+    /// selection would then swap a node where the morph has not finished
+    /// (`every_node_is_fully_morphed_at_the_frame_it_swaps`).
     #[test]
     fn the_metric_is_the_selections_distance() {
         assert_eq!(morph_metric([3.0, 0.0, 4.0], 2), 5.0);
-        assert_eq!(morph_metric([3.0, 10.0, 4.0], 2), 20.0);
         assert_eq!(morph_metric([3.0, -2.0, 4.0], 2), 5.0);
+        // Inside the near field, height counts once...
+        assert_eq!(morph_metric([3.0, 10.0, 4.0], 2), 10.0);
+        assert_eq!(morph_metric([0.0, -NEAR_EXACT, 0.0], 2), NEAR_EXACT);
+        // ...and beyond it twice as fast: 100 blocks down is 96 + 2 * 4.
+        assert_eq!(morph_metric([0.0, -100.0, 0.0], 2), 104.0);
+        assert_eq!(morph_metric([0.0, 200.0, 0.0], 2), 304.0);
+        for squash in 1..=4 {
+            for dy in 0..64 {
+                let v = CHUNK * dy as f32;
+                assert_eq!(
+                    squashed_height(v, squash),
+                    CHUNK * crate::node::squashed_gap(dy, squash) as f32,
+                    "squash {squash}, {dy} chunks"
+                );
+            }
+        }
+    }
+
+    /// **Within [`NEAR_EXACT`] blocks of the eye, in a straight line and in
+    /// any direction, level 0 does not move** (the acceptance tour of
+    /// 2026-11-27: from a peak, ground 75 blocks down and 90 away was drawn
+    /// at level 1's heights, because height counted twice all the way to
+    /// the eye). Every point of the ball, straight down, straight up and
+    /// everything between, has factor 0 in level 0's band at the game's
+    /// schedule and squash; and just outside it, straight down, the band has
+    /// begun. Goes red with the squash applied from the eye (factor 0.75 at
+    /// 60 blocks down).
+    #[test]
+    fn level_0_does_not_move_within_the_near_field_in_true_distance() {
+        let band = morph_bands(DEFAULT_RING_SCHEDULE, SQUASH)[0].expect("level 0 morphs");
+        assert_eq!(band.start, NEAR_EXACT);
+        // A grid over the half-plane of horizontal distance and height,
+        // from straight up to straight down: every point of it inside the
+        // ball (a quarter block apart), in three horizontal directions.
+        let (mut inside, mut steep) = (0, 0);
+        for i in 0..=384 {
+            for j in -384..=384 {
+                let (h, v) = (i as f32 * 0.25, j as f32 * 0.25);
+                let r = h.hypot(v);
+                if r >= NEAR_EXACT {
+                    continue;
+                }
+                inside += 1;
+                if 2.0 * v.abs() > NEAR_EXACT {
+                    steep += 1;
+                }
+                for rel in [[h, v, 0.0], [0.0, v, h], [h * 0.6, v, h * 0.8]] {
+                    let metric = morph_metric(rel, SQUASH);
+                    assert_eq!(
+                        morph_factor(metric, band),
+                        0.0,
+                        "{rel:?}, {r} blocks from the eye, has metric {metric}: inside {band:?}"
+                    );
+                }
+            }
+        }
+        // The guard: the points the squash used to move were checked.
+        assert!(
+            inside > 200_000 && steep > 40_000,
+            "{inside} points, {steep} steep"
+        );
+        let below = morph_metric([0.0, -(NEAR_EXACT + 4.0), 0.0], SQUASH);
+        assert!(
+            morph_factor(below, band) > 0.0,
+            "100 blocks down is in the band"
+        );
     }
 
     /// The least and greatest [`morph_metric`] of any point of `node` from

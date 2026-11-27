@@ -27,7 +27,7 @@ use cubara_render::{
 };
 use cubara_voxel::{BlockId, BlockRegistry, Chunk, ChunkCoord};
 use cubara_world::mesh::{mesh_nodes, mesh_region};
-use cubara_world::node::{desired_nodes, schedule_for_radius};
+use cubara_world::node::{desired_nodes, schedule_for_radius, NodeKey};
 use cubara_world::{TerrainBlocks, World};
 
 /// The real `assets/blocks` registry -- the same one every entry point
@@ -949,6 +949,7 @@ fn the_level_one_ring_morphs_its_heights_on_screen() {
     let params = cubara_render::MorphParams {
         bands: bands.map(|band| band.map(|b| (b.start, b.end))),
         squash: squash as f32,
+        shift: cubara_world::morph::vertical_shift_blocks(squash),
     };
     let shot = |morph| Shot {
         region_radius: 32,
@@ -976,6 +977,318 @@ fn the_level_one_ring_morphs_its_heights_on_screen() {
 /// The least pixels the morph must change in that frame (chosen, not
 /// derived: a quarter of the 82,000 this frame shows, far over backend noise).
 const MORPH_MIN_MOVED_PIXELS: usize = 20_000;
+
+/// The game's vertical squash (`cubara_app::streaming::VERTICAL_LOD_SQUASH`,
+/// which this crate's tests cannot import -- Rule 3).
+const GAME_SQUASH: i32 = 2;
+
+/// The distance morph as the game draws it (`cubara_app::streaming::morph_params`):
+/// its ring schedule's bands, its squash, and the selection's vertical shift.
+fn game_morph() -> cubara_render::MorphParams {
+    let schedule = cubara_world::node::DEFAULT_RING_SCHEDULE;
+    cubara_render::MorphParams {
+        bands: cubara_world::morph::morph_bands(schedule, GAME_SQUASH)
+            .map(|band| band.map(|b| (b.start, b.end))),
+        squash: GAME_SQUASH as f32,
+        shift: cubara_world::morph::vertical_shift_blocks(GAME_SQUASH),
+    }
+}
+
+/// The nodes `schedule` selects around `eye` in three dimensions
+/// (`desired_nodes_3d` at the game's squash, as the game streams them) that
+/// come within `reach` blocks of it in a straight line. What lies further is
+/// left out: the callers ask only about what is nearer.
+fn selection_within(eye: glam::Vec3, schedule: &[(u32, i32)], reach: f32) -> Vec<NodeKey> {
+    let centre = ChunkCoord::from_world_pos(eye.to_array());
+    cubara_world::node::desired_nodes_3d(centre, GAME_SQUASH, schedule)
+        .into_iter()
+        .filter(|n| {
+            let o = n.world_origin();
+            let lo = glam::vec3(o[0] as f32, o[1] as f32, o[2] as f32);
+            let hi = lo + glam::Vec3::splat((16 * n.extent_chunks()) as f32);
+            eye.clamp(lo, hi).distance(eye) <= reach
+        })
+        .collect()
+}
+
+/// `nodes`, meshed by the game's own mesher, as the renderer takes them.
+fn meshed(world: &World, nodes: Vec<NodeKey>) -> Vec<MeshedNode> {
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    mesh_nodes(world, &registry, &layer_of, nodes, real_blocks())
+        .into_iter()
+        .filter_map(to_meshed_node)
+        .collect()
+}
+
+/// [`selection_within`] around `shot`'s eye, rendered with `shot`.
+fn render_selection_within(
+    world: &World,
+    shot: Shot,
+    schedule: &[(u32, i32)],
+    reach: f32,
+) -> Option<Frame> {
+    let (eye, _) = shot.camera.expect("a shot from an eye");
+    let nodes = meshed(world, selection_within(eye.as_vec3(), schedule, reach));
+    let _gpu = gpu_lifecycle::lock();
+    headless::render(nodes, shot)
+}
+
+/// The colour of the sky in `shot`: an empty frame's (one colour all over).
+fn sky_of(shot: Shot) -> Option<[u8; 4]> {
+    let empty = {
+        let _gpu = gpu_lifecycle::lock();
+        headless::render(Vec::new(), shot)?
+    };
+    let sky = *empty.pixels.as_chunks::<4>().0.first()?;
+    assert!(
+        empty.pixels.as_chunks::<4>().0.iter().all(|p| *p == sky),
+        "an empty frame is not one colour, so the sky cannot be told by its colour"
+    );
+    Some(sky)
+}
+
+/// **What a player sees within `NEAR_EXACT` blocks is level 0, exactly, in
+/// every direction** (`docs/PHASE3_ARCHITECTURE.md` §9.6.2): the acceptance
+/// tour of 2026-11-27 found ground 75 blocks under a peak, 90 away, drawn at
+/// level 1's heights -- thin brown slivers and grass slabs -- because the
+/// morph and the selection counted height twice all the way to the eye.
+///
+/// Two eyes the tour stood at -- on the highest peak near the origin,
+/// looking down its slope, and at the foot of the steepest face beside it,
+/// looking up it -- each drawn twice: as the game draws it (its selection,
+/// its morph) and as level 0 alone with no morph, the truth. A knife-edge
+/// fog at the near field's edge turns every pixel whose surface lies further
+/// into the sky's colour in both frames: the renderer's own radial distance,
+/// per pixel, how far its surface is in a straight line -- what the tour's
+/// raycasts measured. What is left to differ is only what is nearer, and
+/// nothing may. Goes red with height squashed from the eye again (the
+/// morph moves that ground, and the selection draws some of it at level 1).
+#[test]
+fn the_near_field_is_level_0_in_every_direction() {
+    // Chosen, not derived: a face whose corner lies just past the band's
+    // start tilts by a sliver short of it -- a top face is a block across,
+    // and every vertex nearer than NEAR_EXACT stands still.
+    const MARGIN: f32 = 2.0;
+    // Chosen, not derived: each eye sees ground nearer than the edge on more
+    // than this share of its frame (measured: the peak 8.9% -- it looks down a
+    // slope that falls away fast -- and the face 83.1%), so a pose that stops
+    // seeing its near field fails rather than passes on nothing.
+    const NEAR_SHARE: f64 = 0.05;
+    let edge = cubara_world::morph::NEAR_EXACT - MARGIN;
+    let lighting = Lighting {
+        fog_start: edge,
+        fog_end: edge + 0.01,
+        ..Lighting::default()
+    };
+    let poses = [
+        (
+            "on the peak, looking down its slope",
+            glam::dvec3(-960.5, 243.62, -3335.5),
+            glam::vec3(0.458, -0.7, 0.889),
+        ),
+        (
+            "at the foot of the face, looking up it",
+            glam::dvec3(-886.5, 70.62, -3137.5),
+            glam::vec3(
+                std::f32::consts::FRAC_1_SQRT_2,
+                0.3,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ),
+        ),
+    ];
+    let world = World::new();
+    let (width, height) = (1280, 832);
+    for (name, eye, look) in poses {
+        let shot = |morph| Shot {
+            width,
+            height,
+            camera: Some((eye, look)),
+            lighting,
+            morph,
+            ..Shot::default()
+        };
+        let Some(sky) = sky_of(shot(None)) else {
+            headless::skip_or_require_gpu("the_near_field_is_level_0_in_every_direction");
+            return;
+        };
+        let reach = edge + 1.0;
+        let schedule = cubara_world::node::DEFAULT_RING_SCHEDULE;
+        let game = render_selection_within(&world, shot(Some(game_morph())), schedule, reach)
+            .expect("the adapter that drew the sky");
+        let truth = render_selection_within(&world, shot(None), &[(0, 8)], reach)
+            .expect("the adapter that drew the sky");
+        let pixels = truth.pixels.as_chunks::<4>().0;
+        let near = pixels.iter().filter(|p| **p != sky).count();
+        let share = near as f64 / pixels.len() as f64;
+        let differing = differing_pixels(&game, &truth);
+        eprintln!(
+            "{name}: ground nearer than {edge} on {:.1}% of the frame, {} pixels differ",
+            100.0 * share,
+            differing.len()
+        );
+        assert!(
+            share > NEAR_SHARE,
+            "{name}: ground nearer than {edge} on only {:.1}% of the frame, so this proves little",
+            100.0 * share
+        );
+        if !differing.is_empty() {
+            let file = |what: &str| {
+                let slug: String = name.split(',').next().unwrap_or(name).replace(' ', "_");
+                golden_dir().join(format!("near_field_{slug}.{what}.actual.png"))
+            };
+            save_png(&file("game"), width, height, &game.pixels);
+            save_png(&file("level0"), width, height, &truth.pixels);
+        }
+        assert!(
+            differing.is_empty(),
+            "{name}: {} pixels nearer than {edge} blocks differ from level 0 ({})",
+            differing.len(),
+            describe(&differing)
+        );
+    }
+}
+
+/// **The morph opens no crack** (`docs/PHASE3_ARCHITECTURE.md` §9.6.2): at
+/// the cliff the acceptance tour of 2026-11-27 stood under, looking east at
+/// a wall about 100 blocks away -- inside level 0's band -- lines of sky one
+/// pixel tall showed along the top edges of blocks, under the wall behind
+/// them. The morph tilts a top face up toward a camera below it, and the
+/// arena dropped every top face of a node the camera stood under
+/// (`morph_may_tilt` in `crates/render/src/arena.rs`). Drawn as the game
+/// draws it, at the tour's own size, twice: by the one-shot path of
+/// `--screenshot` and these goldens, and through the window's own renderer
+/// (`Renderer::offscreen`, what the game's frame goes through). In neither
+/// may a pixel of sky with land directly above and below it be one where
+/// level 0 has ground, by a raycast through the pixel. Goes red with either
+/// path's culling blind to the morph again.
+#[test]
+fn the_morph_opens_no_crack_at_the_cliff() {
+    // Chosen, not derived: the cracks were at 99 to 106 blocks; what lies
+    // past this is left out, and so cannot be told from a hole.
+    const REACH: f32 = 160.0;
+    let eye = glam::dvec3(1752.5, 124.62, -551.5);
+    let look = glam::vec3(1.0, -0.1, 0.0);
+    let (width, height) = (2560, 1664);
+    let shot = Shot {
+        width,
+        height,
+        camera: Some((eye, look)),
+        morph: Some(game_morph()),
+        ..Shot::default()
+    };
+    let Some(sky) = sky_of(shot.clone()) else {
+        headless::skip_or_require_gpu("the_morph_opens_no_crack_at_the_cliff");
+        return;
+    };
+    let world = World::new();
+    let schedule = cubara_world::node::DEFAULT_RING_SCHEDULE;
+    let nodes = selection_within(eye.as_vec3(), schedule, REACH);
+    let one_shot = {
+        let meshed = meshed(&world, nodes.clone());
+        let _gpu = gpu_lifecycle::lock();
+        headless::render(meshed, shot).expect("the adapter that drew the sky")
+    };
+    let window = {
+        let meshed = meshed(&world, nodes);
+        let (vertices, indices) = meshed.iter().fold((0u64, 0u64), |(v, i), n| {
+            (
+                v + n.mesh.vertices.len() as u64,
+                i + n.mesh.indices.len() as u64,
+            )
+        });
+        let camera = cubara_render::CameraPose {
+            eye,
+            look_dir: look,
+        };
+        let _gpu = gpu_lifecycle::lock();
+        let capacity = cubara_render::ArenaCapacity::new(2 * vertices, 2 * indices);
+        let (mut renderer, _) = cubara_render::Renderer::offscreen(width, height, camera, capacity)
+            .expect("the adapter that drew the sky");
+        renderer.set_morph(game_morph());
+        renderer.apply_node_updates([], meshed);
+        let hud = || cubara_render::Hud {
+            hotbar: None,
+            panel: None,
+            health: None,
+            crosshair: false,
+            menu: None,
+        };
+        // Every node up before the frame that is looked at.
+        for _ in 0..1_000 {
+            renderer.render(camera, None, None, &[], hud(), 0.0);
+            if renderer.uploads_pending() == 0 {
+                break;
+            }
+        }
+        assert_eq!(renderer.uploads_pending(), 0, "the nodes never all went up");
+        renderer.render(camera, None, None, &[], hud(), 0.0);
+        renderer
+            .read_frame()
+            .expect("an offscreen renderer reads its frame back")
+    };
+    let to_world = cubara_render::CameraUniform::look_view_proj(
+        width as f32 / height as f32,
+        eye.as_vec3(),
+        look,
+    )
+    .inverse();
+    let blocks = real_blocks();
+    let (w, h) = (width as usize, height as usize);
+    for (path, frame) in [("one-shot", &one_shot), ("window", &window)] {
+        let px = |x: usize, y: usize| &frame.pixels[(y * w + x) * 4..][..4];
+        let land = frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p != sky)
+            .count();
+        assert!(land > w * h / 3, "{path}: land on only {land} pixels");
+        let (mut enclosed, mut cracks) = (0, Vec::new());
+        for y in 1..h - 1 {
+            for x in 0..w {
+                if px(x, y) != sky || px(x, y - 1) == sky || px(x, y + 1) == sky {
+                    continue;
+                }
+                enclosed += 1;
+                // The pixel's ray, by the renderer's own projection.
+                let ndc = glam::vec2(
+                    (x as f32 + 0.5) / width as f32 * 2.0 - 1.0,
+                    1.0 - (y as f32 + 0.5) / height as f32 * 2.0,
+                );
+                let near = to_world.project_point3(ndc.extend(1.0));
+                let far = to_world.project_point3(ndc.extend(0.5));
+                let dir = (far - near).normalize();
+                if world
+                    .raycast(eye.as_vec3().to_array(), dir.to_array(), REACH, blocks)
+                    .is_some()
+                {
+                    cracks.push((x, y));
+                }
+            }
+        }
+        eprintln!(
+            "{path}: {enclosed} pixels of sky between land above and below, {} on ground",
+            cracks.len()
+        );
+        if !cracks.is_empty() {
+            let mut marked = frame.pixels.clone();
+            for &(x, y) in &cracks {
+                marked[(y * w + x) * 4..][..4].copy_from_slice(&[255, 0, 255, 255]);
+            }
+            let file = golden_dir().join(format!("cliff_cracks_{path}.actual.png"));
+            save_png(&file, width, height, &marked);
+        }
+        assert!(
+            cracks.is_empty(),
+            "{path}: {} pixels of sky where level 0 has ground, e.g. {:?}",
+            cracks.len(),
+            &cracks[..cracks.len().min(12)]
+        );
+    }
+}
 
 /// The least share of the frame turning a ring's trees on must change for
 /// them to count as drawn ([`trees_continue_past_the_first_ring`],
@@ -3688,7 +4001,6 @@ fn render_mountain(
     morph: Option<cubara_render::MorphParams>,
     colour: bool,
 ) -> Option<Frame> {
-    use cubara_world::node::NodeKey;
     let world = World::new();
     let registry = real_registry();
     let blocks = TerrainBlocks::from_registry(&registry);
@@ -3756,6 +4068,7 @@ fn a_fully_morphed_level_draws_its_parents_colours() {
         let full = cubara_render::MorphParams {
             bands: std::array::from_fn(|l| (l == level as usize).then_some((-2.0, -1.0))),
             squash: 2.0,
+            shift: 0.0,
         };
         let Some(parent) = render_mountain(level + 1, None, true) else {
             headless::skip_or_require_gpu("a_fully_morphed_level_draws_its_parents_colours");
@@ -3886,7 +4199,6 @@ fn render_forest(
     morph: Option<cubara_render::MorphParams>,
     trees: bool,
 ) -> Option<Frame> {
-    use cubara_world::node::NodeKey;
     let world = World::new();
     let registry = real_registry();
     let blocks = if trees {
@@ -3999,6 +4311,7 @@ fn a_forest_swaps_nothing_at_its_ring_edges() {
     let full = |level: usize| cubara_render::MorphParams {
         bands: std::array::from_fn(|l| (l == level).then_some((-2.0, -1.0))),
         squash: 2.0,
+        shift: 0.0,
     };
     for near in 0..=2u32 {
         let morph = Some(full(near as usize));

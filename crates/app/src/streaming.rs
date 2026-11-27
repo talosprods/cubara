@@ -34,7 +34,13 @@ use crate::far_streaming::{hole_in_blocks, VoxelBox};
 /// RTX 4060; `BENCHMARKS.md`): at the surface 5,603 FPS with `2` against 6,293
 /// with `4`, deep underground 5,096 against 6,985. `4` is faster, but caves
 /// exist only at full detail and it keeps that only 40 blocks up and down, so
-/// the bottom of a shaft you look into turns to solid rock. `2` keeps 80.
+/// the bottom of a shaft you look into turns to solid rock. `2` kept 80.
+///
+/// **Only beyond the near field** (`cubara_world::node::squashed_gap`, 2026-11-27):
+/// height counts once out to 96 blocks, so level 0 is a ball around the eye
+/// there -- standing on a peak, the ground 75 blocks down is level 0 too -- and
+/// every ring reaches 48 blocks further up and down than this squash alone
+/// would put it: level 0 now 128 blocks (`docs/PHASE3_ARCHITECTURE.md` §9.6.2).
 pub(crate) const VERTICAL_LOD_SQUASH: i32 = 2;
 
 /// The distance morph's bands for the game's ring schedule and squash
@@ -53,6 +59,7 @@ pub(crate) fn morph_params_for(
         bands: cubara_world::morph::morph_bands(schedule, squash)
             .map(|band| band.map(|b| (b.start, b.end))),
         squash: squash as f32,
+        shift: cubara_world::morph::vertical_shift_blocks(squash),
     }
 }
 

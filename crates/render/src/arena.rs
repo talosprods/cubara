@@ -279,6 +279,59 @@ struct NodeSlot {
 /// matrix (`Frustum::eye`), good to about a thousandth of a block.
 const FACING_MARGIN: f32 = 0.05;
 
+/// Whether the distance morph may tilt a top face of a node bounded by
+/// `aabb` this frame, with its level's morph `band` (`(start, end)` in
+/// blocks of the metric; `None`: the level does not morph) measured from
+/// `eye` (both relative to the same anchor).
+///
+/// **[`faces_facing`] assumes a face lies in its axis plane, and a morphing
+/// top face does not.** Its corners move up by `delta * factor`, each at its
+/// own factor, so where the factor changes across it -- inside the band --
+/// it tilts: up away from the eye where it rises, by `delta / (end - start)`
+/// a block, and seen from 100 blocks away a face tilted that much faces a
+/// camera standing several blocks below it. The box test called the camera
+/// under the node and dropped every top face: what showed there was the
+/// riser behind, starting at the morphed top, with a line of sky between
+/// (the 1-pixel cracks along block edges the acceptance tour found at the
+/// cliff, 2026-11-27, `docs/PHASE3_ARCHITECTURE.md` §9.6.2).
+///
+/// A face tilts only if its corners' factors differ, which needs one of its
+/// corners strictly inside the band by horizontal distance: the factor of a
+/// corner is that of `max(horizontal, vertical)`, the vertical part is the
+/// same at every corner of a top face, and a factor that is 0 or 1 at every
+/// corner is the same at all four. So the test is the horizontal distances
+/// of the box against the band -- conservative, and no second copy of the
+/// metric's vertical rule (`cubara_world::morph::morph_metric`). Walls stay
+/// in their planes (their corners move only up and down them) and the morph
+/// moves no bottom face, so only the top faces need it.
+pub fn morph_may_tilt(aabb: &Aabb, band: Option<(f32, f32)>, eye: glam::Vec3) -> bool {
+    let Some((start, end)) = band else {
+        return false;
+    };
+    let (lo, hi) = (aabb.min, aabb.max);
+    let near = |e: f32, l: f32, h: f32| (l - e).max(e - h).max(0.0);
+    let far = |e: f32, l: f32, h: f32| (e - l).abs().max((e - h).abs());
+    let nearest = near(eye.x, lo.x, hi.x).hypot(near(eye.z, lo.z, hi.z));
+    let farthest = far(eye.x, lo.x, hi.x).hypot(far(eye.z, lo.z, hi.z));
+    nearest < end && farthest > start
+}
+
+/// [`faces_facing`] for a node the distance morph may move: its level's
+/// `morph` band and the eye that band is measured from. A top face the
+/// morph may tilt ([`morph_may_tilt`]) is drawn whatever the box says; the
+/// GPU's back-face culling still drops it where it faces away.
+pub fn faces_facing_morphed(
+    aabb: &Aabb,
+    eye: glam::Vec3,
+    (band, morph_eye): (Option<(f32, f32)>, glam::Vec3),
+) -> [bool; 6] {
+    let mut facing = faces_facing(aabb, eye);
+    if morph_may_tilt(aabb, band, morph_eye) {
+        facing[cubara_voxel::Face::PosY as usize] = true;
+    }
+    facing
+}
+
 /// Which face directions of a node bounded by `aabb` can face a camera at
 /// `eye`, in [`Face`](cubara_voxel::Face) order.
 ///
@@ -465,6 +518,10 @@ pub struct ChunkArena {
     /// #434's "an overflow is counted, not just logged".
     refused: u64,
     refused_nodes: std::collections::BTreeSet<NodeId>,
+    /// Each level's morph band and the eye its metric is measured from
+    /// (anchor-relative), for [`morph_may_tilt`] in [`prepare`](Self::prepare):
+    /// set every frame with the camera ([`set_morph`](Self::set_morph)).
+    morph: [(Option<(f32, f32)>, glam::Vec3); 4],
 }
 
 impl ChunkArena {
@@ -549,6 +606,17 @@ impl ChunkArena {
             warned_full: false,
             refused: 0,
             refused_nodes: std::collections::BTreeSet::new(),
+            morph: [(None, glam::Vec3::ZERO); 4],
+        }
+    }
+
+    /// The distance morph [`prepare`](Self::prepare) culls for: each level's
+    /// band (`params`) and the eye it is measured from (`eyes`, relative to
+    /// this arena's anchor) -- what the frame draws with, so a top face the
+    /// morph tilts toward the camera is not culled ([`morph_may_tilt`]).
+    pub fn set_morph(&mut self, params: &crate::render::MorphParams, eyes: [glam::Vec3; 4]) {
+        for (level, slot) in self.morph.iter_mut().enumerate() {
+            *slot = (params.bands[level], eyes[level]);
         }
     }
 
@@ -873,7 +941,7 @@ impl ChunkArena {
         // derived `Ord`, so it is pinned by
         // `node_ids_sort_by_level_first_so_truncation_drops_the_coarsest` rather
         // than by this comment.
-        'nodes: for slot in self.slots.values() {
+        'nodes: for (id, slot) in &self.slots {
             if !frustum.intersects_aabb(&slot.aabb) {
                 continue;
             }
@@ -898,7 +966,8 @@ impl ChunkArena {
                 self.visible_triangles += slot.index_count as u64 / 3;
                 continue;
             };
-            let facing = faces_facing(&slot.aabb, eye);
+            let morph = self.morph[(id.level as usize).min(3)];
+            let facing = faces_facing_morphed(&slot.aabb, eye, morph);
             facing_runs(slot.first_index, counts, facing, |first, n| {
                 self.visible.push(draw(first, n));
                 self.visible_triangles += n as u64 / 3;
@@ -1328,6 +1397,79 @@ mod tests {
             }
         }
         assert!(left_out > 0, "nothing was ever left out");
+    }
+
+    /// **A top face the distance morph tilts toward the camera is drawn**
+    /// (the cracks of `docs/PHASE3_ARCHITECTURE.md` §9.6.2). Its corners rise
+    /// by `delta * factor`, each at its own factor, so inside the band it
+    /// leans up away from the eye and can face a camera standing below its
+    /// node's box -- the cliff of the acceptance tour, a wall 100 blocks off
+    /// and 4.4 above the eye. Faces one block across, from before the band
+    /// to past it, each moved as `mesh.wgsl` moves it (by the horizontal
+    /// metric, which is the larger here): wherever one faces the eye, its
+    /// direction is drawn. And the band is what keeps it -- nodes before and
+    /// past the band, and a level that does not morph, are culled from below
+    /// as before. Goes red with the box test alone, or a band test that
+    /// misses the faces it tilts.
+    #[test]
+    fn a_top_face_the_morph_tilts_toward_the_camera_is_drawn() {
+        let band = (96.0f32, 128.0f32);
+        let eye = glam::vec3(0.5, 124.62, 0.5);
+        let factor = |p: glam::Vec3| {
+            let d = p - eye;
+            let h = d.x.hypot(d.z);
+            ((h - band.0) / (band.1 - band.0)).clamp(0.0, 1.0)
+        };
+        let up = cubara_voxel::Face::PosY as usize;
+        let mut leaning_toward = 0;
+        for i in 0..80 {
+            let x = 80.0 + i as f32 * 0.75;
+            for delta in [1.0f32, 3.0, 8.0] {
+                let built = [
+                    glam::vec3(x, 129.0, 3.0),
+                    glam::vec3(x + 1.0, 129.0, 3.0),
+                    glam::vec3(x + 1.0, 129.0, 4.0),
+                    glam::vec3(x, 129.0, 4.0),
+                ];
+                let moved = built.map(|c| c + glam::Vec3::Y * delta * factor(c));
+                // Either triangle of the quad facing the eye shows it.
+                let faces_eye = [(0, 1, 3), (1, 2, 3)].iter().any(|&(a, b, c)| {
+                    let normal = (moved[c] - moved[a]).cross(moved[b] - moved[a]);
+                    normal.y > 0.0 && (eye - moved[a]).dot(normal) > 0.0
+                });
+                // The node's box holds where its vertices are and go (`mesh_aabb`).
+                let aabb = Aabb::new(
+                    glam::vec3(x, 129.0, 3.0),
+                    glam::vec3(x + 1.0, 129.0 + delta, 4.0),
+                );
+                assert!(!faces_facing(&aabb, eye)[up], "the box alone culls it");
+                if faces_eye {
+                    leaning_toward += 1;
+                    assert!(
+                        faces_facing_morphed(&aabb, eye, (Some(band), eye))[up],
+                        "a face at {x} moved by {delta} faces the eye but is culled"
+                    );
+                }
+            }
+        }
+        assert!(
+            leaning_toward > 20,
+            "only {leaning_toward} faces leaned toward the eye"
+        );
+        // Culling from below still works where the morph tilts nothing.
+        for (lo, hi) in [(40.0, 56.0), (140.0, 156.0)] {
+            let node = Aabb::new(glam::vec3(lo, 129.0, 0.0), glam::vec3(hi, 145.0, 16.0));
+            assert!(
+                !faces_facing_morphed(&node, eye, (Some(band), eye))[up],
+                "{lo}..{hi}"
+            );
+        }
+        let in_band = Aabb::new(
+            glam::vec3(100.0, 129.0, 0.0),
+            glam::vec3(116.0, 145.0, 16.0),
+        );
+        assert!(faces_facing_morphed(&in_band, eye, (Some(band), eye))[up]);
+        assert!(!faces_facing_morphed(&in_band, eye, (None, eye))[up]);
     }
 
     /// From each of the eight corners outside a node, its faces that can show
