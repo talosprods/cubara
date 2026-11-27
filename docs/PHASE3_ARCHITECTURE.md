@@ -2510,6 +2510,15 @@ overshot on the far terrain as it is -- stepped every block or two at quads
 of 32 and 64, its walls most of what a low eye sees -- where most trees
 stand on tops hidden behind the next wall.
 
+**How far out it shows.** The tint is the far tops' everywhere past the
+fade, out to the far terrain's edge, and it grows as the line of sight
+flattens. Worked out by the same formula (not measured on screen), with
+the crossed boxes' areas: from the gate's hill eye, a top 2.2 km off shows
+4.5% tree colour, 5 km off 8%, 20 km off 27% under 53% haze, 60 km off two
+thirds under 90% haze; from a low flight 60 blocks over the ground, 15% at
+10 km; from 660 blocks up, 3% at 2.2 km. So near the horizon the tops are
+mostly the trees' colour, and the haze is most of what is seen there.
+
 Measured (`a_fading_wood_keeps_its_colour`): wooded land 2.2 km off,
 the middle 600 x 30 pixels of 1920 x 1080 all land, drawn with every tree
 whole and no tint against no tree and all tint; the largest channel of the
