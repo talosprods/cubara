@@ -1553,6 +1553,11 @@ changes pay for it, none of them specific to the near field:
   mesh -- the same mesh, byte for byte
   (`a_node_the_ground_does_not_reach_into_has_nothing_to_morph`). A rock
   node's job: 2.7 to 1.8 ms on the low flight, 8.0 to 5.2 toward the peak.
+  The trees of its footprint still ride the morph (`morph::tree_columns`):
+  such a node draws them when a cave gives it faces, and left without the
+  columns they stayed put while the ground's copy moved -- 7.2% of the
+  trees' pixels changed at the 288 m swap (`a_forest_swaps_nothing_at_its_ring_edges`
+  caught it).
 - **The pool is asked for what a swap waits for first, one swap after
   another** (`streaming::request_order`): what replaces a drawn node and the
   bare nodes beside a held one, grouped by the swap they finish, the nearest
@@ -1569,15 +1574,15 @@ p50/p90/p99/max; main `f9a83f1`):
 
 | flight | main | this section's first version | now |
 |---|---|---|---|
-| low | 53/110/165/204 | 58/109/180/225 | 45/75/117/130 |
-| toward the peak | 54/64/102/166 | 63/86/142/205 | 49/70/117/144 |
-| down | 55/73/474/699 | 64/90/292/717 | 49/77/205/572 |
+| low | 53/110/165/204 | 58/109/180/225 | 45/75/119/130 |
+| toward the peak | 54/64/102/166 | 63/86/142/205 | 49/70/118/145 |
+| down | 55/73/474/699 | 64/90/292/717 | 49/77/206/583 |
 
 The model leaves out the frames between a search and its answer and
 between a mesh and its upload, so its numbers are lower than the bench's;
 its ratio for the first version toward the peak (p99 1.39 times main's) is
 the bench's (1.47) within the noise of two runs. What is left is toward the
-peak, p90 and p99 6 and 15 ms over main's: the swaps the taller rings make
+peak, p90 and p99 6 and 16 ms over main's: the swaps the taller rings make
 on a mountain. Not modelled: the main thread's frame time (the low flight's
 worst frames), which the bench measures.
 

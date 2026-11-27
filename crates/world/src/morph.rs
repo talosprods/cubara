@@ -204,9 +204,25 @@ pub fn node_columns(
     columns_for(world, node, blocks, true)
 }
 
+/// Every column's top and where it goes at full morph, as [`node_columns`]
+/// has them, **for a node the ground does not reach into as well**: what a
+/// tree standing on a column of the node's footprint rides
+/// (`crate::mesh::node_trees`), whichever node of the column draws it. Spared
+/// by [`node_columns`] because the morph keys nothing in its mesh, such a
+/// node -- rock under the ground with a cave's faces in it -- still draws the
+/// trees of its footprint, and they must move as the ground under them
+/// does.
+pub fn tree_columns(
+    world: &WorldSnapshot,
+    node: NodeKey,
+    blocks: TerrainBlocks,
+) -> Option<MorphColumns> {
+    columns_for(world, node, blocks, false)
+}
+
 /// [`node_columns`], and with `spare_untouched` false the columns of a node
-/// the ground does not reach into as well -- what the test of that rule
-/// checks it against.
+/// the ground does not reach into as well ([`tree_columns`], and what the
+/// test of that rule checks it against).
 fn columns_for(
     world: &WorldSnapshot,
     node: NodeKey,
