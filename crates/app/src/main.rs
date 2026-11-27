@@ -15,6 +15,7 @@
 //! takes no damage, and has unlimited blocks (owner's calls, 2026-09-18 and
 //! 2026-11-09).
 
+mod arena_capacity;
 mod bench;
 mod caps;
 mod capture;
@@ -584,6 +585,7 @@ impl ApplicationHandler for App {
             // exactly what it drew before (issue #425: bench behaviour is
             // out of scope).
             window_use == present::WindowUse::Play,
+            arena_capacity::game_capacity(),
         );
         if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
             log::warn!("--present {m:?} is not offered here");

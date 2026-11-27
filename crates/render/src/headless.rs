@@ -326,7 +326,8 @@ pub fn render_chunks(chunks: &[(ChunkCoord, Chunk)], shot: Shot) -> Option<Frame
         (&[], None, crate::far::FarCulling::default()),
         Vec::new(),
         |device, queue, multi_draw, anchor, ctx| {
-            let mut arena = ChunkArena::new(device, multi_draw, anchor);
+            let mut arena =
+                ChunkArena::new(device, multi_draw, anchor, crate::ArenaCapacity::FLOOR);
             for (coord, chunk) in chunks {
                 let id = NodeId {
                     level: 0,

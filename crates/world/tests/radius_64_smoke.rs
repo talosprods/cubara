@@ -81,8 +81,12 @@ fn zero_layer(_: &str) -> u32 {
 /// workload shape this should have been measuring all along.
 const TIME_BUDGET: Duration = Duration::from_secs(300);
 
-/// Mirrors `cubara_render::arena::{VERTEX_CAPACITY, INDEX_CAPACITY}`. If those
-/// change, check whether this bound should move too.
+/// What this scan's meshes are held under: the size the render arena had as
+/// a constant before issue #434, which now computes its capacity from the
+/// selection (`arena_capacity` in the `cubara` crate, whose own test holds
+/// that to the meshes). Kept as this test's own bound on a radius-64 load of
+/// plain chunks, so a mesh that grows past what the arena was ever sized for
+/// still fails here.
 const VERTEX_CAPACITY: u64 = 8_000_000;
 const INDEX_CAPACITY: u64 = 12_000_000;
 
