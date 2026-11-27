@@ -133,7 +133,7 @@ mod tests {
     /// hand-over at the ring edge move no tree.
     #[test]
     fn a_far_tree_at_quads_of_8_stands_where_level_3_stands_it() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         let blocks = oak_blocks();
         let mut compared = 0;
         for key in some_keys(3) {
@@ -169,7 +169,7 @@ mod tests {
     /// tree there ([`WorldGen::tree_site`]): its own column and height.
     #[test]
     fn a_far_tree_stands_on_its_quads_top() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         let blocks = oak_blocks();
         for level in [4, 5, 6] {
             for key in some_keys(level).into_iter().take(4) {
@@ -204,7 +204,7 @@ mod tests {
     /// ground under them is the coarser quad's.
     #[test]
     fn a_patch_holds_the_trees_of_its_children() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         for key in some_keys(5).into_iter().take(3) {
             let site = |t: &FarTree| (t.x, t.z, t.height);
             let mut parent: Vec<_> = generate_with(&gen, key, with_trees(8))
@@ -228,7 +228,7 @@ mod tests {
     /// without the oak carries none at any level -- nor any wooded share.
     #[test]
     fn trees_are_carried_where_asked_for() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         let key = PatchKey::new(5, 0, 0);
         assert!(!generate_with(&gen, key, with_trees(5)).trees.is_empty());
         let coarse = generate_with(&gen, key, with_trees(4));
@@ -263,7 +263,7 @@ mod tests {
     /// At quads of 8, every column.
     #[test]
     fn a_quads_share_is_the_columns_a_tree_may_grow_on() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         let (mut pits, mut quads) = (0, 0);
         // A mountain's flank, where caves open pits (the seed's nearest
         // range is within 600 blocks of the origin), and flat land.
@@ -312,7 +312,7 @@ mod tests {
     /// spread is about 1.5% at a few thousand trees a height).
     #[test]
     fn the_density_is_what_the_world_grows() {
-        let gen = WorldGen::new(0x5EED_0000_C0FF_EE);
+        let gen = WorldGen::new(crate::World::new().seed());
         let blocks = oak_blocks();
         let per_height = density(blocks);
         assert_eq!(per_height.len(), 3);
