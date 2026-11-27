@@ -1254,14 +1254,17 @@ mod tests {
                             own[0]
                         );
                         for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                            if let Some([s_bot, s_top, _, _]) = riser_map(own, full.at(x + dx, z + dz))
+                            if let Some([s_bot, s_top, _, _]) =
+                                riser_map(own, full.at(x + dx, z + dz))
                             {
                                 // The mesher keys rows `s_bot..s_top`, lays a
                                 // growing riser's foot on `s_bot` and a riser
                                 // with no rows on row `s_top`: none of them
                                 // the node's.
                                 assert!(
-                                    s_top <= 0 || s_bot > height || (s_bot == height && s_top > height),
+                                    s_top <= 0
+                                        || s_bot > height
+                                        || (s_bot == height && s_top > height),
                                     "{node:?} spared, but the riser of ({x},{z}) toward \
                                      ({},{}) has rows {s_bot}..{s_top} of its {height}",
                                     x + dx,

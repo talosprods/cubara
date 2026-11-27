@@ -1236,8 +1236,18 @@ mod tests {
         };
         let quantiles = |mut v: Vec<f64>| -> String {
             v.sort_by(f64::total_cmp);
-            let q = |p: f64| v.get(((v.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(0.0);
-            format!("p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms", q(0.5), q(0.9), q(0.99), q(1.0))
+            let q = |p: f64| {
+                v.get(((v.len() as f64 - 1.0) * p).round() as usize)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            format!(
+                "p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms",
+                q(0.5),
+                q(0.9),
+                q(0.99),
+                q(1.0)
+            )
         };
         for (name, start, look, seconds) in flights {
             let flight = Flight {
@@ -1263,10 +1273,13 @@ mod tests {
             // does it; `count` false for the spawn's.
             let mut round = |center: ChunkCoord, count: bool| -> usize {
                 let began = Instant::now();
-                let desired: HashSet<NodeKey> =
-                    node::desired_nodes_3d(center, VERTICAL_LOD_SQUASH, node::DEFAULT_RING_SCHEDULE)
-                        .into_iter()
-                        .collect();
+                let desired: HashSet<NodeKey> = node::desired_nodes_3d(
+                    center,
+                    VERTICAL_LOD_SQUASH,
+                    node::DEFAULT_RING_SCHEDULE,
+                )
+                .into_iter()
+                .collect();
                 let selected = began.elapsed().as_secs_f64() * 1000.0;
                 let sight = visibility::search(center, &desired, |n| links.get(&n).copied());
                 let searched = began.elapsed().as_secs_f64() * 1000.0;
@@ -1274,16 +1287,26 @@ mod tests {
                 let visible = sight.nodes;
                 // Drawn nodes no longer visible: held while something
                 // replaces them, gone at once otherwise.
-                let stale: Vec<NodeKey> =
-                    resident.iter().copied().filter(|n| !visible.contains(n)).collect();
+                let stale: Vec<NodeKey> = resident
+                    .iter()
+                    .copied()
+                    .filter(|n| !visible.contains(n))
+                    .collect();
                 let held: HashSet<NodeKey> = stale
                     .iter()
                     .copied()
-                    .filter(|&n| replacements_of(n, &visible).iter().any(|r| !resident.contains(r)))
+                    .filter(|&n| {
+                        replacements_of(n, &visible)
+                            .iter()
+                            .any(|r| !resident.contains(r))
+                    })
                     .collect();
                 resident.retain(|n| visible.contains(n) || held.contains(n));
-                let to_load: Vec<NodeKey> =
-                    visible.iter().copied().filter(|n| !resident.contains(n)).collect();
+                let to_load: Vec<NodeKey> = visible
+                    .iter()
+                    .copied()
+                    .filter(|n| !resident.contains(n))
+                    .collect();
                 let asked = request_order(to_load.clone(), &resident, &held, center);
                 // What each held node waits for: what replaces it, and the
                 // bare nodes beside it (`can_unload`).
@@ -1333,7 +1356,9 @@ mod tests {
                     searches += 1;
                     search_ms.push(searched);
                     select_ms.push(selected);
-                    for (order, lags) in [(&asked, &mut swaps_asked), (&nearest, &mut swaps_nearest)] {
+                    for (order, lags) in
+                        [(&asked, &mut swaps_asked), (&nearest, &mut swaps_nearest)]
+                    {
                         let done = finish(order, &cost);
                         for waits in &swaps {
                             let last = waits.iter().map(|n| done[n]).fold(0.0, f64::max);
@@ -2036,39 +2061,52 @@ mod tests {
     #[test]
     fn what_a_swap_waits_for_is_asked_for_first() {
         let center = ChunkCoord::new(0, 0, 0);
-        // A level-1 node splitting: its children replace it.
-        let split = NodeKey::new(1, [5, 0, 0]);
+        // Two level-1 nodes splitting, as far from the eye as each other:
+        // their children replace them, and by distance alone they interleave.
+        let split_a = NodeKey::new(1, [5, 0, 0]);
+        let split_b = NodeKey::new(1, [0, 0, 5]);
         // Children of a level-1 node merging into it: it replaces them.
         let merged = NodeKey::new(1, [-6, 0, 0]);
         let merging_child = merged.children()[0];
         // A level-0 node held until the bare node beside it arrives.
         let held_node = NodeKey::new(0, [0, 0, 8]);
-        let beside_held = NodeKey::new(0, [0, 0, 9]);
+        let beside_held = NodeKey::new(0, [-1, 0, 8]);
         // Ground and air only now seen, nearer than all of the above.
         let frontier = [NodeKey::new(0, [1, 1, 0]), NodeKey::new(0, [0, -2, 1])];
-        let resident: HashSet<NodeKey> = [split, merging_child, held_node].into_iter().collect();
+        let resident: HashSet<NodeKey> = [split_a, split_b, merging_child, held_node]
+            .into_iter()
+            .collect();
         let held: HashSet<NodeKey> = [held_node].into_iter().collect();
-        let children = split.children();
-        let mut to_load: Vec<NodeKey> = children.clone();
+        let (children_a, children_b) = (split_a.children(), split_b.children());
+        let mut to_load: Vec<NodeKey> = children_a.iter().chain(&children_b).copied().collect();
         to_load.extend([merged, beside_held]);
         to_load.extend(frontier);
         let order = request_order(to_load.clone(), &resident, &held, center);
         assert_eq!(order.len(), to_load.len());
         let set: HashSet<NodeKey> = order.iter().copied().collect();
         assert_eq!(set.len(), order.len(), "a node asked for twice");
-        let urgent = children.len() + 2;
-        let (first, rest) = order.split_at(urgent);
-        for n in children.iter().chain([&merged, &beside_held]) {
-            assert!(first.contains(n), "{n:?} waits behind the frontier: {order:?}");
-        }
-        assert!(frontier.iter().all(|n| rest.contains(n)), "{order:?}");
         // One swap after another, the nearest swap first: the held node's
-        // neighbour (8 chunks out), then the split parent's eight children
-        // together, then the merge (11-12 chunks out).
-        assert_eq!(first[0], beside_held);
-        assert!(first[1..=children.len()].iter().all(|n| children.contains(n)), "{first:?}");
-        assert_eq!(first[children.len() + 1], merged);
+        // bare neighbour (its swap 8 chunks out), then each splitting node's
+        // eight children together (11 chunks out; the tie goes by key), then
+        // the merge (12 chunks out); then the frontier.
+        let swap = |range: std::ops::Range<usize>| -> HashSet<NodeKey> {
+            order[range].iter().copied().collect()
+        };
+        assert_eq!(order[0], beside_held, "{order:?}");
+        assert_eq!(
+            swap(1..9),
+            children_b.iter().copied().collect(),
+            "{order:?}"
+        );
+        assert_eq!(
+            swap(9..17),
+            children_a.iter().copied().collect(),
+            "{order:?}"
+        );
+        assert_eq!(order[17], merged, "{order:?}");
         // The rest nearest first.
+        let rest = &order[18..];
+        assert!(frontier.iter().all(|n| rest.contains(n)), "{order:?}");
         let mut nearest = rest.to_vec();
         node::sort_nearest_first(&mut nearest, center);
         assert_eq!(rest, &nearest[..]);

@@ -1531,6 +1531,56 @@ eyes, 6,290 more at the ground eye (0.4%), and the most where the camera
 stands low among slopes inside a band -- 37,520 at the cliff (3.7%), 85,234
 at the foot of the face (5.7%).
 
+**What the near field costs the streaming, and what pays for it.** The
+quiet M3 bench of this section's first version (main against it, two runs
+each) found the gate within noise but the streaming slower: toward the peak
+the swap lag's p99 224 and 223 ms against main's 152 and 152, the low
+flight's worst frame 18.1 and 20.7 ms against 10.7 and 11.2, and in one of
+two low flights a hole of a pixel under a late swap (FLICKER 2; main 0).
+Replayed without a GPU (`streaming::tests::streaming_work_report`: the
+flights' eye at 60 frames a second, the game's selection and search, every
+node a search asks for built by the pool's own job and timed, each batch run
+through a modelled pool of 7 workers), the bigger rings asked for 28% more
+jobs on the low flight and 36% more toward the peak -- level 0 and 1 ground
+under the flight (the near field itself), rock reached through deeper caves,
+air -- for 54% more job time there, and every search took 15% longer. Three
+changes pay for it, none of them specific to the near field:
+
+- **A node the ground does not reach into skips the morph**
+  (`morph::node_columns`): with every column's top under its rows, or every
+  top and floor over them, the mesher would key nothing in it, so it is
+  built without the morph's purity checks and its parent's generation and
+  mesh -- the same mesh, byte for byte
+  (`a_node_the_ground_does_not_reach_into_has_nothing_to_morph`). A rock
+  node's job: 2.7 to 1.8 ms on the low flight, 8.0 to 5.2 toward the peak.
+- **The pool is asked for what a swap waits for first, one swap after
+  another** (`streaming::request_order`): what replaces a drawn node and the
+  bare nodes beside a held one, grouped by the swap they finish, the nearest
+  swap first; then the rest nearest first. By distance alone a swap waited
+  behind the air, rock and new ground a search also asked for, much of it
+  nearer than the ring edges where the swaps are, and its eight children
+  were spread over the batch.
+- **The visibility search answers its neighbours in place**
+  (`visibility::Index::neighbours`, no allocation per step): a search is 24%
+  faster, 43 ms toward the peak where main's takes 49.
+
+Modelled lag of every swap that waits for a job (search plus jobs; ms,
+p50/p90/p99/max; main `f9a83f1`):
+
+| flight | main | this section's first version | now |
+|---|---|---|---|
+| low | 53/110/165/204 | 58/109/180/225 | 45/75/117/130 |
+| toward the peak | 54/64/102/166 | 63/86/142/205 | 49/70/117/144 |
+| down | 55/73/474/699 | 64/90/292/717 | 49/77/205/572 |
+
+The model leaves out the frames between a search and its answer and
+between a mesh and its upload, so its numbers are lower than the bench's;
+its ratio for the first version toward the peak (p99 1.39 times main's) is
+the bench's (1.47) within the noise of two runs. What is left is toward the
+peak, p90 and p99 6 and 15 ms over main's: the swaps the taller rings make
+on a mountain. Not modelled: the main thread's frame time (the low flight's
+worst frames), which the bench measures.
+
 **What this does not fix: a closing step can overshoot where the metric's
 vertical part rules.** The tour's other crack -- four pixels of sky on a
 level-1 top at the ridge (stand -3072,-3232, looking W), 218 blocks away
@@ -1564,8 +1614,11 @@ and the CPU twin and its tests moved to it.
 `level_0_does_not_move_within_the_near_field_in_true_distance` and
 `level_0_stands_exactly_on_the_grid_within_the_near_field_in_true_distance`
 (real nodes from the peak and the foot of the face);
-`arena::tests::a_top_face_the_morph_tilts_toward_the_camera_is_drawn`; and two
-GPU tests, `the_near_field_is_level_0_in_every_direction` (the peak looking
+`arena::tests::a_top_face_the_morph_tilts_toward_the_camera_is_drawn`;
+`morph::tests::a_node_the_ground_does_not_reach_into_has_nothing_to_morph`;
+`streaming::tests::what_a_swap_waits_for_is_asked_for_first` and
+`beside_held_is_every_node_beside_one_of_them` (the streaming's cost is
+measured, not asserted: `streaming_work_report`); and two GPU tests, `the_near_field_is_level_0_in_every_direction` (the peak looking
 down and the face looking up, the game's frame against level 0 alone, a
 knife-edge fog at 94 blocks turning everything further into the sky's
 colour in both: no pixel nearer may differ) and
