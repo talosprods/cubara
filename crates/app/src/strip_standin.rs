@@ -79,6 +79,9 @@ fn low_flight() -> Flight {
         size: SIZE,
         quality: FarQuality::High,
         far_quad_scale: FAR_QUAD_SCALE,
+        // The strip's ground is what this measures: bare, as it was
+        // measured (the trees on it are #433's, `far_trees`).
+        far_trees: false,
         morph: true,
     }
 }
@@ -363,7 +366,7 @@ impl Scene {
         )
         .expect("the flight's quality draws the far terrain");
         let (flight, eyes, cut) = (&self.flight, &self.eyes, self.cut);
-        far::build_where(&self.gen, &view, &mut self.patches, |k| {
+        far::build_where(&self.gen, &view, None, &mut self.patches, |k| {
             !cut || reaches(flight, eyes, patch_reach(k))
         })
     }
@@ -659,7 +662,7 @@ fn the_games_far_streaming_draws_the_strip_by_the_rule() {
         flight.far_quad_scale,
     )
     .expect("the flight's quality draws the far terrain");
-    let keys = far::build_where(&gen, &view, &mut have, |_| true);
+    let keys = far::build_where(&gen, &view, None, &mut have, |_| true);
     for &k in &standin {
         have.entry(k).or_insert_with(|| far::generate(&gen, k));
     }
@@ -815,8 +818,8 @@ fn standin_cost_report() {
                 }
                 (all, of_standin)
             };
-            let old = far::build_where(&gen, &view(voxels.drawn), &mut have, |_| true);
-            let new = far::build_where(&gen, &view(voxels.wanted), &mut have, |_| true);
+            let old = far::build_where(&gen, &view(voxels.drawn), None, &mut have, |_| true);
+            let new = far::build_where(&gen, &view(voxels.wanted), None, &mut have, |_| true);
             was += count(voxels.drawn, &old, &[], &have).0;
             let (all, of_standin) = count(voxels.wanted, &new, &standin, &have);
             now += all;

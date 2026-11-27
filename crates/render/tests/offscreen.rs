@@ -271,6 +271,7 @@ fn rebase_cost_report() {
             border: false,
             mix: [255, 0],
             open: 255,
+            trees: 0,
         })
         .collect();
     let mut far_patches = 0usize;

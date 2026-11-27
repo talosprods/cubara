@@ -2538,6 +2538,229 @@ cull and the shader in `cubara-render`'s
 `the_shader_draws_a_stand_in_as_this_module_does`); `ground_range` and
 `far::build_where` in `cubara-world`'s.
 
+### 9.12 Trees past the voxel rings (#433 item 1)
+
+The voxel rings end at 1,024 blocks, and until this section the far terrain
+beyond them drew bare ground: a strip of wood appeared and disappeared at
+the ring's edge as the ring moved. The far terrain reaches 262 km, and some
+18 million trees stand in view beyond the edge (the world grows one tree in
+twelve chunk columns where a tree may grow, about 325 a square kilometre),
+so they cannot all be drawn one by one. **A far tree is drawn one by one
+while it is large enough on screen to be seen as one, and then its ground
+shows it instead, as a tint of the far terrain's tops** -- the two crossed
+by its size on screen, never cut at a ring or a distance.
+
+**Where a far tree stands** (`cubara_world::far_trees`). The trees are the
+world's own: `WorldGen::tree_site`, one per chunk column at most, no second
+placement (Rule 5). A far patch carries the trees whose trunks stand in it
+(`patch_trees`, from `far::generate_with` with `WithTrees`), each **on the
+top of the far quad its trunk is in** (`quad_top`): the ground the far
+terrain draws there, so a far trunk neither floats nor sinks. At quads of 8
+a far quad is a level-3 cell, and a far tree stands exactly where level 3
+stands it (`node_trees`: the cell's top plus one;
+`a_far_tree_at_quads_of_8_stands_where_level_3_stands_it`); on a wider quad
+it moves with that quad's ground, which is the far terrain's own business
+(§9.8). Only patches near enough to hold a tree drawn one by one carry
+them: the coarsest such level is worked out from the quality's split ratio
+and the fade (`cubara-app`'s `far_trees::tree_level`, the same for every
+screen height) -- level 6 at Medium and High, 7 at Low. Placing them costs
+next to nothing: every tree of every patch up to level 8 around a gate eye,
+326,000 of them, in about 60 ms.
+
+**What a far tree is drawn as** (`cubara_render::far_trees::StandIn`): the
+oak as three boxes -- its canopy as two crossed arms, its bounds a block
+narrower on either side across each, and its trunk below the canopy -- in
+the flat colours the level-3 silhouette has per face direction and texture
+(the texture's mean, shaded by the oak's openness there: `trees::oak_shades`,
+the one table both read). Each box draws only its faces that face the eye,
+chosen in `far_trees.wgsl` from the eye's side of the box: eight face slots
+a tree, 16 triangles, one instanced draw for all of them, no model vertex
+buffer (a vertex index is a slot and a corner). The crossed arms are the
+oak's lower canopy exactly, from along an axis, along a diagonal and from
+above; at the diagonals of its upper canopy, which the oak narrows, a block
+wider.
+
+| at the 1,024 m edge, far tree against level 3's silhouette (48 trees) | one box for the canopy | **two crossed boxes (built)** |
+|---|--:|--:|
+| top, foot (blocks) | 0, 0 | **0, 0** |
+| outline, worst view: mean / worst (square blocks; silhouette 23.5) | 8.4 / 8.7 | **3.4 / 3.5** |
+| colour seen, worst view: mean / worst (/255) | 0.9 / 1.0 | **0.6 / 0.7** |
+| T3, worst direction: mean / worst (/255) | 0.0 / 0.0 | **0.4 / 0.5** |
+| on screen, a wood a kilometre off (`a_wood_swaps_nothing_where_the_voxels_end`): tree pixels drawn by one side only | 33.3% (2,208 far tree pixels against 1,679) | **12.6% (1,860 against 1,679)** |
+| triangles a tree | 10 | **16** |
+
+At the ring's edge a square block is 0.83 square pixels at 1080 rows: one
+box changed a third of each tree's pixels there (its corners, which the oak
+trims), the crossed boxes an eighth. The rest is the upper canopy's
+diagonals and pixels on a five-pixel tree's edge that round the other way.
+
+**The fade by screen size** (`tree_scale`, CPU and `fade.wgsl`, one
+function both shaders include). A tree is drawn whole while it stands
+`FULL_PX` = 3.5 pixels tall or more -- its own height, at the screen's
+height in pixels -- shrinks about the foot of its trunk to nothing at
+`GONE_PX` = 2.5, and is not drawn below that: at 1080 rows, whole to 1.3 to
+1.9 km and gone at 1.9 to 2.6 km for trunks of 4 to 6. A taller screen draws
+them further out. Both are chosen, not derived; the issue asked for "about
+1 to 2 pixels", and the cost decided 2.5 (below). Shrinking, not thinning: a
+tree never leaves the screen in one frame, and at under a pixel it covers a
+pixel's centre in proportion to its area, which is what the tint makes up.
+
+**The tint** (`far.wgsl`'s `tree_tint`, `FarTreeTint`). What a tree no
+longer drawn whole covered -- `1 - s^2` of its area at scale `s` -- its
+top shows instead, in the colour that area shows: so a quad's colour on
+screen is the same however much of its trees is drawn one by one. A top
+carries how wooded it is (`QuadGround::trees`, the share of the columns its
+top is judged on that a tree may grow on: `WorldGen::top_cover`, one pass
+with what the top wears) in the fourth byte of its face's third word, which
+was free; with the world's density per trunk height
+(`cubara_world::far_trees::density`, held to what the world grows within
+3% by `the_density_is_what_the_world_grows`) that is trees per square
+block. **The share is measured along the line of sight** (the lead's
+decision, 2026-11-26, on the estimate that the share canopies cover from
+above -- 0.7% -- would leave a fading wood lighter; measured below): a stand-in seen
+along `v` hides its top's area of the ground under it and its sides'
+facing area over `v.y` behind it -- a shadow as long as the tree is tall
+over the slope of the line of sight -- and trees standing at random leave
+`exp(-n * hidden)` of the ground in sight. Seen straight down it is the
+share the canopies cover from above, 0.7% where every column may grow a
+tree; seen low, much more, as a wood is. **So far wooded land reads darker
+green at grazing angles, as a wooded plain does**, and more so the lower
+the eye; seen from above it is as before. **The shadow is held to the top's
+depth**: only the trees standing on a top can hide it, so of shadows `L`
+long on a top `quad` deep the share `1 - L / 2 quad` falls on it, or
+`quad / 2 L` when they are longer than the top. Without that the tint
+overshot on the far terrain as it is -- stepped every block or two at quads
+of 32 and 64, its walls most of what a low eye sees -- where most trees
+stand on tops hidden behind the next wall.
+
+**How far out it shows.** The tint is the far tops' everywhere past the
+fade, out to the far terrain's edge, and it grows as the line of sight
+flattens. Worked out by the same formula (not measured on screen), with
+the crossed boxes' areas: from the gate's hill eye, a top 2.2 km off shows
+4.5% tree colour, 5 km off 8%, 20 km off 27% under 53% haze, 60 km off two
+thirds under 90% haze; from a low flight 60 blocks over the ground, 15% at
+10 km; from 660 blocks up, 3% at 2.2 km. So near the horizon the tops are
+mostly the trees' colour, and the haze is most of what is seen there.
+
+Measured (`a_fading_wood_keeps_its_colour`): wooded land 2.2 km off,
+the middle 600 x 30 pixels of 1920 x 1080 all land, drawn with every tree
+whole and no tint against no tree and all tint; the largest channel of the
+mean colour, on the image's 0-255 scale:
+
+| eye over the spawn | no tint | the share from above (#433's first wording) | line of sight, not held to the top's depth (first built) | **line of sight, held (built)** | the game's own fade |
+|---|--:|--:|--:|--:|--:|
+| hill (300) | 0.5 | 0.5 | 0.8 | **0.3** | 0.2 |
+| low flight (100) | 0.4 | 0.4 | 1.1 | **0.4** | 0.0 |
+| high flight (700) | 1.2 | 1.0 | -- | **0.1** | 0.1 |
+
+From the hill and the low eye a wood's trees change the land little at
+this distance (walls, and trees hidden behind them); from the high eye,
+which sees the tops, the trees are 1.2 off bare ground and the share from
+above leaves 1.0 of it: that eye is what holds the test to seeing a missing
+tint. The bound is 0.6.
+
+**What is guaranteed** (every claim a test):
+
+| | test |
+|---|---|
+| a far tree is the world's tree, on its quad's top, in exactly one patch of a level | `cubara_world::far_trees` tests |
+| at quads of 8, where level 3 stands it, the same trunk and height | `a_far_tree_at_quads_of_8_stands_where_level_3_stands_it` |
+| a quad's wooded share is the share of its columns the placement's own rule lets a tree grow on | `a_quads_share_is_the_columns_a_tree_may_grow_on` |
+| the stand-in against level 3's silhouette at the ring edge: foot and height exact, outline, T3 and seen colour within bounds | `a_tree_is_the_same_tree_at_every_distance` (`trees.rs`'s `bounds::FAR_*`) |
+| that check fails for a far tree a block up, on another quad's top, of one height, a block wider, unshaded, in the log's colour | `the_far_tree_check_sees_a_wrong_far_tree` |
+| on screen at the ring edge, 15% of the trees' pixels at most, colour within 1.0 | `a_wood_swaps_nothing_where_the_voxels_end`, goldens `forest_far_edge_level_3`, `forest_far_edge_far` |
+| the fade keeps a wood's colour within 0.6, nearer the trees than the share from above | `a_fading_wood_keeps_its_colour`, golden `forest_fading` |
+| a frame draws the trees in view, in reach and not in the voxels' box | `a_frame_draws_the_trees_in_view_and_in_reach` |
+| the trees handed to the GPU hold every tree a frame from an eye within the margin shows, over random eyes and views at 1080 and 1664 rows | `the_trees_in_reach_hold_every_tree_a_frame_within_the_margin_shows` |
+| they are worked out again only when they can change: never for a standing eye or a patch beyond reach | `the_trees_in_reach_are_worked_out_again_only_when_they_can_change`, `the_far_trees_are_worked_out_again_only_when_they_can_change` |
+| the shader drops only trees off screen: never one whose box the frustum can see, at either aspect | `the_shader_drops_only_trees_off_screen` |
+| while a strip loads, its stand-in carries exactly the trees on its tops, drawn inside the voxels' box a hair behind, handed to the renderer with it and taken back with it | `the_stand_in_draws_the_trees_on_its_tops`, `a_stand_in_draws_its_trees_inside_the_box_behind`, `the_stand_in_hands_its_trees_over_and_takes_them_back` |
+
+**What it costs.** The first build culled the trees on the CPU every frame
+(squares of 128 blocks, then each tree) and uploaded the ones in view
+whenever they changed -- every frame the camera turned. The lead's quiet
+bench of it (M3, Medium, 1920 x 1080, 2026-11-27): the gate's ground and
+hill eyes at 992 and 935 FPS against 1,106 and 1,064 with `--far-trees
+off`, CPU/frame +0.052 and +0.069 ms; at 2560 x 1664, 17 and 19% fewer
+FPS; the flight eye, which draws no far tree, 9% fewer -- the tint. The gate
+fell to Low. Three changes since:
+
+- **Nothing a frame does on the CPU scales with the trees.** The trees
+  within their reach plus `REACH_MARGIN` (64 blocks, chosen, not derived)
+  of where the eye stood are worked out (`FarTreeSet::in_reach`) and
+  uploaded only when `ReachCache` says they can have changed: the eye moved
+  past the margin, the anchor, the screen's height or the fade changed, the
+  voxels' box moved, or a patch came or went within reach of where they
+  were worked out. A standing eye -- every gate eye, however the camera
+  turns -- works them out once; a flight, every 64 blocks it flies.
+  `far_trees.wgsl` drops, in its first lines, a tree faded out or off
+  screen: a sphere about its middle that holds it at every size it fades
+  through (`StandIn::radius`) behind the eye or past a side plane, by a
+  bound on the plane's normal read from the view-projection.
+  `FarTreeSet::visible`, the per-tree definition of what a frame shows, is
+  now what the drawing is held to and what a census counts; no frame works
+  it out.
+- **The tint reads three faces, not five, with no local array**: a
+  stand-in's top and, along each horizontal axis, its side towards the eye
+  (the other faces away: a projected area of nothing), and the distance
+  within which every tree is whole is worked out once (`TintGpu`'s
+  `view.y`), not per vertex. The same arithmetic: `forest_fading.png` and
+  the fade's numbers are unchanged.
+- **The far trees' shader compiles on DX12**: the first wrote a corner's
+  coordinates through a varying index (`p[axis] = ...`), which DX12's shader
+  compiler cannot address; the corner is now a mask.
+
+Counted along the bench's camera path (`far_trees_census`'s
+`far_trees_drawn`, Medium; High hands over and shows the same):
+
+| screen, gate eye | far trees held | handed to the GPU (vertex shader runs) | shown a frame (most) | triangles shown |
+|---|--:|--:|--:|--:|
+| 1920 x 1080, ground | 29,359 | 3,776 (120,832) | 838 (887) | 13,412 |
+| 1920 x 1080, hill | 29,359 | 3,712 (118,784) | 854 (910) | 13,672 |
+| 1920 x 1080, flight | 20,362 | 0 | 0 | 0 |
+| 2560 x 1664, ground | 80,411 | 10,681 (341,792) | 2,251 (2,293) | 36,009 |
+| 2560 x 1664, hill | 80,411 | 10,626 (340,032) | 2,288 (2,338) | 36,610 |
+| 2560 x 1664, flight | 76,534 | 3,829 (122,528) | 0 | 0 |
+
+A tree handed over but not shown costs its 32 vertex shader runs up to the
+drop (the fade, one matrix product and four comparisons); one shown, the
+whole shader, as before. A taller screen draws trees whole further out, so
+2.7 times as many at 1664 rows as at 1080. The fade is what decides the
+count: gone at 2 pixels the 1080-row hill eye drew 1,587 trees in the first
+build's count, at 3 about 490 (`GONE_PX`, one constant). One box for the
+canopy would be 10 triangles a tree for the third of each tree's pixels
+changing at the ring edge measured above.
+
+No FPS here: the gate and flight rows are the lead's, on a quiet machine
+(`--bench gate`, `--bench flight`). `--bench` logs the trees handed to the
+GPU and their vertex shader runs. `--far-trees off` draws the same commit's
+bare far ground -- the window, the benches, a flight and `--screenshot` --
+for an A/B without a second build, as `--fog off` does.
+
+**What is left, and why.**
+
+- *A strip handed over* (§9.11). While the strip the voxels' box gained
+  loads, the far terrain is holed at the box the voxels want, so none of its
+  own trees stand in the strip; the stand-in that draws the strip's ground
+  carries the strip's trees instead (`far_streaming::standin_trees`: those
+  on the quads the stand-in draws tops over, by the faces' own rule,
+  `in_strip`), at quads of 8 where level 3 will stand them, drawn inside
+  the box and a hair behind where they stand (`far_trees::STANDIN_TREE`,
+  the stand-in's own `STANDIN_BEHIND`). A node of the strip drawn
+  meanwhile draws its silhouettes in front of them; where a stand-in's
+  crossed boxes reach past a silhouette (the 12.6% above) they show until
+  the strip's last node is drawn and the stand-in leaves. Without them the
+  strip's wood blinked out for the frames it loads
+  (`the_stand_in_draws_the_trees_on_its_tops`,
+  `a_stand_in_draws_its_trees_inside_the_box_behind`,
+  `the_stand_in_hands_its_trees_over_and_takes_them_back`).
+- *Trees over walls.* The tint is the tops'; a tree standing behind a wall
+  and showing over it is not a wall's colour, so the far terrain's walls
+  are never tinted. Measured above as what is left at the low eye.
+- *Cheaper.* A box's three faces share seven corners; with the face's
+  normal taken from the screen derivatives in the fragment shader a tree
+  would shade 20 vertices where it shades 32.
+
 ## §10 The chunk arena's capacity follows from the selection (block 3.0b, [#434](../../issues/434))
 
 The arena had two constants, 8 million vertices and 12 million indices,

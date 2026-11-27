@@ -52,6 +52,19 @@ struct Params {
     side_color: vec4<f32>,
     soil_color: vec4<f32>,
     stone_color: vec4<f32>,
+    // What a top shows of the trees not drawn one by one (issue #433 item 1,
+    // `far_trees.rs`'s `TintGpu`): `.x` the trunk heights in use, `.yzw` the
+    // fade (`fade.wgsl`); per height its density where every column may grow
+    // a tree and its stand-in's height; per height and direction (+X -X +Y
+    // +Z -Z) the stand-in's area times colour (`.w` the area) and area times
+    // colour times openness.
+    tree_fade: vec4<f32>,
+    // `.x` 1: measured from straight above (`far_trees.rs`'s `TintView`);
+    // `.y` the distance within which every trunk height is drawn whole.
+    tree_view: vec4<f32>,
+    tree_height: array<vec4<f32>, 8>,
+    tree_colour: array<array<vec4<f32>, 5>, 8>,
+    tree_open: array<array<vec4<f32>, 5>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -66,7 +79,7 @@ struct Face {
     word0: u32,
     // top + 131072 : 18, rise : 14
     word1: u32,
-    // surface:8 soil:8 open:8, each in 255ths
+    // surface:8 soil:8 open:8 trees:8, each in 255ths
     word2: u32,
 };
 
@@ -254,8 +267,127 @@ fn vs_main(
 
     var out: VertexOut;
     out.clip_pos = frame.view_proj * vec4<f32>(select(sealed, behind, standin), 1.0);
-    out.color = shade(sealed, face_colour(dir, word2) * face_open(word2), FACE_NORMALS[dir]);
+    // A top shows the trees on it no longer drawn one by one.
+    var tint = vec4<f32>(0.0);
+    if !wall {
+        tint = tree_tint(sealed, f32(word2 >> 24u) / 255.0, tile.quad);
+    }
+    out.color = shade(sealed, face_colour(dir, word2) * face_open(word2), FACE_NORMALS[dir], tint);
     return out;
+}
+
+// **What a top shows of its trees that are not drawn one by one** (issue
+// #433 item 1): `.a` the share of the top's ground they hide from the eye,
+// `.rgb` the lit colour they show there -- for a top at `p` whose share of
+// ground a tree may grow on is `wooded`.
+//
+// A far tree shrinks to nothing as its size on screen falls through the
+// fade (`fade.wgsl`, `far_trees.wgsl`); what it no longer covers, `1 - s^2`
+// of its area, the top shows instead. A stand-in seen along `v` (towards
+// the eye) hides its top's area of the ground under it, and its sides'
+// area facing the eye over `v.y` -- the ground behind it, a shadow as long
+// as the tree is tall over the slope of the line of sight. But only the
+// trees standing on a top can hide it, and a top is `quad` deep: a point
+// of it is hidden by the trees in front of it on the top, as far as a
+// shadow reaches, which over the top's depth is a share `1 - L / 2 quad`
+// of the shadows (`L` their length), or `quad / 2 L` of them when they are
+// longer than the top. Trees standing at random, `n` a square block, leave
+// `exp(-n * hidden)` of the top in sight. Summed over the trunk heights,
+// each fading by its own height. Seen straight down it is the share the
+// canopies cover from above; seen low over a wide top, more, as a wood is.
+// Zero where every tree is drawn whole, and for a top without trees.
+//
+// Of a stand-in's faces the eye sees its top and, along each horizontal
+// axis, the side towards it: three directions, whose areas and colours are
+// `params.tree_colour[k]`'s slots (+X 0, -X 1, +Y 2, +Z 3, -Z 4,
+// `far_trees.rs`'s `TINT_DIRECTIONS`). No local array, and nothing written
+// through a varying index: DX12's compiler cannot address one.
+fn tree_tint(p: vec3<f32>, wooded: f32, quad: f32) -> vec4<f32> {
+    let heights = u32(params.tree_fade.x);
+    if heights == 0u || wooded <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    let to_eye = frame.eye.xyz - p;
+    let dist = length(to_eye);
+    // Nearer than this every trunk height is drawn whole (`TintGpu`'s
+    // `view.y`): nothing to tint -- all the far terrain the trees cover.
+    if dist <= params.tree_view.y {
+        return vec4<f32>(0.0);
+    }
+    // The line of sight, or straight up for the share the canopies cover
+    // seen from above (a measurement's, `TintView::FromAbove`).
+    let v = select(to_eye / max(dist, 1e-3), vec3<f32>(0.0, 1.0, 0.0), params.tree_view.x > 0.5);
+    // A top seen from under it, or edge on, shows nothing of what stands on it.
+    if v.y <= 1e-4 {
+        return vec4<f32>(0.0);
+    }
+    let east = v.x > 0.0;
+    let south = v.z > 0.0;
+    let sx = select(1u, 0u, east);
+    let sz = select(4u, 3u, south);
+    // How each seen face is lit (`trees.wgsl`'s light).
+    let lit_top = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(0.0, 1.0, 0.0),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    let lit_x = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(select(-1.0, 1.0, east), 0.0, 0.0),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    let lit_z = frame.sun_color.rgb * face_brightness(
+        vec3<f32>(0.0, 0.0, select(-1.0, 1.0, south)),
+        frame.sun_dir.xyz,
+        frame.ambient.x,
+        frame.ambient.y,
+        frame.sun_color.w,
+    );
+    // How much of a face each way the line of sight sees, per block of
+    // ground, over `v.y`: the top's is 1, a side's its projected area (not
+    // a light; that is `face_brightness`'s, above) times its shadow's share
+    // on the top, below. And how far behind it a tree's side hides the
+    // ground, per block of its height: the line of sight's run over its rise.
+    let fx = abs(v.x) / v.y;
+    let fz = abs(v.z) / v.y;
+    let run = length(v.xz) / v.y;
+    var hidden = 0.0;
+    var colour = vec3<f32>(0.0);
+    for (var k = 0u; k < heights; k++) {
+        let h = params.tree_height[k];
+        let s = tree_scale(h.y, dist, params.tree_fade);
+        let missing = 1.0 - s * s;
+        if missing <= 0.0 {
+            continue;
+        }
+        // The share of the sides' shadows that falls on the top, `quad`
+        // deep, its trees standing anywhere on it.
+        let shadow = h.y * run;
+        let on_top = select(quad / (2.0 * shadow), 1.0 - shadow / (2.0 * quad), shadow < quad);
+        let wx = fx * on_top;
+        let wz = fz * on_top;
+        let ct = params.tree_colour[k][2u];
+        let cx = params.tree_colour[k][sx];
+        let cz = params.tree_colour[k][sz];
+        // `mix(ao_floor, 1, open)` is linear in `open`: over the faces of a
+        // direction, `ao_floor * sum(area * colour) + (1 - ao_floor) *
+        // sum(area * colour * open)`.
+        let area = ct.w + wx * cx.w + wz * cz.w;
+        let seen = lit_top * mix(params.tree_open[k][2u].rgb, ct.rgb, frame.ambient.z)
+            + wx * lit_x * mix(params.tree_open[k][sx].rgb, cx.rgb, frame.ambient.z)
+            + wz * lit_z * mix(params.tree_open[k][sz].rgb, cz.rgb, frame.ambient.z);
+        let n = h.x * wooded * missing;
+        hidden += n * area;
+        colour += n * seen;
+    }
+    if hidden <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(colour / hidden, 1.0 - exp(-hidden));
 }
 
 // ---------------------------------------------------------------------------
@@ -288,8 +420,10 @@ fn face_open(word2: u32) -> f32 {
 // A face of colour `colour` and normal `n` at `p`: lit as `mesh.wgsl` lights
 // a block face (`face.wgsl`'s `face_brightness`, with the terms `mesh.wgsl`
 // gets as pipeline constants read from the frame here -- both are
-// `Lighting`'s), without texture or ambient occlusion; then the fog.
-fn shade(p: vec3<f32>, colour: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+// `Lighting`'s), without texture or ambient occlusion; then `tint` over it
+// (`tree_tint`: the trees on a top not drawn one by one, lit colour and
+// share); then the fog.
+fn shade(p: vec3<f32>, colour: vec3<f32>, n: vec3<f32>, tint: vec4<f32>) -> vec3<f32> {
     let brightness = face_brightness(
         n,
         frame.sun_dir.xyz,
@@ -297,7 +431,7 @@ fn shade(p: vec3<f32>, colour: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         frame.ambient.y,
         frame.sun_color.w,
     );
-    let lit = colour * frame.sun_color.rgb * brightness;
+    let lit = mix(colour * frame.sun_color.rgb * brightness, tint.rgb, tint.a);
 
     let dist = distance(p, frame.eye.xyz);
     let edge = select(0.0, smoothstep(frame.fog.x, frame.fog.y, dist), frame.fog.y > frame.fog.x);

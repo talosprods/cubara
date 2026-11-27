@@ -27,7 +27,8 @@
 //! lattice the voxel rings' coarse cells stand on -- so where the two meet
 //! their steps fall on the same lines.
 
-use crate::WorldGen;
+use crate::far_trees::FarTree;
+use crate::{TerrainBlocks, WorldGen};
 
 /// Quads along one side of a patch.
 pub const PATCH_QUADS: usize = 32;
@@ -366,6 +367,11 @@ pub struct PatchHeights {
     pub tops: Vec<i32>,
     /// The patch as blocks: what [`mesh`] makes of `tops`.
     pub faces: Vec<Face>,
+    /// The trees whose trunks stand in the patch, each on its quad's top
+    /// ([`crate::far_trees::patch_trees`]): what the far terrain draws one
+    /// by one (issue #433 item 1). Empty unless the patch was generated
+    /// with trees ([`generate_with`]) at a level that draws them.
+    pub trees: Vec<FarTree>,
 }
 
 /// Quads along one side of [`PatchHeights::tops`]: the patch's own and one
@@ -454,6 +460,12 @@ pub struct QuadGround {
     pub sides: [[u8; 2]; 4],
     /// Per direction, how open those risers are.
     pub side_open: [u8; 4],
+    /// The share of the columns the top is judged on that a tree may grow
+    /// on, in 255ths ([`WorldGen::top_cover`]): how densely the quad is
+    /// wooded, against ground where every column may grow one. What the
+    /// far terrain tints a top by where its trees are no longer drawn one by
+    /// one (issue #433 item 1). 0 in a world without trees.
+    pub trees: u8,
 }
 
 impl QuadGround {
@@ -464,6 +476,7 @@ impl QuadGround {
         top_open: 255,
         sides: [[255, 0]; 4],
         side_open: [255; 4],
+        trees: 0,
     };
 
     /// **The one place a face's material and occlusion are decided**, on
@@ -483,13 +496,32 @@ impl QuadGround {
     /// the surface block, or a pit's floor in the share the columns are pit.
     /// `top` is the quad's own ([`quad_top`]): the hash is the cell's, and a
     /// cell is its place and its top.
-    pub fn of(gen: &WorldGen, key: PatchKey, i: i32, j: i32, top: i32) -> Self {
+    ///
+    /// **How wooded the quad is** ([`trees`](Self::trees)) is read off the
+    /// same columns, in the same pass ([`WorldGen::top_cover`]), for a
+    /// world with trees (`blocks`).
+    pub fn of(
+        gen: &WorldGen,
+        key: PatchKey,
+        i: i32,
+        j: i32,
+        top: i32,
+        blocks: Option<TerrainBlocks>,
+    ) -> Self {
         use crate::worldgen::GroundLayer;
         let q = key.quad();
         let [ox, oz] = key.origin();
         let (x0, z0) = (ox + i as i64 * q, oz + j as i64 * q);
         // `top - 1`: the top block, which the top face is one above.
-        let wears = match gen.top_layer(x0 as i32, z0 as i32, q as i32, top_samples(key), top - 1) {
+        let (layer, trees) = gen.top_cover(
+            x0 as i32,
+            z0 as i32,
+            q as i32,
+            top_samples(key),
+            top - 1,
+            blocks,
+        );
+        let wears = match layer {
             GroundLayer::Surface => [255, 0],
             GroundLayer::Soil => [0, 255],
             GroundLayer::Stone => [0, 0],
@@ -517,13 +549,33 @@ impl QuadGround {
             top_open: unit(faces.top_open),
             sides,
             side_open: faces.side_open.map(unit),
+            trees: unit(trees),
         }
     }
 }
 /// Samples per axis averaged into one vertex's height, at most.
 const FOOTPRINT_SAMPLES: i64 = 4;
 
-/// The heights of `key`, from the generator.
+/// What a patch is generated with besides its ground (issue #433 item 1):
+/// the world's trees -- its blocks with the oak, `TerrainBlocks::with_oak` --
+/// and the coarsest patch level whose trees are drawn one by one. Every
+/// patch then knows how wooded each quad is ([`QuadGround::trees`]); those
+/// of `up_to_level` and finer also carry their trees
+/// ([`PatchHeights::trees`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithTrees {
+    pub blocks: TerrainBlocks,
+    pub up_to_level: u32,
+}
+
+/// The heights of `key`, from the generator: [`generate_with`] without
+/// trees -- a world drawn as bare ground beyond the voxels.
+pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
+    generate_with(gen, key, None)
+}
+
+/// The heights of `key`, from the generator, with the world's trees when
+/// `trees` says so ([`WithTrees`]).
 ///
 /// Each vertex stands for a quad's width of ground around it, and its height
 /// is the mean top of that ground, sampled on a grid of at most
@@ -531,7 +583,7 @@ const FOOTPRINT_SAMPLES: i64 = 4;
 /// quad, one sample decides whether a vertex is on the peak or beside it, and
 /// the answer changes as the patch moves. At `level` 0 a vertex is one
 /// column, taken exactly.
-pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
+pub fn generate_with(gen: &WorldGen, key: PatchKey, trees: Option<WithTrees>) -> PatchHeights {
     let q = key.quad();
     let [ox, oz] = key.origin();
     let mut heights = Vec::with_capacity(PATCH_VERTS * PATCH_VERTS);
@@ -550,7 +602,7 @@ pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
     for j in 0..PATCH_QUADS as i32 {
         for i in 0..PATCH_QUADS as i32 {
             let top = tops[(j + 1) as usize * TOPS_SIDE + (i + 1) as usize];
-            ground.push(QuadGround::of(gen, key, i, j, top));
+            ground.push(QuadGround::of(gen, key, i, j, top, trees.map(|t| t.blocks)));
         }
     }
     let min = heights.iter().copied().fold(f32::INFINITY, f32::min);
@@ -570,8 +622,12 @@ pub fn generate(gen: &WorldGen, key: PatchKey) -> PatchHeights {
         ground,
         tops,
         faces: Vec::new(),
+        trees: Vec::new(),
     };
     patch.faces = mesh(key, &patch.tops, &patch.ground);
+    if let Some(t) = trees.filter(|t| key.level <= t.up_to_level) {
+        patch.trees = crate::far_trees::patch_trees(gen, key, &patch.tops, t.blocks);
+    }
     patch
 }
 
@@ -631,22 +687,29 @@ fn finer_gap(gen: &WorldGen, heights: &[f32], ox: i64, oz: i64, q: i64) -> (f32,
 /// On one thread. A live game streams instead, spreading the same loop over
 /// frames and workers; a one-shot caller has one frame to be right in.
 pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
+    build_with(gen, view, None)
+}
+
+/// [`build`], every patch generated [`generate_with`] `trees`.
+pub fn build_with(gen: &WorldGen, view: &FarView, trees: Option<WithTrees>) -> Vec<PatchHeights> {
     let mut have = std::collections::HashMap::new();
-    build_where(gen, view, &mut have, |_| true)
+    build_where(gen, view, trees, &mut have, |_| true)
         .iter()
         .filter_map(|k| have.remove(k))
         .collect()
 }
 
 /// [`build`]'s loop for the patches `wanted` lets through, generating into
-/// (and from) `have`: the keys of those it selects, in [`select`]'s order.
-/// A split reads only the patch's own error and its ancestors' -- which
-/// hold its ground, so `wanted` passes them too when it passes by ground
-/// -- so every patch it selects is one [`build`] selects. For a test that
-/// draws a part of the view (`cubara-app`'s `strip_standin`).
+/// (and from) `have`, each [`generate_with`] `trees`: the keys of those it
+/// selects, in [`select`]'s order. A split reads only the patch's own error
+/// and its ancestors' -- which hold its ground, so `wanted` passes them too
+/// when it passes by ground -- so every patch it selects is one [`build`]
+/// selects. For a test that draws a part of the view (`cubara-app`'s
+/// `strip_standin`).
 pub fn build_where(
     gen: &WorldGen,
     view: &FarView,
+    trees: Option<WithTrees>,
     have: &mut std::collections::HashMap<PatchKey, PatchHeights>,
     wanted: impl Fn(PatchKey) -> bool,
 ) -> Vec<PatchKey> {
@@ -661,7 +724,7 @@ pub fn build_where(
             return keys.into_iter().filter(|&k| wanted(k)).collect();
         }
         for k in new {
-            have.insert(k, generate(gen, k));
+            have.insert(k, generate_with(gen, k, trees));
         }
     }
 }
@@ -711,6 +774,9 @@ pub struct Face {
     pub mix: [u8; 2],
     /// How open the face is to the sky, in 255ths ([`QuadGround`]).
     pub open: u8,
+    /// A top: how wooded its quads are ([`QuadGround::trees`]). Zero for a
+    /// wall: a tree stands on a top.
+    pub trees: u8,
 }
 
 impl Face {
@@ -825,6 +891,7 @@ pub fn mesh(key: PatchKey, tops: &[i32], ground: &[QuadGround]) -> Vec<Face> {
             && groups[a] == groups[b]
             && ground[a].top == ground[b].top
             && ground[a].top_open == ground[b].top_open
+            && ground[a].trees == ground[b].trees
             && top((a % N) as i32, (a / N) as i32) == top((b % N) as i32, (b / N) as i32)
     };
     for j in 0..N {
@@ -857,6 +924,7 @@ pub fn mesh(key: PatchKey, tops: &[i32], ground: &[QuadGround]) -> Vec<Face> {
                 border: false,
                 mix: ground[first].top,
                 open: ground[first].top_open,
+                trees: ground[first].trees,
             });
         }
     }
@@ -936,6 +1004,7 @@ pub fn mesh(key: PatchKey, tops: &[i32], ground: &[QuadGround]) -> Vec<Face> {
                     border,
                     mix,
                     open,
+                    trees: 0,
                 });
                 k = end;
             }
@@ -1035,7 +1104,7 @@ pub(crate) mod tests {
             x + k.size() > 0 && z + k.size() > 0
         };
         let mut have = HashMap::new();
-        let part = build_where(&gen, &view, &mut have, quarter);
+        let part = build_where(&gen, &view, None, &mut have, quarter);
         let expected: Vec<PatchKey> = whole.iter().copied().filter(|&k| quarter(k)).collect();
         assert_eq!(part, expected);
         assert!(
@@ -2241,7 +2310,7 @@ mod block_tests {
                         ((x0 as i64 - px) / step as i64) as i32,
                         ((z0 as i64 - pz) / step as i64) as i32,
                     );
-                    let far = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).top;
+                    let far = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j), None).top;
                     let voxel = match block {
                         b if b == blocks.grass => [255, 0],
                         b if b == blocks.soil => [0, 255],
@@ -2307,7 +2376,7 @@ mod block_tests {
                     ((x0 as i64 - px) / q as i64) as i32,
                     ((z0 as i64 - pz) / q as i64) as i32,
                 );
-                let wears = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).top;
+                let wears = QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j), None).top;
                 shown += (wears != [255, 0]) as u32;
             }
             println!(
@@ -2342,7 +2411,7 @@ mod block_tests {
                 if level {
                     found += 1;
                     assert_eq!(
-                        QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j)).sides,
+                        QuadGround::of(&gen, key, i, j, quad_top(&gen, key, i, j), None).sides,
                         [[255, 0]; 4],
                         "the column at ({x}, {z})"
                     );
@@ -2556,6 +2625,7 @@ mod block_tests {
                 border: false,
                 mix: [255, 0],
                 open: 255,
+                trees: 0,
             }),
             "{flat:?}"
         );
@@ -2584,6 +2654,7 @@ mod block_tests {
             border: false,
             mix: [255, 0],
             open: 255,
+            trees: 0,
         };
         assert_eq!(inner, vec![wall(0, 16), wall(16, 32)]);
         // Each of the two cells it crosses: the inside in two, and its two

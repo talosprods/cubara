@@ -193,6 +193,27 @@ pub fn load_tree_models(
     crate::trees::build_tree_models(device, queue, &assets.registry, &structures, &layer_of)
 }
 
+/// The trees on the far terrain (issue #433 item 1), empty, against
+/// `anchor`: their stand-ins built from the same registry and structures
+/// the tree models are ([`load_tree_models`]).
+pub fn load_far_trees(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    assets: &MeshAssets,
+    anchor: Anchor,
+) -> crate::far_trees::FarTrees {
+    let structures = load_structures();
+    let layer_of = |name: &str| assets.layers.layer_of(name);
+    let stand_ins = crate::far_trees::stand_ins(&assets.registry, &structures, &layer_of);
+    crate::far_trees::FarTrees::new(
+        device,
+        queue,
+        &crate::trees::TreeShapes::of(&structures),
+        stand_ins,
+        anchor,
+    )
+}
+
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Uint32, 3 => Uint32];
 
@@ -221,6 +242,11 @@ pub const fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 /// about not spiking the frame while applying it, which is why it stays here
 /// rather than moving out with the streaming policy.
 const MIN_UPLOADS_PER_FRAME: usize = 32;
+
+/// The camera's vertical field of view, in degrees: every view the game
+/// draws is projected with it ([`CameraUniform::look_view_proj`]), and what
+/// a thing's size on screen is worked out from (`far_trees::px_per_block`).
+pub const FOV_Y_DEGREES: f32 = 60.0;
 
 /// Uniform block shared with `mesh.wgsl`: one column-major view*projection matrix.
 #[repr(C)]
@@ -255,7 +281,7 @@ impl CameraUniform {
     /// reversed-Z depth (see [`reverse_z`]).
     pub fn look_view_proj(aspect: f32, eye: glam::Vec3, look_dir: glam::Vec3) -> glam::Mat4 {
         let proj = reverse_z(glam::Mat4::perspective_rh(
-            60f32.to_radians(),
+            FOV_Y_DEGREES.to_radians(),
             aspect,
             NEAR_PLANE,
             FAR_PLANE,
@@ -702,6 +728,15 @@ pub struct Renderer {
     /// patches are the caller's to choose ([`far_insert`](Self::far_insert),
     /// [`far_remove`](Self::far_remove)); this only culls and draws them.
     far: crate::far::FarTerrain,
+    /// The trees on the far terrain (issue #433 item 1): the caller hands
+    /// over each patch's ([`far_trees_insert`](Self::far_trees_insert));
+    /// they go with the patch ([`far_remove`](Self::far_remove)).
+    far_trees: crate::far_trees::FarTrees,
+    /// How densely far trees stand, per trunk height, where every column
+    /// may grow one ([`set_far_tree_density`](Self::set_far_tree_density)):
+    /// what the far terrain's tint is worked out from, again for each
+    /// screen height. Empty: no tint.
+    far_tree_density: Vec<f32>,
     /// Trees beyond the first ring (issue #332, R2): which resident node
     /// contributed which instances, flattened into the two models' GPU
     /// instance buffers only when that set actually changes.
@@ -962,6 +997,7 @@ impl Renderer {
             (FAR_PATCH_CAPACITY, FAR_FACE_CAPACITY),
             anchor,
         );
+        let far_trees = load_far_trees(&device, &queue, &mesh_assets, anchor);
 
         // GPU work for F3, only where it was asked for (the game's window).
         let gpu_timing = wants_gpu_timing(
@@ -988,6 +1024,8 @@ impl Renderer {
             adapter_name,
             arena,
             far,
+            far_trees,
+            far_tree_density: Vec::new(),
             trees: crate::trees::TreeArena::new(tree_shapes, anchor),
             uploads: Uploads::new(),
             swapped_out: Vec::new(),
@@ -1064,14 +1102,65 @@ impl Renderer {
         self.far.insert_as(&self.queue, patch, role)
     }
 
-    /// Stop drawing a far-terrain patch and free its slot.
+    /// Stop drawing a far-terrain patch -- and its trees -- and free its
+    /// slot.
     pub fn far_remove(&mut self, slot: crate::far::FarSlot) {
         self.far.remove(slot);
+        self.far_trees.remove(slot.id());
     }
 
-    /// The far terrain's hole and colour.
+    /// The trees standing on the far patch in `slot` (issue #433 item 1),
+    /// replacing any it had: drawn while the patch is, and removed with it
+    /// ([`far_remove`](Self::far_remove)).
+    pub fn far_trees_insert(
+        &mut self,
+        slot: crate::far::FarSlot,
+        trees: Vec<crate::far_trees::FarTreePlacement>,
+    ) {
+        self.far_trees.insert(slot.id(), trees);
+    }
+
+    /// [`far_trees_insert`](Self::far_trees_insert) for a patch drawn as
+    /// `role`: the trees of a stand-in for voxel nodes not drawn yet are the
+    /// strip's own, drawn inside the voxels' box behind anything there.
+    pub fn far_trees_insert_as(
+        &mut self,
+        slot: crate::far::FarSlot,
+        trees: Vec<crate::far_trees::FarTreePlacement>,
+        role: crate::far::FarRole,
+    ) {
+        self.far_trees.insert_as(slot.id(), trees, role);
+    }
+
+    /// How densely trees stand, per trunk height (in the order of the oak's
+    /// heights), in trees a square block where every column may grow one
+    /// (`cubara_world::far_trees::density`): what the far terrain's tops
+    /// show of the trees no longer drawn one by one. Empty: bare ground.
+    pub fn set_far_tree_density(&mut self, density: &[f32]) {
+        self.far_tree_density = density.to_vec();
+        self.apply_far_tree_tint();
+    }
+
+    /// The far terrain's tint, for the density given and this screen.
+    fn apply_far_tree_tint(&mut self) {
+        let tint = (!self.far_tree_density.is_empty()).then(|| {
+            crate::far_trees::FarTreeTint::new(&self.far_tree_density, self.far_trees.stand_ins())
+        });
+        let px = crate::far_trees::px_per_block(self.size().1);
+        self.far.set_tree_tint(&self.queue, tint.as_ref(), px);
+    }
+
+    /// Far trees handed to the GPU in the last frame (every one in reach,
+    /// [`crate::far_trees::FarTrees::handed`]), and held.
+    pub fn far_trees_counts(&self) -> (usize, usize) {
+        (self.far_trees.handed(), self.far_trees.len())
+    }
+
+    /// The far terrain's hole and colour; a tree whose ground is in the hole
+    /// is the voxels' to draw.
     pub fn set_far_params(&mut self, params: crate::far::FarParams) {
         self.far.set_params(&self.queue, params);
+        self.far_trees.set_hole(params.hole);
     }
 
     /// Whether any of the far terrain can be seen from where the eye is
@@ -1239,6 +1328,8 @@ impl Renderer {
         }
         let rebuilding = std::time::Instant::now();
         self.scene.resize(&self.device, width, height);
+        // A tree's size on screen is the screen's: the tint fades by it.
+        self.apply_far_tree_tint();
         log::info!(
             "resize to {width}x{height}: depth and mesh pipeline rebuilt in {:.2} ms",
             rebuilding.elapsed().as_secs_f64() * 1e3
@@ -1373,6 +1464,14 @@ impl Renderer {
         self.visible_chunks = self.arena.visible_nodes() as usize;
         self.far
             .prepare(&self.queue, &self.frustum, camera.relative_eye(self.anchor));
+        let screen_height = self.size().1;
+        self.far_trees.prepare(
+            &self.device,
+            &self.queue,
+            camera.relative_eye(self.anchor),
+            self.anchor,
+            screen_height,
+        );
         // Trees beyond the first ring (issue #332 decision 2): the same
         // frustum, re-filtering which resident node's trees actually draw
         // this frame -- cheap even every frame, since what it re-uploads is
@@ -1416,6 +1515,7 @@ impl Renderer {
                     cracking,
                     players,
                     far: Some(&self.far),
+                    far_trees: Some(&self.far_trees),
                     trees: Some(crate::scene::TreeDraw {
                         oak: self.trees.oak_instances(),
                         silhouette: self.trees.silhouette_instances(),
@@ -2187,6 +2287,91 @@ pub fn build_tree_pipeline(
     })
 }
 
+/// `@group(1)` in `far_trees.wgsl`: the far trees' stand-ins and fade
+/// (`crate::far_trees::FarTrees` owns it).
+pub fn far_trees_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("far-trees-bind-group-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// The far trees' pipeline (`far_trees.wgsl`, issue #433 item 1): one
+/// instance a tree (`far_trees::FarTreeInstance`), no vertex buffer of its
+/// own -- each vertex is a corner of a face of a box of the tree's stand-in,
+/// made from the vertex index -- depth-tested like the trees and the far
+/// terrain.
+pub fn build_far_tree_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bgl: &wgpu::BindGroupLayout,
+    far_trees_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("far-trees-shader"),
+        source: wgpu::ShaderSource::Wgsl(crate::haze::FAR_TREES_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("far-trees-layout"),
+        bind_group_layouts: &[Some(camera_bgl), Some(far_trees_bgl)],
+        immediate_size: 0,
+    });
+    let instances = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::far_trees::FarTreeInstance>()
+            as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32],
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("far-trees-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(instances)],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            // The faces drawn are the ones facing the eye; a face the eye is
+            // behind the plane of (a top seen from below the box's middle)
+            // winds the other way and is dropped here.
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// `@group(1)` in `far.wgsl`: the far terrain's patch records, its
 /// parameters, its faces and the runs of them drawn this frame
 /// (`crate::far::FarTerrain` owns all four).
@@ -2492,6 +2677,72 @@ mod tests {
     /// must go with the slot -- or the next node to take it draws them at
     /// its own origin until the retry lands. GPU-backed because `ArenaSink`
     /// is the real sink over the real arena; without an adapter it skips.
+    /// **A frame touches the far trees only when the trees in reach can
+    /// change** (issue #433 item 1, `FarTrees::prepare` with the game's own
+    /// stand-ins): worked out once for a standing eye however the camera
+    /// turns, and again when a patch comes or goes within reach, the voxels'
+    /// box moves or the eye moves past the margin -- not for a patch beyond
+    /// reach or a box set to what it was. What is handed over is every tree
+    /// in reach, whichever way the camera looks.
+    #[test]
+    fn the_far_trees_are_worked_out_again_only_when_they_can_change() {
+        use crate::far_trees::{FarTreePlacement, REACH_MARGIN};
+        let pose = CameraPose {
+            eye: glam::DVec3::new(8.0, 300.0, 8.0),
+            look_dir: glam::Vec3::X,
+        };
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose, ArenaCapacity::FLOOR) else {
+            crate::headless::skip_or_require_gpu(
+                "the_far_trees_are_worked_out_again_only_when_they_can_change",
+            );
+            return;
+        };
+        // A row of trees from 1.1 to 1.9 km east, and one 40 km out.
+        let row = |z: i32| -> Vec<FarTreePlacement> {
+            (0..20)
+                .map(|k| FarTreePlacement {
+                    base: [1100 + 40 * k, 40, z],
+                    height: 5,
+                })
+                .collect()
+        };
+        let far_away = vec![FarTreePlacement {
+            base: [40_000, 40, 0],
+            height: 5,
+        }];
+        let (device, queue) = (r.device.clone(), r.queue.clone());
+        let trees = &mut r.far_trees;
+        let eye = glam::Vec3::new(8.0, 300.0, 8.0);
+        let frame = |trees: &mut crate::far_trees::FarTrees, eye: glam::Vec3| {
+            trees.prepare(&device, &queue, eye, [0; 3], 1080);
+            (trees.workings_out(), trees.handed())
+        };
+        trees.insert(1, row(0));
+        assert_eq!(frame(trees, eye), (1, 20), "the first frame");
+        assert_eq!(frame(trees, eye), (1, 20), "standing: nothing");
+        assert_eq!(
+            frame(trees, eye + glam::Vec3::new(30.0, -20.0, 10.0)),
+            (1, 20),
+            "moved within the margin"
+        );
+        trees.insert(2, far_away);
+        assert_eq!(frame(trees, eye), (1, 20), "a patch beyond reach");
+        trees.insert(3, row(64));
+        assert_eq!(frame(trees, eye), (2, 40), "a patch within reach");
+        trees.remove(1);
+        assert_eq!(frame(trees, eye), (3, 20), "a patch within reach left");
+        trees.set_hole(None);
+        assert_eq!(frame(trees, eye), (3, 20), "the box as it was");
+        trees.set_hole(Some(([-1024, -64, -1024], [1300, 400, 1024])));
+        assert_eq!(
+            frame(trees, eye),
+            (4, 15),
+            "the box moved over five of them"
+        );
+        let moved = eye + glam::Vec3::new(REACH_MARGIN + 1.0, 0.0, 0.0);
+        assert_eq!(frame(trees, moved).0, 5, "moved past the margin");
+    }
+
     #[test]
     fn a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot() {
         let pose = CameraPose {

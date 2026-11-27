@@ -3004,6 +3004,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
             FarDir::PosX | FarDir::NegX => FarFace {
                 dir,
@@ -3016,6 +3017,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
             FarDir::PosZ | FarDir::NegZ => FarFace {
                 dir,
@@ -3028,6 +3030,7 @@ fn far_shading_is_the_face_reference() {
                 border: false,
                 mix,
                 open,
+                trees: 0,
             },
         };
         let patch = FarPatch {
@@ -3111,6 +3114,7 @@ fn a_far_runs_padding_draws_nothing() {
         border: false,
         mix: [255, 0],
         open: 255,
+        trees: 0,
     };
     // One face in a corner; and fifteen that cover the middle, a hundred
     // kilometres away.
@@ -3200,6 +3204,7 @@ fn far_faces_are_hazed_by_distance() {
         border: false,
         mix: [0, 0],
         open: 255,
+        trees: 0,
     };
     let patch = FarPatch {
         origin: [0, 0],
@@ -4058,3 +4063,440 @@ fn a_forest_swaps_nothing_at_its_ring_edges() {
 /// this close a view (each tree tens of pixels; at 512 m a few, and the
 /// texture's mip is its mean).
 const FOREST_EDGE: [(f64, f64); 3] = [(0.12, 1.5), (0.01, 0.5), (0.02, 3.0)];
+
+/// A wood as the voxel rings' last ring meets the far terrain (issue #433
+/// item 1): 512 blocks square -- four far patches of quads of 8, sixteen
+/// level-3 nodes -- seen from 1,024 blocks off along the diagonal (the worst
+/// way for a box's corners), 100 blocks above its middle, at 1080 rows:
+/// where the voxels' box ends, a tree is as large on screen as here. The
+/// most-wooded square of gentle ground within 3 km of the spawn
+/// ([`far_edge_scan`]).
+const FAR_EDGE: (i32, i32, i32) = (-1792, 0, 512);
+
+/// How [`FAR_EDGE`] was found: every 512-block square on a 256-block
+/// lattice within 3 km of the spawn whose ground spans 24 blocks or less
+/// (sampled every 8), by how many trees it grows.
+///
+/// ```text
+/// cargo test -p cubara-render --test golden -- --ignored --nocapture far_edge_scan
+/// ```
+#[test]
+#[ignore]
+fn far_edge_scan() {
+    let world = World::new();
+    let gen = cubara_world::WorldGen::new(world.seed());
+    let blocks = real_blocks();
+    let mut best: Vec<(usize, i32, i32, i32)> = Vec::new();
+    for z0 in (-3072..3072).step_by(256) {
+        for x0 in (-3072..3072).step_by(256) {
+            let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+            for z in (z0..z0 + 512).step_by(8) {
+                for x in (x0..x0 + 512).step_by(8) {
+                    let h = world.surface_height(x, z);
+                    lo = lo.min(h);
+                    hi = hi.max(h);
+                }
+            }
+            if hi - lo > 24 {
+                continue;
+            }
+            let trees = (z0 / 16..(z0 + 512) / 16)
+                .flat_map(|cz| (x0 / 16..(x0 + 512) / 16).map(move |cx| (cx, cz)))
+                .filter(|&(cx, cz)| gen.tree_site(cx, cz, blocks).is_some())
+                .count();
+            best.push((trees, x0, z0, hi - lo));
+        }
+    }
+    best.sort_by(|a, b| b.cmp(a));
+    for (trees, x0, z0, span) in best.iter().take(10) {
+        println!("({x0}, {z0}): {trees} trees, ground spans {span} blocks");
+    }
+}
+
+/// The eye and look of [`FAR_EDGE`]'s shots, and the ground under the
+/// middle of the wood.
+fn far_edge_view(world: &World) -> (glam::DVec3, glam::Vec3) {
+    let (x0, z0, side) = FAR_EDGE;
+    let (cx, cz) = (x0 + side / 2, z0 + side / 2);
+    let ground = world.surface_height(cx, cz) as f64;
+    let d = 1024.0 / std::f64::consts::SQRT_2;
+    let eye = glam::DVec3::new(cx as f64 + d, ground + 100.0, cz as f64 + d);
+    let look = (glam::DVec3::new(cx as f64, ground, cz as f64) - eye).as_vec3();
+    (eye, look)
+}
+
+/// The shot of [`FAR_EDGE`]: the game's 1080 rows, no fog -- and, for the
+/// image kept, the 640 x 360 round the wood.
+fn far_edge_shot(world: &World) -> Shot {
+    Shot {
+        width: 1920,
+        height: 1080,
+        camera: Some(far_edge_view(world)),
+        ..Shot::default()
+    }
+}
+
+/// The middle 640 x 360 of a 1920 x 1080 `frame`: the part a golden keeps
+/// of a wood a kilometre or more away.
+fn middle_of(frame: &Frame) -> Frame {
+    let (w, h) = (640usize, 360usize);
+    let (x0, y0) = (
+        (frame.width as usize - w) / 2,
+        (frame.height as usize - h) / 2,
+    );
+    let mut pixels = Vec::with_capacity(w * h * 4);
+    for y in y0..y0 + h {
+        let at = (y * frame.width as usize + x0) * 4;
+        pixels.extend_from_slice(&frame.pixels[at..at + w * 4]);
+    }
+    Frame {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    }
+}
+
+/// [`FAR_EDGE`] drawn by level 3 -- its nodes with their silhouettes, or
+/// (`trees` false) with none.
+fn render_far_edge_level_3(trees: bool) -> Option<Frame> {
+    use cubara_world::node::NodeKey;
+    let world = World::new();
+    let registry = real_registry();
+    let layers = TextureLayers::from_registry(&registry);
+    let layer_of = |name: &str| layers.layer_of(name);
+    let (x0, z0, side) = FAR_EDGE;
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for z in (z0..z0 + side).step_by(8) {
+        for x in (x0..x0 + side).step_by(8) {
+            let h = world.surface_height(x, z);
+            lo = lo.min(h);
+            hi = hi.max(h);
+        }
+    }
+    let size = 128;
+    let mut nodes = Vec::new();
+    for ny in (lo - 16).div_euclid(size)..=(hi + 16).div_euclid(size) {
+        for nz in z0.div_euclid(size)..(z0 + side).div_euclid(size) {
+            for nx in x0.div_euclid(size)..(x0 + side).div_euclid(size) {
+                nodes.push(NodeKey::new(3, [nx, ny, nz]));
+            }
+        }
+    }
+    let meshed = mesh_nodes(&world, &registry, &layer_of, nodes, real_blocks())
+        .into_iter()
+        .filter_map(to_meshed_node)
+        .map(|mut node| {
+            if !trees {
+                node.trees.clear();
+            }
+            node
+        });
+    let _gpu = gpu_lifecycle::lock();
+    headless::render(meshed, far_edge_shot(&world))
+}
+
+/// The far patches of `side`-block square `[x0, x0 + side)^2` at `level`,
+/// generated with the world's trees ([`real_blocks`]) up to `level`.
+fn far_region(x0: i32, z0: i32, side: i32, level: u32) -> Vec<cubara_world::far::PatchHeights> {
+    use cubara_world::far::{generate_with, PatchKey, WithTrees};
+    let world = World::new();
+    let gen = cubara_world::WorldGen::new(world.seed());
+    let size = PatchKey::new(level, 0, 0).size() as i32;
+    let trees = Some(WithTrees {
+        blocks: real_blocks(),
+        up_to_level: level,
+    });
+    let mut out = Vec::new();
+    for pz in z0.div_euclid(size)..(z0 + side).div_euclid(size) {
+        for px in x0.div_euclid(size)..(x0 + side).div_euclid(size) {
+            out.push(generate_with(&gen, PatchKey::new(level, px, pz), trees));
+        }
+    }
+    out
+}
+
+/// `far` drawn as the far terrain with its trees as `trees` says, no hole,
+/// in `shot`.
+fn render_far_with_trees(
+    far: &[cubara_world::far::PatchHeights],
+    trees: headless::FarTreesShot<'_>,
+    shot: Shot,
+) -> Option<Frame> {
+    let faces: Vec<_> = far.iter().map(|p| far_faces(&p.faces)).collect();
+    let patches = far_patches(far, &faces);
+    let params = cubara_render::far::FarParams {
+        hole: None,
+        materials: far_materials(),
+    };
+    let _gpu = gpu_lifecycle::lock();
+    headless::render_with_far_trees(Vec::new(), &patches, Some(params), trees, shot)
+}
+
+/// The renderer's form of the trees `far` carries (`cubara-app`'s
+/// `far_trees::to_far_trees`).
+fn far_tree_placements(
+    far: &[cubara_world::far::PatchHeights],
+) -> Vec<cubara_render::FarTreePlacement> {
+    far.iter()
+        .flat_map(|p| &p.trees)
+        .map(|t| cubara_render::FarTreePlacement {
+            base: [t.x, t.base, t.z],
+            height: t.height,
+        })
+        .collect()
+}
+
+/// **A wood swaps nothing where the voxels end** (issue #433 item 1): the
+/// wood of [`FAR_EDGE`] drawn by level 3 -- the voxels' last ring, the oak's
+/// silhouettes -- and by the far terrain at quads of 8 with its far trees,
+/// the two the ring edge swaps one for the other, from the same eye a
+/// kilometre off where each tree is five pixels tall. The trees' pixels are
+/// found by drawing each again without trees, so the ground's own change
+/// (the far terrain's business, §9.8) is not counted. Held: the share of
+/// the trees' pixels drawn by one side only, and their mean colour.
+/// `forest_far_edge_level_3.png` and `forest_far_edge_far.png` are the
+/// middle of the two frames.
+#[test]
+fn a_wood_swaps_nothing_where_the_voxels_end() {
+    let Some(l3_with) = render_far_edge_level_3(true) else {
+        headless::skip_or_require_gpu("a_wood_swaps_nothing_where_the_voxels_end");
+        return;
+    };
+    let l3_without = render_far_edge_level_3(false).expect("a GPU");
+    let world = World::new();
+    let (x0, z0, side) = FAR_EDGE;
+    let far = far_region(x0, z0, side, 3);
+    let placements = far_tree_placements(&far);
+    assert!(
+        placements.len() > 50,
+        "only {} trees in the wood",
+        placements.len()
+    );
+    let density = cubara_world::far_trees::density(real_blocks());
+    let far_with = render_far_with_trees(
+        &far,
+        headless::FarTreesShot::game(&placements, &density),
+        far_edge_shot(&world),
+    )
+    .expect("a GPU");
+    let far_without =
+        render_far_with_trees(&far, headless::FarTreesShot::NONE, far_edge_shot(&world))
+            .expect("a GPU");
+    let a = tree_pixels(&l3_with, &l3_without);
+    let b = tree_pixels(&far_with, &far_without);
+    let trees = a.iter().filter(|&&m| m).count();
+    let moved = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+    let (ca, cb) = (mean_over(&l3_with, &a), mean_over(&far_with, &b));
+    let colour = (0..3).map(|c| (ca[c] - cb[c]).abs()).fold(0.0, f64::max);
+    let share = moved as f64 / trees.max(1) as f64;
+    eprintln!(
+        "a wood where the voxels end, level 3 against the far trees: {trees} tree pixels \
+         ({} far), {moved} drawn by one side only ({:.1}%), mean colour {ca:.1?} against {cb:.1?}",
+        b.iter().filter(|&&m| m).count(),
+        100.0 * share
+    );
+    assert_frame_golden("forest_far_edge_level_3", Some(middle_of(&l3_with)));
+    assert_frame_golden("forest_far_edge_far", Some(middle_of(&far_with)));
+    assert!(trees > 1_000, "the wood is not in view ({trees} pixels)");
+    let (most_moved, most_colour) = FAR_EDGE_SWAP;
+    assert!(
+        share <= most_moved,
+        "{:.1}% of the trees' pixels change where the voxels end",
+        100.0 * share
+    );
+    assert!(
+        colour <= most_colour,
+        "the trees' mean colour changes by {colour:.1} where the voxels end"
+    );
+}
+
+/// The most [`a_wood_swaps_nothing_where_the_voxels_end`] lets change: the
+/// share of the trees' pixels drawn by one side only, and their mean colour
+/// on the image's 0-255 scale. **Chosen, not derived**: over what this build
+/// measures on the M3 -- 12.6% (1,679 tree pixels at level 3, 1,860 as far
+/// trees) and 0.4 -- and under the 33.3% one box for the canopy measured
+/// (2,208 tree pixels; its colour was 0.5 off, so the colour bound alone
+/// would not see the box). Each tree is five pixels tall here, so a pixel
+/// on its edge that rounds the other way is a few percent of it.
+const FAR_EDGE_SWAP: (f64, f64) = (0.15, 1.0);
+
+/// Wooded land where the far trees fade (issue #433 item 1): 5,120 blocks
+/// square, `[-4096, 1024)^2`, 25 far patches of quads of 32 carrying their
+/// trees, seen from above the spawn towards [`FADING_AT`]: in the middle of
+/// the screen the ground is about 2.2 km off, where a tree is two to three
+/// pixels tall at 1080 rows and the game's fade takes it -- far from the
+/// edges of the patches, whose skirts would otherwise be most of what is
+/// measured.
+const FADING_WOOD: (i32, i32, i32) = (-4096, -4096, 5120);
+
+/// Where the eyes of [`a_fading_wood_keeps_its_colour`] look: the middle of
+/// a 512-block square of gentle wooded ground 2.2 km from the spawn
+/// ([`far_edge_scan`]'s `(-1792, -1792)`).
+const FADING_AT: (i32, i32) = (-1536, -1536);
+
+/// The eyes the fade is looked at from, above the spawn: the gate's hill
+/// eye (300, some 260 blocks over the ground), a low flight's (100) and a
+/// high one's (700), which looks down on the tops more steeply.
+const FADING_EYES: [(&str, f64); 3] = [("hill", 300.0), ("low", 100.0), ("high", 700.0)];
+
+/// The screen rectangle the fade's colour is measured over: the middle
+/// 600 x 30 pixels of 1920 x 1080, ground about 1.9 to 2.6 km off from the
+/// hill eye. **Chosen, not derived**: wide enough for some hundred trees,
+/// short enough to stay at the fade's distance.
+const FADING_RECT: (usize, usize) = (600, 30);
+
+/// [`FADING_WOOD`] from the eye `height` blocks up over `(8, 8)`, looking
+/// at [`FADING_AT`] on the ground, at 1080 rows, no fog.
+fn fading_wood_shot(height: f64) -> Shot {
+    let world = World::new();
+    let (cx, cz) = FADING_AT;
+    let eye = glam::DVec3::new(8.0, height, 8.0);
+    let ground = world.surface_height(cx, cz) as f64;
+    let look = (glam::DVec3::new(cx as f64, ground, cz as f64) - eye).as_vec3();
+    Shot {
+        width: 1920,
+        height: 1080,
+        camera: Some((eye, look)),
+        ..Shot::default()
+    }
+}
+
+/// The mean colour, on the image's 0-255 scale, of every frame of `frames`
+/// over [`FADING_RECT`] in the middle of the screen, and how many of its
+/// pixels are land (not the clear colour of the frame's top-left corner)
+/// in every frame.
+fn middle_means(frames: &[&Frame]) -> (Vec<[f64; 3]>, usize) {
+    let (w, h) = (frames[0].width as usize, frames[0].height as usize);
+    let (rw, rh) = FADING_RECT;
+    let mut mask = vec![false; w * h];
+    for y in (h - rh) / 2..(h + rh) / 2 {
+        for x in (w - rw) / 2..(w + rw) / 2 {
+            mask[y * w + x] = true;
+        }
+    }
+    let sky = |f: &Frame, i: usize| f.pixels[i * 4..i * 4 + 3] == f.pixels[..3];
+    let land = (0..w * h)
+        .filter(|&i| mask[i] && frames.iter().all(|f| !sky(f, i)))
+        .count();
+    let means = frames.iter().map(|f| mean_over(f, &mask)).collect();
+    (means, land)
+}
+
+fn largest_channel_delta(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f64::max)
+}
+
+/// **A fading wood keeps its colour** (issue #433 item 1): the tint a far
+/// top shows of the trees no longer drawn one by one stands for what those
+/// trees covered, so a wood drawn as whole trees and the same wood drawn
+/// as tint alone must be the same colour on screen. [`FADING_WOOD`] from
+/// the hill eye and a low flight's, drawn four ways at once -- every tree
+/// whole and no tint (`Fade::WHOLE`); no tree and all tint, measured along
+/// the line of sight as the game does and as seen from straight above (the
+/// share the canopies cover, #433's first wording); and bare ground -- and
+/// the mean colour of the middle of the screen ([`FADING_RECT`], all land)
+/// compared. The line of sight must hold the colour within
+/// [`FADING_WOOD_COLOUR`], and so must the game's own fade; from above is
+/// reported beside it, which is why the game does not use it.
+/// `forest_fading.png` is the middle of the wood as the game fades it, from
+/// the hill eye.
+#[test]
+fn a_fading_wood_keeps_its_colour() {
+    use cubara_render::far_trees::{Fade, TintView};
+    let (x0, z0, side) = FADING_WOOD;
+    let far = far_region(x0, z0, side, 5);
+    let placements = far_tree_placements(&far);
+    assert!(placements.len() > 5_000, "only {} trees", placements.len());
+    let density = cubara_world::far_trees::density(real_blocks());
+    let shot_of = |fade, view, trees: bool| headless::FarTreesShot {
+        trees: if trees { &placements } else { &[] },
+        density: &density,
+        fade,
+        view,
+    };
+    for (name, height) in FADING_EYES {
+        let shot = fading_wood_shot(height);
+        let Some(whole) = render_far_with_trees(
+            &far,
+            shot_of(Fade::WHOLE, TintView::LineOfSight, true),
+            shot.clone(),
+        ) else {
+            headless::skip_or_require_gpu("a_fading_wood_keeps_its_colour");
+            return;
+        };
+        let render = |trees| render_far_with_trees(&far, trees, shot.clone()).expect("a GPU");
+        let sight = render(shot_of(Fade::GONE, TintView::LineOfSight, false));
+        let above = render(shot_of(Fade::GONE, TintView::FromAbove, false));
+        let bare = render(headless::FarTreesShot::NONE);
+        let game = render(shot_of(Fade::GAME, TintView::LineOfSight, true));
+        if let Some(dir) = std::env::var_os("CUBARA_FADING_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            for (what, f) in [
+                ("whole", &whole),
+                ("sight", &sight),
+                ("above", &above),
+                ("bare", &bare),
+                ("game", &game),
+            ] {
+                save_png(
+                    &dir.join(format!("fading_{name}_{what}.png")),
+                    f.width,
+                    f.height,
+                    &f.pixels,
+                );
+            }
+        }
+        let (means, land) = middle_means(&[&whole, &sight, &above, &bare, &game]);
+        let (rw, rh) = FADING_RECT;
+        assert_eq!(
+            land,
+            rw * rh,
+            "{name}: the middle of the screen is not all land"
+        );
+        let [whole_m, sight_m, above_m, bare_m, game_m] = [0, 1, 2, 3, 4].map(|k| means[k]);
+        let d_sight = largest_channel_delta(whole_m, sight_m);
+        let d_above = largest_channel_delta(whole_m, above_m);
+        let d_bare = largest_channel_delta(whole_m, bare_m);
+        let d_game = largest_channel_delta(whole_m, game_m);
+        eprintln!(
+            "the fading wood from the {name} eye: whole trees {whole_m:.1?}; \
+             all tint along the line of sight {sight_m:.1?} ({d_sight:.1} off), from above \
+             {above_m:.1?} ({d_above:.1} off), bare ground {bare_m:.1?} ({d_bare:.1} off); \
+             the game's fade {game_m:.1?} ({d_game:.1} off)"
+        );
+        if name == "hill" {
+            assert_frame_golden("forest_fading", Some(middle_of(&game)));
+        }
+        assert!(
+            d_sight <= FADING_WOOD_COLOUR,
+            "{name}: the tint along the line of sight is {d_sight:.1} off the whole trees"
+        );
+        assert!(
+            d_game <= FADING_WOOD_COLOUR,
+            "{name}: the game's fade is {d_game:.1} off the whole trees"
+        );
+        assert!(
+            d_sight <= d_above,
+            "{name}: the line of sight ({d_sight:.1}) is further from the trees than from above ({d_above:.1})"
+        );
+        // The steep eye is where a wood's trees show most: there a tint
+        // that is not there must be seen, or this test could not see one.
+        if name == "high" {
+            assert!(
+                d_bare > FADING_WOOD_COLOUR && d_above > FADING_WOOD_COLOUR,
+                "{name}: bare ground ({d_bare:.1}) and the share from above ({d_above:.1}) \
+                 are as near the trees as the bound -- this scene cannot tell a tint"
+            );
+        }
+    }
+}
+
+/// The most [`a_fading_wood_keeps_its_colour`] lets the tint's land, and the
+/// game's fade's, differ from the whole trees', on the image's 0-255 scale,
+/// largest channel. **Chosen, not derived**: over what the build measures
+/// (0.3, 0.4 and 0.1 for the tint at the hill, low and high eyes; 0.2, 0.0
+/// and 0.1 for the game's fade) and under what the alternatives do: no tint
+/// 0.5, 0.4 and 1.2 off; the share seen from above 0.5, 0.4 and 1.0; the
+/// line of sight not held to the top's depth (as first built) 0.8 and 1.1
+/// at the hill and low eyes (§9.12).
+const FADING_WOOD_COLOUR: f64 = 0.6;

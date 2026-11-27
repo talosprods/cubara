@@ -755,6 +755,12 @@ impl NodeStreaming {
         }
     }
 
+    /// Which ids the terrain is made of, the oak included: what the far
+    /// terrain's trees are placed with (issue #433 item 1).
+    pub fn blocks(&self) -> TerrainBlocks {
+        self.blocks
+    }
+
     /// The voxels' box this frame, for an eye at `eye`, as the far terrain
     /// must know it (`crate::far_streaming::VoxelBox`): the box the nodes
     /// draw once loaded, and the part of it they draw now -- the owner's

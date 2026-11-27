@@ -300,6 +300,43 @@ pub fn placed(
     ([found.site.x, found.site.base, found.site.z], found.morph)
 }
 
+/// The stand-in the game draws a far tree of `site` with (issue #433 item
+/// 1): its own trunk height's, built by the game's own builder
+/// (`cubara_render::far_trees::stand_ins`), as a model of every face it can
+/// show -- the GPU draws the ones facing the eye, which a view that culls
+/// back faces sees the same.
+pub fn far_stand_in(setup: &Setup, site: TreeSite) -> cubara_render::TreeModelMesh {
+    let layer_of = |name: &str| setup.layer_of(name);
+    let stand_ins =
+        cubara_render::far_trees::stand_ins(&setup.registry, &setup.structures, &layer_of);
+    let shapes = cubara_render::TreeShapes::of(&setup.structures);
+    stand_ins[shapes.index(site.height)].mesh()
+}
+
+/// Where the game stands the far tree of `site` on the far patch of
+/// `level` that holds its trunk: the world's own placement
+/// (`cubara_world::far_trees::patch_trees`, through `far::generate_with`),
+/// the trunk's base block.
+pub fn far_placed(setup: &Setup, level: u32, site: TreeSite) -> [i32; 3] {
+    use cubara_world::far::{generate_with, PatchKey, WithTrees};
+    let key = PatchKey::containing(level, site.x as i64, site.z as i64);
+    let trees = Some(WithTrees {
+        blocks: setup.tree_blocks(),
+        up_to_level: level,
+    });
+    let found = generate_with(&setup.gen, key, trees)
+        .trees
+        .into_iter()
+        .find(|t| (t.x, t.z) == (site.x, site.z))
+        .unwrap_or_else(|| panic!("the far patch {key:?} does not place the tree at {site:?}"));
+    assert_eq!(
+        found.height, site.height,
+        "the far patch placed the tree at ({}, {}) with another height",
+        site.x, site.z
+    );
+    [found.x, found.base, found.z]
+}
+
 /// One way of drawing a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rep {
@@ -308,6 +345,10 @@ pub enum Rep {
     Instance {
         level: u32,
         morphed: bool,
+    },
+    /// The far tree on the far patch of `level` (issue #433 item 1).
+    Far {
+        level: u32,
     },
 }
 
@@ -322,6 +363,14 @@ pub fn draw(setup: &Setup, snapshot: &WorldSnapshot, site: TreeSite, rep: Rep) -
                 setup,
                 &model_for(setup, level, site),
                 Vec3::new(at[0] as f32, y as f32, at[2] as f32),
+            )
+        }
+        Rep::Far { level } => {
+            let at = far_placed(setup, level, site);
+            model_tree(
+                setup,
+                &far_stand_in(setup, site),
+                Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32),
             )
         }
     }
@@ -606,6 +655,11 @@ pub fn comparisons() -> Vec<(String, Rep, Rep)> {
             inst(2, true),
             inst(3, false),
         ),
+        (
+            "edge 1,024 m: far tree on quads of 8 vs L3".into(),
+            inst(3, false),
+            Rep::Far { level: 3 },
+        ),
     ]
 }
 
@@ -771,6 +825,24 @@ pub mod bounds {
     /// and its tree swaps with it. Measured 1 tree of 48, by 1.
     pub const EDGE_STEP: f32 = 1.0;
     pub const EDGE_MOVED: usize = 2;
+    /// At the voxel rings' edge (1,024 m), the far tree against level 3's
+    /// silhouette (issue #433 item 1), both on the same foot -- a far quad
+    /// of 8 blocks is a level-3 cell. The stand-in's canopy is two crossed
+    /// boxes (`cubara_render::far_trees::build_stand_in`): the oak's
+    /// outline from along an axis and from above, a block wider at the
+    /// diagonals of its upper canopy. In square blocks, the worst view of a
+    /// tree, and the mean over the trees; at the ring edge a square block is
+    /// 0.83 square pixels at 1080 rows. Measured 3.4 in the mean and 3.5 at
+    /// worst, on a silhouette of 23.5 (one box measured 8.4 and 8.7).
+    pub const FAR_OUTLINE: f64 = 3.75;
+    pub const FAR_OUTLINE_MEAN: f64 = 3.5;
+    /// Its colour per face direction, and the mean colour each view sees,
+    /// /255: per direction the stand-in's faces are the silhouette's
+    /// colours, leaves and log, in the stand-in's own proportions of them.
+    /// Measured 0.4 in the mean and 0.5 at worst (T3), 0.6 and 0.7 (seen:
+    /// the stand-in shows fewer of the inner steps the silhouette does).
+    pub const FAR_T3: f64 = 0.75;
+    pub const FAR_SEEN: f64 = 1.0;
 }
 
 /// The bound on the colour a view sees of `rep`'s tree: `otherwise`, or the
@@ -820,8 +892,12 @@ pub fn check(setup: &Setup, measured: &[Vec<(TreeGround, TreeCompare)>]) -> Vec<
                     }
                 }
             }
-            // On the same foot, the same outline from every side.
-            if *ground == TreeGround::Flat && c.foot == 0.0 && c.worst_view_xor() > bounds::OUTLINE
+            // On the same foot, the same outline from every side -- but for
+            // the far tree's stand-in, which has its own bound (below).
+            if *ground == TreeGround::Flat
+                && c.foot == 0.0
+                && c.worst_view_xor() > bounds::OUTLINE
+                && !matches!(b, Rep::Far { .. })
             {
                 failures.push(format!(
                     "{at}: on the same foot its outline differs by {:.2} square blocks",
@@ -874,6 +950,38 @@ pub fn check(setup: &Setup, measured: &[Vec<(TreeGround, TreeCompare)>]) -> Vec<
                         "{name}: the mean tree's {what} is {value:.2}/255 off level 0's"
                     ));
                 }
+            }
+        }
+        if let Rep::Far { .. } = b {
+            for (_, c) in rows {
+                let at = format!(
+                    "{name}: the tree at ({}, {}) (seed {TREE_SEED:#x})",
+                    c.site.x, c.site.z
+                );
+                // Standing where level 3 stands it: a far quad of 8 is a
+                // level-3 cell, and its top the cell's.
+                if c.foot != 0.0 {
+                    failures.push(format!("{at}: its foot moved {:+}", c.foot));
+                }
+                if c.worst_view_xor() > bounds::FAR_OUTLINE {
+                    failures.push(format!(
+                        "{at}: its outline differs by {:.2} square blocks",
+                        c.worst_view_xor()
+                    ));
+                }
+                if c.worst_t3() > bounds::FAR_T3 || c.worst_view_seen() > bounds::FAR_SEEN {
+                    failures.push(format!(
+                        "{at}: T3 {:.2}, seen {:.2}/255 off level 3's",
+                        c.worst_t3(),
+                        c.worst_view_seen()
+                    ));
+                }
+            }
+            let (outline, _) = stats(rows.iter().map(|(_, c)| c.worst_view_xor()));
+            if outline > bounds::FAR_OUTLINE_MEAN {
+                failures.push(format!(
+                    "{name}: the mean tree's outline differs by {outline:.2} square blocks"
+                ));
             }
         }
         if let Rep::Instance { morphed: true, .. } = a {

@@ -15,9 +15,9 @@ use cubara_render::aggregate::Materials;
 use cubara_render::{FarDir, FarFace, FarParams, FarPatch, FarRole, FarSlot, Renderer};
 #[cfg(test)]
 use cubara_voxel::ChunkCoord;
-use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
+use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey, WithTrees};
 use cubara_world::node;
-use cubara_world::WorldGen;
+use cubara_world::{TerrainBlocks, WorldGen};
 
 /// How far the far terrain reaches, in blocks: the owner's "262 km first"
 /// (2026-09-26, `PROPOSAL_FAR_VIEW.md`).
@@ -288,6 +288,7 @@ pub fn to_far_faces(p: &PatchHeights) -> Vec<FarFace> {
             border: f.border,
             mix: f.mix,
             open: f.open,
+            trees: f.trees,
         })
         .collect()
 }
@@ -460,16 +461,43 @@ pub(crate) fn standin_ring(wanted: Hole) -> Vec<PatchKey> {
 /// No face crosses a [`far::JOIN_GRID`] line and the boxes' sides are on
 /// them, so a face's first quad says where all of it is.
 pub fn standin_faces(patch: &PatchHeights, voxels: VoxelBox) -> Vec<FarFace> {
-    let [ox, oz] = patch.key.origin().map(|o| o as f64);
-    let quad = patch.key.quad() as f64;
     to_far_faces(patch)
         .into_iter()
-        .filter(|face| {
-            let [i, j] = face.owner();
-            let at = [ox + i as f64 * quad, oz + j as f64 * quad];
-            within(voxels.wanted, at, quad) && !within(voxels.drawn, at, quad)
-        })
+        .filter(|face| in_strip(patch, face.owner(), voxels))
         .collect()
+}
+
+/// **Whether the quad `[i, j]` of `patch` is the strip's ground**: inside
+/// the box the voxels want and outside the part they draw -- the ground
+/// the strip's nodes will draw. The one rule for what the stand-in draws:
+/// its faces ([`standin_faces`]) and the trees on them ([`standin_trees`]).
+fn in_strip(patch: &PatchHeights, [i, j]: [usize; 2], voxels: VoxelBox) -> bool {
+    let [ox, oz] = patch.key.origin().map(|o| o as f64);
+    let quad = patch.key.quad() as f64;
+    let at = [ox + i as f64 * quad, oz + j as f64 * quad];
+    within(voxels.wanted, at, quad) && !within(voxels.drawn, at, quad)
+}
+
+/// **The trees the stand-in draws** (issue #433 item 1): those of `patch`
+/// standing on a quad of the strip ([`in_strip`]) -- on its top, which the
+/// stand-in draws ([`standin_faces`]), and at quads of 8 where the strip's
+/// level-3 nodes will stand them. The far terrain holed at the box the
+/// voxels want draws none of the strip's trees; without these the strip
+/// would show none for the frames its nodes load, a wood blinking out and
+/// back a kilometre ahead each time the box moves.
+pub fn standin_trees(
+    patch: &PatchHeights,
+    voxels: VoxelBox,
+) -> Vec<cubara_render::FarTreePlacement> {
+    let [ox, oz] = patch.key.origin();
+    let quad = patch.key.quad();
+    let mut out = crate::far_trees::to_far_trees(patch);
+    out.retain(|t| {
+        let i = (t.base[0] as i64 - ox).div_euclid(quad) as usize;
+        let j = (t.base[2] as i64 - oz).div_euclid(quad) as usize;
+        in_strip(patch, [i, j], voxels)
+    });
+    out
 }
 
 /// Every coarser patch holding `key`, up to `top_level`.
@@ -561,8 +589,9 @@ enum Urgency {
 }
 
 /// One patch to generate, and the generation (of [`FarStreaming`]) it was
-/// asked for in.
-type Job = (u64, WorldGen, PatchKey);
+/// asked for in -- with the world's trees, if it draws them (issue #433
+/// item 1).
+type Job = (u64, (WorldGen, Option<WithTrees>), PatchKey);
 
 /// The pool's two queues: a worker takes from `now` while it has anything,
 /// so a patch the eye wants never waits behind the prefetch.
@@ -627,8 +656,9 @@ impl Pool {
                 std::thread::Builder::new()
                     .name("cubara-far".into())
                     .spawn(move || {
-                        while let Some((generation, gen, key)) = next_job(&queues) {
-                            if done.send((generation, far::generate(&gen, key))).is_err() {
+                        while let Some((generation, (gen, trees), key)) = next_job(&queues) {
+                            let patch = far::generate_with(&gen, key, trees);
+                            if done.send((generation, patch)).is_err() {
                                 break;
                             }
                         }
@@ -1103,6 +1133,10 @@ pub struct FarStreaming {
     materials: Materials,
     /// Said once when the renderer runs out of slots, not every frame.
     warned_full: bool,
+    /// The world's trees (issue #433 item 1), and whether the renderer has
+    /// been told how densely they stand.
+    trees: Option<TerrainBlocks>,
+    density_told: bool,
 }
 
 impl FarStreaming {
@@ -1117,7 +1151,43 @@ impl FarStreaming {
             standin_slots: HashMap::new(),
             materials: far_materials(),
             warned_full: false,
+            trees: None,
+            density_told: false,
         }
+    }
+
+    /// The trees of the patches the renderer was handed and still draws:
+    /// what it must hold (`far_trees`'s test of the wiring).
+    #[cfg(test)]
+    pub fn trees_of_drawn_patches(&self) -> usize {
+        self.slots
+            .keys()
+            .filter_map(|k| self.plan.patch(*k))
+            .map(|p| p.trees.len())
+            .sum()
+    }
+
+    /// The trees of the stand-in drawn now ([`standin_trees`] of each of its
+    /// patches, for the box it was cut for): what the renderer must hold for
+    /// it besides [`trees_of_drawn_patches`](Self::trees_of_drawn_patches).
+    #[cfg(test)]
+    pub fn trees_of_standin(&self) -> usize {
+        let Some((strip, _)) = &self.plan.standin else {
+            return 0;
+        };
+        self.standin_slots
+            .keys()
+            .filter_map(|k| self.plan.patch(*k))
+            .map(|p| standin_trees(p, *strip).len())
+            .sum()
+    }
+
+    /// Draw `blocks`' trees on the far terrain (issue #433 item 1): every
+    /// patch near enough to hold one carries its trees, and the tops show the
+    /// ones no longer drawn one by one. Before the first frame.
+    pub fn with_trees(mut self, blocks: TerrainBlocks) -> Self {
+        self.trees = Some(blocks);
+        self
     }
 
     /// Draw with the quality's quads, error bound and floor `scale` times as
@@ -1184,6 +1254,16 @@ impl FarStreaming {
             }
             self.plan.take(patch);
         }
+        if !self.density_told {
+            let density = self.trees.map(cubara_world::far_trees::density);
+            renderer.set_far_tree_density(&density.unwrap_or_default());
+            self.density_told = true;
+        }
+        let trees = self.trees.and_then(|blocks| {
+            let h = renderer.size().1;
+            let view = far_view_scaled([0.0; 3], h, None, self.plan.quality, self.plan.quad_scale)?;
+            crate::far_trees::with_trees(blocks, &view, h)
+        });
         let eye64 = eye.map(|v| v as f64);
         let slots = &self.slots;
         let step = self.plan.step(eye64, renderer.size().1, voxels, || {
@@ -1207,6 +1287,10 @@ impl FarStreaming {
                 let faces = standin_faces(patch, strip);
                 match renderer.far_insert_as(to_far_patch(patch, &faces), FarRole::StandIn) {
                     Some(slot) => {
+                        let trees = standin_trees(patch, strip);
+                        if !trees.is_empty() {
+                            renderer.far_trees_insert_as(slot, trees, FarRole::StandIn);
+                        }
                         self.standin_slots.insert(key, slot);
                     }
                     None if !self.warned_full => {
@@ -1226,11 +1310,11 @@ impl FarStreaming {
         }
         for key in step.request {
             self.pool
-                .ask((self.generation, self.gen, key), Urgency::Now);
+                .ask((self.generation, (self.gen, trees), key), Urgency::Now);
         }
         for key in step.prefetch {
             self.pool
-                .ask((self.generation, self.gen, key), Urgency::Ahead);
+                .ask((self.generation, (self.gen, trees), key), Urgency::Ahead);
         }
         for key in step.leave {
             if let Some(slot) = self.slots.remove(&key) {
@@ -1243,6 +1327,9 @@ impl FarStreaming {
             };
             match renderer.far_insert(to_far_patch(patch, &to_far_faces(patch))) {
                 Some(slot) => {
+                    if !patch.trees.is_empty() {
+                        renderer.far_trees_insert(slot, crate::far_trees::to_far_trees(patch));
+                    }
                     self.slots.insert(key, slot);
                 }
                 None if !self.warned_full => {
@@ -1738,6 +1825,135 @@ mod tests {
         assert!(
             !ring.iter().any(inside),
             "a patch inside the box is in the ring"
+        );
+    }
+
+    /// **The stand-in draws the trees standing on its tops** (issue #433
+    /// item 1, [`standin_trees`]): of a patch of the strip with its trees,
+    /// exactly those whose quad the stand-in draws a top over -- the strip's
+    /// own, by the one rule the faces are cut by -- and none of the others.
+    /// On the patch of the strip the sliver looked through, and the one at
+    /// the strip's end.
+    #[test]
+    fn the_stand_in_draws_the_trees_on_its_tops() {
+        let voxels = low_flight_move();
+        let gen = WorldGen::new(cubara_world::World::new().seed());
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&crate::game::load_structure_registry(), &registry);
+        let trees = Some(WithTrees {
+            blocks,
+            up_to_level: far::FINEST_LEVEL,
+        });
+        let (mut kept, mut left) = (0, 0);
+        for key in [PatchKey::new(3, 4, -2), PatchKey::new(3, 4, 4)] {
+            let patch = far::generate_with(&gen, key, trees);
+            let tops: Vec<FarFace> = standin_faces(&patch, voxels)
+                .into_iter()
+                .filter(|f| f.dir == FarDir::Top)
+                .collect();
+            let under_a_top = |t: &cubara_render::FarTreePlacement| {
+                let [ox, oz] = key.origin();
+                let q = key.quad();
+                let (i, j) = (
+                    (t.base[0] as i64 - ox).div_euclid(q) as u8,
+                    (t.base[2] as i64 - oz).div_euclid(q) as u8,
+                );
+                tops.iter()
+                    .any(|f| f.i0 <= i && i < f.i1 && f.j0 <= j && j < f.j1)
+            };
+            let drawn = standin_trees(&patch, voxels);
+            for t in crate::far_trees::to_far_trees(&patch) {
+                assert_eq!(
+                    drawn.contains(&t),
+                    under_a_top(&t),
+                    "{key:?}: the tree at {:?}",
+                    t.base
+                );
+                if under_a_top(&t) {
+                    kept += 1;
+                } else {
+                    left += 1;
+                }
+            }
+        }
+        assert!(
+            kept > 5 && left > 5,
+            "{kept} trees kept, {left} left: this pins little"
+        );
+    }
+
+    /// **The window hands the stand-in's trees to the renderer and takes
+    /// them back with it** (issue #433 item 1 with §9.11's stand-in, an
+    /// offscreen renderer): settled before the low flight's move, then
+    /// while the strip waits the renderer holds the far terrain's trees and
+    /// the stand-in's, and once the strip's nodes are drawn the far
+    /// terrain's alone.
+    #[test]
+    fn the_stand_in_hands_its_trees_over_and_takes_them_back() {
+        let voxels = low_flight_move();
+        let before = VoxelBox::settled(hole_in_blocks(node::covered_box_3d(
+            ChunkCoord::new(7, 6, 2),
+            node::DEFAULT_RING_SCHEDULE,
+        )));
+        // In chunk (7, 6, 2), then in (8, 6, 2): the move's two boxes.
+        let (eye, moved) = ([120.0, 100.0, 40.0], [136.0, 100.0, 40.0]);
+        let camera = cubara_render::CameraPose {
+            eye: glam::DVec3::from_array(eye.map(f64::from)),
+            look_dir: glam::Vec3::X,
+        };
+        let Some((mut renderer, _assets)) =
+            Renderer::offscreen(320, 180, camera, cubara_render::ArenaCapacity::FLOOR)
+        else {
+            cubara_render::headless::skip_or_require_gpu(
+                "the_stand_in_hands_its_trees_over_and_takes_them_back",
+            );
+            return;
+        };
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&crate::game::load_structure_registry(), &registry);
+        let seed = cubara_world::World::new().seed();
+        let mut far = FarStreaming::new(seed, FarQuality::Medium).with_trees(blocks);
+        let until = |far: &mut FarStreaming,
+                     renderer: &mut Renderer,
+                     (eye, voxels): ([f32; 3], VoxelBox),
+                     done: &dyn Fn(&FarStreaming) -> bool| {
+            // A slow runner generates the patches slowly.
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_secs(300) {
+                far.update(renderer, eye, voxels);
+                if done(far) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+        assert!(
+            until(&mut far, &mut renderer, (eye, before), &|f| f.settled()),
+            "the far terrain did not settle in 300 s"
+        );
+        assert_eq!(far.trees_of_standin(), 0, "nothing waits before the move");
+        assert!(
+            until(&mut far, &mut renderer, (moved, voxels), &|f| f
+                .trees_of_standin()
+                > 0),
+            "no stand-in with trees on the move's strip in 300 s"
+        );
+        let (standin, terrain) = (far.trees_of_standin(), far.trees_of_drawn_patches());
+        assert!(standin > 20, "only {standin} trees on the strip");
+        assert_eq!(
+            renderer.far_trees_counts().1,
+            terrain + standin,
+            "the renderer holds the far terrain's trees and the strip's"
+        );
+        far.update(&mut renderer, moved, VoxelBox::settled(voxels.wanted));
+        assert_eq!(far.trees_of_standin(), 0, "the strip's nodes are drawn");
+        assert_eq!(
+            renderer.far_trees_counts().1,
+            far.trees_of_drawn_patches(),
+            "the stand-in's trees left with it"
         );
     }
 
@@ -2622,7 +2838,7 @@ mod tests {
     #[test]
     fn the_pool_takes_the_urgent_queue_first() {
         let gen = WorldGen::new(1);
-        let job = |x: i32| (0u64, gen, PatchKey::new(4, x, 0));
+        let job = |x: i32| (0u64, (gen, None), PatchKey::new(4, x, 0));
         let mut q = Queues::default();
         q.push(job(1), Urgency::Ahead);
         q.push(job(2), Urgency::Ahead);

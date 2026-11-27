@@ -356,6 +356,78 @@ pub fn build_oak_mesh(
     Some(out)
 }
 
+/// One quad of an oak model, as the silhouette and the far trees read it:
+/// the face direction (+X -X +Y -Y +Z -Z, `Face` order), the plane it lies
+/// in, its texture layer, its rectangle on the plane's two other axes (`lo`
+/// to `hi`, in blocks, along `(axis + 1) % 3` and `(axis + 2) % 3`), and the
+/// mean of its openness over the two triangles it is drawn as.
+struct OakQuad {
+    dir: usize,
+    plane: i32,
+    layer: u32,
+    lo: [i32; 2],
+    hi: [i32; 2],
+    open: f64,
+}
+
+/// `oak`'s quads ([`OakQuad`]).
+fn oak_quads(oak: &TreeModelMesh) -> impl Iterator<Item = OakQuad> + '_ {
+    oak.indices.chunks(6).map(|six| {
+        let base = *six.iter().min().expect("six indices") as usize;
+        let vs = &oak.vertices[base..base + 4];
+        let n = vs[0].normal;
+        let axis = (0..3).find(|&a| n[a] != 0.0).expect("an axis-aligned face");
+        let dir = 2 * axis + usize::from(n[axis] < 0.0);
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let lo = |a: usize| {
+            vs.iter()
+                .map(|p| p.position[a])
+                .fold(f32::MAX, f32::min)
+                .round() as i32
+        };
+        let hi = |a: usize| {
+            vs.iter()
+                .map(|p| p.position[a])
+                .fold(f32::MIN, f32::max)
+                .round() as i32
+        };
+        // The quad's mean openness over the two triangles it is drawn as:
+        // the corners on the shared diagonal count in both.
+        let o: Vec<f64> = vs.iter().map(|p| p.open as f64).collect();
+        let open = if six[0] as usize == base {
+            (2.0 * (o[0] + o[2]) + o[1] + o[3]) / 6.0
+        } else {
+            (2.0 * (o[1] + o[3]) + o[0] + o[2]) / 6.0
+        };
+        OakQuad {
+            dir,
+            plane: vs[0].position[axis].round() as i32,
+            layer: vs[0].layer as u32,
+            lo: [lo(u), lo(v)],
+            hi: [hi(u), hi(v)],
+            open,
+        }
+    })
+}
+
+/// **How open the oak is, per face direction and texture**: the area mean
+/// of its quads' openness (`+X -X +Y -Y +Z -Z`, `Face` order, by texture
+/// layer). What the silhouette shades each of its flat colours by
+/// ([`build_silhouette_mesh`]), and so what the far trees' stand-in shades
+/// its faces by (`crate::far_trees`, #433 item 1): one table for both.
+pub fn oak_shades(oak: &TreeModelMesh) -> BTreeMap<(usize, u32), f32> {
+    let mut sums: BTreeMap<(usize, u32), (f64, f64)> = BTreeMap::new();
+    for q in oak_quads(oak) {
+        let area = ((q.hi[0] - q.lo[0]) * (q.hi[1] - q.lo[1])) as f64;
+        let s = sums.entry((q.dir, q.layer)).or_default();
+        s.0 += area;
+        s.1 += q.open * area;
+    }
+    sums.into_iter()
+        .map(|(k, (area, open))| (k, (open / area) as f32))
+        .collect()
+}
+
 /// **The oak's own outline in flat colours** (#433 item 4): `oak`'s surface
 /// -- the same faces, so the same silhouette from every side -- merged into
 /// as few quads as it takes, each face direction and texture one flat
@@ -377,56 +449,22 @@ pub fn build_silhouette_mesh(
     // the texture: the unit cells the oak's quads cover there.
     type Key = (usize, i32, u32);
     let mut cells: BTreeMap<Key, std::collections::BTreeSet<(i32, i32)>> = BTreeMap::new();
-    // Per face direction and texture: area, and openness times area.
-    let mut shade: BTreeMap<(usize, u32), (f64, f64)> = BTreeMap::new();
-    for six in oak.indices.chunks(6) {
-        let base = *six.iter().min().expect("six indices") as usize;
-        let vs = &oak.vertices[base..base + 4];
-        let n = vs[0].normal;
-        let axis = (0..3).find(|&a| n[a] != 0.0).expect("an axis-aligned face");
-        let dir = 2 * axis + usize::from(n[axis] < 0.0);
-        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-        let plane = vs[0].position[axis].round() as i32;
-        let layer = vs[0].layer as u32;
-        let lo = |a: usize| {
-            vs.iter()
-                .map(|p| p.position[a])
-                .fold(f32::MAX, f32::min)
-                .round() as i32
-        };
-        let hi = |a: usize| {
-            vs.iter()
-                .map(|p| p.position[a])
-                .fold(f32::MIN, f32::max)
-                .round() as i32
-        };
-        let set = cells.entry((dir, plane, layer)).or_default();
-        for a in lo(u)..hi(u) {
-            for b in lo(v)..hi(v) {
+    for q in oak_quads(oak) {
+        let set = cells.entry((q.dir, q.plane, q.layer)).or_default();
+        for a in q.lo[0]..q.hi[0] {
+            for b in q.lo[1]..q.hi[1] {
                 set.insert((a, b));
             }
         }
-        // The quad's mean openness over the two triangles it is drawn as:
-        // the corners on the shared diagonal count in both.
-        let o: Vec<f64> = vs.iter().map(|p| p.open as f64).collect();
-        let mean = if six[0] as usize == base {
-            (2.0 * (o[0] + o[2]) + o[1] + o[3]) / 6.0
-        } else {
-            (2.0 * (o[1] + o[3]) + o[0] + o[2]) / 6.0
-        };
-        let area = ((hi(u) - lo(u)) * (hi(v) - lo(v))) as f64;
-        let s = shade.entry((dir, layer)).or_default();
-        s.0 += area;
-        s.1 += mean * area;
     }
+    let shade = oak_shades(oak);
     let mut out = TreeModelMesh::default();
     for ((dir, plane, layer), mut set) in cells {
         let axis = dir / 2;
         let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
         let mut normal = [0.0f32; 3];
         normal[axis] = if dir % 2 == 0 { 1.0 } else { -1.0 };
-        let (area, open) = shade[&(dir, layer)];
-        let open = (open / area) as f32;
+        let open = shade[&(dir, layer)];
         let colour = colour_of(layer);
         // Greedy rectangles: the first cell left, as far along `u` as the
         // row runs, then as many rows along `v` as run as far.

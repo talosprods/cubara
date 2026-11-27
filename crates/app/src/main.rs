@@ -24,6 +24,9 @@ mod far_census;
 #[cfg(test)]
 mod far_census_horizon;
 mod far_streaming;
+mod far_trees;
+#[cfg(test)]
+mod far_trees_census;
 mod flight;
 mod game;
 #[cfg(test)]
@@ -152,6 +155,9 @@ struct App {
     /// swap as it was before the distance morph (issue #380's study), for
     /// looking at the two side by side.
     no_morph: bool,
+    /// `--far-trees off`: bare far ground, as before issue #433 item 1 --
+    /// the same binary drawn both ways, to look at or measure.
+    no_far_trees: bool,
     /// `--present fifo|mailbox|immediate`: asked for when the surface offers it.
     present: Option<wgpu::PresentMode>,
     /// Whether the window is covered, and whether it is minimised: either
@@ -626,10 +632,13 @@ impl ApplicationHandler for App {
             &ores,
             move |name: &str| layers.layer_of(name),
         ));
-        self.far = Some(
-            far_streaming::FarStreaming::new(self.game.world().seed(), self.settings.far)
-                .with_quad_scale(self.far_quad_scale),
-        );
+        let blocks = self.streaming.as_ref().map(NodeStreaming::blocks);
+        let far = far_streaming::FarStreaming::new(self.game.world().seed(), self.settings.far)
+            .with_quad_scale(self.far_quad_scale);
+        self.far = Some(match blocks.filter(|_| !self.no_far_trees) {
+            Some(blocks) => far.with_trees(blocks),
+            None => far,
+        });
         let mut renderer = renderer;
         renderer.set_icons(self.game.item_icons());
         self.renderer = Some(renderer);
@@ -1170,6 +1179,21 @@ fn main() {
                 })
         },
     );
+    // `--far-trees off|on`: whether the far terrain draws the world's trees
+    // (issue #433 item 1). On unless asked otherwise: `off` is the same
+    // commit drawing bare far ground, for an A/B of what they cost and look
+    // like, as `--fog off` is.
+    let far_trees = match args.iter().position(|a| a == "--far-trees") {
+        None => true,
+        Some(i) => match args.get(i + 1).map(String::as_str) {
+            Some("on") => true,
+            Some("off") => false,
+            _ => {
+                eprintln!("--far-trees needs off or on");
+                std::process::exit(2);
+            }
+        },
+    };
     let present = args.iter().position(|a| a == "--present").map(|i| {
         args.get(i + 1)
             .and_then(|m| present::parse_present(m))
@@ -1317,8 +1341,14 @@ fn main() {
         let radius = match target {
             bench::Target::Radius(radius) => radius,
             bench::Target::Gate => {
-                let tries =
-                    bench::try_qualities(1000.0, size, overlay, gpu_timing, fog, far_quad_scale);
+                let tries = bench::try_qualities(
+                    1000.0,
+                    size,
+                    overlay,
+                    gpu_timing,
+                    fog,
+                    (far_quad_scale, far_trees),
+                );
                 let (_, line) = bench::gate_line(&tries, 1000.0);
                 log::info!("{line}");
                 return;
@@ -1393,6 +1423,7 @@ fn main() {
                     size,
                     quality: far_streaming::FarQuality::High,
                     far_quad_scale,
+                    far_trees,
                     morph: !args.iter().any(|a| a == "--no-morph"),
                 };
                 // `--frames-every N`: also write every Nth rendered frame to
@@ -1430,7 +1461,7 @@ fn main() {
                     overlay,
                     gpu_timing,
                     fog,
-                    far_quad_scale,
+                    (far_quad_scale, far_trees),
                 );
                 let far = bench::best_quality(&tries, target_fps as f64)
                     .unwrap_or(far_streaming::FarQuality::Off);
@@ -1479,6 +1510,7 @@ fn main() {
                     .any(|a| a == "--far")
                     .then_some(far_streaming::FarQuality::High),
                 far_quad_scale,
+                far_trees,
             },
             overlay,
             gpu_timing,
@@ -1544,6 +1576,7 @@ fn main() {
                 .and_then(bench::parse_size)
                 .unwrap_or((1920, 1080)),
             far_quad_scale,
+            far_trees,
         });
         // Static overlay text -- the pause menu or console, for a review
         // screenshot of `Hud::menu` with no window (`--screenshot menu.png
@@ -1579,6 +1612,7 @@ fn main() {
         no_tune,
         far_quad_scale,
         no_morph,
+        no_far_trees: !far_trees,
         present,
         ..App::default()
     };

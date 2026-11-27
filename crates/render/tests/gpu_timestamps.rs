@@ -150,6 +150,7 @@ fn gpu_timestamps_through_encode_scene_produce_a_real_reading() {
             cracking: None,
             players: &[],
             far: None,
+            far_trees: None,
             trees: None,
             overlay: None,
             hotbar: None,
