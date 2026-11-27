@@ -126,7 +126,14 @@ pub fn build_mesh_bounded_occluded_node(
     occluded: impl Fn(i32, i32, i32) -> bool,
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
 ) -> Option<(Mesh, Aabb)> {
-    build_mesh_bounded_occluded_node_morph(chunk, ctx, occluded, may_be_solid, None)
+    build_mesh_bounded_occluded_node_morph(
+        chunk,
+        ctx,
+        occluded,
+        may_be_solid,
+        |_, _, _| false,
+        None,
+    )
 }
 
 /// [`build_mesh_bounded_occluded_node`] with the distance morph baked in
@@ -137,9 +144,10 @@ pub fn build_mesh_bounded_occluded_node_morph(
     ctx: &MeshContext,
     occluded: impl Fn(i32, i32, i32) -> bool,
     may_be_solid: impl Fn(i32, i32, i32) -> bool,
+    outside_solid: impl Fn(i32, i32, i32) -> bool,
     morph: Option<&crate::voxel::MorphColumns>,
 ) -> Option<(Mesh, Aabb)> {
-    let mesh = chunk.build_mesh_morph(ctx, occluded, may_be_solid, morph);
+    let mesh = chunk.build_mesh_morph(ctx, occluded, may_be_solid, outside_solid, morph);
     if mesh.indices.is_empty() {
         return None;
     }

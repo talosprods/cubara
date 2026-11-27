@@ -15,6 +15,7 @@
 //! takes no damage, and has unlimited blocks (owner's calls, 2026-09-18 and
 //! 2026-11-09).
 
+mod arena_capacity;
 mod bench;
 mod caps;
 mod capture;
@@ -36,6 +37,8 @@ mod present;
 mod screenshot;
 mod settings;
 mod streaming;
+#[cfg(test)]
+mod strip_standin;
 mod tick_cost;
 #[cfg(test)]
 mod transition_study;
@@ -590,6 +593,7 @@ impl ApplicationHandler for App {
             // exactly what it drew before (issue #425: bench behaviour is
             // out of scope).
             window_use == present::WindowUse::Play,
+            arena_capacity::game_capacity(),
         );
         if let Some(m) = wanted.filter(|m| Some(*m) != renderer.present_mode()) {
             log::warn!("--present {m:?} is not offered here");
@@ -966,8 +970,8 @@ impl ApplicationHandler for App {
                             w.settle();
                         }
                     }
-                    let hole = streaming.far_hole(renderer, eye);
-                    far.update(renderer, eye, hole);
+                    let voxels = streaming.voxel_box(renderer, eye);
+                    far.update(renderer, eye, voxels);
                     // Shut in underground, none of it can be seen (#424).
                     renderer.set_far_shown(streaming.far_in_sight(eye));
                 }

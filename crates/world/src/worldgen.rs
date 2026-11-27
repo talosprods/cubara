@@ -1984,6 +1984,17 @@ impl WorldGen {
         )
     }
 
+    /// The lowest and highest value [`column_top`](Self::column_top) can
+    /// return: [`surface_range`](Self::surface_range), its floor lowered by
+    /// the deepest pit floor [`pit_floor`](Self::pit_floor) finds. Every
+    /// level's top -- a mean of these, or a summit among them -- is one of
+    /// them plus one, so no ground any level draws stands outside it
+    /// (`crate::far::ground_range`).
+    pub fn column_top_range() -> (i32, i32) {
+        let (lo, hi) = Self::surface_range();
+        (lo - PIT_FLOOR_SEARCH, hi)
+    }
+
     /// No block the generator places is ever higher than this: the tallest
     /// surface the height field can produce, plus the tallest tree on it.
     ///

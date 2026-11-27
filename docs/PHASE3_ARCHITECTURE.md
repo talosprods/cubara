@@ -609,15 +609,19 @@ pub fn ground_faces(&self, x0: i32, z0: i32, w: i32, n: i32) -> GroundFaces;
   riser area per direction and layer -- wherever no cave touches the
   surface. (Since §9.9 it counts the columns' tops, so a pit's walls and
   the risers of its floor are in it, stone under the soil: what a far wall
-  beside a sunk quad is mixed from.) The openness is within 0.08 on tops and 0.14 on a direction's
-  risers, and the test shows where the rest goes: **the mesher bakes a
-  chunk's AO without looking into the next chunk**, so faces at a chunk's
-  edge come out more open than the height field says (up to 0.06 of
-  openness on steep ground, about 2/255 on a grass top). Asked with that
-  blindness put in, the same corner rule gives the mesher's number to the
-  last bit. `ground_faces` reports the true neighbours; the chunk-edge
-  blindness is a level-0 mesher property, recorded here and not fixed by
-  this block.
+  beside a sunk quad is mixed from.) **The openness is exact** (to the
+  rounding of a mean, 1e-4, on tops and on every riser direction): since
+  #430 the mesher shades a face by the blocks across a chunk's border as it
+  does inside it (the border's neighbour is `cubara_world::mesh::
+  NeighbourBlocks`, the one place that says what lies beside a node), so
+  the height field's openness is the mesher's with no chunk-edge case. Before
+  #430 the mesher left the next chunk out -- a face at a chunk's edge, or
+  whose air side was in the chunk above, came out more open than the height
+  field says (up to 0.06 on tops, 0.11 on a direction's risers, about 2/255
+  on a grass top) -- and the test had to model that blindness to hold the two
+  together. An edit now dirties the chunks diagonal to its block as well
+  (`chunks_affected_by_edit`: up to eight at a corner), since a corner
+  reads the blocks around it.
 
 **The far-terrain interface** (#422 calls these; nothing else decides a far
 quad's height or a far face's colour):
@@ -953,13 +957,35 @@ Riser *area* is 0.96 to 1.00 of level 0's at level 1, 0.86 to 0.93 at level
 (§9.2): bumps inside a cell have no riser. It is reported and not bounded
 (§9.1 item 3).
 
-**#423 decision 3's 2/255 holds at levels 1 and 2, in every direction of
-every single footprint, and not at level 3.** Worst footprint and direction
-measured, tops then sides: level 1 1.50 and 1.51; level 2 1.66 and 1.62;
-level 3 **2.88** (nine of forty footprints are over 2.0) and **3.18** (two
-of 63 ranked directions: 3.18 and 2.21). The harness asserts 2.0 and 2.0,
-2.0 and 2.0, 3.0 and 3.25 (`T3_ALLOWED`; level 3's are chosen, just over
-the measured worst). The stone share of the sides is within 1.15 points of
+**#423 decision 3's 2/255 holds at levels 1 and 2 in every direction of
+every single footprint, bar one (below), and not at level 3.** After #430
+-- worst footprint and direction measured, tops then sides: level 1 0.99
+and 1.21; level 2 **2.0076** and 1.20; level 3 2.60 and 3.22. The harness
+asserts 1.25 and 1.5, 2.01 and 1.5, 2.75 and 3.25 (`T3_ALLOWED`, every one
+chosen, not derived, just over the measured worst; the bounds #423 asserted
+were 2.0 and 2.0, 2.0 and 2.0, 3.0 and 3.25, measured then at 1.48 / 1.51,
+1.93 / 1.63 and 2.98 / 3.12). **Level 2's tops are 0.01 over #423's 2.0,
+in one footprint**: `Gentle` at (-4096, -2048), whose coarse tops are
+lighter than level 0's by 0.026 of their light; item 1 below is what is
+missing there.
+
+**#430 moved the floor up before it moved it down.** The coarse AO of #423
+had been chosen against a level 0 that was blind at chunk edges (lighter
+than its own blocks there), and a coarse node is 16 cells wide at every
+level, so it was equally blind at *its* edges. With level 0 shading across
+its borders (§9.3) and the coarse rule unchanged, the worst footprint went
+to 1.96 / 1.81, 3.71 / 2.27 and 5.39 / 3.41. Two things brought it back:
+a coarse node reads what its same-level neighbour draws across its border
+(`NeighbourBlocks`; `a_node_reads_the_cells_its_neighbour_draws` pins that
+the read is the neighbour's own drawn cell, over 5000 border cells), which
+alone gave 0.99 / 1.70, 2.75 / 2.26, 3.45 / 3.41; and two rule changes,
+both chosen from the measurement: **every occluder darkens a coarse top's
+corner**, not only those at least half as tall as the riser that sets the
+band (tops 2.01 and 2.60 at levels 2 and 3), and **the wall band's shade is
+two occluders**, not one (sides 1.21, 1.20, 3.22). Six other variants made
+other footprints worse (band rounding up, down or geometric; the diagonal in
+the band; a riser of one given a band; an inner corner given one more).
+The stone share of the sides is within 1.15 points of
 level 0's in every footprint (asserted at 1.25), the soil share within 3.7,
 0.7 and 5.6 points per kind (asserted at 4.5, 2 and 6.5). What is left at
 level 3, in order (`top_shade_by_riser_report` takes the first apart):
@@ -975,12 +1001,11 @@ level 3, in order (`top_shade_by_riser_report` takes the first apart):
    top is the surface block over as many of them as are drawn, where level
    0 shows one row of it and soil under it: that is the soil level 3 is
    short of, and a direction with a few dozen faces is a sample of level
-   0's mix (the 3.18 is one cliff's +X, 2.45 of it the materials alone).
+   0's mix (the 3.22 is one cliff's +X, 2.40 of it the materials alone).
    **The lever:** let the cut-off row wear the surface block and the rest
    of its cell what the hash picks. Not built.
-3. **Level 0's own chunk-edge AO blindness** (§9.3, #430), which is about
-   2/255 on steep tops by itself and is in the reference every level is
-   held to.
+3. (Level 0's own chunk-edge AO blindness was item 3 here: fixed by #430,
+   §9.3.)
 
 (Pits were item 3 of this list: up to 267 columns of a footprint at level
 3. There are none left on the surface term at any level, and
@@ -2367,7 +2392,7 @@ move). Three changes:
   (`PREFETCH_MARGIN`, chosen, not derived: 60 blocks ahead at 1,024, where a
   patch takes 6 to 9 ms), reaching 1/16 further, with a hole one coarsest
   node smaller on every side -- the ground a moving voxels' box hands back,
-  which `NodeStreaming::far_hole` gives the far terrain at once. Every test
+  which `NodeStreaming::voxel_box` gives the far terrain at once. Every test
   to split in it is the eye's or looser and its hole is inside the eye's,
   so it keeps or splits every patch the eye's view does; it asks for every
   patch it walks, the ones it keeps and the ones it splits, because a
@@ -2387,13 +2412,13 @@ most; at 2.7 58 and 31, 0.0055 / 0.052 / 0.070 ms. #398 §6.2's budget is a
 sum within 3x and no step over 1 ms. The plan holds the heights of 304
 patches at x3 and 328 at 2.7, of which 206 and 227 are drawn.
 
-**Not closed: the strip's sliver.** While the voxels' box has moved and the
-nodes of the strip it gained are not all drawn, the far terrain stands in
-for the strip (`NodeStreaming::far_hole`), drawn as the far terrain draws
-there -- quads of 16 to 32 -- where the finished frame has level 3's cells.
-A sliver of sky between two of its ridges that slides over a pixel level 3
-covers is flicker (#443's frame 326; t 5.49 s at (211, 358) on both quiet
-x3 runs of #442). Two ways of closing it were measured and are not built:
+**The strip's sliver (closed by §9.11).** While the voxels' box has moved
+and the nodes of the strip it gained are not all drawn, the far terrain
+stood in for the strip, drawn as the far terrain draws there -- quads of 16
+to 32 -- where the finished frame has level 3's cells. A sliver of sky
+between two of its ridges that slides over a pixel level 3 covers is
+flicker (#443's frame 326; t 5.49 s at (211, 358) on both quiet x3 runs of
+#442). Two ways of closing it were measured and are not built:
 
 - *A far terrain of level 3 round the voxels' box*, one coarsest node wide,
   so that the strip is level 3's outline before the box moves (#443's
@@ -2409,11 +2434,109 @@ x3 runs of #442). Two ways of closing it were measured and are not built:
   edge. Where the finer outline is lower, land drawn goes missing: flicker
   over a band, to remove a sliver.
 
-What would close it: the strip's level-3 stand-in drawn by the far terrain
-*in addition* to a selection holed at the box the voxels want, clipped to
-the strip -- the far terrain the finished frame draws, plus level 3 where it
-draws nodes. A renderer change (a second box, kept where the hole is cut),
-left for its own issue.
+What closes it is the third: the far terrain the finished frame draws,
+plus level 3 cut to the strip where the finished frame draws nodes (§9.11).
+
+### 9.11 The strip's stand-in: level 3 while the voxels' box loads (#398)
+
+**What flickered.** When the eye crosses a chunk, the voxels' box moves a
+coarsest node on (`node::covered_box_3d`) and gains a strip 128 blocks
+wide about a kilometre ahead. Its nodes take frames to be searched for,
+meshed and drawn, and for those frames the part of the box the voxels draw
+(`NodeStreaming::voxel_box`'s `drawn`) is smaller than the box they want.
+Until this section the far terrain stood in for the strip as it draws it,
+selected and holed at `drawn`: quads of 16 to 32 where the finished frame
+draws level 3's cells. Its skyline is another: on the low flight's first
+move (t 5.27 s, the strip x 1,152 to 1,280) its ridges stood up to five
+pixels above level 3's, and a crack a fifth of a pixel wide between two of
+them slid over pixels level 3 covers -- land, sky, land: the owner's
+flicker. Reproduced on the GPU with the game's renderer
+(`strip_standin::the_strip_stands_in_as_the_finished_frame_draws_it`):
+over the low flight's 60 Hz frames from t 5.28 to 5.80 s, flicker at t
+5.63 s at (209, 357), and 1,438 pixels of the region round the sliver
+unlike the finished frame off its own skyline.
+
+**The rule** (`far_streaming::far_stand`, the one place it is decided).
+While a strip waits, the far terrain is what the finished frame draws --
+selected and holed at the box the voxels *want* -- and a **stand-in** draws
+the strip: the far terrain's finest level over it (`standin_keys`). A far
+quad of 8 is level 3's cell, top for top and wall for wall (§9.8), so the
+stand-in is the ground the strip's nodes will draw. Of each of its patches
+only the faces of a quad in the strip are drawn (`standin_faces`) -- a
+top's own quad, a wall's the higher of the two it stands between
+(`FarFace::owner`), as a voxel mesher gives a riser to the column it is the
+side of. So every face is drawn once: a wall on the strip's side towards
+the drawn voxels where the strip is the higher (theirs where they are), and
+one on its far side where the strip is the higher (the far terrain's
+beyond). Until every patch of it is generated, the far terrain stands in
+for the strip itself, as it did -- never a frame of neither.
+
+**Drawn as it stands, a hair behind.** The renderer takes a stand-in's
+patches as `FarRole::StandIn` (`Renderer::far_insert_as`): drawn inside the
+box, the box's join not applied (its faces are already cut), its tiles
+culled as they stand (`cull_runs`). Every corner is drawn `STANDIN_BEHIND`
+= 1 + 2^-12 times as far along its own line of sight -- the same pixels,
+about 24 cm deeper at a kilometre -- so a node of the strip drawn meanwhile
+keeps every pixel it covers. Measured with every node of the strip drawn
+over the stand-in, the region over 26 frames: without the push 250 to 300
+pixels a frame showed the stand-in instead of the node, at 2^-14 one pixel
+in one frame, at 2^-12 none (chosen, not derived).
+
+**Generated before the box moves.** Whenever the box changes, the ring of
+finest-level patches one coarsest node round it is asked for behind what
+the eye wants (`standin_ring`; 36 patches round the default box). Every
+strip one move can gain is in it, whichever way the eye crosses
+(`the_ring_holds_every_strip_a_move_can_gain`), so the stand-in stands from
+the frame the box moves (`a_box_move_finds_what_it_hands_back_generated`),
+and on every waiting frame of the low flight the far terrain is the
+finished frame's and the stand-in is the strip's
+(`the_live_selection_is_the_exact_one_on_every_frame`, at 2.7 and 3). A box
+that moves twice before its first strip is drawn can outrun the ring: what
+is missing is asked for at once and stood in for when it comes
+(`a_strip_the_ring_does_not_hold_is_asked_for_at_once`).
+
+**Where it does not stand in.** Both boxes must hold every height of
+ground any level draws (`far::ground_range`: a column's top plus one, pit
+floors included, `WorldGen::column_top_range`). An eye some 900 blocks
+above the ground or 770 under it has the box's floor or ceiling through the
+hills, and a move up or down hands over a slab of ground under all of the
+box; there the far terrain stands in as it did
+(`a_box_whose_floor_cuts_the_ground_has_no_stand_in`).
+
+**What it costs.** At a standing eye nothing waits, and the far terrain is
+the same selection with the same hole, triangle for triangle: **0 at the
+gate's eyes**. While a strip waits, the far terrain is the finished frame's
+plus the stand-in (`standin_cost_report`, the triangles
+`FarTerrain::prepare` sends, no GPU): on the low flight's first move at
+High, 244,007 far triangles a frame as it was and 257,967 now at 2.7
+(+13,960), 220,028 and 234,060 at 3 (+14,032) -- of which the stand-in
+12,842 (its nine patches, culled by tiles), and the rest the far terrain's
+own tiles inside the box the voxels want, which the finished frame sends
+too. Only for the frames the strip's nodes take to be drawn -- a few
+hundred milliseconds after each move on the quiet M3's low flights, a move
+every 5.3 s at flight speed. The ring is 36 patches of generation a box
+move on the far workers (6 to 9 ms each), held on the CPU, about 3 MB,
+uploaded only while a strip waits.
+
+**What it does not do.** It is ground. A tree of a strip node not drawn
+yet is land not drawn yet -- first load, as before -- and arrives with its
+node. A cave mouth level 3 opens (a cell-row all of whose ground is cave)
+shows as ground until its node is drawn: land, never sky.
+
+**Tests.** The GPU test above holds every frame of the low flight's strip
+against its finished frame -- no flicker by the flight's own measure, no
+pixel land or nothing unlike it off its skyline, and once the strip's nodes
+are drawn over the stand-in no pixel inside its land of another colour --
+drawing only the 71 nodes and 36 far patches that reach the region, which
+draw it pixel for pixel as the whole scene does
+(`the_cut_draws_the_region_as_the_whole_scene_does`, ignored: minutes).
+`the_games_far_streaming_draws_the_strip_by_the_rule` holds the game's
+`FarStreaming` to `far_stand`, frame for frame. The rules: `standin_keys`,
+`standin_faces`, `far_stand` and the ring in `far_streaming`'s tests; the
+cull and the shader in `cubara-render`'s
+(`a_stand_in_is_drawn_inside_the_hole_and_culled_as_it_stands`,
+`the_shader_draws_a_stand_in_as_this_module_does`); `ground_range` and
+`far::build_where` in `cubara-world`'s.
 
 ### 9.12 Trees past the voxel rings (#433 item 1)
 
@@ -2590,3 +2713,38 @@ off` does.
 - *Cheaper.* A box's three faces share seven corners; with the face's
   normal taken from the screen derivatives in the fragment shader a tree
   would shade 20 vertices where it shades 32.
+
+## §10 The chunk arena's capacity follows from the selection (block 3.0b, [#434](../../issues/434))
+
+The arena had two constants, 8 million vertices and 12 million indices,
+tried once at the default settings (#432). What it has to hold depends on the
+render distance and the vertical squash, which the start-up check is meant to
+choose per PC, so a constant can overflow at a setting nobody tried, with a
+hole and a log line as the only symptom.
+
+**The rule** (`crates/app/src/arena_capacity.rs`): the capacity is the
+selection the streamer picks for the active settings
+(`node::desired_nodes_3d`, the one selection code, Rule 5), costed per
+*column of nodes* of each level (`COLUMN_COST`), at the worst alignment of
+the eye in the octree, times `SWAP_OVERLAP` (1.25: a node and its replacement
+are resident together while levels swap), from `ArenaCapacity::FLOOR`
+(1 M vertices, 1.5 M indices) up to `ArenaCapacity::CEILING` (what one 256 MiB
+buffer is). It is computed when settings are set, never per frame;
+`Renderer::set_arena_capacity` makes the arena over for a new one (the
+resident nodes are gone, the caller streams them in again).
+
+**Why a column and not a node.** A node's mean cost moves with the squash
+(level 0: 293 vertices at squash 1, 514 at squash 4) because the squash only
+changes how many empty nodes stand above and below the ground. The ground is
+a surface and crosses a column of nodes about once, so a column's cost is the
+quantity that stays put. The table is conservative for the coarse squashes
+(level 0 at squash 4 costs half its entry).
+
+**What holds it honest** is `the_capacity_holds_the_worst_selection_at_every_setting`:
+it meshes the whole selection around the steepest seeded mountains at the
+extreme settings (64 chunks at squash 1 is the largest; the first ring alone
+the smallest) and holds the capacity the game builds its arena with against
+the vertices, indices and node slots found. An overflow that still happens is
+counted (`ArenaUsage::refused_inserts`, `refused_nodes`) and reported by
+`--bench flight` as `ARENA OVERFLOWS:`, apart from `HOLES:` -- a hole from a
+full arena is not a hole from a mesh that is still loading.

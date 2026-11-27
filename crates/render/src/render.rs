@@ -19,7 +19,7 @@ use winit::window::{CursorGrabMode, Window};
 use cubara_voxel::{BlockRegistry, ChunkCoord, Vertex};
 
 use crate::anchor::{self, Anchor};
-use crate::arena::{ChunkArena, MeshedNode, NodeId};
+use crate::arena::{ArenaCapacity, ChunkArena, MeshedNode, NodeId};
 use crate::culling::{Aabb, Frustum};
 use crate::materials::{self, MeshAssets};
 use crate::scene::{SceneFrame, SceneRenderer};
@@ -812,6 +812,7 @@ impl Renderer {
         camera: CameraPose,
         choose_present: impl FnOnce(&[wgpu::PresentMode]) -> wgpu::PresentMode,
         time_gpu: bool,
+        arena_capacity: ArenaCapacity,
     ) -> (Self, MeshAssets) {
         let size = window.inner_size();
 
@@ -900,6 +901,7 @@ impl Renderer {
             (format, width, height),
             camera,
             time_gpu,
+            arena_capacity,
         )
     }
 
@@ -912,7 +914,12 @@ impl Renderer {
     /// through the upload pacing, the far terrain's hole and the fog exactly
     /// as the window does; a second renderer built for the purpose would
     /// measure itself.
-    pub fn offscreen(width: u32, height: u32, camera: CameraPose) -> Option<(Self, MeshAssets)> {
+    pub fn offscreen(
+        width: u32,
+        height: u32,
+        camera: CameraPose,
+        arena_capacity: ArenaCapacity,
+    ) -> Option<(Self, MeshAssets)> {
         let instance = crate::new_instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -945,6 +952,7 @@ impl Renderer {
             camera,
             // A measurement's renderer is left exactly as it was.
             false,
+            arena_capacity,
         ))
     }
 
@@ -956,6 +964,7 @@ impl Renderer {
         (format, width, height): (wgpu::TextureFormat, u32, u32),
         camera: CameraPose,
         time_gpu: bool,
+        arena_capacity: ArenaCapacity,
     ) -> (Self, MeshAssets) {
         let (mesh_assets, tex_view, tex_sampler) = load_mesh_assets(&device, &queue);
         let tree_models = load_tree_models(&device, &queue, &mesh_assets);
@@ -981,7 +990,7 @@ impl Renderer {
         let anchor = anchor::anchor_for(camera.eye);
         let frustum = Frustum::from_view_proj(camera.view_proj(aspect, anchor));
 
-        let arena = ChunkArena::new(&device, multi_draw, anchor);
+        let arena = ChunkArena::new(&device, multi_draw, anchor, arena_capacity);
         let far = crate::far::FarTerrain::new(
             &device,
             &queue,
@@ -1080,6 +1089,17 @@ impl Renderer {
     /// Upload a far-terrain patch; `None` when every slot is taken.
     pub fn far_insert(&mut self, patch: crate::far::FarPatch<'_>) -> Option<crate::far::FarSlot> {
         self.far.insert(&self.queue, patch)
+    }
+
+    /// Upload a patch drawn as `role` ([`crate::far::FarRole`]): a
+    /// stand-in for voxel nodes not drawn yet is drawn inside the voxels'
+    /// box, behind anything drawn there; `None` when every slot is taken.
+    pub fn far_insert_as(
+        &mut self,
+        patch: crate::far::FarPatch<'_>,
+        role: crate::far::FarRole,
+    ) -> Option<crate::far::FarSlot> {
+        self.far.insert_as(&self.queue, patch, role)
     }
 
     /// Stop drawing a far-terrain patch -- and its trees -- and free its
@@ -1189,6 +1209,22 @@ impl Renderer {
         self.uploads.clear();
         self.arena.clear();
         self.trees.clear();
+    }
+
+    /// The arena's size now: what the selection it has to hold needs
+    /// (issue #434), and how often it was too small.
+    pub fn arena_usage(&self) -> crate::ArenaUsage {
+        self.arena.usage()
+    }
+
+    /// Make the arena over for a selection that needs `capacity` -- the
+    /// settings changed. Empties the world as [`clear_nodes`](Self::clear_nodes)
+    /// does (what was resident, queued, or drawn as trees is gone), so the
+    /// caller streams the selection in again, as for a new world.
+    pub fn set_arena_capacity(&mut self, capacity: ArenaCapacity) {
+        self.uploads.clear();
+        self.trees.clear();
+        self.arena.reset_with_capacity(&self.device, capacity);
     }
 
     /// The window this renders to. Only the game asks, and the game always
@@ -2635,7 +2671,7 @@ mod tests {
             eye: glam::DVec3::new(8.0, 80.0, 8.0),
             look_dir: glam::Vec3::NEG_Z,
         };
-        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose) else {
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose, ArenaCapacity::FLOOR) else {
             crate::headless::skip_or_require_gpu(
                 "a_failed_reinsert_takes_the_nodes_trees_with_its_freed_slot",
             );
@@ -2685,13 +2721,20 @@ mod tests {
 
         // The same node again, re-meshed too big for the arena -- the
         // insert fails, after the old slot was freed for it.
-        let too_big = quad(crate::arena::VERTEX_CAPACITY as usize + 1);
+        let too_big = quad(sink.arena.capacity().vertices as usize + 1);
         assert!(sink
             .try_insert(id, node(id, too_big, vec![[5, 7, 9]]))
             .is_err());
         assert!(
             !sink.arena.contains(id),
             "the failed insert left the old slot"
+        );
+        // Issue #434: a refusal for want of room is counted, not only logged.
+        let usage = sink.arena.usage();
+        assert_eq!(
+            (usage.refused_inserts, usage.refused_nodes),
+            (1, 1),
+            "the full arena's refusal was not counted"
         );
         assert_eq!(
             sink.trees.node_count(),
@@ -2717,6 +2760,23 @@ mod tests {
             "the freed slot is reused"
         );
         assert_eq!(sink.trees.node_count(), 0);
+
+        // Issue #434: a change of settings makes the arena over at the size
+        // the new selection needs. Empty, the new size, and the count of
+        // what the old one refused still there.
+        let before = r.arena_usage();
+        let bigger = ArenaCapacity::new(
+            before.vertices_capacity as u64 + 1_000_000,
+            before.indices_capacity as u64 + 1_500_000,
+        );
+        r.set_arena_capacity(bigger);
+        let after = r.arena_usage();
+        assert_eq!(
+            (after.vertices_capacity, after.indices_capacity),
+            (bigger.vertices, bigger.indices)
+        );
+        assert_eq!(after.resident_nodes, 0, "nothing survives the new arena");
+        assert_eq!(after.refused_inserts, before.refused_inserts);
     }
 
     #[test]

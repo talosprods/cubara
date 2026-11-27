@@ -205,7 +205,7 @@ impl AnisoChunk {
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
-        self.build_mesh_morph(ctx, occluded, may_be_solid, None)
+        self.build_mesh_morph(ctx, occluded, may_be_solid, |_, _, _| false, None)
     }
 
     /// [`build_mesh_with_neighbours`](Self::build_mesh_with_neighbours),
@@ -217,6 +217,7 @@ impl AnisoChunk {
         ctx: &MeshContext,
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
+        outside_solid: impl Fn(i32, i32, i32) -> bool,
         morph: Option<&MorphColumns>,
     ) -> Mesh {
         let dims = self.mesh_dims().map(|n| n as i32);
@@ -227,6 +228,7 @@ impl AnisoChunk {
             |x, y, z| self.block_at(x, y, z),
             occluded,
             may_be_solid,
+            outside_solid,
             ctx,
             morph.filter(|_| scale[1] == 1),
         )
@@ -317,7 +319,7 @@ impl NodeChunk {
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
     ) -> Mesh {
-        self.build_mesh_morph(ctx, occluded, may_be_solid, None)
+        self.build_mesh_morph(ctx, occluded, may_be_solid, |_, _, _| false, None)
     }
 
     /// [`build_mesh_with_neighbours`](Self::build_mesh_with_neighbours),
@@ -328,11 +330,16 @@ impl NodeChunk {
         ctx: &MeshContext,
         occluded: impl Fn(i32, i32, i32) -> bool,
         may_be_solid: impl Fn(i32, i32, i32) -> bool,
+        outside_solid: impl Fn(i32, i32, i32) -> bool,
         morph: Option<&MorphColumns>,
     ) -> Mesh {
         match self {
-            NodeChunk::Uniform(c) => c.build_mesh_morph(ctx, occluded, may_be_solid, morph),
-            NodeChunk::Aniso(a) => a.build_mesh_morph(ctx, occluded, may_be_solid, morph),
+            NodeChunk::Uniform(c) => {
+                c.build_mesh_morph(ctx, occluded, may_be_solid, outside_solid, morph)
+            }
+            NodeChunk::Aniso(a) => {
+                a.build_mesh_morph(ctx, occluded, may_be_solid, outside_solid, morph)
+            }
         }
     }
 

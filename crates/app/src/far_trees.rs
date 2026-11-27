@@ -112,14 +112,18 @@ mod tests {
     /// world holds none.
     #[test]
     fn a_patchs_trees_come_and_go_with_it() {
-        use crate::far_streaming::{voxel_hole, FarStreaming};
+        use crate::far_streaming::{voxel_hole, FarStreaming, VoxelBox};
         let eye = [8.0, 300.0, 8.0];
         let camera = cubara_render::CameraPose {
             eye: glam::DVec3::from_array(eye.map(f64::from)),
             look_dir: glam::Vec3::new(1.0, -0.25, 0.0),
         };
-        let Some((mut renderer, _assets)) = cubara_render::Renderer::offscreen(320, 180, camera)
-        else {
+        let Some((mut renderer, _assets)) = cubara_render::Renderer::offscreen(
+            320,
+            180,
+            camera,
+            cubara_render::ArenaCapacity::FLOOR,
+        ) else {
             cubara_render::headless::skip_or_require_gpu("a_patchs_trees_come_and_go_with_it");
             return;
         };
@@ -129,7 +133,7 @@ mod tests {
         // A slow runner generates the patches slowly; a few seconds here.
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_secs(300) {
-            far.update(&mut renderer, eye, hole);
+            far.update(&mut renderer, eye, VoxelBox::settled(hole));
             if far.settled() {
                 break;
             }

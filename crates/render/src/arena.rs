@@ -44,47 +44,61 @@ pub struct NodeId {
     pub pos: [i32; 3],
 }
 
-/// Vertex-arena capacity, in vertices (16 bytes/vertex since the colour
-/// morph, `docs/PHASE3_ARCHITECTURE.md` §9.6; 12 in the packed format of
-/// #43): what every resident node's mesh has to fit in together. Past
-/// it [`ChunkArena::insert`] skips the node -- a hole in the world -- so it
-/// is sized from the game's own selection where that is largest, not from
-/// the scene around the origin.
+/// How many vertices and indices a [`ChunkArena`] can hold: what every
+/// resident node's mesh has to fit in together. Past it
+/// [`ChunkArena::insert`] refuses the node -- a hole in the world -- so the
+/// caller works it out from the selection the arena has to hold (issue
+/// #434; `cubara`'s `arena_capacity`), not from a number tried once. This
+/// crate does not know what a selection is (Rule 3), so it only takes the
+/// answer, and keeps the one rule that is about buffers: the floor and the
+/// ceiling.
 ///
-/// **Measured** (issue #423; the game's selection, radius 64 and squash 2,
-/// steady state, on the default seed). Two numbers, and they are not the
-/// same thing:
-///
-/// - **every node of the selection**, seen or not: 2,765,040 vertices around
-///   the origin and 4,280,540 standing on a mountain (chunk column (336,
-///   213), the steepest of a seeded set);
-/// - **what is resident**: only the nodes the visibility search reaches are
-///   meshed and uploaded. On the ground at that column that is 2,474,840
-///   (58% of the selection); the most found from any eye tried is
-///   **3,462,428**, nine chunks above the same mountain, where nearly all
-///   of a smaller selection is in sight (eleven eyes over three mountains
-///   and the origin; a throwaway probe, the review of #432's method).
-///
-/// 8,000,000 is 2.3 times the most found resident, which leaves room for
-/// the nodes that are resident twice while levels swap and for a mountain
-/// steeper than the ones measured.
-/// `streaming::tests::the_arena_holds_the_selection_around_a_mountain`
-/// (`cubara-app`) holds the first number -- more than was found resident
-/// anywhere -- with a swap allowance, under this capacity.
-///
-/// It was 4,000,000 until then, "about 2.4 times" a radius-64 peak of
-/// 1,659,216 vertices measured for #111 around the origin. **What is shown
-/// is that 4,000,000 had no margin left**: 3.46 million resident before any
-/// swap is 87% of it, and over it with a quarter more for a swap. **What is
-/// not shown is that main overflowed**: main's whole selection at that
-/// column is 4,233,148 vertices, but that counts nodes it never uploads,
-/// and what main keeps resident there was not measured.
-pub(crate) const VERTEX_CAPACITY: u32 = 8_000_000;
-/// Index-arena capacity, in indices (4 bytes/index). Same story as
-/// `VERTEX_CAPACITY`, and the same ratio: a mesh of quads has six indices
-/// to four vertices. 6,420,810 in the whole selection on the mountain,
-/// 5,193,642 the most found resident; it was 6,000,000.
-const INDEX_CAPACITY: u32 = 12_000_000;
+/// A vertex is 16 bytes (the colour morph, `docs/PHASE3_ARCHITECTURE.md`
+/// §9.6; 12 in the packed format of #43), an index 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaCapacity {
+    pub vertices: u32,
+    pub indices: u32,
+}
+
+impl ArenaCapacity {
+    /// The least an arena is ever made with: 1,000,000 vertices and
+    /// 1,500,000 indices (a mesh of quads has six indices to four
+    /// vertices). **Chosen, not derived**: room for the explicit-chunk
+    /// scenes of the golden tests and a small world, so a tiny setting
+    /// still has an arena a few edits cannot fill.
+    pub const FLOOR: Self = Self {
+        vertices: 1_000_000,
+        indices: 1_500_000,
+    };
+
+    /// The most one buffer can be: wgpu's default `max_buffer_size`, 256
+    /// MiB (`Limits::default()`, what both renderers ask the device for),
+    /// in vertices and in indices. A capacity over it cannot be created,
+    /// so a setting whose selection needs more is a defect to see at the
+    /// settings test, not something to clamp quietly at start-up.
+    pub const CEILING: Self = Self {
+        vertices: (256 * 1024 * 1024 / std::mem::size_of::<Vertex>()) as u32,
+        indices: (256 * 1024 * 1024 / std::mem::size_of::<u32>()) as u32,
+    };
+
+    /// `vertices` and `indices` asked for, raised to [`FLOOR`](Self::FLOOR)
+    /// and held to [`CEILING`](Self::CEILING). Whether the ceiling cut
+    /// anything is [`needs_more_than_a_buffer`](Self::needs_more_than_a_buffer).
+    pub fn new(vertices: u64, indices: u64) -> Self {
+        Self {
+            vertices: vertices.clamp(Self::FLOOR.vertices as u64, Self::CEILING.vertices as u64)
+                as u32,
+            indices: indices.clamp(Self::FLOOR.indices as u64, Self::CEILING.indices as u64) as u32,
+        }
+    }
+
+    /// Whether `vertices` and `indices` are more than one buffer can be.
+    pub fn needs_more_than_a_buffer(vertices: u64, indices: u64) -> bool {
+        vertices > Self::CEILING.vertices as u64 || indices > Self::CEILING.indices as u64
+    }
+}
+
 /// Max nodes the indirect-args buffer can hold (upper bound on *visible*
 /// nodes in one frame). Node-based streaming (§6.1) is what finally lets
 /// this shrink: the tuned ring schedule (#109) measured 1,341 of 1,585
@@ -186,6 +200,12 @@ pub struct ArenaUsage {
     /// right after loading a scene, before the first frame).
     pub visible_draws: u32,
     pub max_draws: u32,
+    /// Inserts this arena refused for want of room, ever (issue #434), and
+    /// how many different nodes they were for. Zero is the only right
+    /// answer: each is a hole from a full arena, which is not a hole from
+    /// loading.
+    pub refused_inserts: u64,
+    pub refused_nodes: u32,
 }
 
 impl ArenaUsage {
@@ -439,29 +459,47 @@ pub struct ChunkArena {
     /// by the next successful insert, so a later episode is reported again
     /// instead of being silently swallowed for the rest of the process.
     warned_full: bool,
+    /// Inserts refused because the arena was full, over its whole life, and
+    /// the nodes they were for (a refused node is retried every frame, so
+    /// the first count says how long, the second how many holes): issue
+    /// #434's "an overflow is counted, not just logged".
+    refused: u64,
+    refused_nodes: std::collections::BTreeSet<NodeId>,
 }
 
 impl ChunkArena {
-    /// How many vertices every resident node's mesh may hold together, and
-    /// how many indices: readable without a device, so that what the game
-    /// selects can be held against them GPU-free.
-    pub const VERTEX_CAPACITY: u32 = VERTEX_CAPACITY;
-    pub const INDEX_CAPACITY: u32 = INDEX_CAPACITY;
+    /// How many nodes can be resident at once, whatever the vertex capacity:
+    /// every node has one of this many origin slots. An insert past it is
+    /// refused (and counted) like one past the vertices.
+    pub const NODES_CAPACITY: u32 = MAX_NODES;
+
+    /// How many vertices and indices this arena was made to hold.
+    pub fn capacity(&self) -> ArenaCapacity {
+        ArenaCapacity {
+            vertices: self.vertices.capacity(),
+            indices: self.indices.capacity(),
+        }
+    }
 
     /// Create the arena and its GPU buffers. `multi_draw` selects the fast indirect
     /// path; when false, drawing falls back to a per-chunk `draw_indexed` loop over
     /// the same shared buffers. `anchor` is the render anchor the first
     /// nodes are placed against ([`rebase`](Self::rebase) moves it later).
-    pub fn new(device: &wgpu::Device, multi_draw: bool, anchor: Anchor) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        multi_draw: bool,
+        anchor: Anchor,
+        capacity: ArenaCapacity,
+    ) -> Self {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-arena-vertices"),
-            size: VERTEX_CAPACITY as u64 * std::mem::size_of::<Vertex>() as u64,
+            size: capacity.vertices as u64 * std::mem::size_of::<Vertex>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-arena-indices"),
-            size: INDEX_CAPACITY as u64 * std::mem::size_of::<u32>() as u64,
+            size: capacity.indices as u64 * std::mem::size_of::<u32>() as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -498,8 +536,8 @@ impl ChunkArena {
             origins_bind_group,
             origins: vec![[0.0; 4]; MAX_NODES as usize],
             anchor,
-            vertices: SlabAllocator::new(VERTEX_CAPACITY),
-            indices: SlabAllocator::new(INDEX_CAPACITY),
+            vertices: SlabAllocator::new(capacity.vertices),
+            indices: SlabAllocator::new(capacity.indices),
             nodes: NodeIndexAllocator::new(),
             slots: BTreeMap::new(),
             multi_draw,
@@ -509,7 +547,22 @@ impl ChunkArena {
             visible_draws: 0,
             stamped: Vec::new(),
             warned_full: false,
+            refused: 0,
+            refused_nodes: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// Make the arena over with `capacity`, empty: new buffers, nothing
+    /// resident, the render anchor and the count of refused inserts kept.
+    /// What a change of settings does (issue #434): the capacity follows
+    /// from the selection, and a different selection is a different size.
+    /// The resident nodes are gone -- their meshes are not kept CPU-side --
+    /// so whoever changed the setting streams them in again.
+    pub fn reset_with_capacity(&mut self, device: &wgpu::Device, capacity: ArenaCapacity) {
+        let mut fresh = Self::new(device, self.multi_draw, self.anchor, capacity);
+        fresh.refused = self.refused;
+        fresh.refused_nodes = std::mem::take(&mut self.refused_nodes);
+        *self = fresh;
     }
 
     /// The bind group for `@group(1)` in `mesh.wgsl` -- the node-origins
@@ -628,14 +681,16 @@ impl ChunkArena {
             if let Some(n) = node_index {
                 self.nodes.free(n);
             }
+            self.refused += 1;
+            self.refused_nodes.insert(id);
             if !self.warned_full {
                 log::warn!(
                     "chunk arena full (v {}/{}, i {}/{}, nodes {}/{}) — skipping chunks; \
-                     raise capacity",
+                     the capacity does not follow from the selection",
                     self.vertices.high_water,
-                    VERTEX_CAPACITY,
+                    self.vertices.capacity,
                     self.indices.high_water,
-                    INDEX_CAPACITY,
+                    self.indices.capacity,
                     self.nodes.next,
                     MAX_NODES,
                 );
@@ -761,13 +816,15 @@ impl ChunkArena {
     pub fn usage(&self) -> ArenaUsage {
         ArenaUsage {
             vertices_used: self.vertices.high_water,
-            vertices_capacity: VERTEX_CAPACITY,
+            vertices_capacity: self.vertices.capacity,
             indices_used: self.indices.high_water,
-            indices_capacity: INDEX_CAPACITY,
+            indices_capacity: self.indices.capacity,
             resident_nodes: self.slots.len() as u32,
             nodes_capacity: MAX_NODES,
             visible_draws: self.visible_draws,
             max_draws: MAX_DRAWS,
+            refused_inserts: self.refused,
+            refused_nodes: self.refused_nodes.len() as u32,
         }
     }
 
@@ -908,7 +965,23 @@ impl ChunkArena {
         anchor: Anchor,
         meshed: impl IntoIterator<Item = MeshedNode>,
     ) -> Self {
-        let mut arena = Self::new(device, multi_draw, anchor);
+        // The scene is whole and known: the arena is as big as it needs to
+        // be, plus one of each so that a scene that fits to the unit is not
+        // reported as `exhausted` (never under the floor), so there is no
+        // capacity to outgrow here (issue #434).
+        let meshed: Vec<MeshedNode> = meshed.into_iter().collect();
+        let (vertices, indices) = meshed.iter().fold((0u64, 0u64), |(v, i), n| {
+            (
+                v + n.mesh.vertices.len() as u64,
+                i + n.mesh.indices.len() as u64,
+            )
+        });
+        let mut arena = Self::new(
+            device,
+            multi_draw,
+            anchor,
+            ArenaCapacity::new(vertices + 1, indices + 1),
+        );
         let mut total_tris = 0u32;
         for node in meshed {
             if arena.insert(
@@ -944,7 +1017,7 @@ impl ChunkArena {
                 "region exceeds arena capacity: {} — requested {} resident nodes against {} \
                  vertices/{} indices/{} nodes available; excess nodes are silently dropped from \
                  whichever frame's visible set overflows first (arena.rs \
-                 MAX_NODES/VERTEX_CAPACITY/INDEX_CAPACITY). See issue #89.",
+                 MAX_NODES, and the capacity the caller asked for). See issue #89.",
                 exhausted.join(", "),
                 usage.resident_nodes,
                 usage.vertices_capacity,
@@ -1001,7 +1074,35 @@ mod tests {
             nodes_capacity: 100,
             visible_draws: 0,
             max_draws: 100,
+            refused_inserts: 0,
+            refused_nodes: 0,
         }
+    }
+
+    /// Issue #434: a capacity is never under the floor nor over what one
+    /// buffer can be, and the ceiling is what wgpu's default limit allows.
+    #[test]
+    fn a_capacity_is_held_between_the_floor_and_the_ceiling() {
+        assert_eq!(ArenaCapacity::new(0, 0), ArenaCapacity::FLOOR);
+        assert_eq!(
+            ArenaCapacity::new(u64::MAX, u64::MAX),
+            ArenaCapacity::CEILING
+        );
+        let mid = ArenaCapacity::new(5_000_000, 7_500_000);
+        assert_eq!((mid.vertices, mid.indices), (5_000_000, 7_500_000));
+        let limit = wgpu::Limits::default().max_buffer_size;
+        assert!(
+            ArenaCapacity::CEILING.vertices as u64 * std::mem::size_of::<Vertex>() as u64 <= limit
+        );
+        assert!(ArenaCapacity::CEILING.indices as u64 * 4 <= limit);
+        assert!(ArenaCapacity::needs_more_than_a_buffer(
+            ArenaCapacity::CEILING.vertices as u64 + 1,
+            0
+        ));
+        assert!(!ArenaCapacity::needs_more_than_a_buffer(
+            ArenaCapacity::CEILING.vertices as u64,
+            ArenaCapacity::CEILING.indices as u64
+        ));
     }
 
     #[test]

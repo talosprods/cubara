@@ -45,7 +45,7 @@ fn shows_nothing(p: &[u8]) -> bool {
 }
 
 /// Per pixel of `frame`, whether it shows land: anything but [`NOTHING`].
-fn land_of(frame: &Frame) -> Vec<bool> {
+pub(crate) fn land_of(frame: &Frame) -> Vec<bool> {
     frame
         .pixels
         .as_chunks::<4>()
@@ -64,7 +64,7 @@ fn land_of(frame: &Frame) -> Vec<bool> {
 /// its edge go land, sky, land with nothing missing. A hole candidate is
 /// judged by it on the frame before ([`HoleTracker`]), and a hole and a
 /// stale pixel on the finished frame ([`confirm_holes`], [`stale_pixels`]).
-fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
+pub(crate) fn inside_land(land: &[bool], width: usize, i: usize) -> bool {
     let w = width.max(1);
     let (x, y) = (i % w, i / w);
     let rows = land.len() / w;
@@ -235,7 +235,7 @@ pub fn split_stale(stale: &[u32], drawn_and_missing: &[u32]) -> StaleSplit {
 /// `POPS:` measures), not a hole -- the rule the stale pixels were already
 /// judged by (`BENCHMARKS.md` ⁸⁰). Found on the low flight (frame 326 of a
 /// run of PR #441): while the far terrain stands in for a strip of ground
-/// the voxels are taking over (`NodeStreaming::far_hole`), a frame shows
+/// the voxels are taking over (`NodeStreaming::voxel_box`), a frame shows
 /// that strip's skyline as the far terrain draws it, and a sliver of sky a
 /// fifth of a pixel wide between two ridges there slid across a pixel the
 /// voxels' skyline covers in the finished frame -- with sky directly above
@@ -923,6 +923,41 @@ pub struct FlightReport {
     /// How often the world was copied while this ran, and what one copy
     /// weighs (issue #387).
     pub world_clones: WorldClones,
+    /// What the chunk arena refused for want of room (issue #434): holes
+    /// from a full arena, told apart from the holes of loading above.
+    pub arena_overflows: ArenaOverflows,
+}
+
+/// What a run's chunk arena refused for want of room, and what room it had
+/// (issue #434). Every one is a hole that is not a late mesh: the capacity
+/// did not hold the selection. Zero on every standard flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArenaOverflows {
+    /// Inserts refused, counting each retry of the same node.
+    pub refused_inserts: u64,
+    /// Different nodes refused.
+    pub refused_nodes: u32,
+    pub vertices_capacity: u32,
+    pub indices_capacity: u32,
+}
+
+impl ArenaOverflows {
+    pub fn of(usage: cubara_render::ArenaUsage) -> Self {
+        Self {
+            refused_inserts: usage.refused_inserts,
+            refused_nodes: usage.refused_nodes,
+            vertices_capacity: usage.vertices_capacity,
+            indices_capacity: usage.indices_capacity,
+        }
+    }
+
+    /// The `ARENA OVERFLOWS` term of a bench line.
+    pub fn term(&self) -> String {
+        format!(
+            "ARENA OVERFLOWS: {} refused inserts for {} nodes (arena {} vertices, {} indices)",
+            self.refused_inserts, self.refused_nodes, self.vertices_capacity, self.indices_capacity,
+        )
+    }
 }
 
 /// `World` clones over a run: the count, what one clone copies, and the run's
@@ -1045,7 +1080,7 @@ impl FlightReport {
              FIRST LOAD: {first_frames} kept frames show land not drawn yet as nothing, \
              worst {:.3}% | \
              SWAP LAG: n {}, p50/p90/p99/max {:.0}/{:.0}/{:.0}/{:.0} ms \
-             ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {}",
+             ({:.2}/{:.2}/{:.2}/{:.2} blocks) | {} | {}",
             self.mean() * 100.0,
             worst.loading * 100.0,
             worst.t,
@@ -1082,6 +1117,7 @@ impl FlightReport {
             s.p99_blocks,
             s.max_blocks,
             self.world_clones.term(),
+            self.arena_overflows.term(),
         )
     }
 
@@ -1317,7 +1353,12 @@ impl WalkScript {
 pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkReport> {
     use crate::game::{load_item_registry, load_recipe_book, Game};
     let mut game = Game::new();
-    let (mut renderer, assets) = Renderer::offscreen(size.0, size.1, game.camera_pose())?;
+    let (mut renderer, assets) = Renderer::offscreen(
+        size.0,
+        size.1,
+        game.camera_pose(),
+        crate::arena_capacity::game_capacity(),
+    )?;
     renderer.set_morph(crate::streaming::morph_params());
     let layers = assets.layers;
     let registry = Arc::new(assets.registry);
@@ -1340,8 +1381,8 @@ pub fn walk(seconds: f32, size: (u32, u32), fps: u32, fly: bool) -> Option<WalkR
         let camera = game.camera_pose();
         let eye = camera.eye.as_vec3().to_array();
         nodes.update(renderer, game.world(), eye);
-        let hole = nodes.far_hole(renderer, eye);
-        far.update(renderer, eye, hole);
+        let voxels = nodes.voxel_box(renderer, eye);
+        far.update(renderer, eye, voxels);
         renderer.set_far_shown(nodes.far_in_sight(eye));
         renderer.render(
             camera,
@@ -1424,7 +1465,12 @@ impl Streamed {
     /// [`NOTHING`] (the hole count, which a sky-cleared run cannot make).
     fn new(flight: &Flight, sky: bool) -> Option<Self> {
         let camera = pose(flight, flight.start);
-        let (mut renderer, assets) = Renderer::offscreen(flight.size.0, flight.size.1, camera)?;
+        let (mut renderer, assets) = Renderer::offscreen(
+            flight.size.0,
+            flight.size.1,
+            camera,
+            crate::arena_capacity::game_capacity(),
+        )?;
         if !sky {
             renderer.set_clear_color(NOTHING);
         }
@@ -1463,8 +1509,8 @@ impl Streamed {
     fn frame_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
         self.nodes
             .update(&mut self.renderer, &self.world, stream_eye);
-        let hole = self.nodes.far_hole(&self.renderer, stream_eye);
-        self.far.update(&mut self.renderer, stream_eye, hole);
+        let voxels = self.nodes.voxel_box(&self.renderer, stream_eye);
+        self.far.update(&mut self.renderer, stream_eye, voxels);
         self.renderer
             .set_far_shown(self.nodes.far_in_sight(stream_eye));
         self.renderer.render(
@@ -1517,7 +1563,7 @@ impl Streamed {
     }
 }
 
-fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
+pub(crate) fn pose(flight: &Flight, eye: [f32; 3]) -> CameraPose {
     CameraPose {
         eye: glam::Vec3::from(eye).as_dvec3(),
         look_dir: glam::Vec3::from(flight.look).normalize_or_zero(),
@@ -1855,6 +1901,7 @@ pub fn fly(
         bytes_each: live.world.clone_bytes(),
         seconds: start.elapsed().as_secs_f32(),
     };
+    let arena_overflows = ArenaOverflows::of(live.renderer.arena_usage());
     drop(live);
     let (candidates, counts) = holes.map_or((Vec::new(), Vec::new()), |h| {
         let counts = h.counts();
@@ -2098,6 +2145,7 @@ pub fn fly(
         pops,
         swap_lags,
         world_clones,
+        arena_overflows,
     })
 }
 
@@ -2407,6 +2455,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         assert_eq!(r.frames_over(0.01), 0.5);
         assert!((r.mean() - 0.03125).abs() < 1e-12);
@@ -2860,6 +2909,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         assert_eq!(
             r.flicker_frames(),
@@ -3262,6 +3312,7 @@ mod tests {
             pops: Vec::new(),
             swap_lags: SwapLagStats::default(),
             world_clones: WorldClones::default(),
+            arena_overflows: ArenaOverflows::default(),
         };
         // 10 stale pixels per mille in all: 2 late, 5 loading, 3 neither.
         let r = report(vec![sample(0.004, 0.002, 0.002), sample(0.006, 0.0, 0.003)]);
@@ -3372,8 +3423,18 @@ mod tests {
                 bytes_each: 140,
                 seconds: 10.0,
             },
+            arena_overflows: ArenaOverflows {
+                refused_inserts: 7,
+                refused_nodes: 3,
+                vertices_capacity: 5_000_000,
+                indices_capacity: 7_500_000,
+            },
         };
         let line = r.line();
+        assert!(
+            line.contains("ARENA OVERFLOWS: 7 refused inserts for 3 nodes (arena 5000000 vertices, 7500000 indices)"),
+            "{line}"
+        );
         assert!(
             line.contains("HOLES: 1 of 4 frames show a hole, worst 0.400%, of which under a late swap 25% (2 candidate frames, 2 checked against the finished frame)"),
             "{line}"

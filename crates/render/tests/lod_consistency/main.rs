@@ -1531,24 +1531,21 @@ fn the_far_rows_follow_the_ground() {
 /// mesher, counted face by face over the same square.
 ///
 /// Where no cave touches the surface the two agree **exactly** on every
-/// count: top faces, and riser area per direction and per layer.
-///
-/// The openness agrees to within [`OPENNESS_TOLERANCE`], and the test says
-/// where the rest goes: the mesher bakes a chunk's ambient occlusion without
-/// looking into the next chunk, so a face at a chunk's edge (or whose air
-/// side is in the chunk above) comes out more open than the height field
-/// says. Asked the same question with that blindness put in -- the corner
-/// rule itself, `face_ao_of`, over the same height field -- the answer is
-/// the mesher's to the last bit. So `ground_faces` is the mesher's rule on
-/// the true neighbours, and what differs is the mesher's chunk edges.
+/// count: top faces, and riser area per direction and per layer. And on the
+/// ambient occlusion, up to the rounding of a mean: the mesher shades a face
+/// by the blocks around it, across a chunk's border as inside it (issue
+/// #430), so the height field's openness is the mesher's with no chunk-edge
+/// case. (Before #430 the mesher left the next chunk out, and this test had
+/// to model that blindness to hold the two together.)
 #[test]
 fn ground_faces_are_what_the_level_0_mesher_draws() {
-    use cubara_voxel::face_ao_of;
     use cubara_world::{GroundLayer, GROUND_DIRECTIONS};
-    /// **Chosen, not derived**: above the largest gap measured over this
-    /// seed's footprints (0.059 on tops, 0.106 on one direction's risers,
-    /// both on steep ground, where a chunk edge hides the most).
-    const OPENNESS_TOLERANCE: (f64, f64) = (0.08, 0.14);
+    /// The openness of a direction's faces, mean per face: `ground_faces`
+    /// keeps it as an `f32`, the harness sums `f64`. **Chosen, not derived**:
+    /// a thousandth of the 0..1 openness, a hundred times the rounding of a
+    /// mean over a few thousand faces; one wrong corner of one face in the
+    /// whole footprint moves the mean by more than this.
+    const OPENNESS_ROUNDING: f64 = 1e-4;
     /// Counted this far inside the footprint, so that every counted face's
     /// front column is in the footprint too.
     const INNER: i32 = 8;
@@ -1592,36 +1589,6 @@ fn ground_faces_are_what_the_level_0_mesher_draws() {
         let at = format!("{kind:?} {fp:?} (seed {FOOTPRINT_SEED:#x})");
         assert_eq!(ground.columns as f64, m.faces.area[0], "{at}: top faces");
 
-        // The same faces with the mesher's blindness: nothing outside the
-        // chunk of the block a face belongs to is solid.
-        let chunk = |a: i32| a.div_euclid(16);
-        let mut blind = [0f64; 5];
-        // The footprint's heights, worked out once: every block asked about
-        // is within a block of a counted column, and those are `INNER` in.
-        let height = |x: i32, z: i32| field.top(x - fp.x0, z - fp.z0) as i32 - 1;
-        for z in z0..z0 + w {
-            for x in x0..x0 + w {
-                let h = height(x, z);
-                let solid_from = |own: [i32; 3]| {
-                    move |bx: i32, by: i32, bz: i32| {
-                        [bx, by, bz].map(chunk) == own.map(chunk) && by <= height(bx, bz)
-                    }
-                };
-                let sum = |ao: [u8; 4]| ao.iter().map(|&a| a as f64).sum::<f64>() / 12.0;
-                blind[0] += sum(face_ao_of(&solid_from([x, h, z]), 1, 2, 0, h + 1, z, x));
-                for (d, [dx, dz]) in GROUND_DIRECTIONS.into_iter().enumerate() {
-                    for y in height(x + dx, z + dz) + 1..=h {
-                        let solid = solid_from([x, y, z]);
-                        blind[d + 1] += sum(if dx != 0 {
-                            face_ao_of(&solid, 0, 1, 2, x + dx, y, z)
-                        } else {
-                            face_ao_of(&solid, 2, 0, 1, z + dz, x, y)
-                        });
-                    }
-                }
-            }
-        }
-
         for (d, [gx, gz]) in GROUND_DIRECTIONS.into_iter().enumerate() {
             // The harness's directions are +Y first, then these four.
             let h = d + 1;
@@ -1641,38 +1608,25 @@ fn ground_faces_are_what_the_level_0_mesher_draws() {
                     direction_name(h)
                 );
             }
-            assert!(
-                (blind[h] - m.faces.open[h]).abs() < 1e-6,
-                "{at}: {} risers' openness, chunk-blind: {} against the mesher's {}",
-                direction_name(h),
-                blind[h],
-                m.faces.open[h]
-            );
-            if m.faces.area[h] >= 64.0 {
+            if m.faces.area[h] > 0.0 {
                 let gap = (ground.side_open[d] as f64 - m.faces.open[h] / m.faces.area[h]).abs();
                 worst_side = worst_side.max(gap);
                 assert!(
-                    gap <= OPENNESS_TOLERANCE.1,
-                    "{at}: {} risers' openness is {gap:.3} off the mesher's",
+                    gap <= OPENNESS_ROUNDING,
+                    "{at}: {} risers' openness is {gap:.5} off the mesher's",
                     direction_name(h)
                 );
             }
         }
-        assert!(
-            (blind[0] - m.faces.open[0]).abs() < 1e-6,
-            "{at}: the tops' openness, chunk-blind: {} against the mesher's {}",
-            blind[0],
-            m.faces.open[0]
-        );
         let gap = (ground.top_open as f64 - m.faces.open[0] / m.faces.area[0]).abs();
         worst_top = worst_top.max(gap);
         assert!(
-            gap <= OPENNESS_TOLERANCE.0,
-            "{at}: the tops' openness is {gap:.3} off the mesher's"
+            gap <= OPENNESS_ROUNDING,
+            "{at}: the tops' openness is {gap:.5} off the mesher's"
         );
     }
     println!(
-        "checked {checked:?}; worst openness gap: tops {worst_top:.4}, risers {worst_side:.4}"
+        "checked {checked:?}; worst openness gap: tops {worst_top:.6}, risers {worst_side:.6}"
     );
     // Every kind of terrain, cliffs included (stone is there), and enough
     // of them in all: a kind that dropped out would leave `ground_faces`
@@ -2249,32 +2203,40 @@ fn top_shade_by_riser_report() {
 /// of **each face direction of each single footprint** against level 0 over
 /// the same ground: the tops (+Y), then the four side directions.
 ///
-/// **Levels 1 and 2 hold #423's 2/255 in every direction of every
-/// footprint. Level 3 does not, and its bounds are chosen, not derived**:
-/// just over the worst footprint measured on this seed
-/// (`per_footprint_report`):
+/// **Every bound is chosen, not derived**: just over the worst footprint
+/// measured on this seed (`per_footprint_report`), after issue #430 gave
+/// level 0 its neighbour chunks in its ambient occlusion and the coarse
+/// levels theirs (the coarse AO was retuned to that level 0: every occluder
+/// counts, the wall band's shade is two occluders -- `top_ao`, `wall_ao`).
 ///
 /// | level | tops: worst, bound | sides: worst, bound |
 /// |---|---|---|
-/// | 1 | 1.50, 2.0 | 1.51, 2.0 |
-/// | 2 | 1.66, 2.0 | 1.62, 2.0 |
-/// | 3 | 2.88, 3.0 (nine of forty footprints are over 2.0) | 3.18, 3.25 (two of 63 ranked directions are over 2.0: 3.18 and 2.21) |
+/// | 1 | 0.99, 1.25 | 1.21, 1.5 |
+/// | 2 | 2.0076, 2.01 | 1.20, 1.5 |
+/// | 3 | 2.60, 2.75 | 3.22, 3.25 (the bound #423 chose, unchanged) |
+///
+/// (Before #430, against the chunk-blind level 0: 1.48 / 1.51, 1.93 / 1.63,
+/// 2.98 / 3.12. The bounds #423 asserted were 2.0, 2.0 and 3.0 / 3.25.)
+///
+/// **Level 2's tops are the one bound left above #423's 2.0**, by 0.01, and
+/// one footprint carries it: `Gentle` at (-4096, -2048), whose coarse tops
+/// are lighter than level 0's by 0.026 of their light (0.853 against 0.827).
+/// What is missing is the shade of the steps *inside* a coarse cell, which
+/// the lattice holds no data for: `docs/PHASE3_ARCHITECTURE.md` §9.4 item 1,
+/// the lever not built. Six other variants of the rule (band rounding up,
+/// down or geometric, the diagonal in the band, a riser of one given a band,
+/// an inner corner given one more) each moved other footprints further off
+/// than they helped this one.
 ///
 /// What is left at level 3 is stated in `docs/PHASE3_ARCHITECTURE.md` §9.4,
 /// and `top_shade_by_riser_report` takes it apart: a coarse top knows the
-/// risers beside it and nothing of the steps *inside* its 8 x 8 columns, so
-/// a cell with no riser beside it is lighter than its blocks and one under a
-/// tall riser darker, and a footprint is off by whichever it has more of;
+/// risers beside it and nothing of the steps *inside* its 8 x 8 columns,
 /// and a cell is one material over four rows, the one that holds the top
 /// the surface block over as many of them as are drawn, so a direction with
-/// a few dozen faces is a sample of level 0's mix (the 3.18: a cliff's +X,
-/// 2.45 of it the materials alone).
+/// a few dozen faces is a sample of level 0's mix (the 3.22: a cliff's +X,
+/// 2.40 of it the materials alone).
 /// Tightening these numbers is tightening those.
-const T3_ALLOWED: [(u32, f64, f64); 3] = [
-    (1, T3_TOLERANCE, T3_TOLERANCE),
-    (2, T3_TOLERANCE, T3_TOLERANCE),
-    (3, 3.0, 3.25),
-];
+const T3_ALLOWED: [(u32, f64, f64); 3] = [(1, 1.25, 1.5), (2, 2.01, 1.5), (3, 2.75, 3.25)];
 
 /// **T3** (`docs/PROPOSAL_LOD_TRANSITIONS.md` §6, #423 decision 3): *a
 /// coarse node averages like its blocks* -- the area-weighted lit colour of

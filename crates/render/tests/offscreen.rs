@@ -2,7 +2,7 @@
 //! `--bench flight` measures through, so it has to draw what it is handed and
 //! stop drawing what it is told to drop, the way the window does.
 
-use cubara_render::{CameraPose, Hud, MeshedNode, NodeId, Renderer};
+use cubara_render::{ArenaCapacity, CameraPose, Hud, MeshedNode, NodeId, Renderer};
 use cubara_voxel::ChunkCoord;
 use cubara_world::mesh::{mesh_node, mesh_region};
 use cubara_world::node::{schedule_for_radius, NodeKey};
@@ -44,7 +44,8 @@ fn an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped() {
         eye: glam::DVec3::new(8.0, surface as f64 + 24.0, 8.0),
         look_dir: glam::Vec3::new(0.05, -1.0, 0.03),
     };
-    let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera) else {
+    let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera, ArenaCapacity::FLOOR)
+    else {
         cubara_render::headless::skip_or_require_gpu(
             "an_offscreen_renderer_draws_what_it_is_handed_and_nothing_it_dropped",
         );
@@ -110,7 +111,8 @@ fn a_teleport_across_the_anchor_grid_leaves_the_frame_unchanged() {
         eye: glam::DVec3::new(8.3, surface as f64 + 24.0, 8.3),
         look_dir: glam::Vec3::new(0.05, -1.0, 0.03),
     };
-    let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera) else {
+    let Some((mut renderer, assets)) = Renderer::offscreen(64, 48, camera, ArenaCapacity::FLOOR)
+    else {
         cubara_render::headless::skip_or_require_gpu(
             "a_teleport_across_the_anchor_grid_leaves_the_frame_unchanged",
         );
@@ -208,7 +210,8 @@ fn rebase_cost_report() {
         eye: glam::DVec3::new(8.5, surface as f64 + 24.0, 8.5),
         look_dir: glam::Vec3::new(0.3, -0.4, -0.7),
     };
-    let Some((mut renderer, assets)) = Renderer::offscreen(320, 180, camera) else {
+    let Some((mut renderer, assets)) = Renderer::offscreen(320, 180, camera, ArenaCapacity::FLOOR)
+    else {
         cubara_render::headless::skip_or_require_gpu("rebase_cost_report");
         return;
     };

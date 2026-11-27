@@ -159,6 +159,16 @@ pub fn split_ratio_for(pixels: f64, screen_height: f64, fov_y: f64) -> f64 {
     1.0 / (pixels * pixel * PATCH_QUADS as f64)
 }
 
+/// The lowest and highest top any level draws, in blocks: one above the
+/// lowest and the highest ground a column can have
+/// ([`WorldGen::column_top_range`], pit floors included). Every far face's
+/// top, and a wall's foot, stands within it: a top is the mean of such
+/// columns, or a summit among them, plus one.
+pub fn ground_range() -> (f64, f64) {
+    let (lo, hi) = WorldGen::column_top_range();
+    (lo as f64 + 1.0, hi as f64 + 1.0)
+}
+
 /// The lowest and highest surface the generator can produce -- the vertical
 /// extent of a patch whose heights are not known yet.
 pub fn surface_bounds() -> (f64, f64) {
@@ -682,17 +692,36 @@ pub fn build(gen: &WorldGen, view: &FarView) -> Vec<PatchHeights> {
 
 /// [`build`], every patch generated [`generate_with`] `trees`.
 pub fn build_with(gen: &WorldGen, view: &FarView, trees: Option<WithTrees>) -> Vec<PatchHeights> {
-    let mut have: std::collections::HashMap<PatchKey, PatchHeights> =
-        std::collections::HashMap::new();
+    let mut have = std::collections::HashMap::new();
+    build_where(gen, view, trees, &mut have, |_| true)
+        .iter()
+        .filter_map(|k| have.remove(k))
+        .collect()
+}
+
+/// [`build`]'s loop for the patches `wanted` lets through, generating into
+/// (and from) `have`, each [`generate_with`] `trees`: the keys of those it
+/// selects, in [`select`]'s order. A split reads only the patch's own error
+/// and its ancestors' -- which hold its ground, so `wanted` passes them too
+/// when it passes by ground -- so every patch it selects is one [`build`]
+/// selects. For a test that draws a part of the view (`cubara-app`'s
+/// `strip_standin`).
+pub fn build_where(
+    gen: &WorldGen,
+    view: &FarView,
+    trees: Option<WithTrees>,
+    have: &mut std::collections::HashMap<PatchKey, PatchHeights>,
+    wanted: impl Fn(PatchKey) -> bool,
+) -> Vec<PatchKey> {
     loop {
         let keys = select(view, |k| have.get(&k).map(|p| p.error));
         let new: Vec<PatchKey> = keys
             .iter()
             .copied()
-            .filter(|k| !have.contains_key(k))
+            .filter(|&k| wanted(k) && !have.contains_key(&k))
             .collect();
         if new.is_empty() {
-            return keys.iter().filter_map(|k| have.remove(k)).collect();
+            return keys.into_iter().filter(|&k| wanted(k)).collect();
         }
         for k in new {
             have.insert(k, generate_with(gen, k, trees));
@@ -1051,6 +1080,84 @@ pub(crate) mod tests {
 
     /// One pixel at 1080p with a 60° field of view, in radians.
     const PIXEL: f64 = std::f64::consts::FRAC_PI_3 / 1080.0;
+
+    /// **[`build_where`] selects what [`build`] does, of the patches it lets
+    /// through**: let through only the patches over one quarter of the
+    /// ground, it selects the patches of [`build`]'s selection over that
+    /// quarter -- each split by its own error and its ancestors', which
+    /// hold its ground and so are let through too -- and generates nothing
+    /// else. Not vacuous: the quarter's selection is split for roughness
+    /// somewhere (it differs from the selection by distance alone).
+    #[test]
+    fn building_a_part_of_the_view_selects_what_building_it_all_does() {
+        let gen = WorldGen::new(SEED);
+        // Wide quads, out to 2 km: few patches, some split for roughness.
+        let view = FarView {
+            split_ratio: split_ratio_for(32.0, 1080.0, std::f64::consts::FRAC_PI_3),
+            max_error: 4.0 * PIXEL,
+            min_quad: 8.0 * PIXEL,
+            ..view([8.0, 120.0, 8.0], 2_000.0)
+        };
+        let whole: Vec<PatchKey> = build(&gen, &view).iter().map(|p| p.key).collect();
+        let quarter = |k: PatchKey| {
+            let [x, z] = k.origin();
+            x + k.size() > 0 && z + k.size() > 0
+        };
+        let mut have = HashMap::new();
+        let part = build_where(&gen, &view, None, &mut have, quarter);
+        let expected: Vec<PatchKey> = whole.iter().copied().filter(|&k| quarter(k)).collect();
+        assert_eq!(part, expected);
+        assert!(
+            have.keys().all(|&k| quarter(k)),
+            "a patch outside the part was generated"
+        );
+        let by_distance: Vec<PatchKey> = select(&view, |_| None)
+            .into_iter()
+            .filter(|&k| quarter(k))
+            .collect();
+        assert_ne!(
+            part, by_distance,
+            "nothing here was split for its roughness"
+        );
+    }
+
+    /// **No ground any level draws stands outside [`ground_range`]**: every
+    /// far face's top and every wall's foot, at quads of 8 to 64 over the
+    /// pitted mountains, the spawn and a valley, and every column's top
+    /// there. Whether the strip can be stood in for is judged by it
+    /// (`cubara-app`'s `far_streaming::standin_keys`), so a top outside it
+    /// would let a stand-in draw ground the voxels' box does not hold.
+    #[test]
+    fn every_top_stands_in_the_ground_range() {
+        let gen = WorldGen::new(SEED);
+        let (lo, hi) = ground_range();
+        let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+        for (x, z) in [(-848, 4832), (0, 0), (2_000, -3_000), (-6_000, 1_500)] {
+            for level in FINEST_LEVEL..=6 {
+                let patch = generate(&gen, PatchKey::containing(level, x, z));
+                for f in &patch.faces {
+                    for y in [f.top as f64, (f.top - f.rise as i32) as f64] {
+                        lowest = lowest.min(y);
+                        highest = highest.max(y);
+                    }
+                }
+            }
+            for dz in (-256..256).step_by(4) {
+                for dx in (-256..256).step_by(4) {
+                    let y = gen.column_top(x as i32 + dx, z as i32 + dz) as f64 + 1.0;
+                    lowest = lowest.min(y);
+                    highest = highest.max(y);
+                }
+            }
+        }
+        assert!(
+            lo <= lowest && highest <= hi,
+            "tops from {lowest} to {highest}, outside {lo}..={hi}"
+        );
+        // Its top is the highest surface's top face, as the far terrain's
+        // patches are assumed to span before their heights are known.
+        assert_eq!(hi, surface_bounds().1, "the highest top");
+    }
 
     /// What a streaming caller does: select, generate what is new, select
     /// again, until nothing new is asked for.
