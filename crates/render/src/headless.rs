@@ -492,6 +492,9 @@ fn render_arena(
     let eye_rel = pose.relative_eye(anchor);
     let vp = pose.view_proj(width as f32 / height as f32, anchor);
     let frustum = Frustum::from_view_proj(vp);
+    if let Some(params) = &morph {
+        arena.set_morph(params, [eye_rel; 4]);
+    }
     let draw_count = arena.prepare(&queue, &frustum);
     trees.prepare(&device, &queue, &frustum);
     let far_terrain = (!far.is_empty()).then(|| {

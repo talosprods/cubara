@@ -189,49 +189,97 @@ fn vs_main(
         let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);
         if all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)
             && top > params.hole_min.y && top < params.hole_max.y {
-            world.y = min(world.y, params.hole_min.y);
-            // What is left of it, if anything, is under the box. A wall cut
-            // down to nothing must stay nothing: sealed, its corners would
-            // move apart again, and thousands of walls each a tenth of a
-            // pixel tall lie on the box's floor, in sight of an eye
-            // underground (seen as three pixels in `golden.rs`'s curtain
-            // test).
-            seal = 0.0;
+            // The step between the corner quad and the next quad along the
+            // z side, where the corner quad is the higher (`far::corner_wall`):
+            // a wall facing along x, one quad in from the nearest x side,
+            // facing away from it, with an end on a z side.
+            let lo_x = (world.x - params.hole_min.x) / tile.quad;
+            let hi_x = (params.hole_max.x - world.x) / tile.quad;
+            let step_x = i32(round(select(-lo_x, hi_x, hi_x < lo_x)));
+            let away = (dir == DIR_POS_X && step_x == -1) || (dir == DIR_NEG_X && step_x == 1);
+            let run = f32(dj) * tile.quad;
+            let run_lo = select(world.z, world.z - run, e == 1u);
+            let on_lo = run_lo == params.hole_min.z;
+            let on_hi = run_lo + run == params.hole_max.z;
+            let corner_wall = faces_x && away && (on_lo || on_hi);
+            if corner_wall {
+                // Folded onto the z side over the corner quad's part of it:
+                // its far end to the box's corner, at its own height.
+                let side_z = select(params.hole_max.z, params.hole_min.z, on_lo);
+                if world.z != side_z {
+                    world.x = world.x + f32(step_x) * tile.quad;
+                    world.z = side_z;
+                }
+            } else {
+                world.y = min(world.y, params.hole_min.y);
+                // What is left of it, if anything, is under the box. A wall
+                // cut down to nothing must stay nothing: sealed, its corners
+                // would move apart again, and thousands of walls each a tenth
+                // of a pixel tall lie on the box's floor, in sight of an eye
+                // underground (seen as three pixels in `golden.rs`'s curtain
+                // test).
+                seal = 0.0;
+            }
         }
-    } else if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
-        // A top's corner strictly inside the box (`far::join` is this rule,
-        // and its tests say why).
+    } else if all(world.xz >= params.hole_min.xz) && all(world.xz <= params.hole_max.xz) {
+        // A top's corner in the box or on its sides (`far::join` and
+        // `far::corner` are these rules, and their tests say why); every
+        // other corner is drawn where it stands, without a step of this.
         // How many quads to the nearest side of the box along each axis, as
         // a step in the grid: negative towards the low side.
         let lo = (world.xz - params.hole_min.xz) / tile.quad;
         let hi = (params.hole_max.xz - world.xz) / tile.quad;
         let step = vec2<i32>(round(select(-lo, hi, hi < lo)));
-        let ti = i + step.x;
-        let tj = j + step.y;
-        // The first ring inside becomes a skirt: it drops straight down from
-        // the corner on the box's side next to it, as far as the patch's own
-        // skirt does. That closes the seam to the voxels, as the wall on the
-        // edge of a patch that ends on the box's side already does.
-        let snap_x = abs(step.x) == 1 && ti >= 0 && ti <= QUADS;
-        let snap_z = abs(step.y) == 1 && tj >= 0 && tj <= QUADS;
-        if snap_x || snap_z {
-            i = select(i, ti, snap_x);
-            j = select(j, tj, snap_z);
+        // From this corner into its face, and whether that face is in the
+        // box: the middle of its quad beside this corner, at a height the
+        // box holds.
+        let into = vec2<i32>(select(1, -1, e == 1u), select(1, -1, u == 1u));
+        let middle = world.xz + 0.5 * tile.quad * vec2<f32>(into);
+        let face_in = all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)
+            && y > params.hole_min.y && y < params.hole_max.y;
+        if face_in && abs(step.x) == 1 && abs(step.y) <= 1 {
+            // At a corner of the box (`far::corner`): the first ring folds
+            // onto the x side, and the quad after the corner along the z
+            // side stretches its skirt over the corner quad's part of it --
+            // to the corner, and a skirt deep but on the side itself.
+            let toward_x = into.x == step.x;
+            i = i + step.x;
+            j = select(j, j + step.y, step.y != 0 && !toward_x);
+            let drop = step.y != 0 || toward_x;
             world = vec3<f32>(
                 tile.origin.x + f32(i) * tile.quad,
-                y - tile.skirt,
+                select(y, y - tile.skirt, drop),
                 tile.origin.y + f32(j) * tile.quad,
             );
-        } else {
-            // Everything deeper goes where the eye sees only its underside,
-            // which is culled: above the box for an eye inside it with all
-            // the ground above the box's floor, and under it otherwise
-            // (`far::hidden_height`, which is worked out once a frame on the
-            // CPU because it needs to know the ground). Sinking it under the
-            // box whatever the eye, as this used to, hung a wall from the
-            // surface to the box's floor a kilometre away on every side: the
-            // owner's curtain underground (issue #424).
-            world.y = params.hole_min.w;
+        } else if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {
+            // A corner strictly inside the box (`far::join`).
+            let ti = i + step.x;
+            let tj = j + step.y;
+            // The first ring inside becomes a skirt: it drops straight down from
+            // the corner on the box's side next to it, as far as the patch's own
+            // skirt does. That closes the seam to the voxels, as the wall on the
+            // edge of a patch that ends on the box's side already does.
+            let snap_x = abs(step.x) == 1 && ti >= 0 && ti <= QUADS;
+            let snap_z = abs(step.y) == 1 && tj >= 0 && tj <= QUADS;
+            if snap_x || snap_z {
+                i = select(i, ti, snap_x);
+                j = select(j, tj, snap_z);
+                world = vec3<f32>(
+                    tile.origin.x + f32(i) * tile.quad,
+                    y - tile.skirt,
+                    tile.origin.y + f32(j) * tile.quad,
+                );
+            } else {
+                // Everything deeper goes where the eye sees only its underside,
+                // which is culled: above the box for an eye inside it with all
+                // the ground above the box's floor, and under it otherwise
+                // (`far::hidden_height`, which is worked out once a frame on the
+                // CPU because it needs to know the ground). Sinking it under the
+                // box whatever the eye, as this used to, hung a wall from the
+                // surface to the box's floor a kilometre away on every side: the
+                // owner's curtain underground (issue #424).
+                world.y = params.hole_min.w;
+            }
         }
     }
     // Seal the T-junctions a greedy mesh leaves, as `mesh.wgsl` does and by

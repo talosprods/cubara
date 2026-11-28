@@ -1432,6 +1432,205 @@ real level-0 nodes around eyes on the terraces and above them; every vertex
 with a morph target within `NEAR_EXACT` of the eye, by the metric (the
 vertical part included), has factor 0.
 
+#### 9.6.2 The near field in every direction, and the morph's tilt (acceptance tour, 2026-11-27)
+
+**What the tour found.** 9.6.1 made the near field exact *by the metric*,
+and the metric was `max(horizontal, 2 x vertical)` all the way to the eye:
+96 blocks ahead, but only 48 below or above. Standing on the highest peak
+near the origin and looking down, ground 90 blocks away in a straight line
+and 75 below had metric 149 and was drawn at its parent's heights -- the
+thin brown slivers and grass slabs of 9.6.1 again; morph against no morph
+differed on 12-54% of the pixels of every look from the peak, and 20%
+looking up a face from its foot. The selection had the same shape: level 0
+reached only 80 blocks up and down (5 chunks), so ground 81-96 blocks
+straight down was level 1 whatever the morph did.
+
+**The rule: height counts once in the near field.** The selection's
+vertical distance becomes `max(dy, squash * (dy - shift))` (chunks,
+`node::squashed_gap`), and the morph's is the same line continued between
+chunks (`morph::squashed_height`, blocks; `morph.wgsl` with the shift in
+`MorphParams::shift`). `shift` is the least whole number of chunks for which
+the two parts meet at `NEAR_FIELD_CHUNKS` (6, i.e. `NEAR_EXACT`'s 96 blocks,
+now one constant): 3 at the game's squash of 2, so the metric is `|dy|`
+out to 96 blocks and `2|dy| - 96` beyond. Then:
+
+- **Within 96 blocks in a straight line the metric is at most the
+  distance** (`max(h, |v|) <= sqrt(h^2 + v^2)`), so level 0's band, which
+  starts at 96, never reaches that ground, in any direction.
+- **Every ring's vertical reach moves out by the same whole 48 blocks**:
+  level 0 to 128 (was 80), level 1 to 192 (144), level 2 to 304 (256);
+  the cube of the outer reach is untouched. The rings keep their
+  thickness, so the bands are the same numbers of the metric (96-128,
+  224-256, 416-480) and neighbours stay one level apart at every squash
+  (`in_three_dimensions_the_rings_still_tile_and_stay_balanced`, squash 1 to
+  4: a whole-chunk shift rounds every ring alike).
+- **The morph still ends before every swap.** The margins it is derived
+  from (`outer_margin`, `inner_reach`) bound the metric's steepness, and
+  this metric is never steeper than the squash; the morph and the selection
+  are still one metric, so a swap happens where the morph has finished
+  (`every_node_is_fully_morphed_at_the_frame_it_swaps`,
+  `no_node_beside_a_finer_one_has_started_to_morph`).
+
+**The alternatives, and why not.** Measuring only the *morph* in true
+distance leaves the swaps where the selection makes them: a node would
+swap half-morphed (the pops of #380), and level 1 would still draw the
+ground 81-96 blocks down. Growing only level 0's vertical reach leaves
+level 1 a ring thinner than one of its nodes: a level-2 node beside level 0
+vertically, and level 1's band with no room. Winning the coarse rings'
+reach back with a steeper squash beyond the near field fails the same way:
+the margins scale with the steepness, and at 3x level 1's 32-block band
+is gone. A metric that keeps the bands as they are and the one-level
+balance moves every ring out by what level 0 gains (each ring must stay as
+thick as a node of its level plus its band and margin), so this one -- the
+least whole shift -- is the cheapest that does it.
+
+**What it costs** (the selection meshed in full with the morph,
+`morph_cost_census`, every node seen or not; and the nodes the cave
+culling reaches from the eye, `visibility::visible_nodes`):
+
+| eye | resident nodes | resident triangles | reachable triangles |
+|---|---|---|---|
+| ground (8, 40, 8) | 13,698 -> 17,156 | 1,758,152 -> 1,871,664 (+6.5%) | 1,500,660 -> 1,500,660 (0) |
+| hill (8, 300, 8) | 13,698 -> 17,156 | 1,055,690 -> 1,070,898 (+1.4%) | 1,055,082 -> 1,068,696 (+1.3%) |
+| flight (8, 3000, 8) | 14,265 -> 16,722 | 0 -> 0 | 0 -> 0 |
+| peak (-960.5, 243.62, -3335.5) | 14,300 -> 17,198 | 2,114,632 -> 2,475,094 (+17.0%) | 2,102,388 -> 2,397,122 (+14.0%) |
+
+The added nodes are mostly air and rock (no mesh); at the ground eye the
+added triangles are level 0's caves 80-128 blocks under the eye (level 0
+from 490,758 to 591,866), and the cave culling reaches none of them: the
+ground eye can draw exactly the triangles it could before. At the hill eye,
+280 blocks over the ground, level 2's added reach takes some ground over
+from level 3 (level 2 from 553,002 to 569,040 reachable, level 3 from
+502,080 to 499,656). At the peak the added triangles are the point: level
+0 from 217,510 to 610,010 reachable (level 1 from 729,140 to 660,628) --
+the slope under the peak drawn at full detail instead of morphed to
+level 1.
+
+**The cracks: the morph tilts a top face, and the arena culled it.** At the
+cliff the tour stood under, lines of sky one pixel tall showed along the
+top edges of blocks about 100 blocks away, under the wall behind them --
+inside level 0's band, and gone without the morph. A top face's corners
+move up by `delta * factor`, each at its own factor, so inside a band the
+face tilts: up away from the eye, `delta / 32` per block at level 0. Seen
+from 100 blocks, a face tilted that much faces a camera standing several
+blocks *below* it, and `arena::faces_facing` -- which drops every top face
+of a node the camera stands under, as a face in its axis plane could not
+show -- dropped it: the ray passed over the riser in front, under the foot
+of the riser behind (which starts at the morphed top) and out to the sky
+(traced by a CPU raycast against the morphed mesh, with and without that
+culling). **The fix: a node that may be in its level's band is drawn with
+its top faces whatever the box says** (`arena::morph_may_tilt`,
+`faces_facing_morphed`): a face tilts only where its corners' factors
+differ, which needs one inside the band by horizontal distance, so the test
+is the box's horizontal distances against the band -- conservative, and no
+second copy of the metric. The GPU's back-face culling still drops the
+faces that do face away; what it costs is the vertex stage over those top
+faces, which are back-facing but where the morph tilts them: among the
+triangles the cave culling reaches, none more at the hill, flight and peak
+eyes, 6,290 more at the ground eye (0.4%), and the most where the camera
+stands low among slopes inside a band -- 37,520 at the cliff (3.7%), 85,234
+at the foot of the face (5.7%).
+
+**What the near field costs the streaming, and what pays for it.** The
+quiet M3 bench of this section's first version (main against it, two runs
+each) found the gate within noise but the streaming slower: toward the peak
+the swap lag's p99 224 and 223 ms against main's 152 and 152, the low
+flight's worst frame 18.1 and 20.7 ms against 10.7 and 11.2, and in one of
+two low flights a hole of a pixel under a late swap (FLICKER 2; main 0).
+Replayed without a GPU (`streaming::tests::streaming_work_report`: the
+flights' eye at 60 frames a second, the game's selection and search, every
+node a search asks for built by the pool's own job and timed, each batch run
+through a modelled pool of 7 workers), the bigger rings asked for 28% more
+jobs on the low flight and 36% more toward the peak -- level 0 and 1 ground
+under the flight (the near field itself), rock reached through deeper caves,
+air -- for 54% more job time there, and every search took 15% longer. Three
+changes pay for it, none of them specific to the near field:
+
+- **A node the ground does not reach into skips the morph**
+  (`morph::node_columns`): with every column's top under its rows, or every
+  top and floor over them, the mesher would key nothing in it, so it is
+  built without the morph's purity checks and its parent's generation and
+  mesh -- the same mesh, byte for byte
+  (`a_node_the_ground_does_not_reach_into_has_nothing_to_morph`). A rock
+  node's job: 2.7 to 1.8 ms on the low flight, 8.0 to 5.2 toward the peak.
+  The trees of its footprint still ride the morph (`morph::tree_columns`):
+  such a node draws them when a cave gives it faces, and left without the
+  columns they stayed put while the ground's copy moved -- 7.2% of the
+  trees' pixels changed at the 288 m swap (`a_forest_swaps_nothing_at_its_ring_edges`
+  caught it).
+- **The pool is asked for what a swap waits for first, one swap after
+  another** (`streaming::request_order`): what replaces a drawn node and the
+  bare nodes beside a held one, grouped by the swap they finish, the nearest
+  swap first; then the rest nearest first. By distance alone a swap waited
+  behind the air, rock and new ground a search also asked for, much of it
+  nearer than the ring edges where the swaps are, and its eight children
+  were spread over the batch.
+- **The visibility search answers its neighbours in place**
+  (`visibility::Index::neighbours`, no allocation per step): a search is 24%
+  faster, 43 ms toward the peak where main's takes 49.
+
+Modelled lag of every swap that waits for a job (search plus jobs; ms,
+p50/p90/p99/max; main `f9a83f1`):
+
+| flight | main | this section's first version | now |
+|---|---|---|---|
+| low | 53/110/165/204 | 58/109/180/225 | 45/75/119/130 |
+| toward the peak | 54/64/102/166 | 63/86/142/205 | 49/70/118/145 |
+| down | 55/73/474/699 | 64/90/292/717 | 49/77/206/583 |
+
+The model leaves out the frames between a search and its answer and
+between a mesh and its upload, so its numbers are lower than the bench's;
+its ratio for the first version toward the peak (p99 1.39 times main's) is
+the bench's (1.47) within the noise of two runs. What is left is toward the
+peak, p90 and p99 6 and 16 ms over main's: the swaps the taller rings make
+on a mountain. Not modelled: the main thread's frame time (the low flight's
+worst frames), which the bench measures.
+
+**What this does not fix: a closing step can overshoot where the metric's
+vertical part rules.** The tour's other crack -- four pixels of sky on a
+level-1 top at the ridge (stand -3072,-3232, looking W), 218 blocks away
+and 126 below -- is a different class, traced the same way (a CPU raycast
+against the morphed mesh, under the metric as it was): two neighbouring
+columns whose tops meet at full morph, rows 17 and 15 both going to 18. With
+one factor they meet from below; but the factor is taken at each vertex, and
+where the vertical part of the metric is the larger one the lower corner is
+further from the eye and runs ahead -- factor 1.0 at row 15 against 0.913 at
+row 17 -- so the lower top passes the higher by 0.09 blocks, the riser
+between them turns inside out (culled), and nothing faces the camera across
+the gap. The closure tests hold every vertex at one factor, which is why
+they pass. Under this section's metric that spot is no longer in a band
+(metric 218, level 1's band starts at 224), but the class remains wherever
+the vertical part rules inside a band: looking steeply down or up -- by
+more than 30 to 37 degrees -- at ground in a band (96-112 blocks away
+vertically for level 0, 160-176 for level 1, 256-288 for level 2). The fix proposed, not built: take the
+vertical part from the vertex's parent-level node rather than from the
+vertex -- the distance from the eye to that node's slab of rows. It is the
+unit the selection swaps, so the morph still ends before every swap (the
+swap is decided on that same slab); every vertex of a vertical line inside
+the slab then has one factor, so no step can overshoot; siblings and
+horizontal neighbours share the slab; and a vertex on a slab's floor does
+not move (the knot rule), so the jump between slabs moves nothing. It needs
+the slab in `mesh.wgsl` and `trees.wgsl` (from the node's origin and level)
+and the CPU twin and its tests moved to it.
+
+**Pinned by**: `node::tests::no_coarse_node_comes_into_the_near_field` and
+`height_counts_once_in_the_near_field_and_squashed_beyond`;
+`morph::tests::the_metric_is_the_selections_distance`,
+`level_0_does_not_move_within_the_near_field_in_true_distance` and
+`level_0_stands_exactly_on_the_grid_within_the_near_field_in_true_distance`
+(real nodes from the peak and the foot of the face);
+`arena::tests::a_top_face_the_morph_tilts_toward_the_camera_is_drawn`;
+`morph::tests::a_node_the_ground_does_not_reach_into_has_nothing_to_morph`;
+`streaming::tests::what_a_swap_waits_for_is_asked_for_first` and
+`beside_held_is_every_node_beside_one_of_them` (the streaming's cost is
+measured, not asserted: `streaming_work_report`); and two GPU tests, `the_near_field_is_level_0_in_every_direction` (the peak looking
+down and the face looking up, the game's frame against level 0 alone, a
+knife-edge fog at 94 blocks turning everything further into the sky's
+colour in both: no pixel nearer may differ) and
+`the_morph_opens_no_crack_at_the_cliff` (the tour's own pose and size: no
+pixel of sky between land above and below where a raycast through it finds
+level-0 ground).
+
 ### 9.7 One tree at every distance (#433, items 2 to 4)
 
 The ground was made the same at every level by §9.3 to §9.6; the trees on
@@ -1627,6 +1826,24 @@ more of a summit than the rule does. The thresholds in the study (region
 is the finest far patch level at any screen height and quality: on a 1664-row
 display the pixel floor let quads of 4 reach out to 1,589 blocks, a fine band
 between two coarse ones. `the_far_terrain_is_never_finer_than_the_join`.
+
+**The seam at the join is closed on every side of the box** (2026-11-27,
+`far_streaming::the_far_terrain_closes_the_seam_to_the_voxels_on_every_side`,
+GPU-free): wherever the far terrain just outside the voxels' box stands
+higher than the ground the voxels draw just inside it (level 3's cells, by
+`World::certainly_solid_at_v`), the far faces standing on that side and
+facing in -- the first ring folded into a skirt, the wall between the quads
+on either side -- cover every height between the two, at every block column
+of all four sides, for the game's box, view and quad scale at the
+player-view tour's stands, at 1,080 and 1,846 rows. It found the box's
+corners open (`PROPOSAL_FAR_VIEW.md` §3.4 has the change). The tour's static
+pinholes were not the join: every one of them is either another lane's (a
+level-3 or level-2 cave window, a crack the distance morph opens) or the
+drawn geometry's own outline -- a far or level-3 top a few blocks under
+level 0's, with a nearer edge closing the sky round it -- with no far face,
+tile, seal or skirt missing (a CPU ray cast of the voxels' and the far
+terrain's triangles, placed as the shaders place them, agreed with the GPU
+on 2,012 of 2,013 pixels round one of them).
 
 **What a top wears.** The voxels' rule for it (`top_block`, §9.6), read
 through `WorldGen::top_layer`: what level 0 shows from above one of the

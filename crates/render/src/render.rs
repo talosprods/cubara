@@ -389,7 +389,8 @@ pub struct FrameUniform {
     morph_band: [[f32; 4]; 2],
     /// The eye each level's morph metric is measured from, relative to the
     /// anchor -- the camera's, except in a measurement that moves one
-    /// level's morph on its own. `[0].w` is the metric's vertical squash.
+    /// level's morph on its own. `[0].w` is the metric's vertical squash,
+    /// `[1].w` its vertical shift ([`MorphParams::shift`]).
     morph_eye: [[f32; 4]; 4],
 }
 
@@ -406,8 +407,15 @@ pub struct MorphParams {
     /// `(start, end)` per level, in blocks of the metric; `None` for a
     /// level that does not morph.
     pub bands: [Option<(f32, f32)>; 4],
-    /// How many times vertical distance counts in the metric.
+    /// How many times vertical distance counts in the metric, beyond the
+    /// near field.
     pub squash: f32,
+    /// How far, in blocks, the squash moves every ring's vertical reach
+    /// from the eye: the metric's vertical part is
+    /// `max(v, squash * (v - shift))`, so height counts once near the eye
+    /// (`cubara_world::morph::squashed_height`, whose
+    /// `vertical_shift_blocks` gives the selection's own value).
+    pub shift: f32,
 }
 
 impl MorphParams {
@@ -415,6 +423,7 @@ impl MorphParams {
     pub const OFF: Self = Self {
         bands: [None; 4],
         squash: 1.0,
+        shift: 0.0,
     };
 
     fn band_uniform(&self) -> [[f32; 4]; 2] {
@@ -477,6 +486,7 @@ impl FrameUniform {
             *slot = [eye.x, eye.y, eye.z, 0.0];
         }
         self.morph_eye[0][3] = params.squash;
+        self.morph_eye[1][3] = params.shift;
         self
     }
 }
@@ -1637,6 +1647,9 @@ impl Renderer {
             .morph_eyes
             .unwrap_or([camera.eye; 4])
             .map(|eye| anchor::relative_eye(self.anchor, eye));
+        // The arena culls for the morph the frame draws with: a top face
+        // the morph tilts may face a camera below it (`morph_may_tilt`).
+        self.arena.set_morph(&self.morph, eyes);
         self.scene.set_camera(
             &self.device,
             &self.queue,
