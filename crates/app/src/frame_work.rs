@@ -591,6 +591,14 @@ mod tests {
         );
     }
 
+    /// A frame whose every phase is under the line's threshold still names
+    /// its longest: a breakdown always says where the time went.
+    #[test]
+    fn a_frame_of_small_phases_still_names_its_longest() {
+        let f = frame(0.0, &[(Phase::Cull, 0.06), (Phase::Submit, 0.03)]);
+        assert_eq!(breakdown(&f), "0.09 ms = cull 0.06 + 16 more 0.03");
+    }
+
     #[test]
     fn of_equal_phases_the_earlier_is_the_longest() {
         let f = frame(0.0, &[(Phase::Uploads, 2.0), (Phase::Meshes, 2.0)]);

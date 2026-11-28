@@ -1808,8 +1808,7 @@ pub fn fly(
     let video = frames
         .zip(video_every)
         .map(|(dir, every)| VideoDump::new(dir, every));
-    let mut work_times = Vec::new();
-    let mut frame_work = Vec::new();
+    let mut frame_work: Vec<FrameWork> = Vec::new();
     let mut holes: Option<HoleTracker> = None;
     let mut pops = Vec::new();
     let start = Instant::now();
@@ -1821,11 +1820,8 @@ pub fn fly(
             break;
         }
         let eye = eye_at(flight, t);
-        // The frame's work is its phases' sum (issue #454): the same span
-        // as timing the call, read from the same clock reads as the parts.
         let mut work = live.frame(flight, eye);
         work.t = t;
-        work_times.push(work.total().as_secs_f32());
         frame_work.push(work);
         // Every frame, for the holes: one lasts a few frames, and the kept
         // ones are a quarter of a second apart. Read after the work is timed,
@@ -1918,7 +1914,7 @@ pub fn fly(
     // The live pass only (#378): the settled pass below jumps the eye around
     // to reconstruct each kept frame, which is not a swap a player ever
     // waits on.
-    let achieved = work_times.len() as f64 / flight.seconds.max(1e-3) as f64;
+    let achieved = frame_work.len() as f64 / flight.seconds.max(1e-3) as f64;
     let swap_lags = SwapLagStats::of(live.nodes.swap_lags(), achieved, flight.speed);
     let world_clones = WorldClones {
         clones: live.world.clone_generation() - clones_before,
@@ -2160,7 +2156,10 @@ pub fn fly(
     let pixels = (flight.size.0 * flight.size.1) as usize;
     Some(FlightReport {
         samples,
-        work_times,
+        // Each frame's work is its phases' sum (issue #454): the same span
+        // as timing the call, from the same clock reads as the parts, so a
+        // breakdown always adds up to the work this reports.
+        work_times: frame_work.iter().map(|w| w.total().as_secs_f32()).collect(),
         frame_work,
         holes: confirmed,
         holes_late: confirmed_late,
