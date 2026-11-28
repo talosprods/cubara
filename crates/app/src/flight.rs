@@ -24,6 +24,7 @@ use cubara_render::{CameraPose, Frame, Renderer};
 use cubara_world::World;
 
 use crate::far_streaming::{FarQuality, FarStreaming, FAR_VIEW_RADIUS};
+use crate::frame_work::{FrameWork, Laps, Phase, Stopwatch};
 use crate::streaming::{BlockBox, NodeStreaming};
 
 /// Blocks per second: `cubara_sim::player`'s free-fly speed.
@@ -896,6 +897,10 @@ pub struct FlightReport {
     /// measurement's sleep standing in for a display, and a sleep wakes when
     /// it likes -- about 4 ms late at p99 on an idle M3.
     pub work_times: Vec<f32>,
+    /// The same frames' work phase by phase, with what each phase counted
+    /// (issue #454): each one's total is its [`work_times`](Self::work_times)
+    /// entry.
+    pub frame_work: Vec<FrameWork>,
     /// Per frame of the real-time pass, the pixels that were holes: candidates
     /// ([`HoleTracker`]) the finished frame confirmed ([`confirm_holes`]).
     pub holes: Vec<u32>,
@@ -1116,6 +1121,14 @@ impl FlightReport {
             self.world_clones.term(),
             self.arena_overflows.term(),
         )
+    }
+
+    /// The `WORST FRAMES` line ([`crate::frame_work::worst_line`]): which
+    /// phase of the longest frames took the time (issue #454). Printed
+    /// beside [`line`](Self::line), not in it: the gate script parses that
+    /// one.
+    pub fn worst_frames_line(&self) -> String {
+        crate::frame_work::worst_line(&self.frame_work)
     }
 
     /// **The owner's flicker over the flight** (#398): the frames that
@@ -1497,13 +1510,26 @@ impl Streamed {
     /// 7/D), which holds the camera still while the streaming centre moves.
     /// [`frame`](Self::frame) is the one-eye case the rest of the module
     /// uses, so there is still one frame path (`ARCHITECTURE.md` Rule 5).
-    fn frame_at(&mut self, flight: &Flight, stream_eye: [f32; 3], camera_eye: [f32; 3]) {
+    ///
+    /// Returns the frame's work, phase by phase (issue #454): the game's
+    /// calls, lapped as they go ([`crate::frame_work`]); its total is the
+    /// frame's work.
+    fn frame_at(
+        &mut self,
+        flight: &Flight,
+        stream_eye: [f32; 3],
+        camera_eye: [f32; 3],
+    ) -> FrameWork {
+        let mut laps = Stopwatch::start();
         self.nodes
-            .update(&mut self.renderer, &self.world, stream_eye);
+            .update_lapped(&mut self.renderer, &self.world, stream_eye, &mut laps);
         let voxels = self.nodes.voxel_box(&self.renderer, stream_eye);
-        self.far.update(&mut self.renderer, stream_eye, voxels);
+        laps.lap(Phase::VoxelBox);
+        self.far
+            .update_lapped(&mut self.renderer, stream_eye, voxels, &mut laps);
         self.renderer
             .set_far_shown(self.nodes.far_in_sight(stream_eye));
+        laps.lap(Phase::VoxelBox);
         self.renderer.render(
             pose(flight, camera_eye),
             None,
@@ -1518,11 +1544,14 @@ impl Streamed {
             },
             FAR_VIEW_RADIUS as f32,
         );
+        laps.lap_render(&self.renderer.last_work());
+        laps.finish()
     }
 
-    /// Stream for `eye` and draw one frame, the way the game's frame does.
-    fn frame(&mut self, flight: &Flight, eye: [f32; 3]) {
-        self.frame_at(flight, eye, eye);
+    /// Stream for `eye` and draw one frame, the way the game's frame does;
+    /// what it did, phase by phase.
+    fn frame(&mut self, flight: &Flight, eye: [f32; 3]) -> FrameWork {
+        self.frame_at(flight, eye, eye)
     }
 
     /// Stream for `stream_eye` and draw from `camera_eye` until nothing is
@@ -1779,7 +1808,7 @@ pub fn fly(
     let video = frames
         .zip(video_every)
         .map(|(dir, every)| VideoDump::new(dir, every));
-    let mut work_times = Vec::new();
+    let mut frame_work: Vec<FrameWork> = Vec::new();
     let mut holes: Option<HoleTracker> = None;
     let mut pops = Vec::new();
     let start = Instant::now();
@@ -1791,9 +1820,9 @@ pub fn fly(
             break;
         }
         let eye = eye_at(flight, t);
-        let working = Instant::now();
-        live.frame(flight, eye);
-        work_times.push(working.elapsed().as_secs_f32());
+        let mut work = live.frame(flight, eye);
+        work.t = t;
+        frame_work.push(work);
         // Every frame, for the holes: one lasts a few frames, and the kept
         // ones are a quarter of a second apart. Read after the work is timed,
         // so the readback is not counted as the game's.
@@ -1885,7 +1914,7 @@ pub fn fly(
     // The live pass only (#378): the settled pass below jumps the eye around
     // to reconstruct each kept frame, which is not a swap a player ever
     // waits on.
-    let achieved = work_times.len() as f64 / flight.seconds.max(1e-3) as f64;
+    let achieved = frame_work.len() as f64 / flight.seconds.max(1e-3) as f64;
     let swap_lags = SwapLagStats::of(live.nodes.swap_lags(), achieved, flight.speed);
     let world_clones = WorldClones {
         clones: live.world.clone_generation() - clones_before,
@@ -2127,7 +2156,11 @@ pub fn fly(
     let pixels = (flight.size.0 * flight.size.1) as usize;
     Some(FlightReport {
         samples,
-        work_times,
+        // Each frame's work is its phases' sum (issue #454): the same span
+        // as timing the call, from the same clock reads as the parts, so a
+        // breakdown always adds up to the work this reports.
+        work_times: frame_work.iter().map(|w| w.total().as_secs_f32()).collect(),
+        frame_work,
         holes: confirmed,
         holes_late: confirmed_late,
         candidates: counts,
@@ -2437,6 +2470,7 @@ mod tests {
         let r = FlightReport {
             samples: vec![sample(0.0), sample(0.02), sample(0.005), sample(0.1)],
             work_times: vec![0.002; 10],
+            frame_work: Vec::new(),
             holes: Vec::new(),
             holes_late: Vec::new(),
             candidates: Vec::new(),
@@ -2890,6 +2924,7 @@ mod tests {
         let r = FlightReport {
             samples: vec![sample(2, 0.002), sample(3, 0.005), sample(4, 0.0)],
             work_times: Vec::new(),
+            frame_work: Vec::new(),
             holes: vec![3, 0, 0, 1, 0],
             holes_late: vec![0; 5],
             candidates: vec![3, 0, 0, 1, 0],
@@ -3293,6 +3328,7 @@ mod tests {
         let report = |samples| FlightReport {
             samples,
             work_times: Vec::new(),
+            frame_work: Vec::new(),
             holes: Vec::new(),
             holes_late: Vec::new(),
             candidates: Vec::new(),
@@ -3395,6 +3431,7 @@ mod tests {
                 sample(3, 0.002, 0.0, 0.0015, 0.0),
             ],
             work_times: vec![0.002; 10],
+            frame_work: Vec::new(),
             holes: vec![0, 4, 0, 0],
             holes_late: vec![0, 1, 0, 0],
             candidates: vec![0, 5, 3, 0],
@@ -3550,5 +3587,65 @@ mod tests {
     #[test]
     fn swap_lag_stats_of_nothing_is_the_default() {
         assert_eq!(SwapLagStats::of(&[], 60.0, 24.0), SwapLagStats::default());
+    }
+
+    /// **A flight frame's work is the game's calls, lapped, with the
+    /// renderer's own split inside it** (issue #454): over the frames that
+    /// load the start, each frame's renderer phases and upload counts are
+    /// the renderer's own [`cubara_render::RenderWork`] for that frame, and
+    /// the phases together lie inside the call. Run until a frame has
+    /// uploaded nodes and an answer has asked for meshes, so it is not
+    /// vacuous. The far terrain off: its patches at the game's radius take
+    /// minutes to generate in a debug build, and its laps are the same
+    /// `Laps`. GPU-backed (the frame is the real one); without an adapter it
+    /// skips.
+    #[test]
+    fn a_flight_frames_work_holds_the_renderers_own_split() {
+        let f = Flight {
+            quality: FarQuality::Off,
+            ..flight()
+        };
+        let Some(mut live) = Streamed::new(&f, false) else {
+            cubara_render::headless::skip_or_require_gpu(
+                "a_flight_frames_work_holds_the_renderers_own_split",
+            );
+            return;
+        };
+        let (mut uploaded, mut asked) = (0u64, 0u64);
+        let waiting = Instant::now();
+        while uploaded == 0 || asked == 0 {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(120),
+                "nothing was asked for and uploaded in two minutes"
+            );
+            let began = Instant::now();
+            let work = live.frame(&f, f.start);
+            let outer = began.elapsed();
+            let r = live.renderer.last_work();
+            assert!(work.total() <= outer, "the phases outlast the frame");
+            for (phase, own) in [
+                (Phase::Rebase, r.rebase),
+                (Phase::Uploads, r.uploads),
+                (Phase::LightingWait, r.lighting_wait),
+                (Phase::Cull, r.cull),
+                (Phase::FarCull, r.far_cull),
+                (Phase::Trees, r.trees),
+                (Phase::Encode, r.encode),
+                (Phase::Submit, r.submit),
+            ] {
+                assert_eq!(work.phase(phase), own, "{phase:?} is not the renderer's");
+            }
+            assert!(
+                work.phase(Phase::Encode) + work.phase(Phase::Submit) > Duration::ZERO,
+                "the renderer's frame was not split"
+            );
+            assert_eq!(
+                work.count(crate::frame_work::Count::Uploaded),
+                u64::from(r.uploaded_nodes)
+            );
+            uploaded += u64::from(r.uploaded_nodes);
+            asked += work.count(crate::frame_work::Count::Asked);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
