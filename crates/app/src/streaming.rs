@@ -20,6 +20,7 @@ use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
 use crate::far_streaming::{hole_in_blocks, VoxelBox};
+use crate::frame_work::{Count, Laps, Phase};
 
 /// How many times sooner detail coarsens with height and depth than with
 /// horizontal distance (`cubara_world::node::desired_nodes_3d`).
@@ -574,6 +575,21 @@ impl NodeStreaming {
     /// Cheap when nothing changed: `stream_around` only runs on a
     /// chunk-boundary crossing.
     pub fn update(&mut self, renderer: &mut Renderer, world: &World, eye: [f32; 3]) {
+        self.update_lapped(renderer, world, eye, &mut ());
+    }
+
+    /// [`update`](Self::update), telling `laps` where its work went as it
+    /// goes (issue #454): the search answers applied, the meshes taken, the
+    /// held nodes let go -- and how many of each. Still no clock in here:
+    /// whether one is read is the caller's `laps`' business, and the game's
+    /// reads none.
+    pub fn update_lapped(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+        eye: [f32; 3],
+        laps: &mut impl Laps,
+    ) {
         // The frame index `swap_lags` is measured in (decision 2, #378): no
         // clock in here, just this call's own count.
         self.frame += 1;
@@ -591,10 +607,12 @@ impl NodeStreaming {
         while let Ok(done) = self.searcher.done.try_recv() {
             if done.generation == self.generation {
                 self.searching = false;
-                self.follow_visibility(renderer, world, done);
+                laps.count(Count::Answers, 1);
+                self.follow_visibility(renderer, world, done, laps);
             }
         }
-        self.drain_meshes(renderer);
+        laps.lap(Phase::Search);
+        self.drain_meshes(renderer, laps);
     }
 
     /// Force a re-mesh of the chunk `cc` (e.g. after an edit): the worker
@@ -689,7 +707,13 @@ impl NodeStreaming {
     /// node not yet generated counts as seen but is not searched through until
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
-    fn follow_visibility(&mut self, renderer: &mut Renderer, world: &World, done: SearchDone) {
+    fn follow_visibility(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+        done: SearchDone,
+        laps: &mut impl Laps,
+    ) {
         self.searched = Some(done.center);
         let desired = done.desired;
         Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
@@ -746,6 +770,7 @@ impl NodeStreaming {
             .filter(|n| !self.mesh_pool.is_in_flight(*n))
             .collect();
         node::sort_nearest_first(&mut to_load, done.center);
+        laps.count(Count::Asked, to_load.len() as u64);
         // One snapshot for the whole batch (issue #387 decision 2): every job
         // this search starts meshes the same world, and shares the one copy.
         let snapshot = Arc::new(world.snapshot());
@@ -881,8 +906,10 @@ impl NodeStreaming {
     /// issue #83. Marks nodes resident immediately (so they aren't
     /// re-requested); [`Renderer::apply_node_updates`] paces the actual GPU
     /// upload itself.
-    fn drain_meshes(&mut self, renderer: &mut Renderer) {
-        let meshed: Vec<MeshedNode> = sort_batch(self.mesh_pool.poll())
+    fn drain_meshes(&mut self, renderer: &mut Renderer, laps: &mut impl Laps) {
+        let built = self.mesh_pool.poll();
+        laps.count(Count::Meshes, built.len() as u64);
+        let meshed: Vec<MeshedNode> = sort_batch(built)
             .into_iter()
             .filter_map(|built| {
                 if self.links.get(&built.node) != Some(&built.links) {
@@ -898,19 +925,22 @@ impl NodeStreaming {
                 to_meshed_node(built)
             })
             .collect();
+        laps.lap(Phase::Meshes);
         // The arriving meshes may be exactly what a held node was waiting for
         // (#262). Release those in the *same* call, so the coarse node and the
         // fine ones that replace it are never both in the arena -- and never
         // neither.
-        let released = self.release_held();
+        let released = self.release_held(laps);
+        laps.lap(Phase::Held);
         renderer.apply_node_updates(released, meshed);
+        laps.lap(Phase::Meshes);
     }
 
     /// Let go of the held nodes that can leave now ([`can_unload`]), and
     /// return them for the renderer to drop:
     /// [`drain_meshes`](Self::drain_meshes)'s bookkeeping, apart from the
     /// GPU.
-    fn release_held(&mut self) -> Vec<NodeId> {
+    fn release_held(&mut self, laps: &mut impl Laps) -> Vec<NodeId> {
         if self.held.is_empty() {
             return Vec::new();
         }
@@ -926,6 +956,9 @@ impl NodeStreaming {
             .filter(|&&n| can_unload(n, &self.visible, &self.resident, &loading))
             .copied()
             .collect();
+        laps.count(Count::Held, self.held.len() as u64);
+        laps.count(Count::InFlight, loading.len() as u64);
+        laps.count(Count::Released, ready.len() as u64);
         for node in &ready {
             self.held.remove(node);
             self.resident.remove(node);
@@ -1308,7 +1341,7 @@ mod tests {
             .request(&world, &s.registry, &s.layer_of, below, s.blocks);
 
         assert_eq!(
-            s.release_held(),
+            s.release_held(&mut ()),
             Vec::new(),
             "released while the node beside it was being meshed"
         );
@@ -1318,7 +1351,7 @@ mod tests {
         // not drawn: a node nobody is meshing would never land, and waiting
         // for it would hold the parent for ever.
         s.mesh_pool.cancel(below);
-        assert_eq!(s.release_held(), vec![to_node_id(parent)]);
+        assert_eq!(s.release_held(&mut ()), vec![to_node_id(parent)]);
         assert!(!s.held.contains(&parent) && !s.resident.contains(&parent));
     }
 

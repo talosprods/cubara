@@ -668,6 +668,39 @@ pub struct RebaseReport {
     pub took: std::time::Duration,
 }
 
+/// What the last [`Renderer::render`] spent its time on, phase by phase, and
+/// what its uploads came to -- what `--bench flight` splits a long frame's
+/// render by (issue #454). Wall time between `Instant`s read around each
+/// phase, eight a frame; nothing here changes what a frame does. The phases
+/// lie inside the frame, so they never sum to more than it; what lies
+/// between them is the caller's to name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderWork {
+    /// The anchor rebase ([`RebaseReport::took`]), on the rare frame that
+    /// moves it.
+    pub rebase: std::time::Duration,
+    /// Applying queued node uploads and drops ([`Renderer::apply_node_updates`]).
+    pub uploads: std::time::Duration,
+    /// Nodes placed in the arena, their vertices and indices in bytes, and
+    /// drops applied.
+    pub uploaded_nodes: u32,
+    pub uploaded_bytes: u64,
+    pub dropped_nodes: u32,
+    /// Waiting for a lighting pipeline rebuild: an offscreen frame draws
+    /// with the lighting it was asked for.
+    pub lighting_wait: std::time::Duration,
+    /// The voxel nodes' CPU frustum cull and draw list ([`ChunkArena::prepare`]).
+    pub cull: std::time::Duration,
+    /// The far terrain's cull.
+    pub far_cull: std::time::Duration,
+    /// The trees' instance lists.
+    pub trees: std::time::Duration,
+    /// Recording the frame's commands.
+    pub encode: std::time::Duration,
+    /// `Queue::submit`: the frame's commands and every buffer written for it.
+    pub submit: std::time::Duration,
+}
+
 /// All GPU + window state. Created once the event loop has `resumed`.
 ///
 /// Owns no `World`, no streaming policy, no mesh-generation pool -- what to
@@ -749,6 +782,9 @@ pub struct Renderer {
     /// Where each level's morph is measured from instead of the camera --
     /// a measurement's ([`set_morph_eyes`](Self::set_morph_eyes)).
     morph_eyes: Option<[glam::DVec3; 4]>,
+    /// What the last [`render`](Self::render) spent its time on
+    /// ([`last_work`](Self::last_work)).
+    last_work: RenderWork,
 }
 
 impl Renderer {
@@ -1013,6 +1049,7 @@ impl Renderer {
             render_radius_blocks: 0.0,
             morph: MorphParams::OFF,
             morph_eyes: None,
+            last_work: RenderWork::default(),
         };
         (renderer, mesh_assets)
     }
@@ -1046,6 +1083,13 @@ impl Renderer {
     /// teleports across a grid line and prints this.
     pub fn last_rebase(&self) -> Option<RebaseReport> {
         self.last_rebase
+    }
+
+    /// What the last [`render`](Self::render) spent its time on, phase by
+    /// phase (issue #454): how `--bench flight` tells which part of a long
+    /// frame's render took the time.
+    pub fn last_work(&self) -> RenderWork {
+        self.last_work
     }
 
     /// Upload a far-terrain patch; `None` when every slot is taken.
@@ -1277,7 +1321,7 @@ impl Renderer {
     /// when the arena is full -- #390) lives in [`Uploads::drain`]; this is
     /// just the GPU-touching half of it, through the local `ArenaSink`
     /// below.
-    fn drain_uploads(&mut self, last_frame: std::time::Duration) {
+    fn drain_uploads(&mut self, last_frame: std::time::Duration, work: &mut RenderWork) {
         puffin::profile_function!();
         let started = Instant::now();
         let budget = crate::uploads::upload_budget(last_frame);
@@ -1287,12 +1331,19 @@ impl Renderer {
             trees: &mut self.trees,
             queue: &self.queue,
             swapped_out: &mut self.swapped_out,
+            placed: 0,
+            placed_bytes: 0,
+            removed: 0,
         };
         self.uploads.drain(
             MIN_UPLOADS_PER_FRAME,
             || started.elapsed() >= budget,
             &mut sink,
         );
+        work.uploaded_nodes = sink.placed;
+        work.uploaded_bytes = sink.placed_bytes;
+        work.dropped_nodes = sink.removed;
+        work.uploads = started.elapsed();
         // Not re-filtered by the frustum here -- `self.trees.prepare` does
         // that once per frame, alongside `self.arena.prepare` (issue #332
         // decision 2), since only *drawn* (frustum-visible) nodes may
@@ -1327,8 +1378,9 @@ impl Renderer {
         } = hud;
         crate::profiling::Profiler::new_frame();
         puffin::profile_function!();
+        let mut work = RenderWork::default();
         self.render_radius_blocks = render_radius_blocks;
-        self.update(camera);
+        self.update(camera, &mut work);
         self.read_gpu_timing();
 
         let (frame, view) = match &self.target {
@@ -1360,7 +1412,9 @@ impl Renderer {
                 // A measurement reads every frame back, so each must be drawn
                 // with the lighting it was asked for -- the window lets the
                 // pipeline catch up a frame or two late instead.
+                let waiting = Instant::now();
                 self.scene.wait_for_lighting_rebuild();
+                work.lighting_wait = waiting.elapsed();
                 (
                     None,
                     color.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -1369,15 +1423,22 @@ impl Renderer {
         };
 
         // CPU frustum-cull + upload the indirect draw list before the pass begins.
+        let culling = Instant::now();
         let draw_count = self.arena.prepare(&self.queue, &self.frustum);
         self.visible_chunks = self.arena.visible_nodes() as usize;
+        let far_culling = Instant::now();
+        work.cull = far_culling - culling;
         self.far
             .prepare(&self.queue, &self.frustum, camera.relative_eye(self.anchor));
+        let listing_trees = Instant::now();
+        work.far_cull = listing_trees - far_culling;
         // Trees beyond the first ring (issue #332 decision 2): the same
         // frustum, re-filtering which resident node's trees actually draw
         // this frame -- cheap even every frame, since what it re-uploads is
         // at most a few hundred `[f32; 3]`s.
         self.trees.prepare(&self.device, &self.queue, &self.frustum);
+        let encoding = Instant::now();
+        work.trees = encoding - listing_trees;
 
         let mut encoder = self
             .device
@@ -1436,7 +1497,10 @@ impl Renderer {
             timer.resolve(&mut encoder, slot);
         }
 
+        let submitting = Instant::now();
+        work.encode = submitting - encoding;
         self.queue.submit(std::iter::once(encoder.finish()));
+        work.submit = submitting.elapsed();
         if let Some((timer, slot)) = gpu_slot {
             timer.begin_read(slot);
         }
@@ -1448,6 +1512,7 @@ impl Renderer {
         self.waited = presented.map_or(std::time::Duration::ZERO, |p| p.acquire + p.present);
 
         self.report_fps();
+        self.last_work = work;
         presented
     }
 
@@ -1516,7 +1581,7 @@ impl Renderer {
     /// `cubara-sim`'s job (block 1.6); this just tracks frame time for the
     /// on-screen FPS reading and applies streaming the caller already decided
     /// on via [`apply_node_updates`](Self::apply_node_updates).
-    fn update(&mut self, camera: CameraPose) {
+    fn update(&mut self, camera: CameraPose, spent: &mut RenderWork) {
         let now = Instant::now();
         let frame = now - self.last_frame;
         let dt = frame.as_secs_f32();
@@ -1557,9 +1622,10 @@ impl Renderer {
                 report.far_patches,
                 report.took.as_secs_f64() * 1000.0
             );
+            spent.rebase = report.took;
             self.last_rebase = Some(report);
         }
-        self.drain_uploads(std::time::Duration::from_secs_f32(dt));
+        self.drain_uploads(std::time::Duration::from_secs_f32(dt), spent);
 
         let vp = camera.view_proj(self.scene.aspect(), self.anchor);
         self.frustum = Frustum::from_view_proj(vp);
@@ -2359,6 +2425,17 @@ struct ArenaSink<'a> {
     /// Remove actually applies -- after its batch's Inserts, by
     /// [`Uploads::drain`]'s rules -- never when it is only queued.
     swapped_out: &'a mut Vec<Aabb>,
+    /// Nodes placed, their vertices and indices in bytes, and Removes
+    /// applied, for [`RenderWork`].
+    placed: u32,
+    placed_bytes: u64,
+    removed: u32,
+}
+
+/// What a node's geometry writes to the arena: its vertices and indices.
+fn mesh_bytes(mesh: &cubara_voxel::Mesh) -> u64 {
+    (mesh.vertices.len() * std::mem::size_of::<Vertex>()
+        + mesh.indices.len() * std::mem::size_of::<u32>()) as u64
 }
 
 impl Sink<MeshedNode> for ArenaSink<'_> {
@@ -2387,6 +2464,8 @@ impl Sink<MeshedNode> for ArenaSink<'_> {
             node.local_aabb,
         );
         if placed {
+            self.placed += 1;
+            self.placed_bytes += mesh_bytes(&node.mesh);
             // Just placed, so the slot exists; the instances are
             // stored relative to the node's origin and carry this
             // slot (`TreeInstance`).
@@ -2410,6 +2489,7 @@ impl Sink<MeshedNode> for ArenaSink<'_> {
     }
 
     fn remove(&mut self, id: NodeId) {
+        self.removed += 1;
         if let Some(aabb) = self.arena.remove(id) {
             self.swapped_out.push(aabb);
         }
@@ -2539,6 +2619,9 @@ mod tests {
             trees: &mut r.trees,
             queue: &r.queue,
             swapped_out: &mut swapped_out,
+            placed: 0,
+            placed_bytes: 0,
+            removed: 0,
         };
         assert!(sink
             .try_insert(id, node(id, quad(4), vec![[5, 7, 9]]))
@@ -2604,6 +2687,100 @@ mod tests {
         );
         assert_eq!(after.resident_nodes, 0, "nothing survives the new arena");
         assert_eq!(after.refused_inserts, before.refused_inserts);
+    }
+
+    /// **A frame's [`RenderWork`] counts what its uploads did** (issue
+    /// #454): the nodes placed and their bytes on the frame that placed
+    /// them, the drops on the frame that dropped them, nothing on a frame
+    /// that did neither -- and its phases lie inside the frame. Distinct
+    /// sizes, so a count of the wrong thing is seen. GPU-backed because the
+    /// renderer's frame is the real one; without an adapter it skips.
+    #[test]
+    fn a_frames_work_counts_its_uploads_and_drops() {
+        let pose = CameraPose {
+            eye: glam::DVec3::new(8.0, 80.0, 8.0),
+            look_dir: glam::Vec3::NEG_Z,
+        };
+        let Some((mut r, _assets)) = Renderer::offscreen(16, 16, pose, ArenaCapacity::FLOOR) else {
+            crate::headless::skip_or_require_gpu("a_frames_work_counts_its_uploads_and_drops");
+            return;
+        };
+        let node = |x: i32, vertices: usize, quads: usize| {
+            let v =
+                cubara_voxel::Vertex::new(0, 0, 0, 0, cubara_voxel::Face::DRAW_ORDER[0], 0, 0, 0);
+            let id = NodeId {
+                level: 0,
+                pos: [x, 0, 0],
+            };
+            MeshedNode {
+                id,
+                origin: [x * 16, 0, 0],
+                scale: 1.0,
+                mesh: cubara_voxel::Mesh {
+                    vertices: vec![v; vertices],
+                    indices: [0, 1, 2, 0, 2, 3].repeat(quads),
+                    ..Default::default()
+                },
+                local_aabb: crate::culling::Aabb::new(glam::Vec3::ZERO, glam::Vec3::splat(16.0)),
+                trees: Vec::new(),
+                tree_model: crate::trees::TreeModel::Oak,
+            }
+        };
+        let frame = |r: &mut Renderer| {
+            let began = Instant::now();
+            r.render(
+                pose,
+                None,
+                None,
+                &[],
+                crate::scene::Hud {
+                    hotbar: None,
+                    panel: None,
+                    health: None,
+                    crosshair: false,
+                    menu: None,
+                },
+                0.0,
+            );
+            let took = began.elapsed();
+            let w = r.last_work();
+            let phases = w.rebase
+                + w.uploads
+                + w.lighting_wait
+                + w.cull
+                + w.far_cull
+                + w.trees
+                + w.encode
+                + w.submit;
+            assert!(
+                phases <= took,
+                "the phases ({phases:?}) are longer than the frame ({took:?})"
+            );
+            w
+        };
+        r.apply_node_updates(Vec::new(), [node(0, 4, 1), node(1, 8, 3)]);
+        let w = frame(&mut r);
+        assert_eq!(w.uploaded_nodes, 2);
+        // 12 vertices of 16 bytes, 24 indices of 4.
+        assert_eq!(w.uploaded_bytes, 12 * 16 + 24 * 4);
+        assert_eq!(w.dropped_nodes, 0);
+        let nothing = frame(&mut r);
+        assert_eq!(
+            (nothing.uploaded_nodes, nothing.uploaded_bytes, nothing.dropped_nodes),
+            (0, 0, 0)
+        );
+        r.apply_node_updates(
+            [NodeId {
+                level: 0,
+                pos: [1, 0, 0],
+            }],
+            std::iter::empty(),
+        );
+        let dropped = frame(&mut r);
+        assert_eq!(
+            (dropped.uploaded_nodes, dropped.uploaded_bytes, dropped.dropped_nodes),
+            (0, 0, 1)
+        );
     }
 
     #[test]

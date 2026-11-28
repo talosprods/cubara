@@ -19,6 +19,8 @@ use cubara_world::far::{self, FarView, Hole, PatchHeights, PatchKey};
 use cubara_world::node;
 use cubara_world::WorldGen;
 
+use crate::frame_work::{Count, Laps, Phase};
+
 /// How far the far terrain reaches, in blocks: the owner's "262 km first"
 /// (2026-09-26, `PROPOSAL_FAR_VIEW.md`).
 pub const FAR_VIEW_RADIUS: f64 = 262_144.0;
@@ -1178,17 +1180,34 @@ impl FarStreaming {
     /// missing -- and, a little ahead, for what will be -- and stand in for
     /// a strip of the box still loading ([`FarPlan::step`]).
     pub fn update(&mut self, renderer: &mut Renderer, eye: [f32; 3], voxels: VoxelBox) {
+        self.update_lapped(renderer, eye, voxels, &mut ());
+    }
+
+    /// [`update`](Self::update), telling `laps` where its work went as it
+    /// goes (issue #454): the patches taken, the plan, the asks, the uploads
+    /// -- and how many of each. No clock in here: the caller's `laps` reads
+    /// one or not, and the game's does not.
+    pub fn update_lapped(
+        &mut self,
+        renderer: &mut Renderer,
+        eye: [f32; 3],
+        voxels: VoxelBox,
+        laps: &mut impl Laps,
+    ) {
         while let Ok((generation, patch)) = self.pool.done.try_recv() {
             if generation != self.generation {
                 continue;
             }
+            laps.count(Count::FarArrivals, 1);
             self.plan.take(patch);
         }
+        laps.lap(Phase::FarArrivals);
         let eye64 = eye.map(|v| v as f64);
         let slots = &self.slots;
         let step = self.plan.step(eye64, renderer.size().1, voxels, || {
             slots.keys().copied().collect()
         });
+        laps.lap(Phase::FarPlan);
         // The hole this frame's far terrain is drawn with: the box the
         // voxels want while the stand-in draws the strip, else the box they
         // draw.
@@ -1196,6 +1215,7 @@ impl FarStreaming {
         renderer.set_far_params(to_far_params(hole, self.materials));
         for key in step.standin_leave {
             if let Some(slot) = self.standin_slots.remove(&key) {
+                laps.count(Count::FarFreed, 1);
                 renderer.far_remove(slot);
             }
         }
@@ -1205,6 +1225,8 @@ impl FarStreaming {
                     continue;
                 };
                 let faces = standin_faces(patch, strip);
+                laps.count(Count::FarInserts, 1);
+                laps.count(Count::FarBytes, face_bytes(&faces));
                 match renderer.far_insert_as(to_far_patch(patch, &faces), FarRole::StandIn) {
                     Some(slot) => {
                         self.standin_slots.insert(key, slot);
@@ -1221,6 +1243,11 @@ impl FarStreaming {
             }
         }
 
+        laps.lap(Phase::FarInserts);
+        laps.count(
+            Count::FarAsks,
+            (step.promote.len() + step.request.len() + step.prefetch.len()) as u64,
+        );
         for key in step.promote {
             self.pool.promote(key);
         }
@@ -1232,8 +1259,10 @@ impl FarStreaming {
             self.pool
                 .ask((self.generation, self.gen, key), Urgency::Ahead);
         }
+        laps.lap(Phase::FarAsks);
         for key in step.leave {
             if let Some(slot) = self.slots.remove(&key) {
+                laps.count(Count::FarFreed, 1);
                 renderer.far_remove(slot);
             }
         }
@@ -1241,7 +1270,10 @@ impl FarStreaming {
             let Some(patch) = self.plan.patch(key) else {
                 continue;
             };
-            match renderer.far_insert(to_far_patch(patch, &to_far_faces(patch))) {
+            let faces = to_far_faces(patch);
+            laps.count(Count::FarInserts, 1);
+            laps.count(Count::FarBytes, face_bytes(&faces));
+            match renderer.far_insert(to_far_patch(patch, &faces)) {
                 Some(slot) => {
                     self.slots.insert(key, slot);
                 }
@@ -1254,7 +1286,14 @@ impl FarStreaming {
                 None => {}
             }
         }
+        laps.lap(Phase::FarInserts);
     }
+}
+
+/// What a patch's faces come to, in bytes: what its upload writes
+/// (`Renderer::far_insert`), for a measurement's count.
+fn face_bytes(faces: &[FarFace]) -> u64 {
+    std::mem::size_of_val(faces) as u64
 }
 
 #[cfg(test)]
