@@ -23,10 +23,11 @@
 //! renderer did not time itself is [`Phase::RenderRest`], so the split of its
 //! lap adds up as well.
 //!
-//! **What it costs:** one `Instant::now()` per lap, nine per frame here, and
-//! the renderer's eight -- tens of nanoseconds each, under a microsecond a
-//! frame against frames of milliseconds (the PR that added this measured
-//! it). Nothing here changes what a frame does.
+//! **What it costs:** one `Instant::now()` per lap, 13 a flight frame, and
+//! the renderer's own nine -- 14-26 ns each on an M3; 0.4-0.5 us a frame
+//! with the record kept, against frames of milliseconds (`lap_cost_report`).
+//! The game's frame pays only the renderer's nine. Nothing here changes what
+//! a frame does.
 
 use std::time::{Duration, Instant};
 

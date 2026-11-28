@@ -671,7 +671,7 @@ pub struct RebaseReport {
 /// What the last [`Renderer::render`] spent its time on, phase by phase, and
 /// what its uploads came to -- what `--bench flight` splits a long frame's
 /// render by (issue #454). Wall time between `Instant`s read around each
-/// phase, eight a frame; nothing here changes what a frame does. The phases
+/// phase, nine a frame; nothing here changes what a frame does. The phases
 /// lie inside the frame, so they never sum to more than it; what lies
 /// between them is the caller's to name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
