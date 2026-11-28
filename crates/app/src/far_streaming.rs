@@ -2943,4 +2943,232 @@ mod tests {
         let changes = shown.windows(2).filter(|w| w[0] != w[1]).count();
         assert!(changes >= 3, "only {changes} frames changed what is shown");
     }
+
+    /// The voxels' drawn top in the level-3 cell of the box's edge that
+    /// holds the column `(x, z)`: one above the highest block row the cell
+    /// draws solid (`World::certainly_solid_at_v`, the voxels' own rule --
+    /// a cave row under the top leaves the top where it is; a top row a
+    /// cave has opened lowers it).
+    fn edge_cell_top(world: &cubara_world::World, x: i32, z: i32) -> i32 {
+        let level = far::FINEST_LEVEL;
+        let w = 1i32 << level;
+        let cell = world.cell_ground(x.div_euclid(w) * w, z.div_euclid(w) * w, w);
+        (cell.top - 64..=cell.top)
+            .rev()
+            .find(|&y| world.certainly_solid_at_v(y, level, &cell))
+            .map_or(cell.top - 64, |y| y + 1)
+    }
+
+    /// **The seam to the voxels is closed on every side of their box**, at
+    /// any distance and any height (`cubara_render::far::place`, the join of
+    /// `docs/PROPOSAL_FAR_VIEW.md` §3.4). A line of sight from an eye in the
+    /// box that crosses one of its sides between the voxels' ground just
+    /// inside and the far terrain's top just outside must meet a far face
+    /// standing on that side and facing in -- the first ring of tops inside
+    /// folded into a skirt, or the wall between the quads on either side.
+    /// Without one it passes under the far terrain's surface, which has no
+    /// underside: sky, or the far terrain's inside, in a line along the box
+    /// (the static pinholes the 2026-11-27 tour looked for here).
+    ///
+    /// Against the ground the voxels actually draw at the edge (level 3's
+    /// cells, `edge_cell_top`), not the far terrain's idea of it, for the
+    /// game's own box, view and quad scale, at the tour's stands and on the
+    /// steepest ground near the highest peak; every block column of all
+    /// four sides.
+    #[test]
+    fn the_far_terrain_closes_the_seam_to_the_voxels_on_every_side() {
+        use cubara_render::far::{hidden_height, lowest_over, patch_box, place, QUAD_INDICES};
+        use glam::Vec3;
+        let world = cubara_world::World::new();
+        let gen = WorldGen::new(world.seed());
+        // (x, z) of the stand, the eye a player's standing one: the twelve
+        // places of the 2026-11-27 player-view tour (spawn, the highest peak
+        // and the foot of its steepest face, the largest cliff, the densest
+        // forest and its edge, the flattest plain, the largest pit's rim, the
+        // deepest valley, the highest ridge, the owner's spot, a pit under a
+        // tree).
+        let stands = [
+            (0, 0),
+            (-961, -3336),
+            (-887, -3138),
+            (1752, -552),
+            (3298, -2154),
+            (3360, 3834),
+            (176, -1008),
+            (328, 59),
+            (-816, -3616),
+            (-3072, -3232),
+            (5376, 3408),
+            (334, -253),
+        ];
+        let (mut columns, mut needed, mut skirted) = (0usize, 0usize, 0usize);
+        let mut open: Vec<String> = Vec::new();
+        // The gate's screen and the owner's fullscreen one: the far quads at
+        // the box's side are sized by the screen's rows.
+        for ((sx, sz), rows) in stands.into_iter().flat_map(|s| [(s, 1080), (s, 1846)]) {
+            let eye = [
+                sx as f64 + 0.5,
+                gen.column_top(sx, sz) as f64 + 2.62,
+                sz as f64 + 0.5,
+            ];
+            let hole = voxel_hole(eye.map(|v| v as f32));
+            let view = far_view_scaled(eye, rows, Some(hole), FarQuality::High, FAR_QUAD_SCALE)
+                .expect("High draws");
+            // Only the patches over the box's sides, and what they split from.
+            let touches = |k: PatchKey| {
+                let [ox, oz] = k.origin().map(|v| v as f64);
+                let size = k.size() as f64;
+                let (x0, x1, z0, z1) = (ox, ox + size, oz, oz + size);
+                let over = |lo: f64, hi: f64, v: f64| lo <= v && v <= hi;
+                let in_x = x0 <= hole.max[0] && x1 >= hole.min[0];
+                let in_z = z0 <= hole.max[2] && z1 >= hole.min[2];
+                (in_z && (over(x0, x1, hole.min[0]) || over(x0, x1, hole.max[0])))
+                    || (in_x && (over(z0, z1, hole.min[2]) || over(z0, z1, hole.max[2])))
+            };
+            let mut have = HashMap::new();
+            let keys = far::build_where(&gen, &view, &mut have, touches);
+            let patches: Vec<&PatchHeights> = keys.iter().map(|k| &have[k]).collect();
+            let faces: Vec<Vec<FarFace>> = patches.iter().map(|p| to_far_faces(p)).collect();
+            let fps: Vec<FarPatch<'_>> = patches
+                .iter()
+                .zip(&faces)
+                .map(|(p, f)| to_far_patch(p, f))
+                .collect();
+            let (min, max) = (
+                Vec3::from(hole.min.map(|v| v as f32)),
+                Vec3::from(hole.max.map(|v| v as f32)),
+            );
+            let boxes: Vec<_> = fps.iter().map(|p| Some(patch_box(p))).collect();
+            let eye_v = Vec3::from(eye.map(|v| v as f32));
+            let hole_box = cubara_render::Aabb { min, max };
+            let hidden = hidden_height(min, max, eye_v, lowest_over(&boxes, &hole_box));
+            // Every far triangle that lies in a side's plane facing into the
+            // box, as (side, its corners as (along, y)).
+            let mut on_sides: Vec<(usize, [[f32; 2]; 3])> = Vec::new();
+            for p in &fps {
+                let placement = ([p.origin[0] as f32, p.origin[1] as f32], p.quad, p.skirt);
+                for f in p.faces {
+                    let c = f
+                        .corners()
+                        .map(|v| place(&v, placement, Some((min, max)), hidden));
+                    for t in QUAD_INDICES.chunks(3) {
+                        let t = [c[t[0] as usize], c[t[1] as usize], c[t[2] as usize]];
+                        let n = (t[1] - t[0]).cross(t[2] - t[0]);
+                        // Sides: x = min (in: +x), x = max (in: -x), z = min, z = max.
+                        for (side, axis, at, inward) in [
+                            (0, 0, min.x, 1.0f32),
+                            (1, 0, max.x, -1.0),
+                            (2, 2, min.z, 1.0),
+                            (3, 2, max.z, -1.0),
+                        ] {
+                            if t.iter().all(|v| v[axis] == at) && n[axis] * inward > 0.0 {
+                                let along = 2 - axis;
+                                on_sides.push((side, t.map(|v| [v[along], v.y])));
+                            }
+                        }
+                    }
+                }
+            }
+            // The heights a triangle on a side covers over `along`, if any.
+            let cut = |t: &[[f32; 2]; 3], along: f32| -> Option<(f32, f32)> {
+                let mut ys = Vec::new();
+                for k in 0..3 {
+                    let (a, b) = (t[k], t[(k + 1) % 3]);
+                    let (lo, hi) = (a[0].min(b[0]), a[0].max(b[0]));
+                    if along < lo || along > hi {
+                        continue;
+                    }
+                    if a[0] == b[0] {
+                        ys.extend([a[1], b[1]]);
+                    } else {
+                        ys.push(a[1] + (b[1] - a[1]) * (along - a[0]) / (b[0] - a[0]));
+                    }
+                }
+                let foot = ys.iter().copied().fold(f32::MAX, f32::min);
+                let top = ys.iter().copied().fold(f32::MIN, f32::max);
+                (!ys.is_empty()).then_some((foot, top))
+            };
+            // The far terrain's top over a column, from the patch holding it.
+            let far_top = |x: i64, z: i64| {
+                patches.iter().find_map(|p| {
+                    let [ox, oz] = p.key.origin();
+                    let (q, n) = (p.key.quad(), p.key.size());
+                    ((ox..ox + n).contains(&x) && (oz..oz + n).contains(&z))
+                        .then(|| p.top(((x - ox) / q) as i32, ((z - oz) / q) as i32))
+                })
+            };
+            for (side, axis, at, inward) in [
+                (0usize, 0usize, hole.min[0] as i64, 1i64),
+                (1, 0, hole.max[0] as i64, -1),
+                (2, 2, hole.min[2] as i64, 1),
+                (3, 2, hole.max[2] as i64, -1),
+            ] {
+                let (lo, hi) = if axis == 0 {
+                    (hole.min[2] as i64, hole.max[2] as i64)
+                } else {
+                    (hole.min[0] as i64, hole.max[0] as i64)
+                };
+                for a in lo..hi {
+                    // The column just inside (the voxels') and just outside.
+                    let inside = if inward > 0 { at } else { at - 1 };
+                    let outside = if inward > 0 { at - 1 } else { at };
+                    let (ix, iz, ox, oz) = if axis == 0 {
+                        (inside, a, outside, a)
+                    } else {
+                        (a, inside, a, outside)
+                    };
+                    let voxels = edge_cell_top(&world, ix as i32, iz as i32);
+                    let far = far_top(ox, oz).expect("the far terrain reaches the box");
+                    columns += 1;
+                    if far <= voxels {
+                        continue;
+                    }
+                    needed += 1;
+                    // The faces over this column, merged from the top down.
+                    let mid = a as f32 + 0.5;
+                    let mut spans: Vec<(f32, f32)> = on_sides
+                        .iter()
+                        .filter(|s| s.0 == side)
+                        .filter_map(|s| cut(&s.1, mid))
+                        .collect();
+                    spans.sort_by(|x, y| y.1.total_cmp(&x.1));
+                    let mut reach = far as f32;
+                    for (foot, top) in spans {
+                        if top >= reach {
+                            reach = reach.min(foot);
+                        }
+                    }
+                    if reach > voxels as f32 {
+                        open.push(format!(
+                            "stand ({sx}, {sz}) at {rows} rows, side {side}, column {a} ({} from the \
+                             corner): the far terrain stands at {far} outside and the voxels at \
+                             {voxels} inside, but the faces on the side reach down only to {reach}",
+                            (a - lo).min(hi - 1 - a)
+                        ));
+                    }
+                    // The far terrain's own top over the edge cell, where a
+                    // patch reaches over the side: above the voxels, only
+                    // the folded first ring can close the seam there.
+                    if far_top(ix, iz).is_some_and(|inner| inner > voxels) {
+                        skirted += 1;
+                    }
+                }
+            }
+        }
+        println!("{columns} columns, {needed} with the far terrain higher, {skirted} closed by the skirt");
+        for o in open.iter().take(20) {
+            println!("OPEN {o}");
+        }
+        assert!(
+            open.is_empty(),
+            "{} columns of the seam are open",
+            open.len()
+        );
+        // Not vacuous: the join had work to do, and the skirt did some of it.
+        assert!(
+            needed > 1_000,
+            "only {needed} columns needed the seam closed"
+        );
+        assert!(skirted > 500, "only {skirted} columns needed the skirt");
+    }
 }
