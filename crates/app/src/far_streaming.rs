@@ -2141,6 +2141,13 @@ mod tests {
             }
             let shown = &self.shown;
             let step = self.plan.step(eye, 1080, self.voxels, || shown.clone());
+            self.apply(&step);
+            step
+        }
+
+        /// What the renderer and the pool do with a frame's [`Step`]
+        /// (asserting the renderer's side is consistent).
+        fn apply(&mut self, step: &Step) {
             for key in &step.leave {
                 assert!(self.shown.remove(key), "{key:?} left but was not shown");
             }
@@ -2171,8 +2178,7 @@ mod tests {
                 }
                 self.standin_box = Some(strip);
             }
-            self.pool.apply(&step);
-            step
+            self.pool.apply(step);
         }
 
         /// Fly `eyes` through the modelled pool; `shown` after each frame.
@@ -2981,5 +2987,159 @@ mod tests {
         // Not vacuous: the drawn set really changed while flying.
         let changes = shown.windows(2).filter(|w| w[0] != w[1]).count();
         assert!(changes >= 3, "only {changes} frames changed what is shown");
+    }
+
+    /// **What the far terrain asks of the main thread, frame by frame, along
+    /// the gate's four flights** (issue #454: rare frames of 17-34 ms, and
+    /// which main-thread work grows with a burst). GPU-free, at the game's
+    /// radius, quad scale and screen height (`bench::DEFAULT_SIZE`'s 1080):
+    /// the flight's eye at 60 frames a second, the voxels' box handed over 12
+    /// frames after each move ([`HoleLag`]), and a pool of 10 workers at a
+    /// frame a patch -- the rate of `Pool::new`'s 4 workers on the M3 at the
+    /// 6-9 ms a patch #398 step 1 measured, which a model with whole frames
+    /// can only give as more workers. Per frame: the patches taken, asked
+    /// for, uploaded (with their faces' bytes) and freed, the plan's own
+    /// time ([`FarPlan::step`], the selection and the prefetch) and the time
+    /// the uploads' faces take to build (`to_far_faces`/`standin_faces`, the
+    /// CPU half of `FarStreaming::update`'s upload; the GPU write is not
+    /// here). The start is settled first, as the bench does. Prints the
+    /// worst frame of each; asserts nothing.
+    #[test]
+    #[ignore = "generates every patch four flights select at the game's radius: cargo test -p cubara --release far_burst_report -- --ignored --nocapture"]
+    fn far_burst_report() {
+        use crate::flight::{eye_at, toward_peak, Flight, FLY_SPEED};
+        use std::time::Instant;
+
+        /// The worst of one quantity, and when.
+        #[derive(Clone, Copy, Default)]
+        struct Worst {
+            value: f64,
+            t: f32,
+        }
+        impl Worst {
+            fn offer(&mut self, value: f64, t: f32) {
+                if value > self.value {
+                    *self = Worst { value, t };
+                }
+            }
+        }
+        impl std::fmt::Display for Worst {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:.0} (t {:.2} s)", self.value, self.t)
+            }
+        }
+
+        let seed = cubara_world::World::new().seed();
+        let (peak_start, peak_look) = toward_peak(&WorldGen::new(seed));
+        let flights = [
+            ("low", [8.0, 120.0, 8.0], [1.0, -0.15, 0.3], 20.0f32),
+            ("high", [8.0, 400.0, 8.0], [1.0, -0.35, 0.3], 20.0),
+            ("down", [8.0, 450.0, 8.0], [0.4, -0.8, 0.2], 15.0),
+            ("toward the peak", peak_start, peak_look, 30.0),
+        ];
+        for (name, start, look, seconds) in flights {
+            let flight = Flight {
+                start,
+                look,
+                speed: FLY_SPEED,
+                seconds,
+                fps: 60,
+                every: 1.0,
+                size: (1, 1),
+                quality: FarQuality::High,
+                far_quad_scale: FAR_QUAD_SCALE,
+                morph: true,
+            };
+            let frames = (seconds * 60.0) as u32;
+            let eye = |f: u32| eye_at(&flight, f as f32 / 60.0).map(f64::from);
+            let mut holes = HoleLag::new(eye(0), 12);
+            let mut sim = Sim::at_scale(
+                FAR_VIEW_RADIUS,
+                holes.wanted,
+                PoolModel::new(10, 1),
+                FAR_QUAD_SCALE,
+            );
+            sim.settle(eye(0));
+            let (mut arrivals, mut asks, mut inserts, mut mb, mut freed) = (
+                Worst::default(),
+                Worst::default(),
+                Worst::default(),
+                Worst::default(),
+                Worst::default(),
+            );
+            let (mut plan_ms, mut faces_ms, mut both_ms, mut heights) = (
+                Worst::default(),
+                Worst::default(),
+                Worst::default(),
+                Worst::default(),
+            );
+            let (mut busy, mut total_inserts, mut steps) = (0u32, 0u64, 0u32);
+            for f in 1..=frames {
+                let t = f as f32 / 60.0;
+                sim.voxels = holes.at(eye(f));
+                let done = sim.pool.tick();
+                arrivals.offer(done.len() as f64, t);
+                // The pool's work, not the main thread's: generated here,
+                // outside the clock, and taken as `update` takes it.
+                for key in done {
+                    let patch = sim.heights(key);
+                    sim.plan.take(patch);
+                }
+                let shown = &sim.shown;
+                let began = Instant::now();
+                let step = sim.plan.step(eye(f), 1080, sim.voxels, || shown.clone());
+                let planned = began.elapsed().as_secs_f64() * 1000.0;
+                // The CPU half of the uploads: each patch's faces.
+                let began = Instant::now();
+                let mut faces = 0usize;
+                for key in &step.arrive {
+                    if let Some(p) = sim.plan.patch(*key) {
+                        faces += to_far_faces(p).len();
+                    }
+                }
+                if let Some(strip) = step.standin_box {
+                    for key in &step.standin_arrive {
+                        if let Some(p) = sim.plan.patch(*key) {
+                            faces += standin_faces(p, strip).len();
+                        }
+                    }
+                }
+                let built = began.elapsed().as_secs_f64() * 1000.0;
+                let n_in = step.arrive.len() + step.standin_arrive.len();
+                asks.offer(
+                    (step.request.len() + step.prefetch.len() + step.promote.len()) as f64,
+                    t,
+                );
+                inserts.offer(n_in as f64, t);
+                mb.offer(
+                    (faces * std::mem::size_of::<FarFace>()) as f64 / (1024.0 * 1024.0),
+                    t,
+                );
+                freed.offer((step.leave.len() + step.standin_leave.len()) as f64, t);
+                plan_ms.offer(planned, t);
+                faces_ms.offer(built, t);
+                both_ms.offer(planned + built, t);
+                heights.offer(sim.plan.heights.len() as f64, t);
+                busy += u32::from(n_in > 0);
+                total_inserts += n_in as u64;
+                steps += u32::from(step != Step::default());
+                sim.apply(&step);
+            }
+            println!(
+                "FAR {name} ({seconds} s, {frames} frames, {steps} that changed something, {busy} \
+                 that uploaded, {total_inserts} patches uploaded): per frame, worst: patches \
+                 taken {arrivals}, asked {asks}, uploaded {inserts}, their faces {:.2} MB (t \
+                 {:.2} s), freed {freed}; the plan {:.2} ms (t {:.2} s), the uploads' faces \
+                 {:.2} ms (t {:.2} s), both {:.2} ms (t {:.2} s); patches held {heights}",
+                mb.value,
+                mb.t,
+                plan_ms.value,
+                plan_ms.t,
+                faces_ms.value,
+                faces_ms.t,
+                both_ms.value,
+                both_ms.t,
+            );
+        }
     }
 }
