@@ -2766,7 +2766,11 @@ mod tests {
         assert_eq!(w.dropped_nodes, 0);
         let nothing = frame(&mut r);
         assert_eq!(
-            (nothing.uploaded_nodes, nothing.uploaded_bytes, nothing.dropped_nodes),
+            (
+                nothing.uploaded_nodes,
+                nothing.uploaded_bytes,
+                nothing.dropped_nodes
+            ),
             (0, 0, 0)
         );
         r.apply_node_updates(
@@ -2778,7 +2782,11 @@ mod tests {
         );
         let dropped = frame(&mut r);
         assert_eq!(
-            (dropped.uploaded_nodes, dropped.uploaded_bytes, dropped.dropped_nodes),
+            (
+                dropped.uploaded_nodes,
+                dropped.uploaded_bytes,
+                dropped.dropped_nodes
+            ),
             (0, 0, 1)
         );
     }

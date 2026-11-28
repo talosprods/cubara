@@ -1972,6 +1972,9 @@ mod tests {
             resident: Worst,
             checks: u64,
             check_ms: f64,
+            /// Every frame's `release_held` pass: when, held, in flight,
+            /// `beside` checks, ms.
+            releases: Vec<(f32, usize, usize, u64, f64)>,
         }
 
         let registry = cubara_render::load_registry();
@@ -2012,11 +2015,12 @@ mod tests {
             let mut answer: Option<Answer> = None;
             let (mut center, mut stale_links, mut since) = (None, false, 0u32);
             let mut report = Report::default();
-            // One frame, `count` false while the start loads. Returns
-            // whether anything is still to do.
-            let mut frame = |f: u32, eye: [f32; 3], count: bool, report: &mut Report| -> bool {
+            // One frame, `at` the flight's time or `None` while the start
+            // loads (not counted). Returns whether anything is still to do.
+            let mut frame = |f: u32, eye: [f32; 3], at: Option<f32>, report: &mut Report| -> bool {
                 let now = f64::from(f) * FRAME_MS;
-                let t = if count { f as f32 / 60.0 } else { 0.0 };
+                let count = at.is_some();
+                let t = at.unwrap_or(0.0);
                 let here = ChunkCoord::from_world_pos(eye);
                 since += 1;
                 let searching = answer.is_some();
@@ -2087,12 +2091,15 @@ mod tests {
                     for n in to_load {
                         let job = *jobs.entry(n).or_insert_with(|| {
                             let began = Instant::now();
-                            let built =
-                                build_node_shared(&snapshot, &registry, &layer_of, n, blocks, &cache);
+                            let built = build_node_shared(
+                                &snapshot, &registry, &layer_of, n, blocks, &cache,
+                            );
                             let ms = began.elapsed().as_secs_f64() * 1000.0;
                             let bytes = built.geometry.as_ref().map_or(0, |g| {
-                                (g.mesh.vertices.len() * std::mem::size_of::<cubara_voxel::Vertex>()
-                                    + g.mesh.indices.len() * 4) as u64
+                                (g.mesh.vertices.len()
+                                    * std::mem::size_of::<cubara_voxel::Vertex>()
+                                    + g.mesh.indices.len() * 4)
+                                    as u64
                             });
                             Job {
                                 ms,
@@ -2175,6 +2182,11 @@ mod tests {
                     report.resident.offer(resident.len() as f64, t);
                     report.checks += release_checks;
                     report.check_ms += release_ms;
+                    if held_now > 0 {
+                        report
+                            .releases
+                            .push((t, held_now, flying, release_checks, release_ms));
+                    }
                 }
                 answer.is_some() || stale_links || !in_flight.is_empty() || !held.is_empty()
             };
@@ -2182,14 +2194,14 @@ mod tests {
             let at = eye_at(&flight, 0.0);
             let mut f = 0u32;
             let mut ignored = Report::default();
-            while frame(f, at, false, &mut ignored) {
+            while frame(f, at, None, &mut ignored) {
                 f += 1;
                 assert!(f < 100_000, "{name}: the start never loaded");
             }
             let loaded = f;
             for k in 1..=(seconds * 60.0) as u32 {
                 let eye = eye_at(&flight, k as f32 / 60.0);
-                frame(loaded + k, eye, true, &mut report);
+                frame(loaded + k, eye, Some(k as f32 / 60.0), &mut report);
             }
             let r = &report;
             // Seconds of the flight replayed: `t` counts from the start.
@@ -2220,6 +2232,26 @@ mod tests {
                 r.visible,
                 r.resident,
                 r.check_ms * 1e6 / r.checks.max(1) as f64,
+            );
+            let mut releases = r.releases.clone();
+            releases.sort_by(|a, b| b.4.total_cmp(&a.4));
+            let over = |ms: f64| releases.iter().filter(|r| r.4 > ms).count();
+            println!(
+                "  {name} release_held: {} frames ran it; over 1/2/4/8 ms: {}/{}/{}/{}; the \
+                 longest: {}",
+                releases.len(),
+                over(1.0),
+                over(2.0),
+                over(4.0),
+                over(8.0),
+                releases
+                    .iter()
+                    .take(5)
+                    .map(|(t, h, n, c, ms)| format!(
+                        "t {t:.2} s {ms:.2} ms ({h} held x {n} in flight, {c} checks)"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }

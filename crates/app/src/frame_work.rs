@@ -310,7 +310,8 @@ impl Stopwatch {
 
     /// A lap of `phase` ending at `now`.
     pub fn lap_at(&mut self, phase: Phase, now: Instant) {
-        self.work.add(phase, now.saturating_duration_since(self.last));
+        self.work
+            .add(phase, now.saturating_duration_since(self.last));
         self.last = now;
     }
 
@@ -425,7 +426,12 @@ fn breakdown(f: &FrameWork) -> String {
             if counted.is_empty() {
                 format!("{} {:.2}", p.name(), ms(f.phase(p)))
             } else {
-                format!("{} {:.2} ({})", p.name(), ms(f.phase(p)), counted.join(", "))
+                format!(
+                    "{} {:.2} ({})",
+                    p.name(),
+                    ms(f.phase(p)),
+                    counted.join(", ")
+                )
             }
         })
         .collect();
@@ -628,7 +634,11 @@ mod tests {
     fn the_line_names_the_mean_the_frames_over_and_the_worst() {
         let mut long = frame(
             7.5,
-            &[(Phase::Uploads, 18.0), (Phase::Cull, 1.0), (Phase::Held, 0.02)],
+            &[
+                (Phase::Uploads, 18.0),
+                (Phase::Cull, 1.0),
+                (Phase::Held, 0.02),
+            ],
         );
         long.add_count(Count::Uploaded, 212);
         long.add_count(Count::UploadBytes, 38 << 20);
@@ -639,6 +649,58 @@ mod tests {
              cull 1.00 + 15 more 0.01 | frames over 16.7 ms: 1, longest phase: uploads 1 | \
              the 2 longest: t 7.50 s 19.02 ms = uploads 18.00 (212 nodes, 38.0 MB) + \
              cull 1.00 + 15 more 0.02 | t 0.00 s 1.00 ms = cull 1.00 + 16 more 0.00"
+        );
+    }
+
+    /// **What the laps cost a frame** (issue #454: the instrument must not
+    /// change the times it measures): a clock read, and a frame's worth of
+    /// laps as `--bench flight` takes them -- the start, the streamers' nine
+    /// laps, the voxel box's two, the renderer's split and the record --
+    /// timed over a million frames. The renderer's own nine reads are nine
+    /// clock reads. Prints; asserts nothing.
+    #[test]
+    #[ignore = "a timing: cargo test -p cubara --release lap_cost_report -- --ignored --nocapture"]
+    fn lap_cost_report() {
+        const N: u32 = 1_000_000;
+        let began = Instant::now();
+        let mut last = began;
+        for _ in 0..N {
+            last = std::hint::black_box(Instant::now());
+        }
+        let read = (last - began) / N;
+        let laps = [
+            Phase::Search,
+            Phase::Meshes,
+            Phase::Held,
+            Phase::Meshes,
+            Phase::VoxelBox,
+            Phase::FarArrivals,
+            Phase::FarPlan,
+            Phase::FarInserts,
+            Phase::FarAsks,
+            Phase::FarInserts,
+            Phase::VoxelBox,
+        ];
+        let mut kept = Vec::with_capacity(N as usize);
+        let began = Instant::now();
+        for _ in 0..N {
+            let mut watch = Stopwatch::start();
+            for p in laps {
+                watch.lap(p);
+            }
+            watch.count(Count::Asked, 3);
+            watch.lap_render(&RenderWork::default());
+            kept.push(watch.finish());
+        }
+        let frame = began.elapsed() / N;
+        std::hint::black_box(&kept);
+        println!(
+            "LAP COST: {} ns a clock read; {} ns a frame's laps ({} reads, the renderer's \
+             split, the record kept); with the renderer's 9 reads, {} ns a frame",
+            read.as_nanos(),
+            frame.as_nanos(),
+            laps.len() + 2,
+            (frame + read * 9).as_nanos(),
         );
     }
 

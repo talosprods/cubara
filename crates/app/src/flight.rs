@@ -3589,4 +3589,64 @@ mod tests {
     fn swap_lag_stats_of_nothing_is_the_default() {
         assert_eq!(SwapLagStats::of(&[], 60.0, 24.0), SwapLagStats::default());
     }
+
+    /// **A flight frame's work is the game's calls, lapped, with the
+    /// renderer's own split inside it** (issue #454): over the frames that
+    /// load the start, each frame's renderer phases and upload counts are
+    /// the renderer's own [`cubara_render::RenderWork`] for that frame, and
+    /// the phases together lie inside the call. Run until a frame has
+    /// uploaded nodes and an answer has asked for meshes, so it is not
+    /// vacuous. The far terrain off: its patches at the game's radius take
+    /// minutes to generate in a debug build, and its laps are the same
+    /// `Laps`. GPU-backed (the frame is the real one); without an adapter it
+    /// skips.
+    #[test]
+    fn a_flight_frames_work_holds_the_renderers_own_split() {
+        let f = Flight {
+            quality: FarQuality::Off,
+            ..flight()
+        };
+        let Some(mut live) = Streamed::new(&f, false) else {
+            cubara_render::headless::skip_or_require_gpu(
+                "a_flight_frames_work_holds_the_renderers_own_split",
+            );
+            return;
+        };
+        let (mut uploaded, mut asked) = (0u64, 0u64);
+        let waiting = Instant::now();
+        while uploaded == 0 || asked == 0 {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(120),
+                "nothing was asked for and uploaded in two minutes"
+            );
+            let began = Instant::now();
+            let work = live.frame(&f, f.start);
+            let outer = began.elapsed();
+            let r = live.renderer.last_work();
+            assert!(work.total() <= outer, "the phases outlast the frame");
+            for (phase, own) in [
+                (Phase::Rebase, r.rebase),
+                (Phase::Uploads, r.uploads),
+                (Phase::LightingWait, r.lighting_wait),
+                (Phase::Cull, r.cull),
+                (Phase::FarCull, r.far_cull),
+                (Phase::Trees, r.trees),
+                (Phase::Encode, r.encode),
+                (Phase::Submit, r.submit),
+            ] {
+                assert_eq!(work.phase(phase), own, "{phase:?} is not the renderer's");
+            }
+            assert!(
+                work.phase(Phase::Encode) + work.phase(Phase::Submit) > Duration::ZERO,
+                "the renderer's frame was not split"
+            );
+            assert_eq!(
+                work.count(crate::frame_work::Count::Uploaded),
+                u64::from(r.uploaded_nodes)
+            );
+            uploaded += u64::from(r.uploaded_nodes);
+            asked += work.count(crate::frame_work::Count::Asked);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
