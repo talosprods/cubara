@@ -25,6 +25,7 @@ mod far_census;
 mod far_census_horizon;
 mod far_streaming;
 mod flight;
+mod frame_work;
 mod game;
 #[cfg(test)]
 mod lod_probe;
@@ -1415,7 +1416,10 @@ fn main() {
                     flag("--frames").map(std::path::Path::new),
                     video_every,
                 ) {
-                    Some(report) => log::info!("{}", report.line()),
+                    Some(report) => {
+                        log::info!("{}", report.line());
+                        log::info!("{}", report.worst_frames_line());
+                    }
                     None => log::error!("FLIGHT: no GPU to fly on"),
                 }
                 return;

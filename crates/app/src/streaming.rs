@@ -20,6 +20,7 @@ use cubara_world::TerrainBlocks;
 use cubara_world::World;
 
 use crate::far_streaming::{hole_in_blocks, VoxelBox};
+use crate::frame_work::{Count, Laps, Phase};
 
 /// How many times sooner detail coarsens with height and depth than with
 /// horizontal distance (`cubara_world::node::desired_nodes_3d`).
@@ -663,6 +664,21 @@ impl NodeStreaming {
     /// Cheap when nothing changed: `stream_around` only runs on a
     /// chunk-boundary crossing.
     pub fn update(&mut self, renderer: &mut Renderer, world: &World, eye: [f32; 3]) {
+        self.update_lapped(renderer, world, eye, &mut ());
+    }
+
+    /// [`update`](Self::update), telling `laps` where its work went as it
+    /// goes (issue #454): the search answers applied, the meshes taken, the
+    /// held nodes let go -- and how many of each. Still no clock in here:
+    /// whether one is read is the caller's `laps`' business, and the game's
+    /// reads none.
+    pub fn update_lapped(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+        eye: [f32; 3],
+        laps: &mut impl Laps,
+    ) {
         // The frame index `swap_lags` is measured in (decision 2, #378): no
         // clock in here, just this call's own count.
         self.frame += 1;
@@ -680,10 +696,12 @@ impl NodeStreaming {
         while let Ok(done) = self.searcher.done.try_recv() {
             if done.generation == self.generation {
                 self.searching = false;
-                self.follow_visibility(renderer, world, done);
+                laps.count(Count::Answers, 1);
+                self.follow_visibility(renderer, world, done, laps);
             }
         }
-        self.drain_meshes(renderer);
+        laps.lap(Phase::Search);
+        self.drain_meshes(renderer, laps);
     }
 
     /// Force a re-mesh of the chunk `cc` (e.g. after an edit): the worker
@@ -778,7 +796,13 @@ impl NodeStreaming {
     /// node not yet generated counts as seen but is not searched through until
     /// its links arrive, so the visible set grows outward along what can be
     /// seen as meshes come in.
-    fn follow_visibility(&mut self, renderer: &mut Renderer, world: &World, done: SearchDone) {
+    fn follow_visibility(
+        &mut self,
+        renderer: &mut Renderer,
+        world: &World,
+        done: SearchDone,
+        laps: &mut impl Laps,
+    ) {
         self.searched = Some(done.center);
         let desired = done.desired;
         Arc::make_mut(&mut self.links).retain(|&n, _| worth_remembering(n, &desired));
@@ -835,6 +859,7 @@ impl NodeStreaming {
             .filter(|n| !self.mesh_pool.is_in_flight(*n))
             .collect();
         let to_load = request_order(to_load, &self.resident, &self.held, done.center);
+        laps.count(Count::Asked, to_load.len() as u64);
         // One snapshot for the whole batch (issue #387 decision 2): every job
         // this search starts meshes the same world, and shares the one copy.
         let snapshot = Arc::new(world.snapshot());
@@ -970,8 +995,10 @@ impl NodeStreaming {
     /// issue #83. Marks nodes resident immediately (so they aren't
     /// re-requested); [`Renderer::apply_node_updates`] paces the actual GPU
     /// upload itself.
-    fn drain_meshes(&mut self, renderer: &mut Renderer) {
-        let meshed: Vec<MeshedNode> = sort_batch(self.mesh_pool.poll())
+    fn drain_meshes(&mut self, renderer: &mut Renderer, laps: &mut impl Laps) {
+        let built = self.mesh_pool.poll();
+        laps.count(Count::Meshes, built.len() as u64);
+        let meshed: Vec<MeshedNode> = sort_batch(built)
             .into_iter()
             .filter_map(|built| {
                 if self.links.get(&built.node) != Some(&built.links) {
@@ -987,19 +1014,22 @@ impl NodeStreaming {
                 to_meshed_node(built)
             })
             .collect();
+        laps.lap(Phase::Meshes);
         // The arriving meshes may be exactly what a held node was waiting for
         // (#262). Release those in the *same* call, so the coarse node and the
         // fine ones that replace it are never both in the arena -- and never
         // neither.
-        let released = self.release_held();
+        let released = self.release_held(laps);
+        laps.lap(Phase::Held);
         renderer.apply_node_updates(released, meshed);
+        laps.lap(Phase::Meshes);
     }
 
     /// Let go of the held nodes that can leave now ([`can_unload`]), and
     /// return them for the renderer to drop:
     /// [`drain_meshes`](Self::drain_meshes)'s bookkeeping, apart from the
     /// GPU.
-    fn release_held(&mut self) -> Vec<NodeId> {
+    fn release_held(&mut self, laps: &mut impl Laps) -> Vec<NodeId> {
         if self.held.is_empty() {
             return Vec::new();
         }
@@ -1015,6 +1045,9 @@ impl NodeStreaming {
             .filter(|&&n| can_unload(n, &self.visible, &self.resident, &loading))
             .copied()
             .collect();
+        laps.count(Count::Held, self.held.len() as u64);
+        laps.count(Count::InFlight, loading.len() as u64);
+        laps.count(Count::Released, ready.len() as u64);
         for node in &ready {
             self.held.remove(node);
             self.resident.remove(node);
@@ -1634,7 +1667,7 @@ mod tests {
             .request(&world, &s.registry, &s.layer_of, below, s.blocks);
 
         assert_eq!(
-            s.release_held(),
+            s.release_held(&mut ()),
             Vec::new(),
             "released while the node beside it was being meshed"
         );
@@ -1644,7 +1677,7 @@ mod tests {
         // not drawn: a node nobody is meshing would never land, and waiting
         // for it would hold the parent for ever.
         s.mesh_pool.cancel(below);
-        assert_eq!(s.release_held(), vec![to_node_id(parent)]);
+        assert_eq!(s.release_held(&mut ()), vec![to_node_id(parent)]);
         assert!(!s.held.contains(&parent) && !s.resident.contains(&parent));
     }
 
@@ -2255,5 +2288,431 @@ mod tests {
         assert!(s.search_behind(), "the answer is the old chunk's");
         s.searched = s.center;
         assert!(!s.search_behind());
+    }
+
+    /// The worst of one quantity over a replayed flight, and when.
+    #[derive(Clone, Copy, Default)]
+    struct Worst {
+        value: f64,
+        t: f32,
+    }
+
+    impl Worst {
+        fn offer(&mut self, value: f64, t: f32) {
+            if value > self.value {
+                *self = Worst { value, t };
+            }
+        }
+    }
+
+    impl std::fmt::Display for Worst {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:.0} (t {:.2} s)", self.value, self.t)
+        }
+    }
+
+    /// [`can_unload`], counting the [`beside`] checks it makes: the work
+    /// that grows with held nodes times loading ones. Checked against the
+    /// real one on every call by [`node_burst_report`].
+    fn can_unload_counted(
+        node: NodeKey,
+        visible: &HashSet<NodeKey>,
+        resident: &HashSet<NodeKey>,
+        loading: &[NodeKey],
+    ) -> (bool, u64) {
+        let replacements = replacements_of(node, visible);
+        if replacements.is_empty() {
+            return (true, 0);
+        }
+        if !replacements.iter().all(|r| resident.contains(r)) {
+            return (false, 0);
+        }
+        let mut checks = 0;
+        for &n in loading {
+            checks += 1;
+            if beside(node, n) && bare(n, resident) {
+                return (false, checks);
+            }
+        }
+        (true, checks)
+    }
+
+    /// **What the voxel nodes ask of the main thread, frame by frame, along
+    /// the gate's four flights** (issue #454: rare frames of 17-34 ms, and
+    /// which main-thread work grows with a burst). GPU-free: the flight's
+    /// eye at 60 frames a second; the game's selection and visibility search
+    /// as [`NodeStreaming`] runs them (a search when the eye crosses a
+    /// chunk, and ten frames after new links arrived), its answer applied as
+    /// many frames later as the search took here; every node asked for built
+    /// on this thread by the pool's own job (`build_node_shared`), timed,
+    /// and run through a modelled pool of `MODEL_WORKERS` workers in the
+    /// order asked; a finished mesh taken on the first frame after it is
+    /// done. Per frame it counts what [`NodeStreaming::update`] does in
+    /// proportion to a burst: the nodes an answer asks for and the stale
+    /// ones it sorts, the meshes taken and what they upload, the held nodes
+    /// checked against the nodes in flight ([`can_unload`]'s [`beside`]
+    /// checks, in an answer and in `release_held`), and the maps -- and it
+    /// times the real [`can_unload`] passes and the answer's own
+    /// bookkeeping. The start is loaded first, as the bench does, and not
+    /// counted. Prints the worst frame of each; asserts only that its
+    /// counting `can_unload` agrees with the real one.
+    #[test]
+    #[ignore = "builds every node four flights ask for: cargo test -p cubara --release node_burst_report -- --ignored --nocapture"]
+    fn node_burst_report() {
+        use crate::flight::{eye_at, toward_peak, Flight, FLY_SPEED};
+        use cubara_world::mesh::{build_node_shared, ParentCache};
+        use std::time::Instant;
+
+        /// The pool the model runs: the M3's eight cores less the main
+        /// thread's (`MeshPool::new`).
+        const MODEL_WORKERS: usize = 7;
+        const FRAME_MS: f64 = 1000.0 / 60.0;
+
+        /// What a node's job came to: its time on this thread, its links,
+        /// and the bytes its mesh uploads (none when nothing is drawn).
+        #[derive(Clone, Copy)]
+        struct Job {
+            ms: f64,
+            links: visibility::NodeLinks,
+            bytes: u64,
+        }
+        struct Answer {
+            due: u32,
+            center: ChunkCoord,
+            desired: HashSet<NodeKey>,
+            visible: HashSet<NodeKey>,
+        }
+        /// The worst frame of everything counted.
+        #[derive(Default)]
+        struct Report {
+            answers: u64,
+            asked: Worst,
+            stale: Worst,
+            loading: Worst,
+            answer_checks: Worst,
+            answer_ms: Worst,
+            meshes: Worst,
+            uploads: Worst,
+            upload_mb: Worst,
+            held: Worst,
+            in_flight: Worst,
+            release_checks: Worst,
+            release_ms: Worst,
+            links: Worst,
+            visible: Worst,
+            resident: Worst,
+            checks: u64,
+            check_ms: f64,
+            /// Every frame's `release_held` pass: when, held, in flight,
+            /// `beside` checks, ms.
+            releases: Vec<(f32, usize, usize, u64, f64)>,
+            /// Every answer: when, the links before `retain`, stale nodes,
+            /// loading nodes, and the answer's own work in ms (`retain`
+            /// alone, then the whole).
+            answer_list: Vec<(f32, usize, usize, usize, f64, f64)>,
+        }
+
+        let registry = cubara_render::load_registry();
+        let blocks = TerrainBlocks::from_registry(&registry)
+            .with_oak(&cubara_server::assets::load_structure_registry(), &registry)
+            .with_ores(&cubara_server::assets::load_ore_registry(), &registry);
+        let layer_of = |_: &str| 0u32;
+        let world = World::new();
+        let cache = ParentCache::default();
+        let mut jobs: HashMap<NodeKey, Job> = HashMap::new();
+        let (peak_start, peak_look) = toward_peak(&cubara_world::WorldGen::new(world.seed()));
+        let flights = [
+            ("low", [8.0, 120.0, 8.0], [1.0, -0.15, 0.3], 20.0f32),
+            ("high", [8.0, 400.0, 8.0], [1.0, -0.35, 0.3], 20.0),
+            ("down", [8.0, 450.0, 8.0], [0.4, -0.8, 0.2], 15.0),
+            ("toward the peak", peak_start, peak_look, 30.0),
+        ];
+        for (name, start, look, seconds) in flights {
+            let flight = Flight {
+                start,
+                look,
+                speed: FLY_SPEED,
+                seconds,
+                fps: 60,
+                every: 1.0,
+                size: (1, 1),
+                quality: crate::far_streaming::FarQuality::Off,
+                far_quad_scale: crate::far_streaming::FAR_QUAD_SCALE,
+                morph: true,
+            };
+            let mut links: HashMap<NodeKey, visibility::NodeLinks> = HashMap::new();
+            let mut resident: HashSet<NodeKey> = HashSet::new();
+            let mut held: HashSet<NodeKey> = HashSet::new();
+            let mut visible: HashSet<NodeKey> = HashSet::new();
+            // Each node being meshed, and when its job is done (ms).
+            let mut in_flight: HashMap<NodeKey, f64> = HashMap::new();
+            let mut workers = [0.0f64; MODEL_WORKERS];
+            let mut answer: Option<Answer> = None;
+            let (mut center, mut stale_links, mut since) = (None, false, 0u32);
+            let mut report = Report::default();
+            // One frame, `at` the flight's time or `None` while the start
+            // loads (not counted). Returns whether anything is still to do.
+            let mut frame = |f: u32, eye: [f32; 3], at: Option<f32>, report: &mut Report| -> bool {
+                let now = f64::from(f) * FRAME_MS;
+                let count = at.is_some();
+                let t = at.unwrap_or(0.0);
+                let here = ChunkCoord::from_world_pos(eye);
+                since += 1;
+                let searching = answer.is_some();
+                if center != Some(here) || (stale_links && !searching && since >= 10) {
+                    center = Some(here);
+                    stale_links = false;
+                    since = 0;
+                    let began = Instant::now();
+                    let desired: HashSet<NodeKey> = node::desired_nodes_3d(
+                        here,
+                        VERTICAL_LOD_SQUASH,
+                        node::DEFAULT_RING_SCHEDULE,
+                    )
+                    .into_iter()
+                    .collect();
+                    let sight = visibility::search(here, &desired, |n| links.get(&n).copied());
+                    let took = began.elapsed().as_secs_f64() * 1000.0;
+                    answer = Some(Answer {
+                        due: f + ((took / FRAME_MS).ceil() as u32).max(1),
+                        center: here,
+                        desired,
+                        visible: sight.nodes,
+                    });
+                }
+                let mut asked = 0usize;
+                if answer.as_ref().is_some_and(|a| a.due <= f) {
+                    let a = answer.take().expect("due");
+                    let began = Instant::now();
+                    let links_before = links.len();
+                    links.retain(|&n, _| worth_remembering(n, &a.desired));
+                    let retain_ms = began.elapsed().as_secs_f64() * 1000.0;
+                    visible = a.visible;
+                    let stale: Vec<NodeKey> = resident
+                        .iter()
+                        .copied()
+                        .chain(in_flight.keys().copied())
+                        .filter(|n| !visible.contains(n))
+                        .collect();
+                    for n in &stale {
+                        in_flight.remove(n);
+                    }
+                    let resident_stale: Vec<NodeKey> = stale
+                        .iter()
+                        .copied()
+                        .filter(|n| resident.contains(n))
+                        .collect();
+                    let loading = loading_nodes(&visible, &resident);
+                    let (leave, hold): (Vec<NodeKey>, Vec<NodeKey>) = resident_stale
+                        .iter()
+                        .partition(|&&n| can_unload(n, &visible, &resident, &loading));
+                    let answer_ms = began.elapsed().as_secs_f64() * 1000.0;
+                    let mut checks = 0;
+                    for &n in &resident_stale {
+                        let (ok, c) = can_unload_counted(n, &visible, &resident, &loading);
+                        assert_eq!(ok, leave.contains(&n), "the counted can_unload disagrees");
+                        checks += c;
+                    }
+                    for n in &leave {
+                        resident.remove(n);
+                    }
+                    held = hold.into_iter().collect();
+                    let to_load: Vec<NodeKey> = loading
+                        .iter()
+                        .copied()
+                        .filter(|n| !in_flight.contains_key(n))
+                        .collect();
+                    // The order `follow_visibility` asks in (#451).
+                    let to_load = request_order(to_load, &resident, &held, a.center);
+                    asked = to_load.len();
+                    let snapshot = Arc::new(world.snapshot());
+                    for n in to_load {
+                        let job = *jobs.entry(n).or_insert_with(|| {
+                            let began = Instant::now();
+                            let built = build_node_shared(
+                                &snapshot, &registry, &layer_of, n, blocks, &cache,
+                            );
+                            let ms = began.elapsed().as_secs_f64() * 1000.0;
+                            let bytes = built.geometry.as_ref().map_or(0, |g| {
+                                (g.mesh.vertices.len()
+                                    * std::mem::size_of::<cubara_voxel::Vertex>()
+                                    + g.mesh.indices.len() * 4)
+                                    as u64
+                            });
+                            Job {
+                                ms,
+                                links: built.links,
+                                bytes,
+                            }
+                        });
+                        let w = (0..MODEL_WORKERS)
+                            .min_by(|&x, &y| workers[x].total_cmp(&workers[y]))
+                            .unwrap_or(0);
+                        workers[w] = workers[w].max(now) + job.ms;
+                        in_flight.insert(n, workers[w]);
+                    }
+                    if count {
+                        report.answers += 1;
+                        report.stale.offer(stale.len() as f64, t);
+                        report.loading.offer(loading.len() as f64, t);
+                        report.answer_checks.offer(checks as f64, t);
+                        report.answer_ms.offer(answer_ms, t);
+                        report.answer_list.push((
+                            t,
+                            links_before,
+                            stale.len(),
+                            loading.len(),
+                            retain_ms,
+                            answer_ms,
+                        ));
+                        report.checks += checks;
+                        report.check_ms += answer_ms;
+                    }
+                }
+                // The meshes done by now, in the order `sort_batch` takes them.
+                let mut done: Vec<NodeKey> = in_flight
+                    .iter()
+                    .filter(|&(_, &at)| at <= now)
+                    .map(|(&n, _)| n)
+                    .collect();
+                done.sort();
+                let (mut uploads, mut bytes) = (0u64, 0u64);
+                for n in &done {
+                    in_flight.remove(n);
+                    let job = jobs[n];
+                    if links.get(n) != Some(&job.links) {
+                        links.insert(*n, job.links);
+                        stale_links = true;
+                    }
+                    if !visible.contains(n) {
+                        continue;
+                    }
+                    resident.insert(*n);
+                    if job.bytes > 0 {
+                        uploads += 1;
+                        bytes += job.bytes;
+                    }
+                }
+                let (mut release_checks, mut release_ms) = (0u64, 0.0f64);
+                let (held_now, flying) = (held.len(), in_flight.len());
+                if !held.is_empty() {
+                    let began = Instant::now();
+                    let loading: Vec<NodeKey> = in_flight.keys().copied().collect();
+                    let ready: Vec<NodeKey> = held
+                        .iter()
+                        .filter(|&&n| can_unload(n, &visible, &resident, &loading))
+                        .copied()
+                        .collect();
+                    release_ms = began.elapsed().as_secs_f64() * 1000.0;
+                    for &n in &held {
+                        let (ok, c) = can_unload_counted(n, &visible, &resident, &loading);
+                        assert_eq!(ok, ready.contains(&n), "the counted can_unload disagrees");
+                        release_checks += c;
+                    }
+                    for n in &ready {
+                        held.remove(n);
+                        resident.remove(n);
+                    }
+                }
+                if count {
+                    report.asked.offer(asked as f64, t);
+                    report.meshes.offer(done.len() as f64, t);
+                    report.uploads.offer(uploads as f64, t);
+                    report.upload_mb.offer(bytes as f64 / (1024.0 * 1024.0), t);
+                    report.held.offer(held_now as f64, t);
+                    report.in_flight.offer(flying as f64, t);
+                    report.release_checks.offer(release_checks as f64, t);
+                    report.release_ms.offer(release_ms, t);
+                    report.links.offer(links.len() as f64, t);
+                    report.visible.offer(visible.len() as f64, t);
+                    report.resident.offer(resident.len() as f64, t);
+                    report.checks += release_checks;
+                    report.check_ms += release_ms;
+                    if held_now > 0 {
+                        report
+                            .releases
+                            .push((t, held_now, flying, release_checks, release_ms));
+                    }
+                }
+                answer.is_some() || stale_links || !in_flight.is_empty() || !held.is_empty()
+            };
+            // The start, loaded completely, as `--bench flight` does.
+            let at = eye_at(&flight, 0.0);
+            let mut f = 0u32;
+            let mut ignored = Report::default();
+            while frame(f, at, None, &mut ignored) {
+                f += 1;
+                assert!(f < 100_000, "{name}: the start never loaded");
+            }
+            let loaded = f;
+            for k in 1..=(seconds * 60.0) as u32 {
+                let eye = eye_at(&flight, k as f32 / 60.0);
+                frame(loaded + k, eye, Some(k as f32 / 60.0), &mut report);
+            }
+            let r = &report;
+            // Seconds of the flight replayed: `t` counts from the start.
+            let mb = r.upload_mb;
+            println!(
+                "NODES {name} ({seconds} s, {} answers): per frame, worst: nodes asked {}, stale \
+                 {}, loading {}; can_unload in an answer {} beside checks, its answer {:.2} ms \
+                 (t {:.2} s); meshes taken {}, uploads {} nodes {:.1} MB (t {:.2} s); held {}, in \
+                 flight {}, release_held {} beside checks, {:.2} ms (t {:.2} s); links {}, \
+                 visible {}, resident {}; {:.1} ns a beside check over the flight",
+                r.answers,
+                r.asked,
+                r.stale,
+                r.loading,
+                r.answer_checks,
+                r.answer_ms.value,
+                r.answer_ms.t,
+                r.meshes,
+                r.uploads,
+                mb.value,
+                mb.t,
+                r.held,
+                r.in_flight,
+                r.release_checks,
+                r.release_ms.value,
+                r.release_ms.t,
+                r.links,
+                r.visible,
+                r.resident,
+                r.check_ms * 1e6 / r.checks.max(1) as f64,
+            );
+            let mut answers = r.answer_list.clone();
+            answers.sort_by(|a, b| b.5.total_cmp(&a.5));
+            println!(
+                "  {name} answers, the longest: {}",
+                answers
+                    .iter()
+                    .take(3)
+                    .map(|(t, l, s, n, retain, ms)| format!(
+                        "t {t:.2} s {ms:.2} ms ({l} links, retain {retain:.2} ms; {s} stale, {n} \
+                         loading)"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let mut releases = r.releases.clone();
+            releases.sort_by(|a, b| b.4.total_cmp(&a.4));
+            let over = |ms: f64| releases.iter().filter(|r| r.4 > ms).count();
+            println!(
+                "  {name} release_held: {} frames ran it; over 1/2/4/8 ms: {}/{}/{}/{}; the \
+                 longest: {}",
+                releases.len(),
+                over(1.0),
+                over(2.0),
+                over(4.0),
+                over(8.0),
+                releases
+                    .iter()
+                    .take(5)
+                    .map(|(t, h, n, c, ms)| format!(
+                        "t {t:.2} s {ms:.2} ms ({h} held x {n} in flight, {c} checks)"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 }
