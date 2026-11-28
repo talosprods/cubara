@@ -36,6 +36,7 @@ phase="${1:-1}"
 # once while it first loads (`FIRST LOAD:`, printed, not gated); land that
 # has been drawn never shows through again (`FLICKER:`, which must be 0).
 # That replaced STALE_KEPT_FRAMES (PROVISIONAL 0), which counted both.
+POP_P99_PX=2
 
 pass=0
 fail=0
