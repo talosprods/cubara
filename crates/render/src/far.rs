@@ -127,6 +127,8 @@ pub struct FarVertex {
     pub top: i32,
     pub rise: u32,
     pub border: bool,
+    /// How many quads the face runs: a wall along its line, a top along x.
+    pub run: u8,
 }
 
 /// The heights a face can carry: 18 bits, biased.
@@ -239,6 +241,7 @@ impl FarFace {
             top: self.top,
             rise: self.rise,
             border: self.border,
+            run: if wall && self.dir.faces_x() { dj } else { di } as u8,
         }
     }
 
@@ -246,6 +249,11 @@ impl FarFace {
     /// [`QUAD_INDICES`], two triangles wound counter-clockwise as seen from
     /// the side the face looks out of (the far pipeline culls the back).
     pub fn corners(&self) -> [FarVertex; 4] {
+        let run = if self.dir.faces_x() {
+            self.j1 - self.j0
+        } else {
+            self.i1 - self.i0
+        };
         let v = |at: [u8; 2], corner: u8| FarVertex {
             at: [at[0] as i32, at[1] as i32],
             dir: self.dir,
@@ -253,6 +261,7 @@ impl FarFace {
             top: self.top,
             rise: self.rise,
             border: self.border,
+            run,
         };
         let (i0, j0, i1, j1) = (self.i0, self.j0, self.i1, self.j1);
         match self.dir {
@@ -1567,18 +1576,53 @@ pub fn place(
     };
     if v.dir != FarDir::Top {
         if wall_in_hole(v, world, quad, (min, max)) {
-            world.y = world.y.min(min.y);
-        }
-    } else if world.cmpgt(min).all() && world.cmplt(max).all() {
-        let lo = [(x - min.x) / quad, (z - min.z) / quad];
-        let hi = [(max.x - x) / quad, (max.z - z) / quad];
-        match join(v.at, lo, hi) {
-            Join::Skirt(to) => {
-                let [x, z] = at(to);
-                world = Vec3::new(x, y - skirt, z);
+            match corner_wall(v, world, quad, (min, max)) {
+                Some(Some([x, z])) => (world.x, world.z) = (x, z),
+                Some(None) => {}
+                None => world.y = world.y.min(min.y),
             }
-            Join::Hidden => world.y = hidden,
         }
+        return world;
+    }
+    // A corner beside the box, not on it or in it, stands where it is.
+    if x < min.x || x > max.x || z < min.z || z > max.z {
+        return world;
+    }
+    let lo = [(x - min.x) / quad, (z - min.z) / quad];
+    let hi = [(max.x - x) / quad, (max.z - z) / quad];
+    // From this corner into its face, along x and z.
+    let into = [
+        if v.corner & 1 != 0 { -1 } else { 1 },
+        if v.corner & 2 != 0 { -1 } else { 1 },
+    ];
+    // The middle of the face's quad beside this corner: the face is in the
+    // box when it is, at a height the box holds.
+    let middle = [
+        x + 0.5 * quad * into[0] as f32,
+        z + 0.5 * quad * into[1] as f32,
+    ];
+    let face_in = middle[0] > min.x
+        && middle[0] < max.x
+        && middle[1] > min.z
+        && middle[1] < max.z
+        && y > min.y
+        && y < max.y;
+    let inside = world.cmpgt(min).all() && world.cmplt(max).all();
+    let rule = face_in
+        .then(|| corner(v.at, lo, hi, into))
+        .flatten()
+        .or_else(|| inside.then(|| join(v.at, lo, hi)));
+    match rule {
+        Some(Join::Skirt(to)) => {
+            let [x, z] = at(to);
+            world = Vec3::new(x, y - skirt, z);
+        }
+        Some(Join::Slide(to)) => {
+            let [x, z] = at(to);
+            world = Vec3::new(x, y, z);
+        }
+        Some(Join::Hidden) => world.y = hidden,
+        None => {}
     }
     world
 }
@@ -1608,9 +1652,62 @@ pub fn wall_in_hole(v: &FarVertex, world: Vec3, quad: f32, (min, max): (Vec3, Ve
     x > min.x && x < max.x && z > min.z && z < max.z && top > min.y && top < max.y
 }
 
-/// Where `far.wgsl` puts a vertex that lies strictly inside the voxels' box
-/// -- the join of `docs/PROPOSAL_FAR_VIEW.md` §3.4, as a function so it can be
-/// tested. `far.wgsl`'s `vs_main` is this, line for line.
+/// **The wall between the corner quad and the next quad along the z side**,
+/// at a corner of the voxels' box, where the corner quad is the higher
+/// ([`corner`]): a wall facing along x, one quad in from the nearest x side
+/// and facing away from it, with one end on a z side. The corner quad folds
+/// onto the x side and the next quad's skirt, stretched over the corner
+/// quad's part of the z side, hangs from the lower top; this wall is the
+/// step between the two, and folded onto the z side over that part it closes
+/// it: `Some(Some(xz))` for a corner at its far end, moved to the box's
+/// corner at its own height, `Some(None)` for one on the z side, which
+/// stays. `None` for any other wall.
+///
+/// A wall that runs on past the corner quad's row (merged with the step
+/// beside the next row, as quads of 8 merge within a
+/// `cubara_world::far::JOIN_GRID` cell) folds the same way: its far end
+/// goes to the box's corner too. The rest of it stands in the box, where it
+/// was cut off at the floor before.
+pub fn corner_wall(
+    v: &FarVertex,
+    world: Vec3,
+    quad: f32,
+    (min, max): (Vec3, Vec3),
+) -> Option<Option<[f32; 2]>> {
+    if !v.dir.faces_x() {
+        return None;
+    }
+    let (lo, hi) = ((world.x - min.x) / quad, (max.x - world.x) / quad);
+    let step = if hi < lo { hi } else { -lo }.round() as i32;
+    let away = match v.dir {
+        FarDir::PosX => step == -1,
+        _ => step == 1,
+    };
+    // The wall's run along z, from this corner to its other end.
+    let run = v.run as f32 * quad;
+    let other = if v.corner & 1 != 0 {
+        world.z - run
+    } else {
+        world.z + run
+    };
+    let (z0, z1) = (world.z.min(other), world.z.max(other));
+    let side = if z0 == min.z {
+        min.z
+    } else if z1 == max.z {
+        max.z
+    } else {
+        return None;
+    };
+    if !away {
+        return None;
+    }
+    Some((world.z != side).then_some([world.x + step as f32 * quad, side]))
+}
+
+/// Where `far.wgsl` puts a top's corner in the voxels' box -- strictly inside
+/// it ([`join`]), or at one of its corners ([`corner`]) -- the join of
+/// `docs/PROPOSAL_FAR_VIEW.md` §3.4, as a function so it can be tested.
+/// `far.wgsl`'s `vs_main` is this, line for line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Join {
     /// The first ring inside: straight under the grid vertex `[i, j]` on the
@@ -1620,6 +1717,51 @@ pub enum Join {
     /// Deeper: where the eye sees only its underside, which is culled --
     /// above the box for an eye inside it, under it otherwise.
     Hidden,
+    /// Along the box's side to the grid vertex `[i, j]` on its corner, at
+    /// its own height: the top of a skirt stretched over the corner quad's
+    /// stretch of that side ([`corner`]).
+    Slide([i32; 2]),
+}
+
+/// **The join at the box's corners** (found open by
+/// `the_far_terrain_closes_the_seam_to_the_voxels_on_every_side` in
+/// `cubara-app`'s `far_streaming`): [`Join`] for the grid vertex `at` of a
+/// top whose face runs from it by `into` (`+1` or `-1` quads along x and z)
+/// and lies in the box, `lo` and `hi` as for [`join`] -- or `None` away from
+/// a corner, where [`join`] decides alone.
+///
+/// [`join`] moves a vertex one quad in from both sides to the box's corner.
+/// That folds no quad there into a skirt: the corner quad becomes a flat
+/// half and a slanted half, the quad after it along either side a skirt that
+/// tapers to a point at the corner, and the corner quad's stretch of both
+/// sides is open between the voxels' ground and the far terrain outside.
+/// One quad cannot hang a skirt on two sides -- its two triangles share a
+/// diagonal -- so at a corner the first ring folds onto the box's **x
+/// side**, and the quad after the corner along the z side stretches its
+/// skirt over the corner quad's part of that side:
+///
+/// - one quad in from both sides: a face running towards the x side (the
+///   corner quad, and the one after it along the x side) folds along x
+///   only; any other (the one after it along the z side) to the corner;
+/// - on a z side, one quad in from the x side: the corner quad's vertex
+///   folds along x, and the next quad's slides to the corner, at its height.
+///
+/// The targets may lie a quad beyond the patch: the next patch's corner
+/// quad is where the stretched skirt hangs.
+pub fn corner(at: [i32; 2], lo: [f32; 2], hi: [f32; 2], into: [i32; 2]) -> Option<Join> {
+    let step = [0, 1].map(|a| if hi[a] < lo[a] { hi[a] } else { -lo[a] }.round() as i32);
+    if step[0].abs() != 1 {
+        return None;
+    }
+    let toward_x = into[0] == step[0];
+    let x = at[0] + step[0];
+    match step[1] {
+        0 if toward_x => Some(Join::Skirt([x, at[1]])),
+        0 => Some(Join::Slide([x, at[1]])),
+        1 | -1 if toward_x => Some(Join::Skirt([x, at[1]])),
+        1 | -1 => Some(Join::Skirt([x, at[1] + step[1]])),
+        _ => None,
+    }
 }
 
 /// [`Join`] for the grid vertex `at` of a patch, `lo` quads inside the box's
@@ -2580,7 +2722,20 @@ mod tests {
                             && middle.z > hole.0.z
                             && middle.z < hole.1.z;
                         assert_eq!(ins[0], strictly, "{face:?} at {origin:?}");
-                        if strictly {
+                        let folds = corner_wall(&corners[0], raw[0], quad, hole).is_some();
+                        if strictly && folds {
+                            // The step beside a corner quad (`corner_wall`):
+                            // folded onto the box's z side, not cut off.
+                            let side = if p[0].z.abs() > 1000.0 {
+                                p[0].z
+                            } else {
+                                p[1].z
+                            };
+                            assert!(
+                                p.iter().all(|v| v.z == side && v.z.abs() == 1024.0),
+                                "{face:?} at {origin:?}: not folded onto a z side: {p:?}"
+                            );
+                        } else if strictly {
                             inside += 1;
                             assert!(
                                 p.iter().all(|v| v.y <= hole.0.y),
@@ -2838,6 +2993,10 @@ mod tests {
                 Vec3::new(x, height(i, j) - skirt_depth, z)
             }
             Join::Hidden => Vec3::new(x, hidden, z),
+            Join::Slide([i, j]) => {
+                let [x, z] = at(i, j);
+                Vec3::new(x, height(i, j), z)
+            }
         }
     }
 
@@ -3029,6 +3188,220 @@ mod tests {
         );
     }
 
+    /// At a corner of the box the first ring folds onto the x side, and the
+    /// quad after the corner along the z side reaches over the corner
+    /// quad's part of the z side (`corner`). The box's low x and z sides
+    /// one quad below and left of the vertex, far from the others.
+    #[test]
+    fn at_a_corner_the_first_ring_folds_onto_the_x_side() {
+        let (lo, hi) = ([1.0, 1.0], [255.0, 255.0]);
+        // One quad in from both sides: the corner quad (towards both) and
+        // the one after it along x (towards x) fold along x only...
+        assert_eq!(corner([9, 5], lo, hi, [-1, -1]), Some(Join::Skirt([8, 5])));
+        assert_eq!(corner([9, 5], lo, hi, [-1, 1]), Some(Join::Skirt([8, 5])));
+        // ...the one after it along z, and the one beyond both, to the corner.
+        assert_eq!(corner([9, 5], lo, hi, [1, -1]), Some(Join::Skirt([8, 4])));
+        assert_eq!(corner([9, 5], lo, hi, [1, 1]), Some(Join::Skirt([8, 4])));
+        // On the z side, one quad in from the x side: the corner quad's
+        // corner folds along x, the next quad's slides to the corner.
+        let on_z = ([1.0, 0.0], [255.0, 256.0]);
+        assert_eq!(
+            corner([9, 4], on_z.0, on_z.1, [-1, 1]),
+            Some(Join::Skirt([8, 4]))
+        );
+        assert_eq!(
+            corner([9, 4], on_z.0, on_z.1, [1, 1]),
+            Some(Join::Slide([8, 4]))
+        );
+        // The high sides step the other way.
+        let high = ([255.0, 255.0], [1.0, 0.0]);
+        assert_eq!(
+            corner([9, 5], high.0, high.1, [1, -1]),
+            Some(Join::Skirt([10, 5]))
+        );
+        assert_eq!(
+            corner([9, 5], high.0, high.1, [-1, -1]),
+            Some(Join::Slide([10, 5]))
+        );
+        // Away from a corner, `join` decides: on the x side, two quads in
+        // from the z side, or one from x and two from z.
+        assert_eq!(corner([8, 5], [0.0, 1.0], [256.0, 255.0], [1, -1]), None);
+        assert_eq!(corner([9, 6], [1.0, 2.0], [255.0, 254.0], [-1, -1]), None);
+        // A target may lie a quad beyond the patch: the corner quad there
+        // is the next patch's.
+        assert_eq!(corner([0, 5], lo, hi, [1, -1]), Some(Join::Skirt([-1, 4])));
+    }
+
+    /// **Both sides of a corner are skirted** (`corner`, through [`place`]
+    /// as `far.wgsl` places a vertex): a patch of quads of 8 over the box's
+    /// low x, low z corner, every quad a top of its own height. Over every
+    /// column of both sides the patch holds, the first ring's faces stand on
+    /// that side facing into the box, from the top of the quad whose skirt
+    /// hangs there a skirt deep -- the corner quad's own on the x side, the
+    /// next quad's along the z side over the corner quad's part of it.
+    #[test]
+    fn both_sides_of_a_corner_are_skirted() {
+        let (origin, quad, skirt) = ([0.0f32, 0.0f32], 8.0f32, 40.0f32);
+        let height = |i: i32, j: i32| 60 + 9 * ((i * 3 + j * 5) % 7);
+        // The box's corner at grid (4, 4); its other sides far away.
+        let hole = (
+            Vec3::new(32.0, -100.0, 32.0),
+            Vec3::new(5000.0, 900.0, 5000.0),
+        );
+        let hidden = hidden_height(hole.0, hole.1, Vec3::new(500.0, 100.0, 500.0), 20.0);
+        let faces: Vec<FarFace> = (0..12u8)
+            .flat_map(|j| (0..12u8).map(move |i| (i, j)))
+            .map(|(i, j)| unit_top(i, j, height(i as i32, j as i32)))
+            .collect();
+        // Every triangle on a side facing into the box: (x side?, its
+        // corners as (along the side, height)).
+        let mut on_side: Vec<(bool, [[f32; 2]; 3])> = Vec::new();
+        for f in &faces {
+            let c = f
+                .corners()
+                .map(|v| place(&v, (origin, quad, skirt), Some(hole), hidden));
+            // A quad outside the box is drawn where it stands, corners on
+            // the box's sides included.
+            if f.i0 < 4 || f.j0 < 4 {
+                let own = f
+                    .corners()
+                    .map(|v| place(&v, (origin, quad, skirt), None, hidden));
+                assert_eq!(c, own, "{f:?} lies outside the box and was moved");
+            }
+            for t in QUAD_INDICES.chunks(3) {
+                let t = [c[t[0] as usize], c[t[1] as usize], c[t[2] as usize]];
+                let n = (t[1] - t[0]).cross(t[2] - t[0]);
+                if t.iter().all(|p| p.x == hole.0.x) && n.x > 0.0 {
+                    on_side.push((true, t.map(|p| [p.z, p.y])));
+                }
+                if t.iter().all(|p| p.z == hole.0.z) && n.z > 0.0 {
+                    on_side.push((false, t.map(|p| [p.x, p.y])));
+                }
+            }
+        }
+        // The heights the side's triangles cover over `along`.
+        let covered = |x_side: bool, along: f32, from: f32, to: f32| {
+            let mut spans: Vec<(f32, f32)> = on_side
+                .iter()
+                .filter(|s| s.0 == x_side)
+                .filter_map(|s| {
+                    let t = s.1;
+                    let ys: Vec<f32> = (0..3)
+                        .filter_map(|k| {
+                            let (a, b) = (t[k], t[(k + 1) % 3]);
+                            if along < a[0].min(b[0]) || along > a[0].max(b[0]) {
+                                None
+                            } else if a[0] == b[0] {
+                                Some(a[1].max(b[1]))
+                            } else {
+                                Some(a[1] + (b[1] - a[1]) * (along - a[0]) / (b[0] - a[0]))
+                            }
+                        })
+                        .collect();
+                    let lo = (0..3)
+                        .filter_map(|k| {
+                            let (a, b) = (t[k], t[(k + 1) % 3]);
+                            if along < a[0].min(b[0]) || along > a[0].max(b[0]) {
+                                None
+                            } else if a[0] == b[0] {
+                                Some(a[1].min(b[1]))
+                            } else {
+                                Some(a[1] + (b[1] - a[1]) * (along - a[0]) / (b[0] - a[0]))
+                            }
+                        })
+                        .fold(f32::MAX, f32::min);
+                    let hi = ys.iter().copied().fold(f32::MIN, f32::max);
+                    (!ys.is_empty()).then_some((lo, hi))
+                })
+                .collect();
+            spans.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut reach = to;
+            for (lo, hi) in spans {
+                if hi >= reach {
+                    reach = reach.min(lo);
+                }
+            }
+            reach <= from
+        };
+        for k in 4..12 {
+            let along = (k * 8) as f32 + 4.0;
+            // The x side: each quad's own skirt, the corner quad's too.
+            let top = height(4, k) as f32;
+            assert!(covered(true, along, top - skirt, top), "x side, quad {k}");
+            // The z side: each quad's own, the corner quad's stretch the
+            // next quad's.
+            let top = height(k.max(5), 4) as f32;
+            assert!(covered(false, along, top - skirt, top), "z side, quad {k}");
+        }
+    }
+
+    /// The step between the corner quad and the next quad along the z side,
+    /// where the corner quad is the higher, folds onto the z side over the
+    /// corner quad's part of it, facing into the box (`corner_wall`) -- run
+    /// on past that row or not; a step the other way and one further from
+    /// the corner are cut off at the box's floor as before. The box's low x, low z
+    /// corner at grid (4, 4), quads of 8.
+    #[test]
+    fn the_step_beside_the_corner_quad_folds_onto_the_z_side() {
+        let (origin, quad, skirt) = ([0.0f32, 0.0f32], 8.0f32, 40.0f32);
+        let hole = (
+            Vec3::new(32.0, -100.0, 32.0),
+            Vec3::new(5000.0, 900.0, 5000.0),
+        );
+        let wall = |dir, i: u8, j0: u8, j1: u8| FarFace {
+            dir,
+            i0: i,
+            j0,
+            i1: i,
+            j1,
+            top: 90,
+            rise: 12,
+            border: false,
+            mix: [255, 0],
+            open: 255,
+        };
+        let placed = |f: FarFace| {
+            f.corners()
+                .map(|v| place(&v, (origin, quad, skirt), Some(hole), 0.0))
+        };
+        // The corner quad (4, 4) higher than (5, 4): a +x wall on line 5.
+        let p = placed(wall(FarDir::PosX, 5, 4, 5));
+        for v in &p {
+            assert_eq!(v.z, 32.0, "{p:?}: not on the z side");
+            assert!(v.y == 78.0 || v.y == 90.0, "{p:?}: not the step");
+        }
+        let xs: Vec<f32> = p.iter().map(|v| v.x).collect();
+        assert!(
+            xs.contains(&32.0) && xs.contains(&40.0),
+            "{p:?}: not over the corner quad"
+        );
+        for t in QUAD_INDICES.chunks(3) {
+            let [a, b, c] = [p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]];
+            assert!((b - a).cross(c - a).z > 0.0, "{p:?}: faces out of the box");
+        }
+        // Run on past the corner quad's row (merged with the next step), it
+        // folds the same way: its far end to the box's corner.
+        let p = placed(wall(FarDir::PosX, 5, 4, 6));
+        assert!(p.iter().all(|v| v.z == 32.0), "{p:?}: not on the z side");
+        let xs: Vec<f32> = p.iter().map(|v| v.x).collect();
+        assert!(
+            xs.contains(&32.0) && xs.contains(&40.0),
+            "{p:?}: not over the corner quad"
+        );
+        // Lower than the next quad, or further along the side or from it:
+        // in the box, and cut off at its floor.
+        for f in [
+            wall(FarDir::NegX, 5, 4, 5),
+            wall(FarDir::PosX, 6, 4, 5),
+            wall(FarDir::PosX, 5, 5, 6),
+        ] {
+            assert!(
+                placed(f).iter().all(|v| v.y <= -100.0),
+                "{f:?} still stands"
+            );
+        }
+    }
+
     /// Hidden means out of the eye's sight, whichever side that is.
     #[test]
     fn hidden_vertices_go_where_the_eye_sees_their_underside() {
@@ -3071,7 +3444,9 @@ mod tests {
     /// A pin on its text, which is all that holds the skirt ring on the GPU:
     /// `golden.rs` renders that nothing inside the box is seen, and no image
     /// shows the seam's skirt on its own (a missing one is a line of sky a
-    /// few pixels tall, a kilometre away).
+    /// few pixels tall, a kilometre away). What the rule closes is held
+    /// against the voxels' own ground by `cubara-app`'s
+    /// `the_far_terrain_closes_the_seam_to_the_voxels_on_every_side`.
     #[test]
     fn the_shader_joins_as_this_module_does() {
         let wgsl = crate::haze::FAR_WGSL;
@@ -3088,6 +3463,20 @@ mod tests {
             "y - tile.skirt,",
             // `hidden_height`, worked out on the CPU (`FarTerrain::prepare`).
             "world.y = params.hole_min.w;",
+            // Only a top's corner in the box or on its sides is joined.
+            "} else if all(world.xz >= params.hole_min.xz) && all(world.xz <= params.hole_max.xz) {",
+            // `corner`: a top of the box at a corner of the box.
+            "let into = vec2<i32>(select(1, -1, e == 1u), select(1, -1, u == 1u));",
+            "let middle = world.xz + 0.5 * tile.quad * vec2<f32>(into);",
+            "let face_in = all(middle > params.hole_min.xz) && all(middle < params.hole_max.xz)",
+            "&& y > params.hole_min.y && y < params.hole_max.y;",
+            "if face_in && abs(step.x) == 1 && abs(step.y) <= 1 {",
+            "let toward_x = into.x == step.x;",
+            "i = i + step.x;",
+            "j = select(j, j + step.y, step.y != 0 && !toward_x);",
+            "let drop = step.y != 0 || toward_x;",
+            "select(y, y - tile.skirt, drop),",
+            "} else if all(world > params.hole_min.xyz) && all(world < params.hole_max.xyz) {",
             // `wall_in_hole`, and what `place` does with it.
             "let inward = select(0.5, -0.5, (corner & 1u) != 0u) * tile.quad;",
             "let middle = world.xz + select(vec2<f32>(inward, 0.0), vec2<f32>(0.0, inward), faces_x);",
@@ -3096,6 +3485,20 @@ mod tests {
             "world.y = min(world.y, params.hole_min.y);",
             // ...and a wall cut off there is not sealed back open.
             "seal = 0.0;",
+            // `corner_wall`: the step between the corner quad and the next
+            // quad along the z side folds onto the z side.
+            "let step_x = i32(round(select(-lo_x, hi_x, hi_x < lo_x)));",
+            "let away = (dir == DIR_POS_X && step_x == -1) || (dir == DIR_NEG_X && step_x == 1);",
+            "let run = f32(dj) * tile.quad;",
+            "let run_lo = select(world.z, world.z - run, e == 1u);",
+            "let on_lo = run_lo == params.hole_min.z;",
+            "let on_hi = run_lo + run == params.hole_max.z;",
+            "let corner_wall = faces_x && away && (on_lo || on_hi);",
+            "if corner_wall {",
+            "let side_z = select(params.hole_max.z, params.hole_min.z, on_lo);",
+            "if world.z != side_z {",
+            "world.x = world.x + f32(step_x) * tile.quad;",
+            "world.z = side_z;",
             "let sealed = world + outward * (seal * distance(world, frame.eye.xyz));",
         ] {
             assert!(wgsl.contains(line), "far.wgsl no longer has: {line}");
