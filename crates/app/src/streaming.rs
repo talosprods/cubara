@@ -2406,6 +2406,10 @@ mod tests {
             /// Every frame's `release_held` pass: when, held, in flight,
             /// `beside` checks, ms.
             releases: Vec<(f32, usize, usize, u64, f64)>,
+            /// Every answer: when, the links before `retain`, stale nodes,
+            /// loading nodes, and the answer's own work in ms (`retain`
+            /// alone, then the whole).
+            answer_list: Vec<(f32, usize, usize, usize, f64, f64)>,
         }
 
         let registry = cubara_render::load_registry();
@@ -2480,7 +2484,9 @@ mod tests {
                 if answer.as_ref().is_some_and(|a| a.due <= f) {
                     let a = answer.take().expect("due");
                     let began = Instant::now();
+                    let links_before = links.len();
                     links.retain(|&n, _| worth_remembering(n, &a.desired));
+                    let retain_ms = began.elapsed().as_secs_f64() * 1000.0;
                     visible = a.visible;
                     let stale: Vec<NodeKey> = resident
                         .iter()
@@ -2551,6 +2557,14 @@ mod tests {
                         report.loading.offer(loading.len() as f64, t);
                         report.answer_checks.offer(checks as f64, t);
                         report.answer_ms.offer(answer_ms, t);
+                        report.answer_list.push((
+                            t,
+                            links_before,
+                            stale.len(),
+                            loading.len(),
+                            retain_ms,
+                            answer_ms,
+                        ));
                         report.checks += checks;
                         report.check_ms += answer_ms;
                     }
@@ -2664,6 +2678,20 @@ mod tests {
                 r.visible,
                 r.resident,
                 r.check_ms * 1e6 / r.checks.max(1) as f64,
+            );
+            let mut answers = r.answer_list.clone();
+            answers.sort_by(|a, b| b.5.total_cmp(&a.5));
+            println!(
+                "  {name} answers, the longest: {}",
+                answers
+                    .iter()
+                    .take(3)
+                    .map(|(t, l, s, n, retain, ms)| format!(
+                        "t {t:.2} s {ms:.2} ms ({l} links, retain {retain:.2} ms; {s} stale, {n} \
+                         loading)"
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             let mut releases = r.releases.clone();
             releases.sort_by(|a, b| b.4.total_cmp(&a.4));
