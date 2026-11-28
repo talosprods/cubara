@@ -10,10 +10,18 @@
 // declare `frame` with the morph's `morph_band` and `morph_eye` after
 // `anchor` (`render.rs`'s `FrameUniform`); WGSL resolves a module-scope name
 // wherever it is declared.
+//
+// The metric's vertical part counts height once near the eye and `squash`
+// times as fast beyond (`cubara_world::morph::squashed_height`):
+// `max(v, squash * (v - shift))`, the squash in `morph_eye[0].w` and the
+// shift, in blocks, in `morph_eye[1].w` -- so a vertex fewer than
+// `NEAR_EXACT` blocks away in a straight line is never in level 0's band.
 fn morph_factor(at: vec3<f32>, level: u32) -> f32 {
     let band_pair = frame.morph_band[level >> 1u];
     let band = select(band_pair.xy, band_pair.zw, (level & 1u) == 1u);
     let rel = at - frame.morph_eye[level].xyz;
-    let metric = max(length(rel.xz), frame.morph_eye[0].w * abs(rel.y));
+    let v = abs(rel.y);
+    let vertical = max(v, frame.morph_eye[0].w * (v - frame.morph_eye[1].w));
+    let metric = max(length(rel.xz), vertical);
     return clamp((metric - band.x) / max(band.y - band.x, 1e-6), 0.0, 1.0);
 }

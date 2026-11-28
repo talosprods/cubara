@@ -113,7 +113,7 @@ pub fn node_trees(
     let columns = match columns {
         Some(c) => Some(c),
         None => {
-            own = crate::morph::node_columns(world, node, blocks);
+            own = crate::morph::tree_columns(world, node, blocks);
             own.as_ref()
         }
     };

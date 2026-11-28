@@ -222,15 +222,65 @@ pub fn desired_nodes(
 /// **How far is the same in every direction**: the outer radius is a cube, so
 /// a player 300 blocks up still sees the ground below them as far as they see
 /// it ahead. **How detailed falls off faster vertically**: a node is split
-/// towards level 0 by `max(|dx|, |dz|, squash * |dy|)`, so `squash` says how
-/// many times sooner detail coarsens with height and depth than with
-/// horizontal distance.
+/// towards level 0 by `max(|dx|, |dz|, squashed_gap(|dy|, squash))`, so
+/// `squash` says how many times sooner detail coarsens with height and depth
+/// than with horizontal distance -- beyond the near field, where height
+/// counts once ([`squashed_gap`]).
 ///
 /// Both halves matter. Squashing the radius as well was measured first, and at
 /// `squash` 8 a camera 300 blocks up drew nothing at all -- the render distance
 /// straight down had become 128 blocks.
 pub fn desired_nodes_3d(center: ChunkCoord, squash: i32, schedule: &RingSchedule) -> Vec<NodeKey> {
     select_nodes(center, Vertical::Squash(squash.max(1)), schedule)
+}
+
+/// How far from the eye, in chunks, height counts the same as horizontal
+/// distance in the 3D selection's metric -- and so in the distance morph's
+/// (`crate::morph::morph_metric`), which is the same metric continued between
+/// chunks. **Chosen, not derived**: `crate::morph::NEAR_EXACT`'s 96 blocks,
+/// the radius inside which the finest level stands exactly on the block grid
+/// (the owner's play test of 2026-11-25; `docs/PHASE3_ARCHITECTURE.md` §9.6.1).
+///
+/// With height squashed all the way to the eye, "within 96 blocks" was a flat
+/// box: 96 blocks ahead but 48 below. Standing on a peak, ground 75 blocks
+/// down and 90 away was drawn at level 1's heights (the acceptance tour of
+/// 2026-11-27, §9.6.2). A near field that is a ball needs the metric to count
+/// height once out to its radius; this is that radius.
+pub const NEAR_FIELD_CHUNKS: i32 = 6;
+
+/// How far [`squashed_gap`] moves every ring's vertical reach away from the
+/// eye, in chunks, at `squash`: the least whole number of chunks for which
+/// `max(dy, squash * (dy - shift))` counts height once out to
+/// [`NEAR_FIELD_CHUNKS`]. **Derived**: `squash * (dy - shift) <= dy` while
+/// `dy <= squash * shift / (squash - 1)`, so `shift` is
+/// `NEAR_FIELD_CHUNKS * (squash - 1) / squash` rounded up -- 3 at the game's
+/// squash of 2 (the two meet at exactly 6 chunks), 0 at a squash of 1.
+///
+/// A whole number of chunks so that every ring moves by the same whole
+/// number: ring `L`'s vertical reach is `R_L / squash + shift` chunks where
+/// it was `R_L / squash`, so the rings keep their thickness, rounding and
+/// all, and neighbours stay within one level of each other at every squash
+/// (`in_three_dimensions_the_rings_still_tile_and_stay_balanced`).
+pub fn vertical_shift(squash: i32) -> i32 {
+    let s = squash.max(1).unsigned_abs();
+    (NEAR_FIELD_CHUNKS.unsigned_abs() * (s - 1)).div_ceil(s) as i32
+}
+
+/// A vertical gap of `dy` chunks (`>= 0`) as the 3D selection counts it:
+/// once out to the near field, `squash` times as fast beyond it --
+/// `max(dy, squash * (dy - shift))` with [`vertical_shift`]'s `shift`.
+/// The one definition of the selection's vertical distance; its continuous
+/// twin is `crate::morph::morph_metric` (in blocks, `16 * shift`), and the
+/// two agree at every chunk boundary
+/// (`crate::morph::tests::the_metric_is_the_selections_distance`).
+///
+/// Continuous, monotonic, and never steeper than `squash`, which is what
+/// the morph's margins are derived from (`crate::morph::outer_margin`,
+/// `crate::morph::inner_reach`): those hold for this metric as they did for
+/// `squash * dy`.
+pub fn squashed_gap(dy: i32, squash: i32) -> i32 {
+    let s = squash.max(1);
+    dy.max(s * (dy - vertical_shift(s)))
 }
 
 /// The box of chunks [`desired_nodes_3d`] fills around `center`, as
@@ -405,7 +455,12 @@ fn node_distance_components(node: NodeKey, center: ChunkCoord, squash: i32) -> (
     let axis = |c: i32, lo: i32| (lo - c).max(c - (lo + e - 1)).max(0);
     let dx = i64::from(axis(center.x, o.x));
     let dz = i64::from(axis(center.z, o.z));
-    let dy = axis(center.y, o.y) * squash;
+    // A band selection (`squash` 0) ignores height; the 3D one counts it
+    // once in the near field and squashed beyond ([`squashed_gap`]).
+    let dy = match squash {
+        0 => 0,
+        k => squashed_gap(axis(center.y, o.y), k),
+    };
     (dx * dx + dz * dz, dy)
 }
 
@@ -495,7 +550,7 @@ pub fn sort_nearest_first(nodes: &mut [NodeKey], center: ChunkCoord) {
 /// half-chunk offset stays exact without floats); comparing a node's real
 /// center against `center`'s own *corner* instead would make the two chunks
 /// straddling that corner tie in distance and sort arbitrarily.
-fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
+pub fn node_dist_sq(node: NodeKey, center: ChunkCoord) -> i64 {
     let extent = node.extent_chunks() as i64;
     let origin = node.chunk_origin();
     let node_center_x = origin.x as i64 * 2 + extent;
@@ -769,6 +824,93 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// **The near field is a ball, not a flat box** (the acceptance tour of
+    /// 2026-11-27): from eyes anywhere in their chunk, high over the ground
+    /// and deep under it, no node coarser than level 0 comes within
+    /// `16 * NEAR_FIELD_CHUNKS` blocks of the eye in a straight line -- at
+    /// the game's squash and at every other worth using. With height
+    /// squashed all the way to the eye, level 0 reached only 80 blocks up
+    /// and down: a level-1 node 81 blocks under a peak. Goes red then.
+    #[test]
+    fn no_coarse_node_comes_into_the_near_field() {
+        let near = (16 * NEAR_FIELD_CHUNKS) as f32;
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let mut nearest_coarse = f32::MAX;
+        for squash in 1..=4 {
+            for _ in 0..12 {
+                let eye = [
+                    next() * 2000.0 - 1000.0,
+                    next() * 600.0 - 300.0,
+                    next() * 2000.0 - 1000.0,
+                ];
+                let centre = ChunkCoord::from_world_pos(eye);
+                for n in desired_nodes_3d(centre, squash, DEFAULT_RING_SCHEDULE) {
+                    if n.level == 0 {
+                        continue;
+                    }
+                    let o = n.world_origin();
+                    let size = (16 * n.extent_chunks()) as f32;
+                    let gap = |k: usize| {
+                        let lo = o[k] as f32;
+                        (lo - eye[k]).max(eye[k] - (lo + size)).max(0.0)
+                    };
+                    let d = (gap(0).powi(2) + gap(1).powi(2) + gap(2).powi(2)).sqrt();
+                    nearest_coarse = nearest_coarse.min(d);
+                    assert!(
+                        d >= near,
+                        "squash {squash}, eye {eye:?}: {n:?} is {d} blocks away, inside the \
+                         near field ({near})"
+                    );
+                }
+            }
+        }
+        // The guard against a vacuous pass: the coarse levels do come close
+        // to the edge of the near field (the vertical reach of level 0 is 128
+        // blocks at the game's squash, 112 at 3 and 4).
+        assert!(
+            nearest_coarse < 2.0 * near,
+            "nearest coarse node {nearest_coarse}"
+        );
+    }
+
+    /// The selection's vertical distance ([`squashed_gap`]): height once out
+    /// to the near field, `squash` times as fast beyond it, so every ring's
+    /// vertical reach moves out by the same whole number of chunks.
+    #[test]
+    fn height_counts_once_in_the_near_field_and_squashed_beyond() {
+        assert_eq!(vertical_shift(1), 0);
+        assert_eq!(vertical_shift(2), 3);
+        assert_eq!(vertical_shift(3), 4);
+        assert_eq!(vertical_shift(4), 5);
+        let at_2: Vec<i32> = (0..=10).map(|dy| squashed_gap(dy, 2)).collect();
+        assert_eq!(at_2, [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14]);
+        for squash in 1..=4 {
+            for dy in 0..=NEAR_FIELD_CHUNKS {
+                assert_eq!(squashed_gap(dy, squash), dy, "squash {squash}, {dy}");
+            }
+            for dy in 0..200 {
+                let step = squashed_gap(dy + 1, squash) - squashed_gap(dy, squash);
+                assert!(
+                    (1..=squash).contains(&step),
+                    "squash {squash} at {dy}: {step}"
+                );
+                // Far out, it is the plain squash moved by the shift.
+                if dy > 2 * NEAR_FIELD_CHUNKS {
+                    assert_eq!(
+                        squashed_gap(dy, squash),
+                        squash * (dy - vertical_shift(squash))
+                    );
                 }
             }
         }
